@@ -1,0 +1,207 @@
+name: Phase 4C validation
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+    inputs:
+      smoke_only:
+        description: Only verify GitHub-hosted runner routing
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  runner-smoke:
+    name: Linux runner smoke
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.smoke_only }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify runner identity
+        shell: bash
+        env:
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_NAME: ${{ runner.name }}
+        run: |
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          printf 'name=%s os=%s arch=%s environment=%s\n' "$RUNNER_NAME" "$RUNNER_OS" "$RUNNER_ARCH" "$RUNNER_ENVIRONMENT"
+
+  windows-runner-smoke:
+    name: Windows runner smoke
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.smoke_only }}
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - name: Verify runner identity
+        shell: pwsh
+        env:
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_NAME: ${{ runner.name }}
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows') { throw 'Expected a Windows runner.' }
+          if ($env:RUNNER_ARCH -ne 'X64') { throw 'Expected an X64 runner.' }
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Expected a GitHub-hosted runner.' }
+          Write-Output "name=$env:RUNNER_NAME os=$env:RUNNER_OS arch=$env:RUNNER_ARCH environment=$env:RUNNER_ENVIRONMENT"
+
+  validate:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.smoke_only }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+        python: ["3.11"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Restore triggering tag object
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          TRIGGERING_REF: ${{ github.ref }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +x
+          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          printf '::add-mask::%s\n' "$auth_header"
+          GIT_CONFIG_COUNT=1
+          GIT_CONFIG_KEY_0='http.https://github.com/.extraheader'
+          GIT_CONFIG_VALUE_0="$auth_header"
+          export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+          unset GITHUB_TOKEN auth_header
+          git fetch --no-tags origin "+${TRIGGERING_REF}:${TRIGGERING_REF}"
+          unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: "1.3.11"
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86
+        with:
+          version: "0.12.18"
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+      - name: Install Python
+        run: uv python install ${{ matrix.python }}
+      - name: Source tests
+        run: uv run --python ${{ matrix.python }} python -m unittest discover -v
+      - name: Typecheck
+        run: uvx --from basedpyright basedpyright
+      - name: Validate release identity
+        if: startsWith(github.ref, 'refs/tags/')
+        run: uv run --python ${{ matrix.python }} python scripts/validate_release_identity.py
+      - name: Build release artifacts
+        run: uv build --wheel --sdist --out-dir "${{ runner.temp }}/evospec-artifacts"
+      - name: Installed artifact smoke
+        run: uv run --python ${{ matrix.python }} tests/installed_runtime_smoke.py --artifacts "${{ runner.temp }}/evospec-artifacts"
+
+  native:
+    name: Native / ${{ matrix.platform }}
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.smoke_only }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            platform: windows-x86_64
+            architecture: x86_64
+          - runner: ubuntu-22.04
+            platform: linux-x86_64
+            architecture: x86_64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86
+        with:
+          version: "0.12.18"
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+      - name: Install Python
+        run: uv python install 3.11
+      - name: Build native bundle
+        run: uv run --python 3.11 python scripts/build_native_bundle.py --platform ${{ matrix.platform }} --output dist/native
+      - name: Smoke native bundle
+        run: uv run --python 3.11 python tests/native_bundle_smoke.py --platform ${{ matrix.platform }} --bundle dist/native/evospec
+      - name: Test PowerShell installer
+        if: matrix.platform == 'windows-x86_64'
+        run: uv run --python 3.11 python -m unittest -v tests.test_install_ps1
+      - name: Test documented Windows native bootstrap
+        if: matrix.platform == 'windows-x86_64'
+        run: uv run --python 3.11 python tests/native_installer_e2e.py --bundle dist/native/evospec
+      - name: Test POSIX installer
+        if: matrix.platform != 'windows-x86_64'
+        run: uv run --python 3.11 python -m unittest -v tests.test_install_sh
+      - name: Create versioned native archive
+        run: uv run --python 3.11 python scripts/assemble_release_assets.py --output dist/native --platform ${{ matrix.platform }} --bundle dist/native/evospec
+      - name: Validate native archive before upload
+        run: uv run --python 3.11 python scripts/assemble_release_assets.py --output dist/native --platform ${{ matrix.platform }} --validate-platform-asset
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-${{ matrix.platform }}
+          path: dist/native/*.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  release-candidate:
+    name: Release candidate
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.smoke_only) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
+    needs: native
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86
+        with:
+          version: "0.12.18"
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+      - name: Install Python
+        run: uv python install 3.11
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: native-*
+          path: dist/native-input
+          merge-multiple: true
+      - name: Verify native archive set
+        run: |
+          version="$(uv run --python 3.11 python -c "import tomllib; print(tomllib.loads(open('pyproject.toml', encoding='utf-8').read())['project']['version'])")"
+          expected="evospec-${version}-linux-x86_64.zip evospec-${version}-windows-x86_64.zip"
+          actual="$(find dist/native-input -maxdepth 1 -type f -name '*.zip' -printf '%f\n' | sort | tr '\n' ' ' | sed 's/ $//')"
+          test "$actual" = "$expected"
+      - name: Assemble release candidate
+        run: |
+          version="$(uv run --python 3.11 python -c "import tomllib; print(tomllib.loads(open('pyproject.toml', encoding='utf-8').read())['project']['version'])")"
+          mkdir -p dist/bundles
+          for platform in windows-x86_64 linux-x86_64; do
+            unzip -q "dist/native-input/evospec-${version}-${platform}.zip" -d "dist/bundles/${platform}"
+          done
+          uv run --python 3.11 python scripts/assemble_release_assets.py --output dist/release-candidate --bundle windows-x86_64=dist/bundles/windows-x86_64/evospec --bundle linux-x86_64=dist/bundles/linux-x86_64/evospec
+          cp scripts/install.ps1 scripts/install.sh dist/release-candidate/
+          expected_files="SHA256SUMS evospec-${version}-linux-x86_64.zip evospec-${version}-windows-x86_64.zip install.ps1 install.sh"
+          actual_files="$(find dist/release-candidate -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ' | sed 's/ $//')"
+          test "$actual_files" = "$expected_files"
+          test "$(find dist/release-candidate -maxdepth 1 -type f | wc -l | tr -d ' ')" = 5
+          test "$(wc -l < dist/release-candidate/SHA256SUMS | tr -d ' ')" = 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-candidate
+          path: dist/release-candidate
+          if-no-files-found: error
+          compression-level: 0

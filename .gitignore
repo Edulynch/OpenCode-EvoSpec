@@ -1,0 +1,16 @@
+.omo/
+.opencode/node_modules/
+.serena/
+.changebudget/
+__pycache__/
+*.py[cod]
+.opencode/plugins/changebudget.js
+.opencode/plugins/evospec/
+.evospec/
+build/
+dist/
+.venv/
+*.egg-info/
+.env
+.env.*
+!.env.example

@@ -1,0 +1,2 @@
+ops/actions-runner/*.sh text eol=lf
+tests/fixtures/opencode-v0.3.3-windows-x86_64/resources/** -text whitespace=cr-at-eol
