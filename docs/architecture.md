@@ -12,8 +12,10 @@ agent or caller reasoning
  deterministic Core authority
           |
           v
- local persisted state and Living Specs
+  local persisted state and Living Specs
 ```
+
+> **E0 V2 boundary:** [`methodology.md`](methodology.md) contains a proposed contract prepared for product review, not an adopted architecture. This page describes the existing runtime boundary below; it does not select or prove an implementation for the E0 proposal.
 
 The agent or caller interprets intent, chooses what to inspect, supplies evidence, and makes semantic judgments. Core does not infer product meaning. It validates the facts and requests supplied to it, persists them, enforces lifecycle rules, recovers state, and guards publication.
 

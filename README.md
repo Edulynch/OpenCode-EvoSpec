@@ -10,7 +10,7 @@
 EvoSpec keeps important decisions with the project so AI coding agents can continue without rebuilding context.
 The model reasons. EvoSpec remembers and keeps the work aligned.
 
-<p><a href="#-the-problem">Problem</a> · <a href="#-quick-start">Quick Start</a> · <a href="#-project-status">Status</a> · <a href="#-documentation">Docs</a></p>
+<p><a href="#-the-problem">Problem</a> · <a href="#quick-start">Quick Start</a> · <a href="#project-status">Status</a> · <a href="#-documentation">Docs</a></p>
 
 </div>
 
@@ -85,9 +85,9 @@ Read the [EvoSpec Methodology](docs/methodology.md) for the deeper picture.
 
 **Source/package version:** `0.5.0` (source snapshot; not a published release in this repository).
 
-**Methodology status:** EvoSpec V2 is under review. E0 has not received explicit approval; E1 remains unauthorized.
+**E0 V2 methodology:** The contract and validation walkthroughs are prepared for product-owner review; E0 approval is pending and E1 has not started. The proposal does not describe the current runtime.
 
-The former **v0.6.0 — Autonomy Pass** targets are legacy planning, not the current approved scope. Historical details remain in [ROADMAP.md](ROADMAP.md).
+The **v0.6.0 — Autonomy Pass** is paused historical planning, not an active EvoSpec V2 objective. Its task state remains in [ROADMAP.md](ROADMAP.md).
 
 CI validates this source snapshot; no native installer/archive assets, PyPI package, or GitHub Release have been published from this repository.
 
@@ -145,6 +145,7 @@ Detected existing SDD context is preserved and never silently replaced.
 - [Roadmap](ROADMAP.md)
 - [OpenCode integration](docs/opencode.md)
 - [EvoSpec Methodology](docs/methodology.md)
+- [E0 V2 contract review and validation](docs/e0-v2-validation.md)
 - [Standalone CLI](docs/standalone-cli.md)
 
 ## 🛠️ Development

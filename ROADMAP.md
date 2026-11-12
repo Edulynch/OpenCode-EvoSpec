@@ -15,7 +15,18 @@ This roadmap is intentionally human-readable. It answers three questions:
 
 ## Current focus
 
-### Feature 10 — Autonomy Pass / v0.6.0 [in progress]
+### E0 V2 methodology contract — prepared for product-owner review [documentation only]
+
+The compact contract, proposed command/context boundaries, S1–S9 desk walkthroughs, premortem, and E0→E1 gate are documented in [`docs/methodology.md`](docs/methodology.md) and [`docs/e0-v2-validation.md`](docs/e0-v2-validation.md).
+
+- **Document status:** prepared for review; this is not product-owner approval or accepted Product Truth.
+- **Gate:** proposed NO-GO to E1 until the product owner explicitly reviews and approves the contract and gate.
+- **Scope:** documentation only. No E1 comparison, runtime work, architecture/schema decision, or code change is included.
+- The Autonomy Pass plan below is preserved as historical planning with its task checkboxes unchanged; it is not an active E0 objective.
+
+## Historical implementation planning (paused)
+
+### Feature 10 — Autonomy Pass / v0.6.0 [paused; historical planning]
 
 Goal: EvoSpec should finish normal work with dramatically fewer human handoffs.
 
@@ -170,7 +181,7 @@ Goal: safely reevaluate a persisted blocker when new attributable evidence shows
 - [ ] Let Work Queue choose the next legal state after the blocker is satisfied.
 - [ ] Use the historical 0.4.3 artifact-quota blocker as a real acceptance case.
 
-**Do not resume this feature until the Autonomy Pass is complete.**
+**This remains paused unless a future roadmap decision explicitly re-prioritizes it; the Autonomy Pass is historical planning, not an active prerequisite.**
 
 ---
 
