@@ -2,6 +2,8 @@
 
 EvoSpec integrates with **OpenCode V2** through a dependency-free local plugin, nine native commands, and the `evospec` skill. The plugin registers typed tools that call EvoSpec's provider-neutral protocol or CLI for the current OpenCode session. It also adds a session-context hook that directs EvoSpec lifecycle work to the skill and canonical context.
 
+> **E0 V2 boundary:** This page describes the current OpenCode integration and its nine `/evospec.*` commands. The unprefixed `/specify`, `/clarify`, `/plan`, `/implement`, `/status`, and `/change` names in [`methodology.md`](methodology.md) are approved E0 method-level UX, not commands provided by the current integration or a selected implementation design.
+
 The integration writes only these EvoSpec-owned resources:
 
 - `.opencode/plugins/evospec/index.ts`
@@ -14,7 +16,7 @@ It does not create or edit `opencode.json`, `package.json`, npm lockfiles, instr
 
 ## Requirements
 
-Use OpenCode V2. This private repository currently offers a source-only installation; Git access and Python 3.11 or newer are required. No native release bundle or installer assets are published here.
+Use OpenCode V2. This repository currently offers a source-only installation; Git access and Python 3.11 or newer are required. No native release bundle or installer assets are published here.
 
 ## Install EvoSpec from source
 

@@ -11,11 +11,22 @@ This roadmap is intentionally human-readable. It answers three questions:
 - Every completed major task or feature must update this file in the same commit/PR or immediately after.
 - When the active milestone changes, update the **Current focus** section in both `ROADMAP.md` and `README.md`.
 - Keep `master` current after a major task/feature is validated and integrated.
-- Do not start unrelated work that is not represented here without first adding it to the roadmap.
+- Register new features, material scope changes, and milestone or priority changes here before implementation. Clear, bounded, low-risk corrections need only a proportional change/evidence trace and do not require a roadmap entry unless they affect a milestone or priority.
 
 ## Current focus
 
-### Feature 10 — Autonomy Pass / v0.6.0 [in progress]
+### E0 V2 methodology contract — product-approved [documentation only]
+
+The compact contract, approved E0 method-level command/context boundaries, S1–S9 desk walkthroughs, premortem, and E0→E1 gate are documented in [`docs/methodology.md`](docs/methodology.md) and [`docs/e0-v2-validation.md`](docs/e0-v2-validation.md).
+
+- **Document status:** product owner approved the E0 methodology contract on 2026-11-12. It defines intended method behavior, not implemented runtime Product Truth.
+- **Gate:** E0 method approval is recorded; E1 remains NO-GO until the product owner separately authorizes its scope and start.
+- **Scope:** documentation only. No E1 comparison, runtime work, architecture/schema decision, or code change is included.
+- The Autonomy Pass plan below is preserved as historical planning with its task checkboxes unchanged; it is not an active E0 objective.
+
+## Historical implementation planning (paused)
+
+### Feature 10 — Autonomy Pass / v0.6.0 [paused; historical planning]
 
 Goal: EvoSpec should finish normal work with dramatically fewer human handoffs.
 
@@ -170,7 +181,7 @@ Goal: safely reevaluate a persisted blocker when new attributable evidence shows
 - [ ] Let Work Queue choose the next legal state after the blocker is satisfied.
 - [ ] Use the historical 0.4.3 artifact-quota blocker as a real acceptance case.
 
-**Do not resume this feature until the Autonomy Pass is complete.**
+**This remains paused unless a future roadmap decision explicitly re-prioritizes it; the Autonomy Pass is historical planning, not an active prerequisite.**
 
 ---
 
