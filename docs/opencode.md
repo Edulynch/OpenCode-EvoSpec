@@ -2,7 +2,7 @@
 
 EvoSpec integrates with **OpenCode V2** through a dependency-free local plugin, nine native commands, and the `evospec` skill. The plugin registers typed tools that call EvoSpec's provider-neutral protocol or CLI for the current OpenCode session. It also adds a session-context hook that directs EvoSpec lifecycle work to the skill and canonical context.
 
-> **E0 V2 boundary:** This page describes the current OpenCode integration and its nine `/evospec.*` commands. The unprefixed `/specify`, `/clarify`, `/plan`, `/implement`, `/status`, and `/change` names in [`methodology.md`](methodology.md) are proposed contract UX, not commands added by this document or a selected integration design.
+> **E0 V2 boundary:** This page describes the current OpenCode integration and its nine `/evospec.*` commands. The unprefixed `/specify`, `/clarify`, `/plan`, `/implement`, `/status`, and `/change` names in [`methodology.md`](methodology.md) are approved E0 method-level UX, not commands provided by the current integration or a selected implementation design.
 
 The integration writes only these EvoSpec-owned resources:
 

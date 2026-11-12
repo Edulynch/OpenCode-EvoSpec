@@ -15,7 +15,7 @@ agent or caller reasoning
   local persisted state and Living Specs
 ```
 
-> **E0 V2 boundary:** [`methodology.md`](methodology.md) contains a proposed contract prepared for product review, not an adopted architecture. This page describes the existing runtime boundary below; it does not select or prove an implementation for the E0 proposal.
+> **E0 V2 boundary:** [`methodology.md`](methodology.md) is an approved method-level contract, not an approved architecture. This page describes the existing runtime boundary below; it does not select or prove an implementation of the E0 method.
 
 The agent or caller interprets intent, chooses what to inspect, supplies evidence, and makes semantic judgments. Core does not infer product meaning. It validates the facts and requests supplied to it, persists them, enforces lifecycle rules, recovers state, and guards publication.
 

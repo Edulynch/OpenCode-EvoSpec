@@ -1,10 +1,10 @@
-# EvoSpec V2 Methodology Contract (E0 proposal)
+# EvoSpec V2 Methodology Contract (E0 approved)
 
-> **Status: prepared for product review; not adopted.** This document defines the desired E0 V2 method, not a selected Core, schema, storage engine, CLI, or integration design. The command names below are proposed UX only. No E1 comparison or implementation is authorized by this proposal.
+> **Status: product-owner approved on 2026-11-12 as the E0 method contract.** This defines intended method-level UX and record responsibilities, not a selected Core, schema, storage engine, CLI, or integration design. The command names are approved as method-level UX, not implemented commands or API specifications. E1 and implementation require separate authorization.
 
 EvoSpec defines how project intent, decisions, tasks, acceptance, evidence, and continuity are kept understandable across interruptions. It does **not** orchestrate agents, measure or benchmark models, provide a sandbox, scheduler, network service, or Docker/runtime requirement. A host and its agents execute the work; project permission systems authorize actual effects.
 
-The detailed desktop walkthroughs and proposed E1 gate are in [`e0-v2-validation.md`](e0-v2-validation.md). Existing runtime documentation is retained at the end of this page and is explicitly distinguished from the proposed contract.
+The detailed desktop walkthroughs and E1 authorization boundary are in [`e0-v2-validation.md`](e0-v2-validation.md). Existing runtime documentation is retained at the end of this page and is explicitly distinguished from the approved E0 method contract.
 
 ## Core terms and boundaries
 
@@ -58,11 +58,11 @@ Relationship to the active feature is explicit: a **correction** satisfies alrea
 
 Examples that defeat size-based routing: a one-line permission change is high risk; a thousand-line mechanical rename may still be low semantic risk if reversible and bounded; a tiny deletion that removes observed offline behavior needs a material decision; passing tests do not resolve whether a game mechanic is fun. These are method examples, not deterministic classification guarantees.
 
-## Proposed command behavior (not an implementation contract)
+## Approved E0 command behavior (not an implementation contract)
 
 These slash-command names describe user-visible operations only. Arguments refine the operation; they never authorize extra scope. A no-prompt command uses context only when the repository/worktree and active feature are unambiguous and valid. Missing, closed, invalid, or multiple candidates produce a concise conflict and the minimum selection request; never choose the most recent feature automatically.
 
-| Proposed command | Purpose and minimum context | Arguments | Documentary effects | Authority and no-context behavior |
+| E0 method command (not yet implemented) | Purpose and minimum context | Arguments | Documentary effects | Authority and no-context behavior |
 | --- | --- | --- | --- | --- |
 | `/specify` | Create a feature agreement or propose a delta for a uniquely identified feature. Requires the intended outcome and enough context to identify applicable project truth. | New intent or refinement is optional when explicit conversational context already supplies it. | May record the stated intent, explicit decisions, boundaries, and proposed next-slice contract. | A clear request with an identifiable target needs no redundant confirmation; ask only for a missing material decision. Does not authorize code. If intent or target is missing/ambiguous, ask the smallest question; do not turn a recommendation into accepted Product Truth. |
 | `/clarify` | Resolve a currently pending material decision for the unique active feature. | The question ID may be omitted only when exactly one question is pending. The answer may be omitted: without an explicit, attributable user answer, show the pending question and options and wait. | Record the answer and decision lineage only after an explicit, attributable user answer. With no answer, make no documentary mutation, record no decision, and infer/select no option. | Answering a question authorizes only what that decision explicitly covers. If no question is pending, report status/no-op; do not invent one or choose a default. |
@@ -117,15 +117,15 @@ Keep these outcomes separate:
 
 Missing, stale, mock-only, conflicting, or unattributable mandatory evidence is not a PASS. A subjective criterion such as usefulness or fun requires appropriate human/value feedback; automated tests cannot decide it. A valid objective slice may proceed independently while the parent feature stays open.
 
-## E0 review boundary
+## E0 approval boundary
 
-E0 specifies the behavior and record responsibilities only. It does not select an architecture, engine, exact schema, command count in the runtime, storage, state machine, migration, repository merger, or product implementation. Compare options against the same approved contract and evidence in a later E1 phase, after human review. The proposed gate and scenario matrix are recorded in [`e0-v2-validation.md`](e0-v2-validation.md).
+E0 specifies the behavior and record responsibilities only. It does not select an architecture, engine, exact schema, command count in the runtime, storage, state machine, migration, repository merger, or product implementation. Compare options against this approved contract only after separate E1 authorization. The gate and scenario matrix are recorded in [`e0-v2-validation.md`](e0-v2-validation.md).
 
 ---
 
 ## Existing published methodology (runtime baseline, not E0 implementation evidence)
 
-> The following describes the previously published workflow documentation retained for continuity. Its presence is not evidence that the E0 V2 proposal above has been implemented, adopted, or accepted as Product Truth.
+> The following describes the previously published workflow documentation retained for continuity. Its presence is not evidence that the approved E0 V2 method has been implemented in runtime, verified as Product Truth, or released.
 
 ### The current documented workflow in brief
 
@@ -168,7 +168,7 @@ If implementation changes after a review or verification checkpoint, the affecte
 
 Convergence is optional until someone explicitly requests it. It is allowed only after an acceptable review, sufficient verification, and explicit reconciliation of relevant decisions, observations, experiments, drift, and final context.
 
-If expected behavior changed, convergence needs caller or model authored Product Truth content before a new immutable Living Spec revision can be published. This retained historical wording describes content provenance only: a caller may submit model-assisted content, but authorship or submission alone neither accepts it nor authorizes publication. The existing protocol's caller-authored `product_truth_content` requirement and explicit convergence authority are unchanged by this E0 proposal. If expected behavior did not change, the change can reach an accepted terminal archive without publishing a new Product Truth revision. There is no automatic convergence.
+If expected behavior changed, convergence needs caller or model authored Product Truth content before a new immutable Living Spec revision can be published. This retained historical wording describes content provenance only: a caller may submit model-assisted content, but authorship or submission alone neither accepts it nor authorizes publication. The existing protocol's caller-authored `product_truth_content` requirement and explicit convergence authority are unchanged by E0 method approval. If expected behavior did not change, the change can reach an accepted terminal archive without publishing a new Product Truth revision. There is no automatic convergence.
 
 Code, tests, runtime observations, and experiment results are evidence. They are not autonomous Product Truth publication. A rejected experiment remains useful knowledge without changing the Living Spec. An accepted experiment becomes eligible for deliberate product adoption only through an explicit decision.
 

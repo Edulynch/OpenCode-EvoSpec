@@ -1,6 +1,6 @@
 # E0 V2 Contract Review: Walkthroughs, Premortem, and Gate
 
-> **Status: documentary desk review prepared for product-owner review.** This page checks coherence of the proposed method in [`methodology.md`](methodology.md). S1–S9 are hypothetical/tabletop examples, not runs of an agent, Core, CLI, or runtime. An illustrative answer is not an actual user decision or accepted Product Truth.
+> **Status: E0 method approved by the product owner on 2026-11-12; walkthroughs remain hypothetical.** This page documents the coherence review of the approved method in [`methodology.md`](methodology.md). S1–S9 are tabletop examples, not runs of an agent, Core, CLI, or runtime. An illustrative answer is not an actual user decision or accepted Product Truth.
 
 ## How to read the walkthroughs
 
@@ -132,22 +132,24 @@ The scenarios validate the method and proposed records. They do **not** test mod
 | E0 deliverable / criterion | Contract location | Walkthrough / validation |
 | --- | --- | --- |
 | Compact method and glossary: Project/Constitution, Feature, Slice, Task, Change, Decision, Evidence | [`methodology.md`](methodology.md) — “Core terms and boundaries,” routes, gates | S1, S3, S4, S8, S9 |
-| Proposed command table, optional arguments, context, effects, authorization, missing context | [`methodology.md`](methodology.md) — “Proposed command behavior” | S3, S5, S6, S7 |
+| Approved E0 command table, optional arguments, context, effects, authorization, missing context | [`methodology.md`](methodology.md) — “Approved E0 command behavior” | S3, S5, S6, S7 |
 | Conceptual JSON index and canonical sources, no schema selection | [`methodology.md`](methodology.md) — “Conceptual active-feature index and canonical sources” | S5, S6; stale/dual-source premortem |
 | `/change` preflight, semantic risk, adversarial examples | [`methodology.md`](methodology.md) — “Proportional routes and materiality” and “`/change` preflight” | S1, S2, S4, S7, S9 |
 | All nine required desk scenarios and minimum records | This page, S1–S9 | This page; all are hypothetical desk checks, not runtime trials |
 | Premortem: bureaucracy, scope creep, stale context, dual source, feature hijack, false acceptance | This page, “Premortem” | Six failure rows each have a signal, prevention, and check/stop condition |
-| Explicit gate into E1 and non-goals | This page, “E0 → E1 gate” | Product approval is pending; no E1 work or architecture selection occurred |
+| Explicit gate into E1 and non-goals | This page, “E0 → E1 gate” | E0 method approved; E1 separately unauthorized; no E1 work or architecture selection occurred |
 
 ### Contrast sources, not dependencies
 
-- [Gentle AI / ODD usage guide](https://github.com/Gentleman-Programming/gentle-ai/blob/main/docs/usage.md) was a contrast for small explore → implement → proportional check loops. This proposal does not adopt its separate review artifacts or infrastructure as requirements.
-- [Spec Kit `implement` template](https://github.com/github/spec-kit/blob/main/templates/commands/implement.md) was a contrast for optional arguments and use of available context. This proposal does not adopt a mandatory future-task waterfall, hooks, or a ritual checklist.
+- [Gentle AI / ODD usage guide](https://github.com/Gentleman-Programming/gentle-ai/blob/main/docs/usage.md) was a contrast for small explore → implement → proportional check loops. The approved E0 method does not adopt its separate review artifacts or infrastructure as requirements.
+- [Spec Kit `implement` template](https://github.com/github/spec-kit/blob/main/templates/commands/implement.md) was a contrast for optional arguments and use of available context. The approved E0 method does not adopt a mandatory future-task waterfall, hooks, or a ritual checklist.
 
 ## E0 → E1 gate
 
-**Documentary result:** The requested E0 materials are prepared for review and cross-referenced. This is an internal document completeness/coherence assessment, not human product approval, live implementation validation, or adoption of Product Truth.
+**Documentary result:** The E0 method contract and S1–S9 coherence review are complete. The product owner explicitly approved the methodology on 2026-11-12. This is a product-method decision, not live runtime validation, implementation evidence, or automatic publication of Product Truth.
 
-**Recommendation: NO-GO to E1 now; conditional GO only after explicit product-owner review and approval of the methodology contract and this gate.** Until that decision is recorded, E0 acceptance remains pending. E1 has **not** started or been approved; no architecture, JSON schema, storage, engine, CLI, or repository merger is selected.
+**Decision record — E0_APPROVED (2026-11-12):** The approved scope is method-level behavior, proposed command UX, canonical record responsibilities, proportional routing, evidence/authority boundaries, walkthroughs, and explicit exclusions. Provenance: attributable product-owner acceptance in the project conversation. This record is not a GitHub PR review and does not authorize a merge, release, runtime change, or E1.
 
-**Next and only gate action:** product owner reviews and explicitly accepts, requests a delta to, or rejects the contract plus this gate. After that decision, E1 may compare implementation options against the accepted contract; it must not be inferred from these prepared documents.
+**E1 status: NO-GO until separately authorized.** E1 has not started; no architecture, JSON schema, storage engine, CLI/API implementation, or repository merger has been selected.
+
+**Next gate:** Complete the independent PR review and obtain separate merge authority if appropriate. A future E1 option comparison requires its own scoped authorization; E0 approval does not start it.

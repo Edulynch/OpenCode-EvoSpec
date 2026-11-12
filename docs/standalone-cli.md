@@ -2,7 +2,7 @@
 
 The standalone CLI is a thin local adapter around EvoSpec's workflow service. It reads and writes the selected repository's `.evospec` state. It does not replace the Core workflow or publish Product Truth by itself.
 
-> **E0 V2 boundary:** This guide describes the existing standalone CLI. The proposed command table in [`methodology.md`](methodology.md) is a method-level UX contract for review, not a CLI/API implementation or decision to change the current command surface.
+> **E0 V2 boundary:** This guide describes the existing standalone CLI. The E0-approved command table in [`methodology.md`](methodology.md) is a method-level UX contract, not a CLI/API implementation or a decision to change the current command surface.
 
 For the workflow model, see [methodology.md](methodology.md). For the storage boundary, see [architecture.md](architecture.md).
 

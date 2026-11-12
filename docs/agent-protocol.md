@@ -2,7 +2,7 @@
 
 The agent protocol is a provider-neutral JSON boundary over `WorkflowService`. An agent sends one JSON request on standard input and receives one JSON response on standard output. The protocol is separate from the standalone lifecycle CLI and does not bypass Core.
 
-> **E0 V2 boundary:** The proposed `/specify`, `/clarify`, `/plan`, `/implement`, `/status`, and `/change` UX in [`methodology.md`](methodology.md) is not this implemented JSON action surface or an approved API. This guide documents the existing protocol only; E0 has not selected its eventual engine or schema.
+> **E0 V2 boundary:** The E0-approved `/specify`, `/clarify`, `/plan`, `/implement`, `/status`, and `/change` method-level UX in [`methodology.md`](methodology.md) is not implemented by this JSON action surface and is not an approved API. This guide documents the existing protocol only; E0 selected no engine or schema.
 
 For the workflow rules, see [methodology.md](methodology.md). For OpenCode's native integration, see [opencode.md](opencode.md). For persistence and authority boundaries, see [architecture.md](architecture.md). For lock behavior, see [semantic-locks.md](semantic-locks.md).
 

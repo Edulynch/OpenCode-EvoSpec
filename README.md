@@ -85,7 +85,7 @@ Read the [EvoSpec Methodology](docs/methodology.md) for the deeper picture.
 
 **Source/package version:** `0.5.0` (source snapshot; not a published release in this repository).
 
-**E0 V2 methodology:** The contract and validation walkthroughs are prepared for product-owner review; E0 approval is pending and E1 has not started. The proposal does not describe the current runtime.
+**E0 V2 methodology:** Product-owner approved on 2026-11-12 as a method-level contract. E1 remains separately unauthorized and has not started. This approval does not certify the current runtime or authorize implementation.
 
 The **v0.6.0 — Autonomy Pass** is paused historical planning, not an active EvoSpec V2 objective. Its task state remains in [ROADMAP.md](ROADMAP.md).
 

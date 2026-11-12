@@ -15,12 +15,12 @@ This roadmap is intentionally human-readable. It answers three questions:
 
 ## Current focus
 
-### E0 V2 methodology contract — prepared for product-owner review [documentation only]
+### E0 V2 methodology contract — product-approved [documentation only]
 
-The compact contract, proposed command/context boundaries, S1–S9 desk walkthroughs, premortem, and E0→E1 gate are documented in [`docs/methodology.md`](docs/methodology.md) and [`docs/e0-v2-validation.md`](docs/e0-v2-validation.md).
+The compact contract, approved E0 method-level command/context boundaries, S1–S9 desk walkthroughs, premortem, and E0→E1 gate are documented in [`docs/methodology.md`](docs/methodology.md) and [`docs/e0-v2-validation.md`](docs/e0-v2-validation.md).
 
-- **Document status:** prepared for review; this is not product-owner approval or accepted Product Truth.
-- **Gate:** proposed NO-GO to E1 until the product owner explicitly reviews and approves the contract and gate.
+- **Document status:** product owner approved the E0 methodology contract on 2026-11-12. It defines intended method behavior, not implemented runtime Product Truth.
+- **Gate:** E0 method approval is recorded; E1 remains NO-GO until the product owner separately authorizes its scope and start.
 - **Scope:** documentation only. No E1 comparison, runtime work, architecture/schema decision, or code change is included.
 - The Autonomy Pass plan below is preserved as historical planning with its task checkboxes unchanged; it is not an active E0 objective.
 
