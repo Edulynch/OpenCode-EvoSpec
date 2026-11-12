@@ -28,7 +28,7 @@ Your intent  →  Shared direction  →  Confident building  →  A result you r
 
 ## Quick Start
 
-This private repository currently provides a source-only installation. Git access and Python 3.11 or newer are required. No native installer/archive assets or PyPI release are published here yet.
+This repository currently provides a source-only installation. Git access and Python 3.11 or newer are required. No native installer/archive assets or PyPI release are published here yet.
 
 1. **Clone and install EvoSpec from source.**
 
@@ -85,16 +85,11 @@ Read the [EvoSpec Methodology](docs/methodology.md) for the deeper picture.
 
 **Source/package version:** `0.5.0` (source snapshot; not a published release in this repository).
 
-**Current product focus:** **v0.6.0 - Autonomy Pass**
+**Methodology status:** EvoSpec V2 is under review. E0 has not received explicit approval; E1 remains unauthorized.
 
-The next milestone is not about adding more product features. It is about reducing human coordination:
+The former **v0.6.0 — Autonomy Pass** targets are legacy planning, not the current approved scope. Historical details remain in [ROADMAP.md](ROADMAP.md).
 
-- normal feature: target **<= 5 human interventions**;
-- normal release: target **1 prompt** when publication is pre-authorized;
-- tests/builds/Oracle/CI/waits/worktrees/hashes/uploads: target **0 prompts**;
-- more than 10 handoffs for a normal feature is considered an autonomy failure.
-
-No native installer/archive assets, PyPI package, or release/CI run is claimed for this source snapshot. See [ROADMAP.md](ROADMAP.md) for the task-level plan.
+CI validates this source snapshot; no native installer/archive assets, PyPI package, or GitHub Release have been published from this repository.
 
 ## ⌨️ Optional Commands
 Natural language is the default. Use a command only when you want a direct control point:
