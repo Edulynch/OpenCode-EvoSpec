@@ -11,7 +11,7 @@ This roadmap is intentionally human-readable. It answers three questions:
 - Every completed major task or feature must update this file in the same commit/PR or immediately after.
 - When the active milestone changes, update the **Current focus** section in both `ROADMAP.md` and `README.md`.
 - Keep `master` current after a major task/feature is validated and integrated.
-- Do not start unrelated work that is not represented here without first adding it to the roadmap.
+- Register new features, material scope changes, and milestone or priority changes here before implementation. Clear, bounded, low-risk corrections need only a proportional change/evidence trace and do not require a roadmap entry unless they affect a milestone or priority.
 
 ## Current focus
 
