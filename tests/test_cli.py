@@ -104,7 +104,7 @@ class CliTests(unittest.TestCase):
         # Then: the public command surface remains intentionally narrow
         self.assertEqual(
             tuple(name for name in action.choices if name not in ("integrate", "doctor")),
-            ("init", "new", "change", "clarify", "continue", "status", "accept-slice", "review", "ui"),
+            ("init", "new", "change", "clarify", "continue", "status", "accept-slice", "upgrade-e1-schema", "review", "ui"),
         )
         self.assertIn("doctor", action.choices)
 

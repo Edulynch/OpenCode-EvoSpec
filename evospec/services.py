@@ -72,6 +72,8 @@ from .domain import (
     SharedIntent,
     State,
     StateValidationError,
+    E1SchemaUpgradeReceipt,
+    TaskProgress,
     TerminalArchive,
     VerificationEvidence,
     WorkingContext,
@@ -139,6 +141,34 @@ class StaleRevisionError(ServiceError):
             f"expected state revision {self.expected_revision}, "
             f"but authority is revision {self.actual_revision}"
         )
+
+
+class DurabilityUncertainError(ServiceError):
+    """The state replacement may have committed; recovery must precede retry."""
+
+
+def _accepted_e1_scope(state: State, root: Path) -> tuple[WorkingContext, AgreementRecord, AgreementRecord]:
+    """Resolve a single accepted primary Task without trusting caller-provided scope."""
+    context = state.active_context
+    initialization = state.initialization
+    root_identity = sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+    if initialization is None or initialization.repository_id != root_identity:
+        raise ServiceError("E1 repository authority does not match the exact local root")
+    if (context is None or context.side_of is not None or context.change_id is None
+            or state.preserved_primary_context is not None or state.preserved_primary_work_id is not None
+            or state.work_items or state.parked_work is not None or state.pending_intake is not None
+            or state.deferred_side_request is not None or len(state.agreements) != 2):
+        raise ServiceError("E1 Task progress requires one active primary accepted Slice")
+    feature = next((item for item in state.agreements if item.id == context.feature_agreement_ref), None)
+    slice_record = next((item for item in state.agreements if item.id == context.slice_agreement_ref), None)
+    if (feature is None or slice_record is None or feature.kind != "FEATURE" or slice_record.kind != "SLICE"
+            or feature.change_id != context.change_id or slice_record.change_id != context.change_id
+            or feature.feature_id != context.feature_id or slice_record.feature_id != context.feature_id
+            or feature.repository_id != root_identity or slice_record.repository_id != root_identity
+            or not slice_record.task_id or not slice_record.initial_task or not slice_record.checkpoint
+            or context.current_work != slice_record.initial_task or context.focus != slice_record.title):
+        raise ServiceError("E1 Task progress cannot expand or replace the human-approved scope")
+    return context, feature, slice_record
 
 
 def _validated(candidate: State, message: str) -> State:
@@ -1651,6 +1681,129 @@ class CoreService:
             raise ServiceError("first Slice aggregate publication was rejected") from error
         return saved
 
+    def e1_upgrade_statement(self, state: State) -> str:
+        """Show the exact authority-bound decision the human must confirm."""
+        current = _authoritative_state(self.__persistence, state)
+        if self.__persistence.e1_schema_ready():
+            raise ServiceError("accepted E1 authority already uses schema 14")
+        _, feature, slice_record = _accepted_e1_scope(current, self.__repository_root)
+        assert current.initialization is not None
+        return (
+            f"Autorizo migrar E1 a schema 14; repository: {current.initialization.repository_id}; "
+            f"revision: {current.revision}; Feature: {feature.id}; Slice: {slice_record.id}; "
+            f"Task: {slice_record.task_id}; source-sha256: {self.__persistence.state_source_sha256()}"
+        )
+
+    def confirmed_e1_upgrade(self, source_revision: int) -> State | None:
+        """Recognize an already committed conversion using its immutable in-state receipt."""
+        current = self.__persistence.recover()
+        receipt = current.e1_schema_upgrade
+        if (type(source_revision) is int and source_revision >= 0 and receipt is not None
+                and receipt.source_revision == source_revision and self.__persistence.e1_schema_ready()):
+            return current
+        return None
+
+    def upgrade_e1_schema(self, state: State, acceptance: UserAcceptance) -> State:
+        """Convert accepted E1 schema 13 only after a revision-bound terminal decision."""
+        current = _authoritative_state(self.__persistence, state)
+        _, feature, slice_record = _accepted_e1_scope(current, self.__repository_root)
+        statement = self.e1_upgrade_statement(current)
+        token = sha256(statement.encode("utf-8")).hexdigest()[:12]
+        if (type(acceptance) is not UserAcceptance or acceptance.source != "INTERACTIVE_TERMINAL"
+                or acceptance.statement != statement or acceptance.source_reference != f"tty:{token}"):
+            raise ServiceError("schema upgrade requires exact attributable human confirmation")
+
+        def convert(locked: State) -> State:
+            # Rebind the accepted identity and revision while holding the writer lock.
+            _accepted_e1_scope(locked, self.__repository_root)
+            if locked != current:
+                raise ServiceError("accepted E1 authority changed before schema conversion")
+            assert locked.initialization is not None
+            receipt = E1SchemaUpgradeReceipt(
+                locked.revision, locked.revision + 1, source_digest,
+                acceptance.statement, acceptance.source, acceptance.source_reference,
+                locked.initialization.repository_id, feature.id, slice_record.id,
+            )
+            return _prepare_state_publication(replace(locked, e1_schema_upgrade=receipt), locked.revision)
+
+        try:
+            # A concurrent in-place rewrite with the same revision invalidates consent too.
+            source_digest = statement.rsplit("source-sha256: ", 1)[1]
+            return self.__persistence.transact_e1(
+                current.revision, convert, upgrade=True, source_digest=source_digest,
+            )
+        except AtomicFailure as error:
+            self.__raise_e1_publication_error(current.revision, error)
+
+    def record_accepted_task_progress(
+        self, state: State, repository_id: str, task_id: str,
+        feature_agreement_ref: str, slice_agreement_ref: str,
+        checkpoint: str, statement: str, evidence_refs: tuple[str, ...],
+    ) -> State:
+        """Commit one unverified Task report and in-memory lifecycle transitions in one CAS."""
+        current = _authoritative_state(self.__persistence, state)
+        values = (repository_id, task_id, feature_agreement_ref, slice_agreement_ref, checkpoint, statement)
+        if any(type(item) is not str or not item.strip() or len(item) > 2048 for item in values):
+            raise ServiceError("E1 Task progress requires bounded nonblank identity and text")
+        if (type(evidence_refs) is not tuple or len(evidence_refs) > 16
+                or len(set(evidence_refs)) != len(evidence_refs)
+                or any(type(item) is not str or not item.strip() or len(item) > 2048 for item in evidence_refs)):
+            raise ServiceError("E1 evidence references must be bounded distinct leads")
+
+        def record(locked: State) -> State:
+            context, feature, slice_record = _accepted_e1_scope(locked, self.__repository_root)
+            if (locked != current or repository_id != slice_record.repository_id
+                    or feature_agreement_ref != feature.id or slice_agreement_ref != slice_record.id
+                    or task_id != slice_record.task_id):
+                raise ServiceError("E1 Task identity, root, agreement or revision does not match authority")
+            if _evaluate_autonomy(context, "progress", (), False).authorization is not AutonomyAuthorization.ALLOWED:
+                raise ServiceError("E1 Task progress is outside the current autonomy budget or permissions")
+            if context.unresolved_material_decision:
+                raise ServiceError("E1 Task progress cannot bypass an unresolved human decision")
+            pair = (context.status, context.phase)
+            try:
+                if pair == (LifecycleState.PROPOSED, Phase.RESEARCH):
+                    pair = advance(*pair, LifecycleState.READY, Phase.READY,
+                                   context.unresolved_material_decision, context.review, context.verification,
+                                   context.convergence_complete)
+                if pair == (LifecycleState.READY, Phase.READY):
+                    pair = advance(*pair, LifecycleState.IN_PROGRESS, Phase.IMPLEMENT,
+                                   context.unresolved_material_decision, context.review, context.verification,
+                                   context.convergence_complete)
+            except LifecycleError as error:
+                raise ServiceError("E1 Task progress lifecycle transition is invalid") from error
+            if pair != (LifecycleState.IN_PROGRESS, Phase.IMPLEMENT):
+                raise ServiceError("E1 Task progress is permitted only during implementation")
+            report = TaskProgress(
+                task_id, checkpoint.strip(), statement.strip(), "REPORTED_UNVERIFIED",
+                # Same-user protocol clients cannot prove they were invoked by the host.
+                "UNKNOWN", None, evidence_refs, locked.revision + 1,
+            )
+            updated = replace(
+                context, status=pair[0], phase=pair[1], task_progress=report,
+                current_action="accepted Task progress reported",
+                resume_point=None,
+                autonomy_metrics=replace(context.autonomy_metrics,
+                                         automatic_operations=context.autonomy_metrics.automatic_operations + 1),
+            )
+            return _prepare_state_publication(replace(locked, active_context=updated), locked.revision)
+
+        try:
+            return self.__persistence.transact_e1(current.revision, record)
+        except AtomicFailure as error:
+            self.__raise_e1_publication_error(current.revision, error)
+
+    def __raise_e1_publication_error(self, expected_revision: int, error: AtomicFailure) -> Never:
+        """Preserve uncertainty; a failed fsync after replacement is not proof of rollback."""
+        if "durability is uncertain" in str(error):
+            raise DurabilityUncertainError(
+                "E1_DURABILITY_UNKNOWN: state may have committed; recover and inspect revision before retry"
+            ) from error
+        actual_revision = self.__persistence.recover().revision
+        if actual_revision != expected_revision:
+            raise StaleRevisionError(expected_revision, actual_revision) from error
+        raise ServiceError(str(error)) from error
+
     def record_capability_selection(self, state: State, selection: PendingCapabilitySelection) -> State:
         current = _authoritative_state(self.__persistence, state)
         if current.pending_capability_selection is not None:
@@ -1763,6 +1916,10 @@ class CoreService:
 
     def recover(self) -> State:
         return self.__persistence.recover()
+
+    def e1_schema_ready(self) -> bool:
+        """Inspect the persisted writer format without changing Core authority."""
+        return self.__persistence.e1_schema_ready()
 
     def mutation_state(self, expected_revision: ExpectedRevision) -> State:
         """Recover authority only when the caller's mutation revision is current."""
@@ -2646,6 +2803,8 @@ class CoreService:
         resume_point: str | None,
     ) -> State:
         current = _authoritative_state(self.__persistence, state)
+        if current.active_context is not None and current.active_context.slice_agreement_ref is not None:
+            raise ServiceError("accepted E1 Task progress requires the guarded typed operation")
         active = current.active_context
         if active is None:
             raise ServiceError("progress recording requires active work")

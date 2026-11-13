@@ -60,6 +60,8 @@ def _parser() -> _ArgumentParser:
     accept.add_argument("--task", required=True, help="Initial Task to resume after restart")
     accept.add_argument("--checkpoint", required=True, help="Initial pending verification checkpoint")
     accept.add_argument("--expected-revision", required=True, type=int)
+    upgrade = commands.add_parser("upgrade-e1-schema")
+    upgrade.add_argument("--expected-revision", required=True, type=int)
     commands.add_parser("doctor")
     commands.add_parser("review")
     ui = commands.add_parser("ui")
@@ -122,18 +124,40 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             print(f"ERROR {error}", file=target)
             return 2
         return 0
-    if arguments.command == "accept-slice":
+    if arguments.command in ("accept-slice", "upgrade-e1-schema"):
+        workflow = WorkflowService.open(Path(arguments.root))
+        if arguments.command == "upgrade-e1-schema":
+            try:
+                already = workflow.confirmed_e1_schema_upgrade(
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            except RecoveryError as error:
+                print(f"ERROR {error}", file=target)
+                return 2
+            if already is not None:
+                # An already committed conversion is an inspection, not a second approval.
+                _render(already, target)
+                return 0
         # Only a user at a real terminal can cross the first acceptance boundary.
         if not sys.stdin.isatty() or not sys.stdout.isatty():
-            print("ERROR Slice acceptance requires an interactive user terminal", file=target)
+            print("ERROR E1 approval requires an interactive user terminal", file=target)
             return 2
         if arguments.expected_revision < 0:
             print("ERROR expected revision must be nonnegative", file=target)
             return 2
-        statement = (
-            f"Acepto Feature: {arguments.feature}; Slice: {arguments.slice}; "
-            f"Task: {arguments.task}; checkpoint: {arguments.checkpoint}"
-        )
+        if arguments.command == "accept-slice":
+            statement = (
+                f"Acepto Feature: {arguments.feature}; Slice: {arguments.slice}; "
+                f"Task: {arguments.task}; checkpoint: {arguments.checkpoint}"
+            )
+        else:
+            try:
+                statement = workflow.e1_upgrade_agreement(
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            except (RecoveryError, WorkflowError) as error:
+                print(f"ERROR {error}", file=target)
+                return 2
         token = sha256(statement.encode("utf-8")).hexdigest()[:12]
         print(f"Acuerdo para aprobación explícita:\n{statement}", file=target)
         try:
@@ -144,13 +168,18 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
         if typed != f"ACEPTO {token}":
             print("ERROR acceptance was not explicitly confirmed", file=target)
             return 2
-        workflow = WorkflowService.open(Path(arguments.root))
         try:
-            result = workflow.accept_first_slice(
-                arguments.feature, arguments.slice, arguments.task,
-                arguments.checkpoint, UserAcceptance(statement, f"tty:{token}"),
-                expected_revision=ExpectedRevision(arguments.expected_revision),
-            )
+            if arguments.command == "accept-slice":
+                result = workflow.accept_first_slice(
+                    arguments.feature, arguments.slice, arguments.task,
+                    arguments.checkpoint, UserAcceptance(statement, f"tty:{token}"),
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            else:
+                result = workflow.upgrade_e1_schema(
+                    UserAcceptance(statement, f"tty:{token}"),
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
         except (RecoveryError, WorkflowError) as error:
             print(f"ERROR {error}", file=target)
             return 2
@@ -222,10 +251,19 @@ def _render_status(context: AgentContext, output: TextIO) -> None:
         if context.progress.current_work is not None:
             print(f"Current: {context.progress.current_work}", file=output)
         if context.accepted_slice is not None:
+            if context.e1_schema_ready is False:
+                print("E1 schema: 13 | explicit upgrade-e1-schema approval required", file=output)
             print(
                 f"Accepted Slice: {context.accepted_slice.slice_title} "
                 f"| Task ID: {context.accepted_slice.task_id} "
                 f"| Pending checkpoint: {context.accepted_slice.checkpoint}",
+                file=output,
+            )
+        if context.task_progress is not None:
+            print(
+                f"Current Task report: {context.task_progress.checkpoint} "
+                f"| {context.task_progress.report_kind} "
+                f"| revision {context.task_progress.recorded_revision}",
                 file=output,
             )
     elif context.completed_terminal:

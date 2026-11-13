@@ -776,6 +776,35 @@ class ConvergenceAssessment:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskProgress:
+    """One unverified operational report, never acceptance of completed value."""
+
+    task_id: str
+    checkpoint: str
+    statement: str
+    report_kind: str
+    source_kind: str
+    source_reference: str | None
+    evidence_refs: tuple[str, ...]
+    recorded_revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class E1SchemaUpgradeReceipt:
+    """Durable proof of exactly which old E1 authority the human converted."""
+
+    source_revision: int
+    converted_revision: int
+    source_sha256: str
+    statement: str
+    source: str
+    source_reference: str
+    repository_id: str
+    feature_agreement_ref: str
+    slice_agreement_ref: str
+
+
+@dataclass(frozen=True, slots=True)
 class WorkingContext:
     feature_id: FeatureId
     change_id: ChangeId | None
@@ -813,6 +842,7 @@ class WorkingContext:
     autonomy_metrics: AutonomyMetrics = field(default=AutonomyMetrics(), compare=False)
     feature_agreement_ref: str | None = None
     slice_agreement_ref: str | None = None
+    task_progress: TaskProgress | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -897,6 +927,7 @@ class State:
     pending_autonomy_expansion: PendingAutonomyExpansion | None = None
     autonomy_expansion_history: tuple[AutonomyExpansionRecord, ...] = ()
     agreements: tuple[AgreementRecord, ...] = ()
+    e1_schema_upgrade: E1SchemaUpgradeReceipt | None = None
 
 
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -1499,6 +1530,29 @@ def _context_shape(context: WorkingContext) -> None:
         raise StateValidationError("autonomy metrics are invalid")
     if context.publication is not None:
         _publication_shape(context.publication)
+    if context.task_progress is not None:
+        report = context.task_progress
+        if type(report) is not TaskProgress:
+            raise StateValidationError("Task progress must use the typed E1 record")
+        for value, label in (
+            (report.task_id, "Task progress id"),
+            (report.checkpoint, "Task progress checkpoint"),
+            (report.statement, "Task progress statement"),
+        ):
+            if type(value) is not str or not value.strip() or len(value) > 2048:
+                raise StateValidationError(f"{label} must be bounded nonblank text")
+        if report.report_kind != "REPORTED_UNVERIFIED" or report.source_kind not in ("UNKNOWN", "AGENT_REPORTED"):
+            raise StateValidationError("Task progress cannot claim verification or host attestation")
+        if report.source_reference is not None:
+            raise StateValidationError("unattested Task progress cannot claim a source reference")
+        if (type(report.evidence_refs) is not tuple or len(report.evidence_refs) > 16
+                or len(set(report.evidence_refs)) != len(report.evidence_refs)
+                or any(type(item) is not str or not item.strip() or len(item) > 2048 for item in report.evidence_refs)):
+            raise StateValidationError("Task progress evidence references must be bounded leads")
+        if type(report.recorded_revision) is not int or report.recorded_revision < 1:
+            raise StateValidationError("Task progress revision is invalid")
+        if context.resume_point is not None:
+            raise StateValidationError("E1 Task progress cannot duplicate its checkpoint in resume_point")
 
 
 def _publication_shape(publication: LivingSpecPublication) -> None:
@@ -2115,6 +2169,32 @@ def validate_state(state: State) -> None:
             not agreement.task_id or not agreement.initial_task or not agreement.checkpoint
         ):
             raise StateValidationError("Slice agreement requires its initial Task and checkpoint")
+    receipt = state.e1_schema_upgrade
+    if receipt is not None:
+        if type(receipt) is not E1SchemaUpgradeReceipt:
+            raise StateValidationError("E1 schema upgrade receipt is not typed authority")
+        if (type(receipt.source_revision) is not int or receipt.source_revision < 1
+                or type(receipt.converted_revision) is not int
+                or receipt.converted_revision != receipt.source_revision + 1
+                or receipt.converted_revision > state.revision
+                or type(receipt.source_sha256) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", receipt.source_sha256) is None):
+            raise StateValidationError("E1 schema upgrade source identity is invalid")
+        if (initialization is None or receipt.repository_id != initialization.repository_id
+                or len(state.agreements) != 2):
+            raise StateValidationError("E1 schema upgrade receipt does not bind accepted authority")
+        feature = next((item for item in state.agreements if item.id == receipt.feature_agreement_ref), None)
+        slice_record = next((item for item in state.agreements if item.id == receipt.slice_agreement_ref), None)
+        if feature is None or slice_record is None or feature.kind != "FEATURE" or slice_record.kind != "SLICE":
+            raise StateValidationError("E1 schema upgrade receipt must bind the exact Feature and Slice")
+        statement = (
+            f"Autorizo migrar E1 a schema 14; repository: {receipt.repository_id}; "
+            f"revision: {receipt.source_revision}; Feature: {feature.id}; Slice: {slice_record.id}; "
+            f"Task: {slice_record.task_id}; source-sha256: {receipt.source_sha256}"
+        )
+        if (receipt.statement != statement or receipt.source != "INTERACTIVE_TERMINAL"
+                or receipt.source_reference != f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"):
+            raise StateValidationError("E1 schema upgrade human approval evidence is invalid")
     parked = state.parked_work
     if parked is not None:
         if type(parked) is not ParkedWork:
@@ -2386,6 +2466,15 @@ def validate_state(state: State) -> None:
                 or feature_agreement.change_id != context.change_id
             ):
                 raise StateValidationError("context agreement references are not authoritative")
+        if context.task_progress is not None:
+            report = context.task_progress
+            slice_agreement = agreement_index.get(slice_ref)
+            if (
+                slice_agreement is None
+                or slice_agreement.task_id != report.task_id
+                or report.recorded_revision > state.revision
+            ):
+                raise StateValidationError("Task progress does not belong to the accepted Slice")
     for agreement in state.agreements:
         if agreement.kind == "SLICE" and not any(
             context.slice_agreement_ref == agreement.id for context in agreement_contexts

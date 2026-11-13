@@ -39,6 +39,32 @@ Start with `context` and treat the returned EvoSpec lifecycle fields as authorit
 
 Choose the next action from the returned `legal_actions`. Do not assume that an action is legal because it was legal in an earlier response. `context` is read-only and does not require `expected_revision`.
 
+### E1 accepted Task: guarded operational progress (Slice C)
+
+An explicitly approved E1 Slice is a different authority boundary from legacy `progress`. The immutable `accepted_slice` object continues to show the human-approved Feature, Slice, first Task and **initial** checkpoint. The optional `task_progress` object reports the **current operational** checkpoint with `report_kind: "REPORTED_UNVERIFIED"`; it never marks that checkpoint verified or changes the original agreement. For compatibility, `progress.resume_point` is derived from `task_progress.checkpoint` on E1 reads, but it is not written as a second source of truth.
+
+Once `e1_schema_ready: true`, `legal_actions` may offer `accepted_task_progress` instead of `progress` for the accepted Task. Send the exact current repository ID, Task ID and agreement references returned by `context`, plus the current `revision`:
+
+```json
+{
+  "action": "accepted_task_progress",
+  "expected_revision": 2,
+  "repository_id": "<context.repository_id>",
+  "task_id": "<accepted_slice.task_id>",
+  "feature_agreement_ref": "<accepted_slice.feature_agreement_ref>",
+  "slice_agreement_ref": "<accepted_slice.slice_agreement_ref>",
+  "checkpoint": "Local task list renders",
+  "statement": "Implementation progress observed; verification remains pending",
+  "evidence_refs": ["tests/task-list.test.ts"]
+}
+```
+
+Core checks the exact local root and accepted Task, current focus, reversible `progress` authority, operation budget and revision **under one writer lock**. Successful reports advance the lifecycle through legal in-memory transitions and publish one state revision. The report has source kind `UNKNOWN` and no host attestation: another process owned by the same trusted local OS user can also call the provider-neutral protocol, but cannot bypass Core scope checks. A stale request must be inspected again, never automatically rebound or replayed.
+
+Accepted E1 projects persisted in schema 13 remain **read-only** until an actual human uses the local interactive CLI command `evospec --project <repository> upgrade-e1-schema --expected-revision <current-revision>`. The prompt binds the prior state SHA-256, root identity, Task and agreements to an exact confirmation token. Conversion writes schema 14 once and retains an in-state acceptance receipt; it does not create Task progress. A recovered already-committed conversion is recognized without a second write. Non-E1 schema 13 continues writing schema 13, and compatible older non-E1 writes promote at most to 13. New repositories initialize at 14.
+
+This gate verifies logical atomicity and process recovery. Physical power-loss durability on Windows remains **not certified**, because directory `fsync` is not implemented there; after a post-replace uncertainty, inspect the recovered state before taking another action.
+
 `outcome.kind` is exactly one of `HUMAN_MATERIAL_DECISION`, `SAFE_AUTOMATIC_OPERATION`, `BOUNDED_DELEGATION`, `EXTERNAL_WAIT`, or `STRUCTURAL_DEFECT`. It is derived from Core facts, not from an action name. `outcome.intervention` preserves the compatibility projection: `HUMAN_MATERIAL_DECISION` maps to `USER`; `SAFE_AUTOMATIC_OPERATION`, `BOUNDED_DELEGATION`, and `EXTERNAL_WAIT` map to `AUTOMATIC`; and `STRUCTURAL_DEFECT` maps to `NONE`. A `HUMAN_MATERIAL_DECISION` outcome always carries `material_decision` with one concrete decision and at least two distinct Core-offered options. Nonhuman outcomes cannot carry material-decision evidence. `BOUNDED_DELEGATION` is a typed disposition only; it does not create or persist authority. Missing decision choices are surfaced as `STRUCTURAL_DEFECT`, never as a user handoff. A terminal context has `outcome: null`; existing terminal and completion facts remain authoritative.
 
 When `initialization_state` is `UNINITIALIZED`, `context`, `new`, and `change` return a normal success envelope whose result code is `INIT_REQUIRED`. The legal actions are exactly `init` and `context`; initialize with the returned revision before submitting intake. This state does not inspect repository capabilities or external SDD structure. Persisted authority that cannot be recovered remains a `WORKFLOW_ERROR`.

@@ -75,6 +75,8 @@ from .domain import (
     SemanticLockRevision,
     State,
     StateValidationError,
+    E1SchemaUpgradeReceipt,
+    TaskProgress,
     TerminalArchive,
     PendingIntake,
     PendingDiscoveryRecovery,
@@ -99,7 +101,8 @@ from .discovery import DiscoveryPolicy
 JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 )
-SCHEMA: Final = 13
+SCHEMA: Final = 14
+LEGACY_WRITE_SCHEMA: Final = 13
 INTEGRATION_REGISTRY_SCHEMA: Final = 1
 
 _STATE_LOCKS: dict[str, threading.RLock] = {}
@@ -140,6 +143,7 @@ STATE_FIELDS: Final = frozenset(
         "pending_autonomy_expansion",
         "autonomy_expansion_history",
         "agreement_refs",
+        "e1_schema_upgrade",
     )
 )
 CONTEXT_FIELDS: Final = frozenset(
@@ -178,11 +182,13 @@ CONTEXT_FIELDS: Final = frozenset(
         "autonomy_metrics",
         "feature_agreement_ref",
         "slice_agreement_ref",
+        "task_progress",
     )
 )
 _CAPABILITY_SELECTION_FIELDS: Final = frozenset(("pending_capability_selection", "capability_selection_history"))
 _DISCOVERY_RECOVERY_FIELD: Final = frozenset(("pending_discovery_recovery",))
-STATE_FIELDS_V12: Final = STATE_FIELDS - frozenset(("agreement_refs",))
+STATE_FIELDS_V13: Final = STATE_FIELDS - frozenset(("e1_schema_upgrade",))
+STATE_FIELDS_V12: Final = STATE_FIELDS_V13 - frozenset(("agreement_refs",))
 STATE_FIELDS_V11: Final = STATE_FIELDS_V12 - frozenset(("pending_autonomy_expansion", "autonomy_expansion_history"))
 STATE_FIELDS_V10: Final = STATE_FIELDS_V11 - frozenset(("irreversible_authorizations",))
 STATE_FIELDS_V9_PRE_SELECTION: Final = STATE_FIELDS_V10 - _CAPABILITY_SELECTION_FIELDS - _DISCOVERY_RECOVERY_FIELD
@@ -192,7 +198,8 @@ STATE_FIELDS_V7: Final = STATE_FIELDS_V8 - frozenset(("parked_work",))
 STATE_FIELDS_V5: Final = STATE_FIELDS_V7 - frozenset(
     ("locks", "lock_revisions", "lock_releases", "lock_authorizations", "change_lock_assessments")
 )
-CONTEXT_FIELDS_V12: Final = CONTEXT_FIELDS - frozenset(("feature_agreement_ref", "slice_agreement_ref"))
+CONTEXT_FIELDS_V13: Final = CONTEXT_FIELDS - frozenset(("task_progress",))
+CONTEXT_FIELDS_V12: Final = CONTEXT_FIELDS_V13 - frozenset(("feature_agreement_ref", "slice_agreement_ref"))
 CONTEXT_FIELDS_V9: Final = CONTEXT_FIELDS_V12 - frozenset(("autonomy_envelope", "autonomy_metrics"))
 CONTEXT_FIELDS_V2: Final = CONTEXT_FIELDS_V9 - frozenset(("safety_facts",))
 
@@ -390,7 +397,7 @@ def _required_publication_from_json(value: JsonValue) -> LivingSpecPublication:
     return publication
 
 
-def _context_to_json(context: WorkingContext | None) -> JsonValue:
+def _context_to_json(context: WorkingContext | None, schema: int = SCHEMA) -> JsonValue:
     if context is None:
         return None
     review: JsonValue = None
@@ -403,7 +410,7 @@ def _context_to_json(context: WorkingContext | None) -> JsonValue:
     paused: JsonValue = None
     if context.paused_pair is not None:
         paused = [context.paused_pair[0], context.paused_pair[1]]
-    return {
+    value: dict[str, JsonValue] = {
         "feature_id": context.feature_id,
         "change_id": context.change_id,
         "status": context.status,
@@ -488,6 +495,21 @@ def _context_to_json(context: WorkingContext | None) -> JsonValue:
         "feature_agreement_ref": context.feature_agreement_ref,
         "slice_agreement_ref": context.slice_agreement_ref,
     }
+    if schema >= 14:
+        report = context.task_progress
+        value["task_progress"] = None if report is None else {
+            "task_id": report.task_id,
+            "checkpoint": report.checkpoint,
+            "statement": report.statement,
+            "report_kind": report.report_kind,
+            "source_kind": report.source_kind,
+            "source_reference": report.source_reference,
+            "evidence_refs": list(report.evidence_refs),
+            "recorded_revision": report.recorded_revision,
+        }
+    elif context.task_progress is not None:
+        raise ValueError("typed E1 Task progress cannot be encoded in an old schema")
+    return value
 
 
 def _review(value: JsonValue) -> ReviewResult | None:
@@ -599,7 +621,8 @@ def _context_from_json(value: JsonValue, schema: int) -> WorkingContext | None:
     if value is None:
         return None
     fields = (
-        CONTEXT_FIELDS if schema >= 13
+        CONTEXT_FIELDS if schema >= 14
+        else CONTEXT_FIELDS_V13 if schema == 13
         else CONTEXT_FIELDS_V12 if schema >= 10 or (isinstance(value, dict) and set(value) == set(CONTEXT_FIELDS_V12))
         else CONTEXT_FIELDS_V9
     )
@@ -641,6 +664,22 @@ def _context_from_json(value: JsonValue, schema: int) -> WorkingContext | None:
             raise DecodeError("invalid paused pair") from error
     change_id = _optional_string(raw["change_id"], "change_id")
     side_of = _optional_string(raw["side_of"], "side_of")
+    task_progress = None
+    if schema >= 14 and raw["task_progress"] is not None:
+        report = _object(raw["task_progress"], frozenset((
+            "task_id", "checkpoint", "statement", "report_kind", "source_kind",
+            "source_reference", "evidence_refs", "recorded_revision",
+        )), "Task progress")
+        task_progress = TaskProgress(
+            _string(report["task_id"], "Task progress id"),
+            _string(report["checkpoint"], "Task checkpoint"),
+            _string(report["statement"], "Task statement"),
+            _string(report["report_kind"], "Task report kind"),
+            _string(report["source_kind"], "Task source kind"),
+            _optional_string(report["source_reference"], "Task source reference"),
+            _strings(report["evidence_refs"], "Task evidence references"),
+            _integer(report["recorded_revision"], "Task report revision"),
+        )
     return WorkingContext(
         FeatureId(_string(raw["feature_id"], "feature_id")),
         None if change_id is None else ChangeId(change_id),
@@ -684,6 +723,7 @@ def _context_from_json(value: JsonValue, schema: int) -> WorkingContext | None:
         _autonomy_metrics(raw["autonomy_metrics"]) if schema >= 10 else AutonomyMetrics(),
         feature_agreement_ref=_optional_string(raw["feature_agreement_ref"], "Feature agreement reference") if schema >= 13 else None,
         slice_agreement_ref=_optional_string(raw["slice_agreement_ref"], "Slice agreement reference") if schema >= 13 else None,
+        task_progress=task_progress,
     )
 
 
@@ -714,6 +754,33 @@ def _agreement_from_json(value: JsonValue) -> AgreementRecord:
         _optional_string(raw["initial_task"], "agreement initial task"),
         _optional_string(raw["checkpoint"], "agreement checkpoint"),
     )
+
+
+_E1_UPGRADE_FIELDS: Final = frozenset((
+    "source_revision", "converted_revision", "source_sha256", "statement",
+    "source", "source_reference", "repository_id", "feature_agreement_ref", "slice_agreement_ref",
+))
+
+
+def _e1_upgrade_from_json(value: JsonValue) -> E1SchemaUpgradeReceipt | None:
+    if value is None:
+        return None
+    raw = _object(value, _E1_UPGRADE_FIELDS, "E1 schema upgrade receipt")
+    return E1SchemaUpgradeReceipt(
+        _integer(raw["source_revision"], "E1 source revision"),
+        _integer(raw["converted_revision"], "E1 converted revision"),
+        _string(raw["source_sha256"], "E1 source SHA-256"),
+        _string(raw["statement"], "E1 approval statement"),
+        _string(raw["source"], "E1 approval source"),
+        _string(raw["source_reference"], "E1 approval reference"),
+        _string(raw["repository_id"], "E1 upgrade repository"),
+        _string(raw["feature_agreement_ref"], "E1 upgrade Feature"),
+        _string(raw["slice_agreement_ref"], "E1 upgrade Slice"),
+    )
+
+
+def _e1_upgrade_to_json(receipt: E1SchemaUpgradeReceipt | None) -> JsonValue:
+    return None if receipt is None else {name: getattr(receipt, name) for name in _E1_UPGRADE_FIELDS}
 
 
 def _autonomy_envelope(value: JsonValue) -> AutonomyEnvelope:
@@ -1423,10 +1490,12 @@ def _recover_state(root: Path) -> State:
         schema = _integer(schema_value, "schema")
         if schema in (9, 10):
             raw = _object(decoded, STATE_FIELDS_V10, "state")
-        elif schema in (11, 12, SCHEMA):
+        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, SCHEMA):
             decoded_fields = set(decoded)
             if schema == SCHEMA and decoded_fields == set(STATE_FIELDS):
                 raw = _object(decoded, STATE_FIELDS, "state")
+            elif schema == LEGACY_WRITE_SCHEMA and decoded_fields == set(STATE_FIELDS_V13):
+                raw = _object(decoded, STATE_FIELDS_V13, "state")
             elif schema == 12 and decoded_fields == set(STATE_FIELDS_V12):
                 raw = _object(decoded, STATE_FIELDS_V12, "state")
             elif schema < SCHEMA and decoded_fields == set(STATE_FIELDS_V11):
@@ -1492,7 +1561,7 @@ def _recover_state(root: Path) -> State:
                 legacy_fields,
                 "state",
             )
-        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, SCHEMA):
+        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, SCHEMA):
             raise DecodeError("unknown state schema")
         (
             initialization, deferred, intake, selection, recovery, selection_history,
@@ -1563,6 +1632,7 @@ def _recover_state(root: Path) -> State:
             pending_autonomy_expansion,
             autonomy_expansion_history,
             agreements=_load_references(root, raw["agreement_refs"], "agreement_refs", "records/agreements", _agreement_from_json) if schema >= 13 else (),
+            e1_schema_upgrade=_e1_upgrade_from_json(raw["e1_schema_upgrade"]) if schema >= 14 else None,
         )
         validate_state(state)
         _validate_capability_selection_authority(state, schema)
@@ -1615,9 +1685,9 @@ def _validate_capability_selection_authority(state: State, schema: int) -> None:
             raise StateValidationError("pending capability selection is not Core-issued")
 
 
-def _archive_to_json(archive: TerminalArchive) -> JsonValue:
+def _archive_to_json(archive: TerminalArchive, schema: int = SCHEMA) -> JsonValue:
     return {
-        "context": _context_to_json(archive.context),
+        "context": _context_to_json(archive.context, schema),
         "parent_feature_id": archive.parent_feature_id,
         "convergence_assessment": _convergence_assessment_to_json(archive.convergence_assessment),
         "legacy_unassessed_acceptance": archive.legacy_unassessed_acceptance,
@@ -1667,12 +1737,12 @@ def _legacy_work_item(parked: ParkedWork) -> WorkItem:
     )
 
 
-def _work_item_to_json(item: WorkItem) -> JsonValue:
+def _work_item_to_json(item: WorkItem, schema: int = SCHEMA) -> JsonValue:
     return {
         "id": item.id,
         "operational_state": item.operational_state,
-        "context": _context_to_json(item.context),
-        "preserved_primary_context": _context_to_json(item.preserved_primary_context),
+        "context": _context_to_json(item.context, schema),
+        "preserved_primary_context": _context_to_json(item.preserved_primary_context, schema),
         "deferred_side_request": _deferred_side_request_to_json(item.deferred_side_request),
         "pending_intake": _pending_intake_to_json(item.pending_intake),
         "reason": item.reason,
@@ -2028,16 +2098,19 @@ def _pending_intake_from_json(value: JsonValue) -> PendingIntake | None:
     return PendingIntake(IntakeId(_string(item["id"], "intake id")), _string(item["intent"], "intake intent"), FeatureId(_string(item["deferred_from_feature_id"], "intake feature")), None if completed is None else ChangeId(completed), _optional_string(item["target_hint"], "intake target"))
 
 
-def _state_bytes(state: State) -> bytes:
+def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
+    """Keep legacy writes on their approved format; E1 owns the schema-14 boundary."""
+    if schema not in (LEGACY_WRITE_SCHEMA, SCHEMA):
+        raise ValueError("unsupported state writer schema")
     value: dict[str, JsonValue] = {
-            "schema": SCHEMA,
+            "schema": schema,
             "revision": state.revision,
-            "active_context": _context_to_json(state.active_context),
+            "active_context": _context_to_json(state.active_context, schema),
             "active_work_id": state.active_work_id,
             "preserved_primary_work_id": state.preserved_primary_work_id,
-            "preserved_primary_context": _context_to_json(state.preserved_primary_context),
+            "preserved_primary_context": _context_to_json(state.preserved_primary_context, schema),
             "publications": [_publication_to_json(item) for item in state.publications],
-            "completed_side_contexts": [_archive_to_json(item) for item in state.completed_side_contexts],
+            "completed_side_contexts": [_archive_to_json(item, schema) for item in state.completed_side_contexts],
             "features": [_feature_to_json(item) for item in state.features],
             "change_refs": [
                 {"id": item.id, "path": f"records/changes/{item.id}.json"}
@@ -2059,7 +2132,7 @@ def _state_bytes(state: State) -> bytes:
                 {"id": item.id, "path": f"records/observations/{item.id}.json"}
                 for item in state.drifts
             ],
-            "terminal_archives": [_archive_to_json(item) for item in state.terminal_archives],
+            "terminal_archives": [_archive_to_json(item, schema) for item in state.terminal_archives],
             "publication_history": [
                 _publication_to_json(item) for item in state.publication_history
             ],
@@ -2068,10 +2141,14 @@ def _state_bytes(state: State) -> bytes:
             "lock_releases": [_lock_release_to_json(item) for item in state.lock_releases],
             "lock_authorizations": [_lock_authorization_to_json(item) for item in state.lock_authorizations],
             "change_lock_assessments": [_change_lock_assessments_to_json(item) for item in state.change_lock_assessments],
-            "work_items": [_work_item_to_json(item) for item in state.work_items],
+            "work_items": [_work_item_to_json(item, schema) for item in state.work_items],
             "work_relations": [_work_relation_to_json(item) for item in state.work_relations],
     }
     value.update(_extensions_to_json(state))
+    if schema >= 14:
+        value["e1_schema_upgrade"] = _e1_upgrade_to_json(state.e1_schema_upgrade)
+    elif state.e1_schema_upgrade is not None:
+        raise ValueError("human E1 schema upgrade receipt cannot be downgraded")
     return encode_json(value)
 
 
@@ -2246,6 +2323,10 @@ class _StateStore:
         raw = _read_json(_artifact_path(self.__root, "state.json"))
         return isinstance(raw, dict) and raw.get("schema") == SCHEMA
 
+    def state_source_sha256(self) -> str:
+        """Bind a human schema decision to exact source-state bytes, not only revision."""
+        return sha256(_artifact_path(self.__root, "state.json").read_bytes()).hexdigest()
+
     def publish_feature(self, state: State) -> None:
         self.__publish_state(state)
 
@@ -2253,7 +2334,9 @@ class _StateStore:
         """Commit Feature/Slice/Task as one authority revision after durable records."""
         with _state_publish_lock(self.__root):
             # Validate the CAS before creating records that may become inert orphans.
-            self.__check_state_revision(state)
+            current = self.__check_state_revision(state)
+            if self.__writer_schema_locked(current) != SCHEMA:
+                raise AtomicFailure("first E1 Slice requires the current state schema")
             for agreement in agreements:
                 self.__publish_immutable(
                     f"records/agreements/{agreement.id}.json",
@@ -2314,18 +2397,36 @@ class _StateStore:
         self.__publish_decision(state, replacement)
 
     def publish_observation(self, state: State, observation: Observation) -> None:
-        self.__publish_immutable(
+        self.__publish_with_immutable(state,
             f"records/observations/{observation.id}.json",
             encode_json(_observation_to_json(observation)),
         )
-        self.__publish_state(state)
 
     def publish_drift(self, state: State, drift: Drift) -> None:
-        self.__publish_immutable(
+        self.__publish_with_immutable(state,
             f"records/observations/{drift.id}.json",
             encode_json(_drift_to_json(drift)),
         )
-        self.__publish_state(state)
+
+    def transact_e1(
+        self, expected_revision: int, transform: Callable[[State], State], *,
+        upgrade: bool = False, source_digest: str | None = None,
+    ) -> State:
+        """Validate and publish one E1 operation entirely under the state writer lock."""
+        with _state_publish_lock(self.__root):
+            current = self.recover()
+            if current.revision != expected_revision:
+                raise AtomicFailure("E1 expected revision is stale")
+            if upgrade and (source_digest is None or self.state_source_sha256() != source_digest):
+                raise AtomicFailure("E1 conversion source identity changed after human approval")
+            source_schema = self.__writer_schema_locked(current, allow_e1_upgrade=upgrade)
+            if source_schema != SCHEMA:
+                raise AtomicFailure("E1_TASK_PROGRESS_REQUIRES_SCHEMA_14")
+            candidate = transform(current)
+            if candidate.revision != current.revision + 1:
+                raise AtomicFailure("E1 operation must publish exactly one revision")
+            self.__publish_state_locked(candidate, strict_directory=True, allow_e1_upgrade=upgrade)
+            return candidate
 
     def publish_primary_convergence(
         self, state: State, publication: LivingSpecPublication, content: str
@@ -2347,8 +2448,36 @@ class _StateStore:
             raise AtomicFailure("state revision changed before publication")
         return current
 
-    def __publish_state_locked(self, state: State, *, strict_directory: bool = False) -> None:
+    def __writer_schema_locked(self, current: State, *, allow_e1_upgrade: bool = False) -> int:
+        """Choose the output version from persisted authority, never caller input."""
+        state_path = _artifact_path(self.__root, "state.json")
+        if not state_path.exists():
+            if allow_e1_upgrade:
+                raise AtomicFailure("E1 conversion requires existing schema-13 authority")
+            return SCHEMA
+        raw = _read_json(state_path)
+        if not isinstance(raw, dict) or type(raw.get("schema")) is not int:
+            raise AtomicFailure("persisted schema authority is invalid")
+        source_schema = raw["schema"]
+        if allow_e1_upgrade:
+            if source_schema != LEGACY_WRITE_SCHEMA or not current.agreements:
+                raise AtomicFailure("only accepted E1 schema-13 authority may be converted")
+            return SCHEMA
+        if source_schema == LEGACY_WRITE_SCHEMA and current.agreements:
+            raise AtomicFailure("E1_SCHEMA_UPGRADE_REQUIRED: ordinary writers are read-only")
+        return SCHEMA if source_schema == SCHEMA else LEGACY_WRITE_SCHEMA
+
+    def __publish_state_locked(
+        self, state: State, *, strict_directory: bool = False, allow_e1_upgrade: bool = False,
+    ) -> None:
         current = self.__check_state_revision(state)
+        output_schema = self.__writer_schema_locked(current, allow_e1_upgrade=allow_e1_upgrade)
+        if current.agreements and state.agreements != current.agreements:
+            raise AtomicFailure("the original accepted E1 agreements cannot be replaced")
+        if (current.e1_schema_upgrade != state.e1_schema_upgrade
+                and not (allow_e1_upgrade and current.e1_schema_upgrade is None
+                         and state.e1_schema_upgrade is not None)):
+            raise AtomicFailure("the human E1 conversion receipt is immutable")
         ready = tuple(
             item for item in current.irreversible_authorizations
             if item.status is IrreversibleAuthorizationStatus.READY
@@ -2379,29 +2508,34 @@ class _StateStore:
                     "Core mutations are blocked while an irreversible operation is reserved"
                 )
         _atomic_replace(
-            _artifact_path(self.__root, "state.json"), _state_bytes(state), self.__operations,
+            _artifact_path(self.__root, "state.json"), _state_bytes(state, output_schema), self.__operations,
             strict_directory=strict_directory,
         )
 
+    def __publish_with_immutable(self, state: State, relative: str, data: bytes) -> None:
+        """Reject ineligible writers before any auxiliary artifact can be created."""
+        with _state_publish_lock(self.__root):
+            current = self.__check_state_revision(state)
+            self.__writer_schema_locked(current)
+            self.__publish_immutable(relative, data)
+            self.__publish_state_locked(state)
+
     def __publish_change(self, state: State, change: Change) -> None:
-        self.__publish_immutable(
+        self.__publish_with_immutable(state,
             f"records/changes/{change.id}.json",
             encode_json(_change_to_json(change)),
         )
-        self.__publish_state(state)
 
     def __publish_decision(self, state: State, decision: Decision) -> None:
-        self.__publish_immutable(
+        self.__publish_with_immutable(state,
             f"records/decisions/{decision.id}.json",
             encode_json(_decision_to_json(decision)),
         )
-        self.__publish_state(state)
 
     def __publish_living_spec(
         self, state: State, publication: LivingSpecPublication, content: str
     ) -> None:
-        self.__publish_immutable(publication.path.value, content.encode("utf-8"))
-        self.__publish_state(state)
+        self.__publish_with_immutable(state, publication.path.value, content.encode("utf-8"))
 
     def __publish_immutable(
         self, relative: str, data: bytes, *, strict_directory: bool = False,

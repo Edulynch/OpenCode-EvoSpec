@@ -152,6 +152,10 @@ class WorkflowService:
     def open(cls, root: Path) -> WorkflowService:
         return cls(root, CoreService.open(root))
 
+    def e1_schema_ready(self) -> bool:
+        """Expose the actual local persisted schema to read-only projections."""
+        return self.__core.e1_schema_ready()
+
     def init(self, *, expected_revision: ExpectedRevision | None = None) -> InitResult:
         state, blocked = self._preflight(Action.INIT, expected_revision)
         if blocked is not None:
@@ -180,6 +184,65 @@ class WorkflowService:
         except ServiceError as error:
             raise WorkflowError(str(error)) from error
         return self._result("SLICE_ACCEPTED", saved, "accepted Feature, Slice and first Task persisted")
+
+    def e1_upgrade_agreement(self, *, expected_revision: ExpectedRevision) -> str:
+        """Present a specific accepted authority to the terminal without changing it."""
+        committed = self.__core.confirmed_e1_upgrade(expected_revision)
+        if committed is not None and committed.e1_schema_upgrade is not None:
+            return committed.e1_schema_upgrade.statement
+        state = self._mutation_state(expected_revision)
+        try:
+            return self.__core.e1_upgrade_statement(state)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+
+    def confirmed_e1_schema_upgrade(self, *, expected_revision: ExpectedRevision) -> WorkflowResult | None:
+        """Treat a recovered, receipt-backed conversion as an idempotent read."""
+        committed = self.__core.confirmed_e1_upgrade(expected_revision)
+        if committed is None:
+            return None
+        return self._result(
+            "E1_SCHEMA_ALREADY_UPGRADED", committed,
+            "previous human-approved E1 conversion recovered; no additional write",
+        )
+
+    def upgrade_e1_schema(
+        self, acceptance: UserAcceptance, *, expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        """Perform one explicitly approved schema conversion, without Task progress."""
+        committed = self.__core.confirmed_e1_upgrade(expected_revision)
+        if committed is not None and committed.e1_schema_upgrade is not None:
+            receipt = committed.e1_schema_upgrade
+            if (type(acceptance) is not UserAcceptance
+                    or acceptance.statement != receipt.statement or acceptance.source != receipt.source
+                    or acceptance.source_reference != receipt.source_reference):
+                raise WorkflowError("retry confirmation does not match the committed E1 approval")
+            return self._result(
+                "E1_SCHEMA_ALREADY_UPGRADED", committed,
+                "previous human-approved E1 conversion recovered; no additional write",
+            )
+        state = self._mutation_state(expected_revision)
+        try:
+            saved = self.__core.upgrade_e1_schema(state, acceptance)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        return self._result("E1_SCHEMA_UPGRADED", saved, "human-approved E1 schema 14 conversion persisted")
+
+    def accepted_task_progress(
+        self, repository_id: str, task_id: str, feature_agreement_ref: str,
+        slice_agreement_ref: str, checkpoint: str, statement: str,
+        evidence_refs: tuple[str, ...], *, expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        """Report operational facts only; Core validates scope, budget, and one-write CAS."""
+        state = self._mutation_state(expected_revision)
+        try:
+            saved = self.__core.record_accepted_task_progress(
+                state, repository_id, task_id, feature_agreement_ref,
+                slice_agreement_ref, checkpoint, statement, evidence_refs,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        return self._result("TASK_PROGRESS_RECORDED", saved, "accepted Task report persisted as unverified")
 
     def new(
         self,
@@ -763,6 +826,9 @@ class WorkflowService:
         expected_revision: ExpectedRevision | None = None,
     ) -> WorkflowResult:
         state, blocked = self._preflight(Action.PROGRESS, expected_revision)
+        # Legacy progress cannot take a multi-revision path through accepted E1 authority.
+        if state.active_context is not None and state.active_context.slice_agreement_ref is not None:
+            raise WorkflowError("accepted E1 Task progress requires the guarded typed operation")
         if blocked is not None:
             return blocked
         context = state.active_context
