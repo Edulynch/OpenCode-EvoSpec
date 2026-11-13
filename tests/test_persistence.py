@@ -39,6 +39,7 @@ from evospec.lifecycle import (
     is_valid_pair,
 )
 from evospec.persistence import (
+    SCHEMA,
     DecodeError,
     RecoveryError,
     StateStore,
@@ -58,6 +59,24 @@ from tests.test_services_state import (
 )
 
 
+def _legacy_before_e1(value: dict) -> dict:
+    """Remove only schema-13 fields from a fixture representing older authority."""
+    value.pop("agreement_refs", None)
+
+    def remove_context_fields(item: object) -> None:
+        if isinstance(item, dict):
+            item.pop("feature_agreement_ref", None)
+            item.pop("slice_agreement_ref", None)
+            for nested in item.values():
+                remove_context_fields(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                remove_context_fields(nested)
+
+    remove_context_fields(value)
+    return value
+
+
 class PersistenceTests(unittest.TestCase):
     def test_schema_ten_migrates_without_irreversible_authorization_history(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -66,7 +85,7 @@ class PersistenceTests(unittest.TestCase):
             workflow.init()
             workflow.new("Schema migration feature")
             state_path = root / ".evospec" / "state.json"
-            legacy = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy = _legacy_before_e1(json.loads(state_path.read_text(encoding="utf-8")))
             legacy["schema"] = 10
             legacy.pop("irreversible_authorizations", None)
             legacy.pop("pending_autonomy_expansion", None)
@@ -78,7 +97,7 @@ class PersistenceTests(unittest.TestCase):
             repersisted = CoreService.open(root).record_progress(
                 recovered, "migration", "schema 10", (), None, (), "resume"
             )
-            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["schema"], 12)
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["schema"], SCHEMA)
             self.assertEqual(CoreService.open(root).recover(), repersisted)
 
     def test_schema_eleven_migrates_without_autonomy_expansion_fields(self) -> None:
@@ -89,7 +108,7 @@ class PersistenceTests(unittest.TestCase):
                 service.recover(), Feature(FeatureId("feature-main"), "Main", None)
             )
             state_path = root / ".evospec" / "state.json"
-            legacy = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy = _legacy_before_e1(json.loads(state_path.read_text(encoding="utf-8")))
             legacy["schema"] = 11
             legacy.pop("pending_autonomy_expansion")
             legacy.pop("autonomy_expansion_history")
@@ -102,7 +121,7 @@ class PersistenceTests(unittest.TestCase):
                 recovered, Feature(FeatureId("feature-next"), "Next", None)
             )
             self.assertEqual(repersisted.revision, state.revision + 1)
-            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["schema"], 12)
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["schema"], SCHEMA)
 
     def test_schema_nine_context_migrates_to_core_default_envelope_and_schema_eleven(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -111,7 +130,7 @@ class PersistenceTests(unittest.TestCase):
             workflow.init()
             workflow.new("Legacy export")
             state_path = root / ".evospec" / "state.json"
-            legacy = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy = _legacy_before_e1(json.loads(state_path.read_text(encoding="utf-8")))
             legacy["schema"] = 9
             legacy.pop("irreversible_authorizations", None)
             legacy.pop("pending_autonomy_expansion", None)
@@ -129,7 +148,7 @@ class PersistenceTests(unittest.TestCase):
 
             self.assertEqual(recovered.active_context.autonomy_envelope.goal, "legacy work")
             self.assertEqual(recovered.active_context.autonomy_metrics.automatic_operations, 0)
-            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["schema"], 12)
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["schema"], SCHEMA)
             self.assertEqual(CoreService.open(root).recover(), saved)
     def test_integration_registry_is_separate_from_v0_2_lifecycle_state(self) -> None:
         # Given: an existing v0.2 lifecycle state
@@ -149,7 +168,7 @@ class PersistenceTests(unittest.TestCase):
             # Then: lifecycle authority retains its existing schema and bytes
             self.assertEqual(providers, ("opencode",))
             self.assertEqual(before, state_path.read_bytes())
-            self.assertEqual(json.loads(before)["schema"], 12)
+            self.assertEqual(json.loads(before)["schema"], SCHEMA)
 
     def test_json_decoder_value_and_recursion_errors_are_typed_recovery_failures(self) -> None:
         cases = (
@@ -349,7 +368,7 @@ class PersistenceTests(unittest.TestCase):
                 self.assertEqual((side.code, deferred.code, completed_side.code), ("SIDE_ACTIVE", "DEFERRED", "DONE"))
                 self.assertEqual(len(archived.completed_side_contexts), 1)
                 state_path = root / ".evospec" / "state.json"
-                legacy = json.loads(state_path.read_text(encoding="utf-8"))
+                legacy = _legacy_before_e1(json.loads(state_path.read_text(encoding="utf-8")))
                 legacy["schema"] = schema
                 legacy.pop("irreversible_authorizations", None)
                 legacy.pop("pending_autonomy_expansion", None)
@@ -396,7 +415,7 @@ class PersistenceTests(unittest.TestCase):
                 )
                 forward = json.loads(state_path.read_text(encoding="utf-8"))
 
-                self.assertEqual(forward["schema"], 12)
+                self.assertEqual(forward["schema"], SCHEMA)
                 self.assertTrue(forward["terminal_archives"][0]["legacy_unassessed_acceptance"])
                 self.assertTrue(forward["completed_side_contexts"][-1]["legacy_unassessed_acceptance"])
                 self.assertEqual(CoreService.open(root).recover(), repersisted)
@@ -409,7 +428,7 @@ class PersistenceTests(unittest.TestCase):
                 service.recover(), Feature(FeatureId("feature-main"), "Main", None)
             )
             state_path = root / ".evospec" / "state.json"
-            legacy = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy = _legacy_before_e1(json.loads(state_path.read_text(encoding="utf-8")))
             legacy["schema"] = 7
             legacy.pop("irreversible_authorizations", None)
             legacy.pop("pending_autonomy_expansion", None)
@@ -429,7 +448,7 @@ class PersistenceTests(unittest.TestCase):
 
             self.assertIsNone(recovered.parked_work)
             self.assertEqual(repersisted.revision, state.revision + 1)
-            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["schema"], 12)
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["schema"], SCHEMA)
 
     def test_schema_nine_work_queue_enums_recover_as_typed_failures(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -692,7 +711,7 @@ class PersistenceTests(unittest.TestCase):
             self.assertTrue(payload.endswith(b"\n"))
             self.assertEqual(CoreService.open(root).recover(), saved)
             decoded = json.loads(payload)
-            self.assertEqual(decoded["schema"], 12)
+            self.assertEqual(decoded["schema"], SCHEMA)
             self.assertEqual(decoded["revision"], 1)
             self.assertEqual(decoded["features"][0]["id"], "feature-main")
 

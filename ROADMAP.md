@@ -15,13 +15,13 @@ This roadmap is intentionally human-readable. It answers three questions:
 
 ## Current focus
 
-### E0 V2 methodology contract — product-approved [documentation only]
+### E1 — first accepted Feature/Slice/Task and session recovery [implementation in review]
 
 The compact contract, approved E0 method-level command/context boundaries, S1–S9 desk walkthroughs, premortem, and E0→E1 gate are documented in [`docs/methodology.md`](docs/methodology.md) and [`docs/e0-v2-validation.md`](docs/e0-v2-validation.md).
 
-- **Document status:** product owner approved the E0 methodology contract on 2026-11-12. It defines intended method behavior, not implemented runtime Product Truth.
-- **Gate:** E0 method approval is recorded; E1 remains NO-GO until the product owner separately authorizes its scope and start.
-- **Scope:** documentation only. No E1 comparison, runtime work, architecture/schema decision, or code change is included.
+- **Decisions:** product owner approved the E0 methodology on 2026-11-12 and subsequently authorized the first bounded E1 implementation on a feature branch with tests and a Draft PR. E1.2 selected a portable application with local state, **without synchronization between computers**.
+- **Scope:** one explicitly accepted Feature/Slice pair, initial Task/checkpoint, Core-owned immutable records, one atomic state-revision boundary, and read-only recovery in later sessions. No auto-execution, Product Truth publication, release, remote sync, or migration of old work.
+- **Gate:** implementation remains under review. The merge, native-host parity claim and publication require their own evidence and authorization; only the first Slice was authorized.
 - The Autonomy Pass plan below is preserved as historical planning with its task checkboxes unchanged; it is not an active E0 objective.
 
 ## Historical implementation planning (paused)

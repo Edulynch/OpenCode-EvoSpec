@@ -191,6 +191,24 @@ class RepositoryInitialization:
 
 
 @dataclass(frozen=True, slots=True)
+class AgreementRecord:
+    """Immutable, user-accepted Feature or Slice scope owned by Core."""
+
+    id: str
+    kind: str
+    feature_id: FeatureId
+    change_id: ChangeId
+    title: str
+    statement: str
+    source: str
+    source_reference: str
+    repository_id: str
+    task_id: str | None = None
+    initial_task: str | None = None
+    checkpoint: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DeferredSideRequest:
     id: IntakeId
     intent: str
@@ -793,6 +811,8 @@ class WorkingContext:
         default=AutonomyEnvelope("legacy work"), compare=False
     )
     autonomy_metrics: AutonomyMetrics = field(default=AutonomyMetrics(), compare=False)
+    feature_agreement_ref: str | None = None
+    slice_agreement_ref: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -876,6 +896,7 @@ class State:
     irreversible_authorizations: tuple[IrreversibleAuthorization, ...] = ()
     pending_autonomy_expansion: PendingAutonomyExpansion | None = None
     autonomy_expansion_history: tuple[AutonomyExpansionRecord, ...] = ()
+    agreements: tuple[AgreementRecord, ...] = ()
 
 
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -2070,6 +2091,30 @@ def validate_state(state: State) -> None:
                 or not evidence.source_relationship
             ):
                 raise StateValidationError("discovery evidence is invalid")
+    if type(state.agreements) is not tuple or any(
+        type(agreement) is not AgreementRecord for agreement in state.agreements
+    ):
+        raise StateValidationError("agreement records must be immutable tuples")
+    _unique((agreement.id for agreement in state.agreements), "agreement")
+    for agreement in state.agreements:
+        _identity(agreement.id, "agreement")
+        if agreement.kind not in ("FEATURE", "SLICE"):
+            raise StateValidationError("agreement kind is invalid")
+        for value in (agreement.title, agreement.statement, agreement.source,
+                      agreement.source_reference, agreement.repository_id):
+            _text(value, "agreement provenance")
+        if agreement.source != "INTERACTIVE_TERMINAL":
+            raise StateValidationError("agreement provenance must identify the interactive channel")
+        if initialization is None or agreement.repository_id != initialization.repository_id:
+            raise StateValidationError("agreement repository identity is not authoritative")
+        if agreement.kind == "FEATURE" and any(
+            value is not None for value in (agreement.task_id, agreement.initial_task, agreement.checkpoint)
+        ):
+            raise StateValidationError("Feature agreement cannot own Slice task details")
+        if agreement.kind == "SLICE" and (
+            not agreement.task_id or not agreement.initial_task or not agreement.checkpoint
+        ):
+            raise StateValidationError("Slice agreement requires its initial Task and checkpoint")
     parked = state.parked_work
     if parked is not None:
         if type(parked) is not ParkedWork:
@@ -2309,6 +2354,47 @@ def validate_state(state: State) -> None:
     ):
         raise StateValidationError("preserved primary context shape is invalid")
     records = _validate_records(state)
+    agreement_index = {agreement.id: agreement for agreement in state.agreements}
+    for agreement in state.agreements:
+        if (
+            agreement.feature_id not in records.features
+            or agreement.change_id not in records.changes
+            or records.changes[agreement.change_id].feature_id != agreement.feature_id
+        ):
+            raise StateValidationError("agreement must own an authoritative Feature and Change")
+    agreement_contexts = tuple(
+        context for context in (state.active_context, state.preserved_primary_context)
+        if context is not None
+    ) + tuple(
+        context for item in state.work_items
+        for context in (item.context, item.preserved_primary_context)
+        if context is not None
+    ) + tuple(archive.context for archive in state.terminal_archives)
+    for context in agreement_contexts:
+        feature_ref, slice_ref = context.feature_agreement_ref, context.slice_agreement_ref
+        if (feature_ref is None) != (slice_ref is None):
+            raise StateValidationError("Feature and Slice agreement references must be paired")
+        if feature_ref is not None:
+            feature_agreement = agreement_index.get(feature_ref)
+            slice_agreement = agreement_index.get(slice_ref)
+            if (
+                feature_agreement is None or slice_agreement is None
+                or feature_agreement.kind != "FEATURE" or slice_agreement.kind != "SLICE"
+                or feature_agreement.feature_id != context.feature_id
+                or slice_agreement.feature_id != context.feature_id
+                or slice_agreement.change_id != context.change_id
+                or feature_agreement.change_id != context.change_id
+            ):
+                raise StateValidationError("context agreement references are not authoritative")
+    for agreement in state.agreements:
+        if agreement.kind == "SLICE" and not any(
+            context.slice_agreement_ref == agreement.id for context in agreement_contexts
+        ):
+            raise StateValidationError("Slice agreement has no owning context")
+    _unique(
+        (agreement.task_id for agreement in state.agreements if agreement.task_id is not None),
+        "Slice Task",
+    )
     _validate_irreversible_authorizations(state)
     _validate_autonomy_expansions(state)
     if intake is not None:

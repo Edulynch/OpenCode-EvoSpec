@@ -88,7 +88,7 @@ from .discovery import (
     _WORDS,
 )
 from .policies import AssurancePolicy, CapabilityRoute, IntakeOperation, IntakePolicy
-from .services import CoreService, NextActionable, ServiceError, StaleRevisionError
+from .services import CoreService, NextActionable, ServiceError, StaleRevisionError, UserAcceptance
 
 
 class WorkflowError(Exception):
@@ -160,6 +160,26 @@ class WorkflowService:
         evidence = DiscoveryPolicy(self.__root).discover()
         saved = self.__core.initialize(state, RepositoryInitialization(identity, evidence))
         return self._result("INITIALIZED", saved, "repository authority initialized")
+
+    def accept_first_slice(
+        self,
+        feature_title: str,
+        slice_title: str,
+        initial_task: str,
+        checkpoint: str,
+        acceptance: UserAcceptance,
+        *,
+        expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        """Accept one human-approved Slice; never infer consent from lifecycle state."""
+        state = self._mutation_state(expected_revision)
+        try:
+            saved = self.__core.accept_first_slice(
+                state, feature_title, slice_title, initial_task, checkpoint, acceptance,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        return self._result("SLICE_ACCEPTED", saved, "accepted Feature, Slice and first Task persisted")
 
     def new(
         self,
@@ -374,8 +394,8 @@ class WorkflowService:
             "legacy detail recorded as a non-material observation; normal lifecycle resumed",
         )
 
-    def status(self) -> StatusResult:
-        state = self.__core.recover()
+    def status(self, state: State | None = None) -> StatusResult:
+        state = self.__core.recover() if state is None else state
         return (
             self._init_required(state)
             if state.initialization is None

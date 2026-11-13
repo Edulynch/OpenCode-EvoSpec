@@ -28,6 +28,7 @@ from evospec.services import CoreService, ServiceError
 from evospec.workflow import WorkflowError, WorkflowService
 from tests._tempdir import TemporaryDirectory
 from tests.test_persistence_atomic import FailingReplace
+from tests.test_persistence import _legacy_before_e1
 from tests.test_services_state import convergence_assessment
 from tests.test_workflow_assurance import established_change_assessment
 
@@ -114,7 +115,7 @@ class WorkQueueTests(unittest.TestCase):
             workflow.record_progress("implement", "queue", (), "work", (), "resume")
             workflow.park("external verification service is unavailable")
             state_path = root / ".evospec" / "state.json"
-            schema_nine = json.loads(state_path.read_text(encoding="utf-8"))
+            schema_nine = _legacy_before_e1(json.loads(state_path.read_text(encoding="utf-8")))
             item = schema_nine["work_items"][0]
             schema_eight = dict(schema_nine)
             schema_eight["schema"] = 8

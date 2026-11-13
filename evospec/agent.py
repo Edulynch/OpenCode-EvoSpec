@@ -169,11 +169,28 @@ class AgentContext:
     irreversible_authorizations: tuple[IrreversibleAuthorizationSummary, ...] = ()
     pending_autonomy_expansion: PendingAutonomyExpansion | None = None
     repository_id: str | None = None
+    accepted_slice: AcceptedSliceContext | None = None
 
 
-def project_context(workflow: WorkflowService) -> AgentContext:
+@dataclass(frozen=True, slots=True)
+class AcceptedSliceContext:
+    """One read-only projection of Core-owned accepted scope and initial Task."""
+
+    feature_agreement_ref: str
+    slice_agreement_ref: str
+    feature_title: str
+    slice_title: str
+    task_id: str
+    initial_task: str
+    checkpoint: str
+    source: str
+    source_reference: str
+
+
+def project_context(workflow: WorkflowService, inspection: ReviewInspection | None = None) -> AgentContext:
     """Return a concise, deterministic projection of current workflow authority."""
-    inspection = workflow.inspect_locks()
+    if inspection is None:
+        inspection = workflow.inspect_locks()
     queue_activation_available = (
         inspection.state.initialization is not None
         and workflow.queue_next(inspection.state).code in ("SELECTED", "AMBIGUOUS")
@@ -332,6 +349,25 @@ def project_context(workflow: WorkflowService) -> AgentContext:
             _irreversible_authorization_summaries(inspection.state.irreversible_authorizations),
             inspection.state.pending_autonomy_expansion,
             None if inspection.state.initialization is None else inspection.state.initialization.repository_id,
+            _accepted_slice_context(inspection.state),
+    )
+
+
+def _accepted_slice_context(state: State) -> AcceptedSliceContext | None:
+    context = state.active_context
+    if context is None or context.slice_agreement_ref is None:
+        return None
+    feature = next((item for item in state.agreements if item.id == context.feature_agreement_ref), None)
+    slice_record = next((item for item in state.agreements if item.id == context.slice_agreement_ref), None)
+    if feature is None or slice_record is None:
+        return None
+    assert slice_record.task_id is not None
+    assert slice_record.initial_task is not None
+    assert slice_record.checkpoint is not None
+    return AcceptedSliceContext(
+        feature.id, slice_record.id, feature.title, slice_record.title,
+        slice_record.task_id, slice_record.initial_task, slice_record.checkpoint,
+        slice_record.source, slice_record.source_reference,
     )
 
 

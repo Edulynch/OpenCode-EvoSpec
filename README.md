@@ -85,7 +85,7 @@ Read the [EvoSpec Methodology](docs/methodology.md) for the deeper picture.
 
 **Source/package version:** `0.5.0` (source snapshot; not a published release in this repository).
 
-**E0 V2 methodology:** Product-owner approved on 2026-11-12 as a method-level contract. E1 remains separately unauthorized and has not started. This approval does not certify the current runtime or authorize implementation.
+**E0 V2 methodology:** Product-owner approved on 2026-11-12 as a method-level contract. E1 first-Slice implementation was subsequently authorized and is in review on this feature branch; it is not a release or a declaration of native runtime parity. The approved E1.2 shape is a portable application with repository-local state. Cross-computer synchronization is outside E1.
 
 The **v0.6.0 — Autonomy Pass** is paused historical planning, not an active EvoSpec V2 objective. Its task state remains in [ROADMAP.md](ROADMAP.md).
 
@@ -104,7 +104,6 @@ Useful CLI commands include:
 
 ```text
 evospec status
-evospec context
 evospec ui
 ```
 
