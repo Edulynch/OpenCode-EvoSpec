@@ -12,6 +12,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from evospec.agent import project_context
@@ -26,9 +27,23 @@ from evospec.workflow import WorkflowError, WorkflowService
 from tests.test_e1_first_slice import CHECKPOINT, FEATURE, SLICE, STATEMENT, TASK, _TTY
 
 
-def _request(action: str, **fields: object) -> dict[str, object]:
+def _request(action: str, **fields: Any) -> dict[str, Any]:
     """Use the public protocol, as an independent OpenCode adapter would."""
     return {"action": action, **fields}
+
+
+def _record_with_core(core: CoreService, request: dict[str, Any]) -> None:
+    """Drive the guarded Core API with the exact typed request fields in failure tests."""
+    _ = core.record_accepted_task_progress(
+        core.recover(),
+        repository_id=request["repository_id"],
+        task_id=request["task_id"],
+        feature_agreement_ref=request["feature_agreement_ref"],
+        slice_agreement_ref=request["slice_agreement_ref"],
+        checkpoint=request["checkpoint"],
+        statement=request["statement"],
+        evidence_refs=tuple(request["evidence_refs"]),
+    )
 
 
 class FailStateReplace(FileOperations):
@@ -49,20 +64,20 @@ class GuardedTaskProgressTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix="evospec-e1c-")
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.workflow = WorkflowService.open(self.root)
+        self.root = Path(temporary.name)  # pyright: ignore[reportUninitializedInstanceVariable]
+        self.workflow = WorkflowService.open(self.root)  # pyright: ignore[reportUninitializedInstanceVariable]
         self.workflow.init()
         acceptance = UserAcceptance(STATEMENT, f"tty:{sha256(STATEMENT.encode()).hexdigest()[:12]}")
         self.workflow.accept_first_slice(
             FEATURE, SLICE, TASK, CHECKPOINT, acceptance, expected_revision=ExpectedRevision(1),
         )
 
-    def _context(self) -> dict[str, object]:
+    def _context(self) -> dict[str, Any]:
         response = json.loads(execute(self.root, json.dumps(_request("context"))))
         self.assertNotIn("error", response)
         return response["context"]
 
-    def _progress_request(self, **changes: object) -> dict[str, object]:
+    def _progress_request(self, **changes: Any) -> dict[str, Any]:
         context = self._context()
         accepted = context["accepted_slice"]
         assert isinstance(accepted, dict)
@@ -77,7 +92,7 @@ class GuardedTaskProgressTests(unittest.TestCase):
         request.update(changes)
         return request
 
-    def _send(self, request: dict[str, object]) -> dict[str, object]:
+    def _send(self, request: dict[str, Any]) -> dict[str, Any]:
         return json.loads(execute(self.root, json.dumps(request, ensure_ascii=False)))
 
     def _authority_snapshot(self) -> dict[str, tuple[bytes, int]]:
@@ -129,7 +144,7 @@ class GuardedTaskProgressTests(unittest.TestCase):
         self.assertEqual(state["active_context"]["task_progress"]["recorded_revision"], 3)
         self.assertEqual(state["active_context"]["autonomy_metrics"]["automatic_operations"], 1)
         for path, identity in before.items():
-            if path != ".evospec/state.json":
+            if Path(path).name != "state.json":
                 self.assertEqual(self._authority_snapshot()[path], identity)
 
     def test_c02_fresh_process_and_status_are_read_only(self) -> None:
@@ -190,25 +205,11 @@ class GuardedTaskProgressTests(unittest.TestCase):
         core = CoreService.open(self.root, FailStateReplace())
         before = self._authority_snapshot()
         with self.assertRaises(ServiceError):
-            core.record_accepted_task_progress(
-                core.recover(), *(
-                    request[key] for key in (
-                        "repository_id", "task_id", "feature_agreement_ref",
-                        "slice_agreement_ref", "checkpoint", "statement",
-                    )
-                ), tuple(request["evidence_refs"]),
-            )
+            _record_with_core(core, request)
         self.assertEqual(before, self._authority_snapshot())
         uncertain = CoreService.open(self.root, FailStateDirectorySync())
         with self.assertRaises(DurabilityUncertainError):
-            uncertain.record_accepted_task_progress(
-                uncertain.recover(), *(
-                    request[key] for key in (
-                        "repository_id", "task_id", "feature_agreement_ref",
-                        "slice_agreement_ref", "checkpoint", "statement",
-                    )
-                ), tuple(request["evidence_refs"]),
-            )
+            _record_with_core(uncertain, request)
         self.assertEqual(CoreService.open(self.root).recover().revision, 3)
         self.assertEqual(self._send(request)["error"]["code"], "STALE_REVISION")
 
@@ -247,7 +248,7 @@ class GuardedTaskProgressTests(unittest.TestCase):
         self.assertIsNone(self._context()["task_progress"])
         after = self._authority_snapshot()
         for path, identity in before.items():
-            if path != ".evospec/state.json":
+            if Path(path).name != "state.json":
                 self.assertEqual(after[path], identity)
         self.assertEqual(self._send({**request, "expected_revision": 3})["result"]["revision"], 4)
 
@@ -324,6 +325,7 @@ class GuardedTaskProgressTests(unittest.TestCase):
         self.assertTrue(set(results) <= {"E1_SCHEMA_UPGRADED", "E1_SCHEMA_ALREADY_UPGRADED", "REJECTED"})
         recovered = CoreService.open(self.root).recover()
         self.assertEqual(recovered.revision, 3)
+        assert recovered.active_context is not None
         self.assertIsNone(recovered.active_context.task_progress)
         self.assertTrue(WorkflowService.open(self.root).e1_schema_ready())
 

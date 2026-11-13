@@ -2468,7 +2468,7 @@ def validate_state(state: State) -> None:
                 raise StateValidationError("context agreement references are not authoritative")
         if context.task_progress is not None:
             report = context.task_progress
-            slice_agreement = agreement_index.get(slice_ref)
+            slice_agreement = agreement_index.get(slice_ref) if slice_ref is not None else None
             if (
                 slice_agreement is None
                 or slice_agreement.task_id != report.task_id
