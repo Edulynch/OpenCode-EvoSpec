@@ -4,6 +4,7 @@ import json
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from evospec.domain import (
@@ -59,7 +60,7 @@ from tests.test_services_state import (
 )
 
 
-def _legacy_before_e1(value: dict) -> dict:
+def _legacy_before_e1(value: dict[str, Any]) -> dict[str, Any]:
     """Remove only schema-13 fields from a fixture representing older authority."""
     value.pop("agreement_refs", None)
 

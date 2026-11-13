@@ -12,6 +12,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from evospec.agent_protocol import execute
@@ -59,7 +60,10 @@ class _TTY(io.StringIO):
 
 
 class FirstSliceTests(unittest.TestCase):
-    def setUp(self) -> None:
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        # Construct the isolated authority with the test instance itself.
+        # A fresh instance never shares mutable Core state with another test.
         self.temporary = tempfile.TemporaryDirectory(prefix="evospec-e1-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -74,7 +78,7 @@ class FirstSliceTests(unittest.TestCase):
             expected_revision=ExpectedRevision(self.initial.revision),
         )
 
-    def _context(self) -> dict:
+    def _context(self) -> dict[str, Any]:
         response = json.loads(execute(self.root, json.dumps({"action": "context"})))
         self.assertNotIn("error", response)
         return response["context"]
@@ -84,13 +88,16 @@ class FirstSliceTests(unittest.TestCase):
         self.assertEqual(accepted.code, "SLICE_ACCEPTED")
         self.assertEqual(accepted.revision, self.initial.revision + 1)
         recovered = CoreService.open(self.root).recover()
+        context = recovered.active_context
+        if context is None:
+            self.fail("accepted Slice must retain an active Task")
         self.assertEqual(len(recovered.agreements), 2)
         self.assertEqual([item.kind for item in recovered.agreements], ["FEATURE", "SLICE"])
-        self.assertEqual(recovered.active_context.current_work, TASK)
-        self.assertEqual(recovered.active_context.checkpoints[0].name, CHECKPOINT)
-        self.assertFalse(recovered.active_context.checkpoints[0].valid)
-        self.assertEqual(recovered.active_context.feature_agreement_ref, recovered.agreements[0].id)
-        self.assertEqual(recovered.active_context.slice_agreement_ref, recovered.agreements[1].id)
+        self.assertEqual(context.current_work, TASK)
+        self.assertEqual(context.checkpoints[0].name, CHECKPOINT)
+        self.assertFalse(context.checkpoints[0].valid)
+        self.assertEqual(context.feature_agreement_ref, recovered.agreements[0].id)
+        self.assertEqual(context.slice_agreement_ref, recovered.agreements[1].id)
         self.assertEqual(len(list((self.root / ".evospec/records/agreements").glob("*.json"))), 2)
         self.assertEqual(len(list((self.root / ".evospec/records/changes").glob("*.json"))), 1)
 

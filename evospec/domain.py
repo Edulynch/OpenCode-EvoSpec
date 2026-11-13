@@ -2374,7 +2374,7 @@ def validate_state(state: State) -> None:
         feature_ref, slice_ref = context.feature_agreement_ref, context.slice_agreement_ref
         if (feature_ref is None) != (slice_ref is None):
             raise StateValidationError("Feature and Slice agreement references must be paired")
-        if feature_ref is not None:
+        if feature_ref is not None and slice_ref is not None:
             feature_agreement = agreement_index.get(feature_ref)
             slice_agreement = agreement_index.get(slice_ref)
             if (
