@@ -15,13 +15,15 @@ This roadmap is intentionally human-readable. It answers three questions:
 
 ## Current focus
 
-### E1 — first accepted Feature/Slice/Task and session recovery [implementation in review]
+### E1 — first accepted Feature/Slice/Task and session recovery [Slice B functionally complete]
 
 The compact contract, approved E0 method-level command/context boundaries, S1–S9 desk walkthroughs, premortem, and E0→E1 gate are documented in [`docs/methodology.md`](docs/methodology.md) and [`docs/e0-v2-validation.md`](docs/e0-v2-validation.md).
 
-- **Decisions:** product owner approved the E0 methodology on 2026-11-12 and subsequently authorized the first bounded E1 implementation on a feature branch with tests and a Draft PR. E1.2 selected a portable application with local state, **without synchronization between computers**.
-- **Scope:** one explicitly accepted Feature/Slice pair, initial Task/checkpoint, Core-owned immutable records, one atomic state-revision boundary, and read-only recovery in later sessions. No auto-execution, Product Truth publication, release, remote sync, or migration of old work.
-- **Gate:** implementation remains under review. The merge, native-host parity claim and publication require their own evidence and authorization; only the first Slice was authorized.
+- **Decisions:** the product owner approved the E0 methodology on 2026-11-12 and separately authorized a bounded E1 Vertical Slice B implementation. E1.2 selected a portable application with project/worktree-local state, **without synchronization between computers**.
+- **Completed Slice B (2026-11-13):** [PR #3](https://github.com/Edulynch/OpenCode-EvoSpec/pull/3) merged at `f2ff8edf4121e1e6435a338d3355e52c5e2bcaae`. A real terminal acceptance persisted an accepted Feature/Slice/initial Task and checkpoint; a fresh OpenCode 2.3.0 session read exactly the same context without mutation. Linux/Windows GitHub CI passed, and the owner reported Windows isolated qualification (128 Python + 20 Node PASS and independent native sessions A/B).
+- **Boundaries:** Core-owned immutable agreement records, one atomic state-revision publication boundary, and read-only context recovery. No auto-execution, Product Truth publication, release, remote sync, or old-state migration. Windows power-loss durability is **not certified**; terminal acceptance is **not** an unforgeable identity guarantee against processes running with the same user's rights. Neither risk is silently marked PASS.
+- **Next design gate:** reconcile E1.2 logical recommendations D-12A/B/C and E1.3 command/host/Core mapping under [issue #2](https://github.com/Edulynch/OpenCode-EvoSpec/issues/2). The broader E1 design phase remains open.
+- **Candidate next Vertical Slice C — proposal only:** resume an explicitly accepted Task after restart, then record revision-checked progress/a new checkpoint through Core while retaining the same Feature/Slice authority. A separately approved mini-spec, risk review and explicit implementation authorization are required; neither this roadmap entry nor Slice B's merge is a GO.
 - The Autonomy Pass plan below is preserved as historical planning with its task checkboxes unchanged; it is not an active E0 objective.
 
 ## Historical implementation planning (paused)
