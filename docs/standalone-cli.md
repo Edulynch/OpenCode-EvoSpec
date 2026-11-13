@@ -71,7 +71,20 @@ The package installation above is the normal source-based path and also provides
 
 ## Lifecycle Commands
 
-The lifecycle surface contains `init`, `new`, `change`, `clarify`, `continue`, `status`, and `review`. The separate `ui` dashboard and `doctor` diagnostic are read-only local commands.
+The lifecycle surface contains `init`, `new`, `change`, `clarify`, `continue`, `status`, and `review`, plus a narrowly scoped E1 `accept-slice` user-confirmation command. The separate `ui` dashboard and `doctor` diagnostic are read-only local commands.
+
+### `accept-slice` (E1 first Slice, explicit human consent)
+
+The repository must be initialized and have no existing work. Read the current revision with `evospec status` before issuing the command, then enter the exact terminal confirmation shown. This is a **human terminal action**: headless/agent execution is intentionally refused. The command writes one Feature, one Slice, its first Task and pending checkpoint into the same authoritative State revision; it never starts implementation automatically.
+
+```text
+cd <repository>
+evospec init
+evospec status
+evospec accept-slice --feature "Task manager" --slice "Local task list" --task "Implement task list" --checkpoint "Local list verified" --expected-revision 1
+```
+
+After acceptance, restart OpenCode V2 or run `evospec status` in another local session. The OpenCode `evospec_context` tool recovers the same immutable agreement references, Task ID and initial Task through Core's read-only context projection. State lives only in the selected repository's `.evospec` directory; copying the state to another root is rejected and cross-computer synchronization is out of scope. Older state schemas remain readable but cannot enter this first-Slice writer automatically. This path is not yet a native OpenCode approval-dialog implementation and does not prove OpenCode host permission parity.
 
 ### `init`
 

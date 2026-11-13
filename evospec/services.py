@@ -12,6 +12,7 @@ import subprocess
 from typing import TYPE_CHECKING, Never, final
 
 from .domain import (
+    AgreementRecord,
     IDENTITY,
     AssessmentOperation,
     AutonomyAuthorization,
@@ -115,6 +116,15 @@ class ServiceError(Exception):
 
 class ServiceConstructionError(TypeError):
     """Raised when callers bypass the supported open path."""
+
+
+@dataclass(frozen=True, slots=True)
+class UserAcceptance:
+    """Acceptance evidence; the CLI must obtain it from a human terminal prompt."""
+
+    statement: str
+    source_reference: str
+    source: str = "INTERACTIVE_TERMINAL"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1557,6 +1567,89 @@ class CoreService:
         service.__persistence = _StateStore(root, operations)
         service.__repository_root = root.resolve()
         return service
+
+    def accept_first_slice(
+        self,
+        state: State,
+        feature_title: str,
+        slice_title: str,
+        initial_task: str,
+        checkpoint: str,
+        acceptance: UserAcceptance,
+    ) -> State:
+        """Persist a human-approved Feature, Slice and Task in one Core commit."""
+        current = _authoritative_state(self.__persistence, state)
+        if current.initialization is None:
+            raise ServiceError("repository initialization is required before Slice acceptance")
+        if not self.__persistence.e1_schema_ready():
+            raise ServiceError("legacy authority is read-only for E1; no automatic migration")
+        root_identity = sha256(str(self.__repository_root).encode("utf-8")).hexdigest()[:16]
+        if current.initialization.repository_id != root_identity:
+            raise ServiceError("the persisted repository identity belongs to another root")
+        values = (feature_title, slice_title, initial_task, checkpoint)
+        if any(type(value) is not str or not value.strip() or len(value) > 2048 for value in values):
+            raise ServiceError("Feature, Slice, Task and checkpoint must be bounded nonblank text")
+        if (
+            type(acceptance) is not UserAcceptance
+            or acceptance.source != "INTERACTIVE_TERMINAL"
+            or not acceptance.statement.strip()
+        ):
+            raise ServiceError("attributable user acceptance evidence is required")
+        accepted_statement = (
+            f"Acepto Feature: {feature_title}; Slice: {slice_title}; "
+            f"Task: {initial_task}; checkpoint: {checkpoint}"
+        )
+        expected_reference = f"tty:{sha256(accepted_statement.encode('utf-8')).hexdigest()[:12]}"
+        if acceptance.statement != accepted_statement or acceptance.source_reference != expected_reference:
+            raise ServiceError("acceptance must match exactly the human-confirmed agreement")
+        # Bind a retry to identical canonical input and the exact initialized root.
+        digest = sha256(json.dumps([
+            root_identity, *values, acceptance.statement, acceptance.source_reference,
+        ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+        feature_id = FeatureId(f"feature-{digest}")
+        change_id = ChangeId(f"change-{digest}")
+        task_id = f"task-{digest}"
+        feature_ref, slice_ref = f"agreement-feature-{digest}", f"agreement-slice-{digest}"
+        if current.agreements:
+            if (
+                len(current.agreements) == 2
+                and tuple(item.id for item in current.agreements) == (feature_ref, slice_ref)
+            ):
+                return current
+            raise ServiceError("the first Slice has already been accepted")
+        if current.active_context is not None or current.features or current.changes or current.work_items:
+            raise ServiceError("first Slice acceptance requires an initialized, empty work ledger")
+        feature = Feature(feature_id, feature_title.strip(), LivingSpecId(f"spec-{digest}"))
+        change = Change(change_id, feature_id, slice_title.strip(), Classification.FEATURE)
+        feature_agreement = AgreementRecord(
+            feature_ref, "FEATURE", feature_id, change_id, feature.title,
+            acceptance.statement, acceptance.source, acceptance.source_reference, root_identity,
+        )
+        slice_agreement = AgreementRecord(
+            slice_ref, "SLICE", feature_id, change_id, slice_title.strip(),
+            acceptance.statement, acceptance.source, acceptance.source_reference, root_identity,
+            task_id, initial_task.strip(), checkpoint.strip(),
+        )
+        candidate = _record_change(_record_feature(current, feature), change)
+        assert candidate.active_context is not None
+        candidate = replace(
+            candidate,
+            active_context=replace(
+                candidate.active_context,
+                focus=slice_title.strip(),
+                current_work=initial_task.strip(),
+                checkpoints=(Checkpoint(checkpoint.strip(), False),),
+                feature_agreement_ref=feature_ref,
+                slice_agreement_ref=slice_ref,
+            ),
+            agreements=(feature_agreement, slice_agreement),
+        )
+        saved = _prepare_state_publication(candidate, current.revision)
+        try:
+            self.__persistence.publish_first_slice(saved, change, saved.agreements)
+        except AtomicFailure as error:
+            raise ServiceError("first Slice aggregate publication was rejected") from error
+        return saved
 
     def record_capability_selection(self, state: State, selection: PendingCapabilitySelection) -> State:
         current = _authoritative_state(self.__persistence, state)

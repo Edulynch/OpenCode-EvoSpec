@@ -106,6 +106,17 @@ def _autonomy_delta_json(delta: AutonomyEnvelopeDelta) -> dict[str, JsonValue]:
 def context_json(context: AgentContext) -> dict[str, JsonValue]:
     """Return the stable JSON-safe representation of an agent context."""
     payload: dict[str, JsonValue] = {"revision": context.revision, "repository_id": context.repository_id, "initialization_state": context.initialization_state,
+            "accepted_slice": None if context.accepted_slice is None else {
+                "feature_agreement_ref": context.accepted_slice.feature_agreement_ref,
+                "slice_agreement_ref": context.accepted_slice.slice_agreement_ref,
+                "feature_title": context.accepted_slice.feature_title,
+                "slice_title": context.accepted_slice.slice_title,
+                "task_id": context.accepted_slice.task_id,
+                "initial_task": context.accepted_slice.initial_task,
+                "checkpoint": context.accepted_slice.checkpoint,
+                "source": context.accepted_slice.source,
+                "source_reference": context.accepted_slice.source_reference,
+            },
             "lifecycle": None if context.lifecycle is None else list(context.lifecycle),
             "feature_id": context.feature_id, "change_id": context.change_id, "classification": context.classification,
             "progress": {"current_action": context.progress.current_action, "focus": context.progress.focus,
@@ -275,6 +286,12 @@ def execute(root: Path, payload: str) -> str:
         request = decode_request(payload)
         if parse_action(request) == "autonomy_evaluate":
             return _execute_autonomy_evaluation(workflow, request)
+        if parse_action(request) == "context":
+            validate_action_request(request, "context")
+            inspection = workflow.inspect_locks()
+            return encode_success(
+                workflow.status(inspection.state), project_context(workflow, inspection)
+            )
         result = _dispatch(workflow, request)
         return encode_success(result, project_context(workflow))
     except ProtocolError as error:
@@ -302,7 +319,7 @@ def _execute_autonomy_evaluation(
         parse_repository_paths(request, "paths"),
         irreversible=parse_boolean(request, "irreversible"),
     )
-    context = project_context(workflow)
+    context = project_context(workflow, inspection)
     return _encode(
         {
             "evaluation": None

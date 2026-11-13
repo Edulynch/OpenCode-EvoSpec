@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
 import sys
 import tomllib
 from collections.abc import Sequence
@@ -15,6 +16,8 @@ from .dashboard import DEFAULT_PORT, serve
 from .opencode_integration import IntegrationRegistry, OpenCodeIntegrationInspection, OpenCodeIntegrationProvider
 from .persistence import IntegrationRegistryError, RecoveryError
 from .workflow import ClarificationAnswer, WorkflowError, WorkflowResult, WorkflowService
+from .domain import ExpectedRevision
+from .services import UserAcceptance
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -51,6 +54,12 @@ def _parser() -> _ArgumentParser:
     clarify.add_argument("answer", nargs="*", metavar="QUESTION=ANSWER")
     commands.add_parser("continue")
     commands.add_parser("status")
+    accept = commands.add_parser("accept-slice")
+    accept.add_argument("--feature", required=True, help="Human-approved Feature title")
+    accept.add_argument("--slice", required=True, help="Human-approved first Slice title")
+    accept.add_argument("--task", required=True, help="Initial Task to resume after restart")
+    accept.add_argument("--checkpoint", required=True, help="Initial pending verification checkpoint")
+    accept.add_argument("--expected-revision", required=True, type=int)
     commands.add_parser("doctor")
     commands.add_parser("review")
     ui = commands.add_parser("ui")
@@ -113,8 +122,46 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             print(f"ERROR {error}", file=target)
             return 2
         return 0
+    if arguments.command == "accept-slice":
+        # Only a user at a real terminal can cross the first acceptance boundary.
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            print("ERROR Slice acceptance requires an interactive user terminal", file=target)
+            return 2
+        if arguments.expected_revision < 0:
+            print("ERROR expected revision must be nonnegative", file=target)
+            return 2
+        statement = (
+            f"Acepto Feature: {arguments.feature}; Slice: {arguments.slice}; "
+            f"Task: {arguments.task}; checkpoint: {arguments.checkpoint}"
+        )
+        token = sha256(statement.encode("utf-8")).hexdigest()[:12]
+        print(f"Acuerdo para aprobación explícita:\n{statement}", file=target)
+        try:
+            typed = input(f"Para autorizar la escritura, escribe ACEPTO {token}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("ERROR acceptance cancelled", file=target)
+            return 2
+        if typed != f"ACEPTO {token}":
+            print("ERROR acceptance was not explicitly confirmed", file=target)
+            return 2
+        workflow = WorkflowService.open(Path(arguments.root))
+        try:
+            result = workflow.accept_first_slice(
+                arguments.feature, arguments.slice, arguments.task,
+                arguments.checkpoint, UserAcceptance(statement, f"tty:{token}"),
+                expected_revision=ExpectedRevision(arguments.expected_revision),
+            )
+        except (RecoveryError, WorkflowError) as error:
+            print(f"ERROR {error}", file=target)
+            return 2
+        _render(result, target)
+        return 0
     workflow = WorkflowService.open(Path(arguments.root))
     try:
+        if arguments.command == "status":
+            inspection = workflow.inspect_locks()
+            _render_status(project_context(workflow, inspection), target)
+            return 0
         match arguments.command:
             case "init":
                 result = workflow.init()
@@ -126,8 +173,6 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
                 result = workflow.clarify(tuple(_answer(value) for value in arguments.answer))
             case "continue":
                 result = workflow.continue_work()
-            case "status":
-                result = workflow.status()
             case "doctor":
                 return _render_doctor(Path(arguments.root), workflow, target)
             case "review":
@@ -137,9 +182,6 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
     except (RecoveryError, WorkflowError) as error:
         print(f"ERROR {error}", file=target)
         return 2
-    if arguments.command == "status":
-        _render_status(project_context(workflow), target)
-        return 0
     _render(result, target)
     return 2 if result.code == "INIT_REQUIRED" and arguments.command in ("new", "change") else 0
 
@@ -170,6 +212,7 @@ def _next_guidance(context: AgentContext):
 def _render_status(context: AgentContext, output: TextIO) -> None:
     health = "RECOVERY_REQUIRED" if context.stale else context.initialization_state
     print(f"Health: {health}", file=output)
+    print(f"Revision: {context.revision}", file=output)
     if context.lifecycle is not None:
         print(f"Flow: {context.lifecycle[0]} / {context.lifecycle[1]}", file=output)
         work = " | ".join(
@@ -178,6 +221,13 @@ def _render_status(context: AgentContext, output: TextIO) -> None:
         print(f"Work: {work}", file=output)
         if context.progress.current_work is not None:
             print(f"Current: {context.progress.current_work}", file=output)
+        if context.accepted_slice is not None:
+            print(
+                f"Accepted Slice: {context.accepted_slice.slice_title} "
+                f"| Task ID: {context.accepted_slice.task_id} "
+                f"| Pending checkpoint: {context.accepted_slice.checkpoint}",
+                file=output,
+            )
     elif context.completed_terminal:
         print("History: DONE", file=output)
     guidance = _next_guidance(context)

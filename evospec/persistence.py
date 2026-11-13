@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Final, Protocol, TypeAlias, TypeVar
 
 from .domain import (
+    AgreementRecord,
     AssessmentConfidence,
     AssessmentDepth,
     AssessmentDepthValue,
@@ -98,7 +99,7 @@ from .discovery import DiscoveryPolicy
 JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 )
-SCHEMA: Final = 12
+SCHEMA: Final = 13
 INTEGRATION_REGISTRY_SCHEMA: Final = 1
 
 _STATE_LOCKS: dict[str, threading.RLock] = {}
@@ -138,6 +139,7 @@ STATE_FIELDS: Final = frozenset(
         "irreversible_authorizations",
         "pending_autonomy_expansion",
         "autonomy_expansion_history",
+        "agreement_refs",
     )
 )
 CONTEXT_FIELDS: Final = frozenset(
@@ -174,11 +176,14 @@ CONTEXT_FIELDS: Final = frozenset(
         "review_findings",
         "autonomy_envelope",
         "autonomy_metrics",
+        "feature_agreement_ref",
+        "slice_agreement_ref",
     )
 )
 _CAPABILITY_SELECTION_FIELDS: Final = frozenset(("pending_capability_selection", "capability_selection_history"))
 _DISCOVERY_RECOVERY_FIELD: Final = frozenset(("pending_discovery_recovery",))
-STATE_FIELDS_V11: Final = STATE_FIELDS - frozenset(("pending_autonomy_expansion", "autonomy_expansion_history"))
+STATE_FIELDS_V12: Final = STATE_FIELDS - frozenset(("agreement_refs",))
+STATE_FIELDS_V11: Final = STATE_FIELDS_V12 - frozenset(("pending_autonomy_expansion", "autonomy_expansion_history"))
 STATE_FIELDS_V10: Final = STATE_FIELDS_V11 - frozenset(("irreversible_authorizations",))
 STATE_FIELDS_V9_PRE_SELECTION: Final = STATE_FIELDS_V10 - _CAPABILITY_SELECTION_FIELDS - _DISCOVERY_RECOVERY_FIELD
 STATE_FIELDS_V9_PRE_RECOVERY: Final = STATE_FIELDS_V10 - _DISCOVERY_RECOVERY_FIELD
@@ -187,7 +192,8 @@ STATE_FIELDS_V7: Final = STATE_FIELDS_V8 - frozenset(("parked_work",))
 STATE_FIELDS_V5: Final = STATE_FIELDS_V7 - frozenset(
     ("locks", "lock_revisions", "lock_releases", "lock_authorizations", "change_lock_assessments")
 )
-CONTEXT_FIELDS_V9: Final = CONTEXT_FIELDS - frozenset(("autonomy_envelope", "autonomy_metrics"))
+CONTEXT_FIELDS_V12: Final = CONTEXT_FIELDS - frozenset(("feature_agreement_ref", "slice_agreement_ref"))
+CONTEXT_FIELDS_V9: Final = CONTEXT_FIELDS_V12 - frozenset(("autonomy_envelope", "autonomy_metrics"))
 CONTEXT_FIELDS_V2: Final = CONTEXT_FIELDS_V9 - frozenset(("safety_facts",))
 
 
@@ -479,6 +485,8 @@ def _context_to_json(context: WorkingContext | None) -> JsonValue:
             "operational_handoffs": context.autonomy_metrics.operational_handoffs,
             "automatic_operations": context.autonomy_metrics.automatic_operations,
         },
+        "feature_agreement_ref": context.feature_agreement_ref,
+        "slice_agreement_ref": context.slice_agreement_ref,
     }
 
 
@@ -590,7 +598,11 @@ def _review_findings(value: JsonValue) -> tuple[ReviewFinding, ...]:
 def _context_from_json(value: JsonValue, schema: int) -> WorkingContext | None:
     if value is None:
         return None
-    fields = CONTEXT_FIELDS if schema >= 10 or (isinstance(value, dict) and set(value) == set(CONTEXT_FIELDS)) else CONTEXT_FIELDS_V9
+    fields = (
+        CONTEXT_FIELDS if schema >= 13
+        else CONTEXT_FIELDS_V12 if schema >= 10 or (isinstance(value, dict) and set(value) == set(CONTEXT_FIELDS_V12))
+        else CONTEXT_FIELDS_V9
+    )
     raw = _object(value, fields, "context")
     try:
         status = LifecycleState(_string(raw["status"], "status"))
@@ -670,6 +682,37 @@ def _context_from_json(value: JsonValue, schema: int) -> WorkingContext | None:
         _review_findings(raw["review_findings"]),
         _autonomy_envelope(raw["autonomy_envelope"]) if schema >= 10 else AutonomyEnvelope(_string(raw["focus"], "focus") if raw["focus"] is not None else "legacy work"),
         _autonomy_metrics(raw["autonomy_metrics"]) if schema >= 10 else AutonomyMetrics(),
+        feature_agreement_ref=_optional_string(raw["feature_agreement_ref"], "Feature agreement reference") if schema >= 13 else None,
+        slice_agreement_ref=_optional_string(raw["slice_agreement_ref"], "Slice agreement reference") if schema >= 13 else None,
+    )
+
+
+_AGREEMENT_FIELDS: Final = frozenset((
+    "id", "kind", "feature_id", "change_id", "title", "statement", "source",
+    "source_reference", "repository_id", "task_id", "initial_task", "checkpoint",
+))
+
+
+def _agreement_to_json(agreement: AgreementRecord) -> JsonValue:
+    """Encode one immutable agreement without inferring missing user consent."""
+    return {name: getattr(agreement, name) for name in _AGREEMENT_FIELDS}
+
+
+def _agreement_from_json(value: JsonValue) -> AgreementRecord:
+    raw = _object(value, _AGREEMENT_FIELDS, "agreement")
+    return AgreementRecord(
+        _string(raw["id"], "agreement id"),
+        _string(raw["kind"], "agreement kind"),
+        FeatureId(_string(raw["feature_id"], "agreement feature")),
+        ChangeId(_string(raw["change_id"], "agreement change")),
+        _string(raw["title"], "agreement title"),
+        _string(raw["statement"], "agreement statement"),
+        _string(raw["source"], "agreement source"),
+        _string(raw["source_reference"], "agreement source reference"),
+        _string(raw["repository_id"], "agreement repository"),
+        _optional_string(raw["task_id"], "agreement task"),
+        _optional_string(raw["initial_task"], "agreement initial task"),
+        _optional_string(raw["checkpoint"], "agreement checkpoint"),
     )
 
 
@@ -1380,24 +1423,26 @@ def _recover_state(root: Path) -> State:
         schema = _integer(schema_value, "schema")
         if schema in (9, 10):
             raw = _object(decoded, STATE_FIELDS_V10, "state")
-        elif schema in (11, SCHEMA):
+        elif schema in (11, 12, SCHEMA):
             decoded_fields = set(decoded)
             if schema == SCHEMA and decoded_fields == set(STATE_FIELDS):
                 raw = _object(decoded, STATE_FIELDS, "state")
-            elif decoded_fields == set(STATE_FIELDS_V11):
+            elif schema == 12 and decoded_fields == set(STATE_FIELDS_V12):
+                raw = _object(decoded, STATE_FIELDS_V12, "state")
+            elif schema < SCHEMA and decoded_fields == set(STATE_FIELDS_V11):
                 raw = {
                     "pending_autonomy_expansion": None,
                     "autonomy_expansion_history": [],
                     **_object(decoded, STATE_FIELDS_V11, "state"),
                 }
-            elif decoded_fields == set(STATE_FIELDS_V10):
+            elif schema < SCHEMA and decoded_fields == set(STATE_FIELDS_V10):
                 raw = {
                     "irreversible_authorizations": [],
                     "pending_autonomy_expansion": None,
                     "autonomy_expansion_history": [],
                     **_object(decoded, STATE_FIELDS_V10, "state"),
                 }
-            elif decoded_fields == STATE_FIELDS_V9_PRE_SELECTION:
+            elif schema < SCHEMA and decoded_fields == STATE_FIELDS_V9_PRE_SELECTION:
                 raw = {
                     "pending_capability_selection": None,
                     "capability_selection_history": [],
@@ -1407,7 +1452,7 @@ def _recover_state(root: Path) -> State:
                     "autonomy_expansion_history": [],
                     **_object(decoded, STATE_FIELDS_V9_PRE_SELECTION, "state"),
                 }
-            elif decoded_fields == STATE_FIELDS_V9_PRE_RECOVERY:
+            elif schema < SCHEMA and decoded_fields == STATE_FIELDS_V9_PRE_RECOVERY:
                 raw = {
                     "pending_discovery_recovery": None,
                     "irreversible_authorizations": [],
@@ -1447,7 +1492,7 @@ def _recover_state(root: Path) -> State:
                 legacy_fields,
                 "state",
             )
-        if schema not in (5, 6, 7, 8, 9, 10, 11, SCHEMA):
+        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, SCHEMA):
             raise DecodeError("unknown state schema")
         (
             initialization, deferred, intake, selection, recovery, selection_history,
@@ -1517,6 +1562,7 @@ def _recover_state(root: Path) -> State:
             irreversible_authorizations,
             pending_autonomy_expansion,
             autonomy_expansion_history,
+            agreements=_load_references(root, raw["agreement_refs"], "agreement_refs", "records/agreements", _agreement_from_json) if schema >= 13 else (),
         )
         validate_state(state)
         _validate_capability_selection_authority(state, schema)
@@ -1997,6 +2043,10 @@ def _state_bytes(state: State) -> bytes:
                 {"id": item.id, "path": f"records/changes/{item.id}.json"}
                 for item in state.changes
             ],
+            "agreement_refs": [
+                {"id": item.id, "path": f"records/agreements/{item.id}.json"}
+                for item in state.agreements
+            ],
             "decision_refs": [
                 {"id": item.id, "path": f"records/decisions/{item.id}.json"}
                 for item in state.decisions
@@ -2073,7 +2123,9 @@ class StateStore:
 
 
 
-def _atomic_replace(path: Path, data: bytes, operations: FileOperations) -> None:
+def _atomic_replace(
+    path: Path, data: bytes, operations: FileOperations, *, strict_directory: bool = False,
+) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
@@ -2111,8 +2163,11 @@ def _atomic_replace(path: Path, data: bytes, operations: FileOperations) -> None
         raise AtomicFailure("atomic publication failed before replacement") from error
     try:
         operations.fsync_directory(path.parent)
-    except OSError:
-        return
+    except OSError as error:
+        # The rename may already be visible. Report uncertainty to the E1 caller;
+        # its next step must be recovery, never an assumed automatic retry.
+        if strict_directory:
+            raise AtomicFailure("publication durability is uncertain after replacement") from error
 
 
 def load_integration_providers(root: Path) -> tuple[str, ...]:
@@ -2179,10 +2234,37 @@ class _StateStore:
         self.__operations = FileOperations() if operations is None else operations
 
     def recover(self) -> State:
-        return _recover_state(self.__root)
+        state = _recover_state(self.__root)
+        if state.agreements:
+            expected_id = sha256(str(self.__root).encode("utf-8")).hexdigest()[:16]
+            if state.initialization is None or state.initialization.repository_id != expected_id:
+                raise RecoveryError("accepted Slice state belongs to a different repository root")
+        return state
+
+    def e1_schema_ready(self) -> bool:
+        """Legacy state remains readable but cannot silently enter the E1 writer path."""
+        raw = _read_json(_artifact_path(self.__root, "state.json"))
+        return isinstance(raw, dict) and raw.get("schema") == SCHEMA
 
     def publish_feature(self, state: State) -> None:
         self.__publish_state(state)
+
+    def publish_first_slice(self, state: State, change: Change, agreements: tuple[AgreementRecord, ...]) -> None:
+        """Commit Feature/Slice/Task as one authority revision after durable records."""
+        with _state_publish_lock(self.__root):
+            # Validate the CAS before creating records that may become inert orphans.
+            self.__check_state_revision(state)
+            for agreement in agreements:
+                self.__publish_immutable(
+                    f"records/agreements/{agreement.id}.json",
+                    encode_json(_agreement_to_json(agreement)),
+                    strict_directory=True,
+                )
+            self.__publish_immutable(
+                f"records/changes/{change.id}.json", encode_json(_change_to_json(change)),
+                strict_directory=True,
+            )
+            self.__publish_state_locked(state, strict_directory=True)
 
     def publish_lifecycle(self, state: State) -> None:
         self.__publish_state(state)
@@ -2257,45 +2339,49 @@ class _StateStore:
 
     def __publish_state(self, state: State) -> None:
         with _state_publish_lock(self.__root):
-            current = _recover_state(self.__root)
-            if state.revision != current.revision + 1:
-                raise AtomicFailure("state revision changed before publication")
-            ready = tuple(
-                item
-                for item in current.irreversible_authorizations
-                if item.status is IrreversibleAuthorizationStatus.READY
-            )
-            if ready:
-                only_authorization_changed = replace(
-                    state,
-                    revision=current.revision,
-                    irreversible_authorizations=current.irreversible_authorizations,
-                ) == current
-                before = {item.id: item for item in current.irreversible_authorizations}
-                after = {item.id: item for item in state.irreversible_authorizations}
-                resolved = (
-                    only_authorization_changed
-                    and before.keys() == after.keys()
-                    and all(
-                        after[identity] == previous
-                        if previous.status is not IrreversibleAuthorizationStatus.READY
-                        else after[identity].status
-                        in (
-                            IrreversibleAuthorizationStatus.CONSUMED,
-                            IrreversibleAuthorizationStatus.INVALIDATED,
-                        )
-                        for identity, previous in before.items()
+            self.__publish_state_locked(state)
+
+    def __check_state_revision(self, state: State) -> State:
+        current = _recover_state(self.__root)
+        if state.revision != current.revision + 1:
+            raise AtomicFailure("state revision changed before publication")
+        return current
+
+    def __publish_state_locked(self, state: State, *, strict_directory: bool = False) -> None:
+        current = self.__check_state_revision(state)
+        ready = tuple(
+            item for item in current.irreversible_authorizations
+            if item.status is IrreversibleAuthorizationStatus.READY
+        )
+        if ready:
+            only_authorization_changed = replace(
+                state,
+                revision=current.revision,
+                irreversible_authorizations=current.irreversible_authorizations,
+            ) == current
+            before = {item.id: item for item in current.irreversible_authorizations}
+            after = {item.id: item for item in state.irreversible_authorizations}
+            resolved = (
+                only_authorization_changed
+                and before.keys() == after.keys()
+                and all(
+                    after[identity] == previous
+                    if previous.status is not IrreversibleAuthorizationStatus.READY
+                    else after[identity].status in (
+                        IrreversibleAuthorizationStatus.CONSUMED,
+                        IrreversibleAuthorizationStatus.INVALIDATED,
                     )
+                    for identity, previous in before.items()
                 )
-                if not resolved:
-                    raise AtomicFailure(
-                        "Core mutations are blocked while an irreversible operation is reserved"
-                    )
-            _atomic_replace(
-                _artifact_path(self.__root, "state.json"),
-                _state_bytes(state),
-                self.__operations,
             )
+            if not resolved:
+                raise AtomicFailure(
+                    "Core mutations are blocked while an irreversible operation is reserved"
+                )
+        _atomic_replace(
+            _artifact_path(self.__root, "state.json"), _state_bytes(state), self.__operations,
+            strict_directory=strict_directory,
+        )
 
     def __publish_change(self, state: State, change: Change) -> None:
         self.__publish_immutable(
@@ -2317,13 +2403,20 @@ class _StateStore:
         self.__publish_immutable(publication.path.value, content.encode("utf-8"))
         self.__publish_state(state)
 
-    def __publish_immutable(self, relative: str, data: bytes) -> None:
+    def __publish_immutable(
+        self, relative: str, data: bytes, *, strict_directory: bool = False,
+    ) -> None:
         destination = _artifact_path(self.__root, relative)
         if destination.exists():
             if destination.read_bytes() != data:
                 raise AtomicFailure("immutable artifact already exists with different content")
+            if strict_directory:
+                try:
+                    self.__operations.fsync_directory(destination.parent)
+                except OSError as error:
+                    raise AtomicFailure("existing immutable record durability is uncertain") from error
             return
-        _atomic_replace(destination, data, self.__operations)
+        _atomic_replace(destination, data, self.__operations, strict_directory=strict_directory)
 
 
 __all__ = (
