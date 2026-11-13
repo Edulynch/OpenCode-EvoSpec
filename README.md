@@ -85,7 +85,7 @@ Read the [EvoSpec Methodology](docs/methodology.md) for the deeper picture.
 
 **Source/package version:** `0.5.0` (source snapshot; not a published release in this repository).
 
-**E0 V2 methodology:** Product-owner approved on 2026-11-12 as a method-level contract. E1 first-Slice implementation was subsequently authorized and is in review on this feature branch; it is not a release or a declaration of native runtime parity. The approved E1.2 shape is a portable application with repository-local state. Cross-computer synchronization is outside E1.
+**E0 V2 methodology:** Product-owner approved on 2026-11-12 as a method-level contract. **E1 Vertical Slice B is functionally complete and merged** ([PR #3](https://github.com/Edulynch/OpenCode-EvoSpec/pull/3), 2026-11-13): an explicitly accepted Feature/Slice/Task and checkpoint persist locally and are recovered in an independent OpenCode session. Windows native-host qualification used OpenCode 2.3.0; Linux/Windows CI passed. This does **not** close all E1 design gates, certify Windows power-loss durability, prove unforgeable human identity against same-user processes, or authorize a release. E1.2 specifies a portable application with repository/worktree-local state; cross-computer context synchronization is outside E1.
 
 The **v0.6.0 — Autonomy Pass** is paused historical planning, not an active EvoSpec V2 objective. Its task state remains in [ROADMAP.md](ROADMAP.md).
 
