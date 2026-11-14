@@ -1,10 +1,20 @@
 ---
 name: evospec
-description: Use for EvoSpec lifecycle work, revision-bound protocol actions, Semantic Locks, review, or explicit convergence.
+description: Use for EvoSpec project work, natural-language status or resume questions (e.g. ¿dónde seguimos?), revision-bound protocol actions, Semantic Locks, review, or explicit convergence.
 ---
 
 <!-- EvoSpec-managed: opencode-v2 -->
 # EvoSpec Protocol
+
+## Natural-language recovery: read only
+
+When the user asks "¿dónde seguimos?", "¿en qué quedamos?", "what were we doing?", or otherwise requests the current project context, activate this skill automatically. The user need not name EvoSpec or invoke a command. Call **only** `evospec_context` for the executing session's project/worktree. A question about status is not a request to initialize a project, accept an agreement again, plan, execute, advance a lifecycle, change permissions, or invoke `evospec_continuation`. Do not write to `.evospec` or any other file.
+
+Answer briefly in ordinary language: current Feature and Slice titles, the known Task, the last reported checkpoint, and what remains or blocks continuation, **only where authoritative context supplies each fact**. `accepted_slice.checkpoint` is the *initial accepted checkpoint*, not evidence of work completed. If present, `task_progress.checkpoint` is a later report for the same Task: identify it as `REPORTED_UNVERIFIED`, not independently verified completion; when absent or null, state that no later Task progress is recorded. The separate `progress` and `outcome` fields may explain current work or a blocker, but neither proves a criterion passed. Do not invent acceptance criteria, agreements, Task status, or verification evidence missing from the returned context. Show technical IDs and revisions only when requested or needed to distinguish ambiguous work.
+
+If state is missing, invalid, from another worktree, or ambiguous, explain the uncertainty and stop without initialization, repair, search across unrelated worktrees, or a guessed resume point. Ask for a material clarification only when necessary. If the user later explicitly asks to perform work, begin the normal protocol below with fresh context and its legal actions; a read-only answer confers no execution authority.
+
+## Explicit lifecycle work
 
 Call `evospec_context` and `evospec_continuation` before repository inspection, tests, implementation state, or EvoSpec lifecycle mutation. Internal task, todo, and reasoning work may precede context only when it does not mutate the repository or EvoSpec and does not claim authorization. Treat returned `legal_actions`, preflight requirements, lifecycle, lock metadata, outcome, Autonomy Envelope, and revision as authority. Context chooses legality; never infer an allowed action from a phase name. Every mutation includes that exact `expected_revision`; reload canonical context after every Core mutation. On `STALE_REVISION`, discard conclusions tied to the old revision, refresh, and reevaluate the intended operation; replay only when current Core legality and the exact offered IDs/choices still match. Never blindly replay, and never edit `.evospec`.
 
