@@ -34,6 +34,11 @@ ACTION_KEYS = {
     "remove_work_relation": frozenset(("action", "expected_revision", "predecessor_id", "successor_id", "kind")),
     "reject": frozenset(("action", "expected_revision")),
     "progress": frozenset(("action", "expected_revision", "current_action", "focus", "completed_work", "current_work", "pending_work", "resume_point")),
+    "accepted_task_progress": frozenset((
+        "action", "expected_revision", "repository_id", "task_id",
+        "feature_agreement_ref", "slice_agreement_ref", "checkpoint",
+        "statement", "evidence_refs",
+    )),
     "assess_locks": frozenset(("action", "expected_revision", "assessments")),
     "review": frozenset(("action", "expected_revision", "review")),
     "verify": frozenset(("action", "expected_revision", "verification")),

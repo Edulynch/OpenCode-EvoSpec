@@ -468,7 +468,16 @@ const tools = [
     "evospec",
     "Read EvoSpec context or submit one provider-neutral protocol request for the executing session's repository.",
     object({ request: string }),
-    (args, context) => executeRequest(context.runtime, args.request, context),
+    (args, context) => {
+      // Keep the E1 capability visible to the host as its own permission-controlled tool.
+      if (staleRequest(args.request)?.action === "accepted_task_progress") {
+        return JSON.stringify({ error: {
+          code: "DEDICATED_TOOL_REQUIRED",
+          detail: "Use evospec_accepted_task_progress for accepted E1 Task reports",
+        } })
+      }
+      return executeRequest(context.runtime, args.request, context)
+    },
   ),
   protocolTool(
     "evospec_start",
@@ -527,6 +536,22 @@ const tools = [
     "Read canonical EvoSpec context and guidance for the executing session's repository.",
     object({}),
     (_, context) => executeRequest(context.runtime, { action: "context" }, context),
+  ),
+  protocolTool(
+    "evospec_accepted_task_progress",
+    "Report one unverified operational checkpoint for the exact human-accepted E1 Task; requires the host's permission and Core's revision, root, scope, and autonomy checks. Never approves or verifies a Task.",
+    object({
+      expected_revision: nonnegativeInteger,
+      repository_id: { type: "string", minLength: 1, maxLength: 2048 },
+      task_id: { type: "string", minLength: 1, maxLength: 2048 },
+      feature_agreement_ref: { type: "string", minLength: 1, maxLength: 2048 },
+      slice_agreement_ref: { type: "string", minLength: 1, maxLength: 2048 },
+      checkpoint: { type: "string", minLength: 1, maxLength: 2048 },
+      statement: { type: "string", minLength: 1, maxLength: 2048 },
+      evidence_refs: { type: "array", items: { type: "string", minLength: 1, maxLength: 2048 }, maxItems: 16, uniqueItems: true },
+    }),
+    // A stale report is never silently rebound to a different accepted revision.
+    (args, context) => executeRequest(context.runtime, { action: "accepted_task_progress", ...args }, context, { retryStale: false }),
   ),
   protocolTool(
     "evospec_work_list",

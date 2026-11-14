@@ -34,6 +34,20 @@ class AgentProgress:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentTaskProgress:
+    """A current operational checkpoint, explicitly not an accepted verification."""
+
+    task_id: str
+    checkpoint: str
+    statement: str
+    report_kind: str
+    source_kind: str
+    source_reference: str | None
+    evidence_refs: tuple[str, ...]
+    recorded_revision: int
+
+
+@dataclass(frozen=True, slots=True)
 class AgentDecisionState:
     unresolved_material_decision: bool
     clarification_count: int
@@ -170,6 +184,8 @@ class AgentContext:
     pending_autonomy_expansion: PendingAutonomyExpansion | None = None
     repository_id: str | None = None
     accepted_slice: AcceptedSliceContext | None = None
+    task_progress: AgentTaskProgress | None = None
+    e1_schema_ready: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,12 +207,14 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
     """Return a concise, deterministic projection of current workflow authority."""
     if inspection is None:
         inspection = workflow.inspect_locks()
+    # A separate schema read could advertise a newer writer gate with an older revision.
+    e1_schema_ready = inspection.e1_schema_ready
     queue_activation_available = (
         inspection.state.initialization is not None
         and workflow.queue_next(inspection.state).code in ("SELECTED", "AMBIGUOUS")
     )
     guidance = project(
-        inspection, queue_activation_available=queue_activation_available
+        inspection, queue_activation_available=queue_activation_available, e1_schema_ready=e1_schema_ready,
     )
     if inspection.state.initialization is None:
         return AgentContext(
@@ -214,7 +232,7 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
             False,
             None,
             WorkQueueSummary((), (), (), (), (), (), None, None, "NONE", (), 0, True, (), 0, True, 0, True),
-            allowed_actions(inspection, queue_activation_available=queue_activation_available),
+            allowed_actions(inspection, queue_activation_available=queue_activation_available, e1_schema_ready=e1_schema_ready),
             guidance,
             (),
             0,
@@ -258,7 +276,7 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
             False,
             None,
             work_queue,
-            allowed_actions(inspection, queue_activation_available=queue_activation_available),
+            allowed_actions(inspection, queue_activation_available=queue_activation_available, e1_schema_ready=e1_schema_ready),
             guidance,
             accepted_capabilities[:MAX_ACCEPTED_CAPABILITIES],
             accepted_capabilities_total,
@@ -310,7 +328,8 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
             context.completed_work,
             context.current_work,
             context.pending_work,
-            context.resume_point,
+            # resume_point remains a read-only compatibility projection, never a second E1 ledger.
+            context.task_progress.checkpoint if context.task_progress is not None else context.resume_point,
         ),
         AgentDecisionState(
             context.unresolved_material_decision,
@@ -325,7 +344,7 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
         stale,
         "semantic lock assessment is missing or stale" if stale else None,
         work_queue,
-        allowed_actions(inspection, queue_activation_available=queue_activation_available) +
+        allowed_actions(inspection, queue_activation_available=queue_activation_available, e1_schema_ready=e1_schema_ready) +
         (("structure_material_clarification",) if context.safety_facts.unresolved_decision_details and context.unresolved_material_decision else ())
         + (("recover_legacy_non_material_detail",) if context.change_id is not None and context.safety_facts.unresolved_decision_details and context.unresolved_material_decision else ()),
         guidance,
@@ -350,6 +369,17 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
             inspection.state.pending_autonomy_expansion,
             None if inspection.state.initialization is None else inspection.state.initialization.repository_id,
             _accepted_slice_context(inspection.state),
+            None if context.task_progress is None else AgentTaskProgress(
+                context.task_progress.task_id,
+                context.task_progress.checkpoint,
+                context.task_progress.statement,
+                context.task_progress.report_kind,
+                context.task_progress.source_kind,
+                context.task_progress.source_reference,
+                context.task_progress.evidence_refs,
+                context.task_progress.recorded_revision,
+            ),
+            e1_schema_ready,
     )
 
 

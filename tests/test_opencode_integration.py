@@ -115,9 +115,9 @@ const runtime = {
   },
 }
 await plugin.setup(runtime)
-assert(definitions.length === 24, "raw protocol tool and all typed helpers register")
+assert(definitions.length === 25, "raw protocol tool and all typed helpers register")
 const names = new Set(definitions.map((definition) => definition.name))
-for (const name of ["evospec", "evospec_start", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
+for (const name of ["evospec", "evospec_start", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
 const recoveryTool = definitions.find((definition) => definition.name === "evospec_recover_legacy_non_material_detail")
 assert(recoveryTool.input.additionalProperties === false, "typed recovery tool rejects undeclared replacement prose")
 assert(JSON.stringify(recoveryTool.input.required) === JSON.stringify(["expected_revision", "repository_id", "feature_id", "change_id", "legacy_detail"]), "typed recovery tool requires exact recovery identity and detail only")
