@@ -84,6 +84,9 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn("task_progress.checkpoint", skill)
         self.assertIn("REPORTED_UNVERIFIED", skill)
         self.assertIn("If state is missing, invalid, from another worktree, or ambiguous", skill)
+        self.assertIn("accepted Slice details attached to parked items", skill)
+        self.assertIn("never select, reactivate", skill.lower())
+        self.assertIn("accepted work_queue items as inactive", plugin)
 
         # Both slash consultations share the same read-only contract, even when natural
         # language activates the skill without a slash command.
@@ -92,6 +95,8 @@ class OpenCodeIntegrationTests(unittest.TestCase):
             self.assertIn("call only `evospec_context`", resource)
             self.assertIn("REPORTED_UNVERIFIED", resource)
             self.assertIn("read-only", resource)
+            self.assertIn("work_queue", resource)
+            self.assertIn("inactive", resource)
             self.assertEqual(
                 resource,
                 (Path(__file__).parents[1] / ".opencode" / "commands" / command).read_text(encoding="utf-8"),

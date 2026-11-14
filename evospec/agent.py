@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .domain import AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, State, WorkItem
+from .domain import AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, State, WorkItem, WorkingContext
 from .guidance import (
     ActionGuidance,
     MaterialDecisionEvidence,
@@ -101,6 +101,7 @@ class WorkItemSummary:
     verification_sufficient: bool
     activation_eligible: bool
     blocker: str | None
+    accepted_slice: AcceptedSliceContext | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,7 +355,12 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
 
 
 def _accepted_slice_context(state: State) -> AcceptedSliceContext | None:
-    context = state.active_context
+    return _accepted_slice_for_context(state, state.active_context)
+
+
+def _accepted_slice_for_context(state: State, context: WorkingContext | None) -> AcceptedSliceContext | None:
+    # A parked Task keeps its accepted agreement, but remains inactive. Project
+    # its titles without promoting it to the current Task or selecting work.
     if context is None or context.slice_agreement_ref is None:
         return None
     feature = next((item for item in state.agreements if item.id == context.feature_agreement_ref), None)
@@ -573,4 +579,5 @@ def _work_item_summary(workflow: WorkflowService, state: State, item: WorkItem) 
         False if context is None else context.verification.sufficient,
         item.operational_state is OperationalState.READY and blocker is None,
         blocker,
+        _accepted_slice_for_context(state, context),
     )

@@ -7,7 +7,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from .agent import AgentContext, WorkItemSummary, project_context
+from .agent import AcceptedSliceContext, AgentContext, WorkItemSummary, project_context
 from .agent_protocol_schema import (
     ProtocolError,
     decode_request,
@@ -103,20 +103,28 @@ def _autonomy_delta_json(delta: AutonomyEnvelopeDelta) -> dict[str, JsonValue]:
     }
 
 
+def _accepted_slice_json(accepted: AcceptedSliceContext | None) -> dict[str, JsonValue] | None:
+    # Active and parked Tasks share one projection so both preserve exactly
+    # the agreement's original meaning and checkpoint.
+    if accepted is None:
+        return None
+    return {
+        "feature_agreement_ref": accepted.feature_agreement_ref,
+        "slice_agreement_ref": accepted.slice_agreement_ref,
+        "feature_title": accepted.feature_title,
+        "slice_title": accepted.slice_title,
+        "task_id": accepted.task_id,
+        "initial_task": accepted.initial_task,
+        "checkpoint": accepted.checkpoint,
+        "source": accepted.source,
+        "source_reference": accepted.source_reference,
+    }
+
+
 def context_json(context: AgentContext) -> dict[str, JsonValue]:
     """Return the stable JSON-safe representation of an agent context."""
     payload: dict[str, JsonValue] = {"revision": context.revision, "repository_id": context.repository_id, "initialization_state": context.initialization_state,
-            "accepted_slice": None if context.accepted_slice is None else {
-                "feature_agreement_ref": context.accepted_slice.feature_agreement_ref,
-                "slice_agreement_ref": context.accepted_slice.slice_agreement_ref,
-                "feature_title": context.accepted_slice.feature_title,
-                "slice_title": context.accepted_slice.slice_title,
-                "task_id": context.accepted_slice.task_id,
-                "initial_task": context.accepted_slice.initial_task,
-                "checkpoint": context.accepted_slice.checkpoint,
-                "source": context.accepted_slice.source,
-                "source_reference": context.accepted_slice.source_reference,
-            },
+            "accepted_slice": _accepted_slice_json(context.accepted_slice),
             "lifecycle": None if context.lifecycle is None else list(context.lifecycle),
             "feature_id": context.feature_id, "change_id": context.change_id, "classification": context.classification,
             "progress": {"current_action": context.progress.current_action, "focus": context.progress.focus,
@@ -264,6 +272,7 @@ def _work_queue_json(context: AgentContext) -> dict[str, JsonValue]:
             "review_verdict": summary.review_verdict,
             "verification_sufficient": summary.verification_sufficient,
             "activation_eligible": summary.activation_eligible, "blocker": summary.blocker,
+            "accepted_slice": _accepted_slice_json(summary.accepted_slice),
         }
     return {
         "all": [item(value) for value in queue.all], "pending": [item(value) for value in queue.pending],
