@@ -3076,7 +3076,8 @@ class CoreService:
         return saved
 
     def inspect_review(self) -> ReviewInspection:
-        return inspect(self.__persistence.recover())
+        state, e1_schema_ready = self.__persistence.recover_snapshot()
+        return replace(inspect(state), e1_schema_ready=e1_schema_ready)
 
     def lock_gate(self, state: State) -> str | None:
         return _lock_gate(_authoritative_state(self.__persistence, state))

@@ -387,6 +387,21 @@ class GuardedTaskProgressTests(unittest.TestCase):
             self.assertIsNone(recovered.task_progress)
             self.assertEqual(recovered.progress.resume_point, "resume")
 
+    def test_c17_schema_gate_and_revision_share_one_read_snapshot(self) -> None:
+        """A status projection must not combine an old revision with a newer schema gate."""
+        with patch.object(WorkflowService, "e1_schema_ready", side_effect=AssertionError("second schema read")):
+            current = self.workflow.inspect_locks()
+            self.assertTrue(current.e1_schema_ready)
+            self.assertTrue(project_context(self.workflow, current).e1_schema_ready)
+
+            # A valid legacy E1 authority must remain read-only under the same projection.
+            self._schema13()
+            legacy = self.workflow.inspect_locks()
+            self.assertFalse(legacy.e1_schema_ready)
+            projected = project_context(self.workflow, legacy)
+            self.assertFalse(projected.e1_schema_ready)
+            self.assertNotIn("accepted_task_progress", projected.legal_actions)
+
 
 if __name__ == "__main__":
     unittest.main()

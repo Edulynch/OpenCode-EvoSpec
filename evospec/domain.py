@@ -2644,6 +2644,8 @@ class ReviewInspection:
     lock_revisions: tuple[SemanticLockRevision, ...] = ()
     lock_releases: tuple[LockRelease, ...] = ()
     lock_authorizations: tuple[LockAuthorization, ...] = ()
+    # This read-only value comes from the same state.json read as `state`.
+    e1_schema_ready: bool | None = None
 
     @property
     def context(self) -> WorkingContext | None:

@@ -1478,10 +1478,11 @@ def _legacy_preserved_work_id(value: JsonValue, schema: int) -> WorkId | None:
     return None if context is None else _work_id(context)
 
 
-def _recover_state(root: Path) -> State:
+def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
+    """Read the persisted schema and its state from the same authority snapshot."""
     state_path = _artifact_path(root, "state.json")
     if not state_path.exists():
-        return State(0, None)
+        return State(0, None), None
     try:
         decoded = _read_json(state_path)
         if not isinstance(decoded, dict):
@@ -1655,6 +1656,12 @@ def _recover_state(root: Path) -> State:
                 raise DecodeError("publication predecessor is missing")
     except (OSError, UnicodeDecodeError, DecodeError, DomainError, StateValidationError) as error:
         raise RecoveryError("state authority cannot be recovered") from error
+    return state, schema
+
+
+def _recover_state(root: Path) -> State:
+    """Keep existing callers focused on domain state, without schema metadata."""
+    state, _ = _recover_state_with_schema(root)
     return state
 
 
@@ -2311,12 +2318,17 @@ class _StateStore:
         self.__operations = FileOperations() if operations is None else operations
 
     def recover(self) -> State:
-        state = _recover_state(self.__root)
+        state, _ = self.recover_snapshot()
+        return state
+
+    def recover_snapshot(self) -> tuple[State, bool | None]:
+        """Pair the accepted E1 schema gate with the state that was actually decoded."""
+        state, schema = _recover_state_with_schema(self.__root)
         if state.agreements:
             expected_id = sha256(str(self.__root).encode("utf-8")).hexdigest()[:16]
             if state.initialization is None or state.initialization.repository_id != expected_id:
                 raise RecoveryError("accepted Slice state belongs to a different repository root")
-        return state
+        return state, (schema == SCHEMA if state.agreements else None)
 
     def e1_schema_ready(self) -> bool:
         """Legacy state remains readable but cannot silently enter the E1 writer path."""

@@ -207,7 +207,8 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
     """Return a concise, deterministic projection of current workflow authority."""
     if inspection is None:
         inspection = workflow.inspect_locks()
-    e1_schema_ready = workflow.e1_schema_ready() if inspection.state.agreements else None
+    # A separate schema read could advertise a newer writer gate with an older revision.
+    e1_schema_ready = inspection.e1_schema_ready
     queue_activation_available = (
         inspection.state.initialization is not None
         and workflow.queue_next(inspection.state).code in ("SELECTED", "AMBIGUOUS")
