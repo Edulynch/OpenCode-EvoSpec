@@ -61,22 +61,29 @@ function Assert-PrivateHostReady {
         [Parameter(Mandatory)][string]$FixtureRoot,
         [Parameter(Mandatory)][string]$ServerUrl,
         [Parameter(Mandatory)][System.Diagnostics.Process]$ServerProcess,
+        [Parameter(Mandatory)][string]$Authorization,
         [Parameter(Mandatory)][hashtable]$Evidence
     )
 
     # No model request is allowed until the private host reports the exact
     # fixture location and an active EvoSpec plugin. Plugin setup itself
     # verifies registration of evospec_context in the native tool registry.
+    $headers = @{ Authorization = $Authorization }
     $location = $null
     for ($attempt = 0; $attempt -lt 80; $attempt++) {
         if ($ServerProcess.HasExited) {
             throw "STOP: private OpenCode server exited before location discovery (exit $($ServerProcess.ExitCode))."
         }
         try {
-            $location = Invoke-RestMethod -Method Get -Uri "$ServerUrl/api/location" -TimeoutSec 2
+            $location = Invoke-RestMethod -Method Get -Uri "$ServerUrl/api/location" -Headers $headers -TimeoutSec 2
             break
         }
-        catch { Start-Sleep -Milliseconds 250 }
+        catch {
+            if ([int]$_.Exception.Response.StatusCode -eq 401) {
+                throw 'STOP: private OpenCode API rejected preflight authentication (HTTP 401).'
+            }
+            Start-Sleep -Milliseconds 250
+        }
     }
     if ($null -eq $location) { throw 'STOP: private OpenCode server did not answer /api/location.' }
 
@@ -102,7 +109,7 @@ function Assert-PrivateHostReady {
     for ($attempt = 0; $attempt -lt 80; $attempt++) {
         if ($ServerProcess.HasExited) { throw 'STOP: private OpenCode server stopped during plugin discovery.' }
         try {
-            $reply = Invoke-RestMethod -Method Get -Uri "$ServerUrl/api/plugin?location%5Bdirectory%5D=$encodedRoot" -TimeoutSec 3
+            $reply = Invoke-RestMethod -Method Get -Uri "$ServerUrl/api/plugin?location%5Bdirectory%5D=$encodedRoot" -Headers $headers -TimeoutSec 3
             $plugin = @($reply.data | Where-Object { $_.id -eq 'evospec' } | Select-Object -First 1)
             if ($plugin.Count -gt 0) {
                 $state = [string]$plugin[0].state.status
@@ -116,6 +123,9 @@ function Assert-PrivateHostReady {
         }
         catch {
             if ($_.Exception.Message -like 'STOP:*') { throw }
+            if ([int]$_.Exception.Response.StatusCode -eq 401) {
+                throw 'STOP: private OpenCode API rejected plugin authentication (HTTP 401).'
+            }
             # An initial 503 or connection delay is expected while plugins load.
         }
         Start-Sleep -Milliseconds 250
@@ -193,6 +203,10 @@ try {
         try {
             $port = Get-FreeLoopbackPort
             $serverUrl = "http://127.0.0.1:$port"
+            # A fresh secret authenticates only this ephemeral loopback server.
+            # It never enters Git, a persistent config, or the process command line.
+            $privatePassword = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+            $basicCredential = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("opencode:$privatePassword"))
             # This private server remains alive for the exact session whose
             # plugin and location we inspect. No shared service is reused.
             # An encoded command preserves Windows paths and non-ASCII text;
@@ -202,10 +216,11 @@ try {
             $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($serveCommand))
             $serverProcess = Start-Process -FilePath (Get-Command pwsh -CommandType Application).Source `
                 -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand) `
+                -Environment @{ OPENCODE_PASSWORD = $privatePassword } `
                 -WindowStyle Hidden -PassThru `
                 -RedirectStandardOutput (Join-Path $evidenceRoot "server-$($job.Name).stdout.log") `
                 -RedirectStandardError (Join-Path $evidenceRoot "server-$($job.Name).stderr.log")
-            Assert-PrivateHostReady -FixtureRoot $fixtureRoot -ServerUrl $serverUrl -ServerProcess $serverProcess -Evidence $preflight
+            Assert-PrivateHostReady -FixtureRoot $fixtureRoot -ServerUrl $serverUrl -ServerProcess $serverProcess -Authorization "Basic $basicCredential" -Evidence $preflight
 
             Push-Location $fixtureRoot
             try {
@@ -214,8 +229,20 @@ try {
                 }
                 # The model connects to the same preflighted private server;
                 # --auto handles only non-denied host permissions.
-                $outputLines = @(& opencode run --server $serverUrl --auto --agent build --model $modelName --format json $job.Prompt 2>&1)
-                $exitCode = $LASTEXITCODE
+                $previousPassword = [Environment]::GetEnvironmentVariable('OPENCODE_PASSWORD', 'Process')
+                try {
+                    $env:OPENCODE_PASSWORD = $privatePassword
+                    $outputLines = @(& opencode run --server $serverUrl --auto --agent build --model $modelName --format json $job.Prompt 2>&1)
+                    $exitCode = $LASTEXITCODE
+                }
+                finally {
+                    # Restore precisely the caller's original process environment.
+                    if ($null -eq $previousPassword) {
+                        Remove-Item Env:OPENCODE_PASSWORD -ErrorAction SilentlyContinue
+                    } else {
+                        $env:OPENCODE_PASSWORD = $previousPassword
+                    }
+                }
             }
             finally { Pop-Location }
         }
@@ -239,6 +266,20 @@ try {
                         }
                     }
                     finally { $serverProcess.Dispose() }
+                }
+                if (-not [string]::IsNullOrEmpty($privatePassword)) {
+                    # OpenCode may echo its server password on stdout. Preserve
+                    # diagnostics without leaving that temporary secret in logs.
+                    foreach ($logName in @("server-$($job.Name).stdout.log", "server-$($job.Name).stderr.log")) {
+                        $logPath = Join-Path $evidenceRoot $logName
+                        if (-not (Test-Path -LiteralPath $logPath)) { continue }
+                        $rawLog = Get-Content -LiteralPath $logPath -Raw -Encoding utf8
+                        if ([string]::IsNullOrEmpty($rawLog)) { continue }
+                        $safeLog = $rawLog.Replace($privatePassword, '[REDACTED]').Replace($basicCredential, '[REDACTED]')
+                        if ($safeLog -cne $rawLog) {
+                            Set-Content -LiteralPath $logPath -Value $safeLog -Encoding utf8 -NoNewline
+                        }
+                    }
                 }
             }
         }

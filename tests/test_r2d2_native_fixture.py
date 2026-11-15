@@ -66,6 +66,11 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         self.assertIn("$Evidence.LocationVerified = $true", runner)
         self.assertIn("$Evidence.PluginVerified = $true", runner)
         self.assertIn("$state -eq 'active'", runner)
+        self.assertIn("RandomNumberGenerator]::GetBytes(32)", runner)
+        self.assertIn("-Environment @{ OPENCODE_PASSWORD = $privatePassword }", runner)
+        self.assertIn("-Headers $headers", runner)
+        self.assertIn("$env:OPENCODE_PASSWORD = $privatePassword", runner)
+        self.assertIn("Remove-Item Env:OPENCODE_PASSWORD", runner)
         self.assertIn("ModelCallsIssuedByRunnerBeforePreflight = 0", runner)
         self.assertIn("$serverProcess.Kill($true)", runner)
         self.assertLess(
