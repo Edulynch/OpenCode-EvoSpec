@@ -101,6 +101,8 @@ def _parser() -> _ArgumentParser:
     revise.add_argument("--previous-criteria-revision", required=True, help="Current criteria revision, or NOT_RECORDED")
     revise.add_argument("--reason", required=True, help="Why this material criterion amendment is needed")
     revise.add_argument("--expected-revision", required=True, type=int)
+    upgrade = commands.add_parser("upgrade-e1-schema")
+    upgrade.add_argument("--expected-revision", required=True, type=int)
     commands.add_parser("doctor")
     commands.add_parser("review")
     ui = commands.add_parser("ui")
@@ -163,32 +165,54 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             print(f"ERROR {error}", file=target)
             return 2
         return 0
-    if arguments.command in ("accept-slice", "revise-slice-criteria"):
-        # Only a user at a real terminal can cross the first acceptance boundary.
+    if arguments.command in ("accept-slice", "revise-slice-criteria", "upgrade-e1-schema"):
+        workflow = WorkflowService.open(Path(arguments.root))
+        if arguments.command == "upgrade-e1-schema":
+            try:
+                already = workflow.confirmed_e1_schema_upgrade(
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            except RecoveryError as error:
+                print(f"ERROR {error}", file=target)
+                return 2
+            if already is not None:
+                # An already committed conversion is an inspection, not a second approval.
+                _render(already, target)
+                return 0
+        # Only a human in a real terminal may accept or change durable authority.
         if not sys.stdin.isatty() or not sys.stdout.isatty():
-            print("ERROR Slice acceptance or amendment requires an interactive user terminal", file=target)
+            print("ERROR E1 approval requires an interactive user terminal", file=target)
             return 2
         if arguments.expected_revision < 0:
             print("ERROR expected revision must be nonnegative", file=target)
             return 2
-        first_acceptance = arguments.command == "accept-slice"
         try:
-            if first_acceptance:
+            if arguments.command == "accept-slice":
                 criteria = None if not arguments.criteria_file else _load_criteria_spec(arguments.criteria_file)
                 statement = slice_acceptance_statement(
                     arguments.feature, arguments.slice, arguments.task, arguments.checkpoint, criteria,
                 )
-            else:
+            elif arguments.command == "revise-slice-criteria":
                 criteria = _load_criteria_spec(arguments.criteria_file)
                 statement = slice_criteria_decision_statement(
                     arguments.previous_criteria_revision, arguments.reason, criteria,
                 )
-        except (ValueError, ServiceError) as error:
+            else:
+                criteria = None
+                statement = workflow.e1_upgrade_agreement(
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+        except (ValueError, ServiceError, RecoveryError, WorkflowError) as error:
             print(f"ERROR {error}", file=target)
             return 2
         token = sha256(statement.encode("utf-8")).hexdigest()[:12]
-        verb = "ACEPTO" if first_acceptance else "DECIDO"
-        print(f"{'Acuerdo inicial' if first_acceptance else 'Decisión de modificación'} para aprobación explícita:\n{statement}", file=target)
+        verb = "DECIDO" if arguments.command == "revise-slice-criteria" else "ACEPTO"
+        description = {
+            "accept-slice": "Acuerdo inicial",
+            "revise-slice-criteria": "Decisión de modificación",
+            "upgrade-e1-schema": "Acuerdo de migración",
+        }[arguments.command]
+        print(f"{description} para aprobación explícita:\n{statement}", file=target)
         try:
             typed = input(f"Para autorizar la escritura, escribe {verb} {token}: ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -197,18 +221,22 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
         if typed != f"{verb} {token}":
             print("ERROR acceptance was not explicitly confirmed", file=target)
             return 2
-        workflow = WorkflowService.open(Path(arguments.root))
         try:
-            if first_acceptance:
+            if arguments.command == "accept-slice":
                 result = workflow.accept_first_slice(
                     arguments.feature, arguments.slice, arguments.task,
                     arguments.checkpoint, UserAcceptance(statement, f"tty:{token}"),
                     expected_revision=ExpectedRevision(arguments.expected_revision), criteria=criteria,
                 )
-            else:
+            elif arguments.command == "revise-slice-criteria":
                 assert criteria is not None
                 result = workflow.revise_slice_criteria(
                     criteria, arguments.previous_criteria_revision, arguments.reason,
+                    UserAcceptance(statement, f"tty:{token}"),
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            else:
+                result = workflow.upgrade_e1_schema(
                     UserAcceptance(statement, f"tty:{token}"),
                     expected_revision=ExpectedRevision(arguments.expected_revision),
                 )
@@ -283,6 +311,8 @@ def _render_status(context: AgentContext, output: TextIO) -> None:
         if context.progress.current_work is not None:
             print(f"Current: {context.progress.current_work}", file=output)
         if context.accepted_slice is not None:
+            if context.e1_schema_ready is False:
+                print("E1 schema: 13 | explicit upgrade-e1-schema approval required", file=output)
             print(
                 f"Accepted Slice: {context.accepted_slice.slice_title} "
                 f"| Task ID: {context.accepted_slice.task_id} "
@@ -293,6 +323,13 @@ def _render_status(context: AgentContext, output: TextIO) -> None:
             print(f"Slice criteria: {context.accepted_slice.criteria_status}", file=output)
             if context.accepted_slice.criteria_revision is not None:
                 print(f"Criteria revision: {context.accepted_slice.criteria_revision.id}", file=output)
+        if context.task_progress is not None:
+            print(
+                f"Current Task report: {context.task_progress.checkpoint} "
+                f"| {context.task_progress.report_kind} "
+                f"| revision {context.task_progress.recorded_revision}",
+                file=output,
+            )
     elif context.completed_terminal:
         print("History: DONE", file=output)
     guidance = _next_guidance(context)

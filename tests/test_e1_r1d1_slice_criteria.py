@@ -187,27 +187,103 @@ class SliceCriteriaTests(unittest.TestCase):
         with self.assertRaises(RecoveryError):
             CoreService.open(self.root).recover()
 
-    def test_r1_06_legacy_schema13_stays_not_recorded_until_explicit_amendment(self) -> None:
+    def test_r1_06_legacy_schema13_requires_approved_upgrade_before_amendment(self) -> None:
         first = self._accept()
         path = self.root / ".evospec/state.json"
         legacy = json.loads(path.read_text(encoding="utf-8"))
         legacy["schema"] = 13
         legacy.pop("slice_criteria_refs")
         legacy.pop("slice_criteria_heads")
+        legacy.pop("e1_schema_upgrade")
+        # Historical context records cannot carry the newer Task-progress slot.
+        for key in ("active_context", "preserved_primary_context"):
+            if legacy[key] is not None:
+                legacy[key].pop("task_progress", None)
         path.write_text(json.dumps(legacy), encoding="utf-8")
         self.assertEqual(self._context()["criteria_status"], "NOT_RECORDED")
         self.assertIsNone(self._context()["criteria_revision"])
-        self.assertEqual(self._revise("NOT_RECORDED", _spec(), "Criterios explicitados después del legado", first), first + 1)
+        original_files = {
+            file.relative_to(self.root): (file.read_bytes(), file.stat().st_mtime_ns)
+            for file in (self.root / ".evospec").rglob("*") if file.is_file()
+        }
+        with self.assertRaises(WorkflowError):
+            self._revise("NOT_RECORDED", _spec(), "Criterios explicitados después del legado", first)
+        self.assertEqual(original_files, {
+            file.relative_to(self.root): (file.read_bytes(), file.stat().st_mtime_ns)
+            for file in (self.root / ".evospec").rglob("*") if file.is_file()
+        })
+        agreement = self.workflow.e1_upgrade_agreement(expected_revision=ExpectedRevision(first))
+        upgraded = self.workflow.upgrade_e1_schema(
+            _provenance(agreement), expected_revision=ExpectedRevision(first),
+        )
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["schema"], 14)
+        receipt = CoreService.open(self.root).recover().e1_schema_upgrade
+        self.assertIsNotNone(receipt)
+        self.assertEqual(
+            self._revise("NOT_RECORDED", _spec(), "Criterios explicitados después del legado", upgraded.revision),
+            upgraded.revision + 1,
+        )
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["schema"], 15)
+        self.assertEqual(CoreService.open(self.root).recover().e1_schema_upgrade, receipt)
         self.assertEqual(self._context()["criteria_status"], "RECORDED")
 
-    def test_r1_07_unknown_schema14_is_never_silently_reinterpreted(self) -> None:
+    def test_r1_07_schema14_cannot_claim_newer_criteria_authority(self) -> None:
+        self._accept(_spec())
         path = self.root / ".evospec/state.json"
         state = json.loads(path.read_text(encoding="utf-8"))
         state["schema"] = 14
         path.write_text(json.dumps(state), encoding="utf-8")
         with self.assertRaises(RecoveryError):
             CoreService.open(self.root).recover()
+
+    def test_r1_07a_schema14_progress_survives_explicit_criteria_revision(self) -> None:
+        """A separately decided criterion revision preserves accepted Task evidence."""
+        first = self._accept()
+        path = self.root / ".evospec/state.json"
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(state["schema"], 15)
+        state["schema"] = 14
+        state.pop("slice_criteria_refs")
+        state.pop("slice_criteria_heads")
+        path.write_text(json.dumps(state), encoding="utf-8")
+
+        accepted = CoreService.open(self.root).recover()
+        feature, slice_record = accepted.agreements
+        assert accepted.initialization is not None
+        progress = self.workflow.accepted_task_progress(
+            accepted.initialization.repository_id,
+            str(slice_record.task_id),
+            feature.id,
+            slice_record.id,
+            "Lista visible",
+            "Primera implementación reportada sin verificar",
+            ("tests/task-list.test.ts",),
+            expected_revision=ExpectedRevision(first),
+        )
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["schema"], 14)
+        original_agreements = {
+            file.name: (file.read_bytes(), file.stat().st_mtime_ns)
+            for file in (self.root / ".evospec/records/agreements").iterdir()
+        }
+        original_report = CoreService.open(self.root).recover().active_context
+        assert original_report is not None
+        self.assertIsNotNone(original_report.task_progress)
+
+        revised = self._revise(
+            "NOT_RECORDED", _spec(), "Se precisan criterios para el Slice",
+            progress.revision,
+        )
+        self.assertEqual(revised, progress.revision + 1)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["schema"], 15)
+        current = CoreService.open(self.root).recover()
+        self.assertEqual(current.agreements, accepted.agreements)
+        assert current.active_context is not None
+        self.assertEqual(current.active_context.task_progress, original_report.task_progress)
+        self.assertEqual(self._context()["criteria_status"], "RECORDED")
+        self.assertEqual(original_agreements, {
+            file.name: (file.read_bytes(), file.stat().st_mtime_ns)
+            for file in (self.root / ".evospec/records/agreements").iterdir()
+        })
 
     def test_r1_07b_old_schema_cannot_discard_nonempty_criteria(self) -> None:
         self._accept(_spec())

@@ -98,6 +98,10 @@ jobs:
         run: uv python install ${{ matrix.python }}
       - name: Source tests
         run: uv run --python ${{ matrix.python }} python -m unittest discover -v
+      - name: E1 OpenCode adapter and continuation tests
+        # These contract tests exercise the native tool registration and its
+        # protected boundaries without requiring an authenticated host session.
+        run: node --test tests/opencode_continuation.test.mjs tests/opencode_e1_task_progress.test.mjs
       - name: Typecheck
         run: uvx --from basedpyright basedpyright
       - name: Validate release identity
