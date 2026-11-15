@@ -1751,6 +1751,8 @@ class CoreService:
         if current.initialization is None or current.active_context is None:
             raise ServiceError("an accepted active Slice is required for criterion amendment")
         slice_ref = current.active_context.slice_agreement_ref
+        if slice_ref is None:
+            raise ServiceError("an accepted Slice reference is required for criterion amendment")
         agreement = next((item for item in current.agreements if item.id == slice_ref), None)
         if agreement is None or agreement.kind != "SLICE":
             raise ServiceError("Slice criteria cannot amend unaccepted scope")

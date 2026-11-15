@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from evospec.agent_protocol import execute
@@ -62,7 +63,9 @@ class FailCriteriaSync(FileOperations):
 
 
 class SliceCriteriaTests(unittest.TestCase):
-    def setUp(self) -> None:
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        # Each test receives its own repository and authority lifetime.
         temporary = tempfile.TemporaryDirectory(prefix="evospec-r1d1-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -83,7 +86,7 @@ class SliceCriteriaTests(unittest.TestCase):
             spec, previous, reason, _provenance(statement), expected_revision=ExpectedRevision(revision),
         ).revision
 
-    def _context(self) -> dict:
+    def _context(self) -> dict[str, Any]:
         payload = json.loads(execute(self.root, json.dumps({"action": "context"})))
         self.assertNotIn("error", payload)
         return payload["context"]["accepted_slice"]
