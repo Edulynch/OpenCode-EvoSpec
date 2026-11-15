@@ -2,4 +2,4 @@
 description: Show authoritative EvoSpec status without mutation.
 ---
 <!-- EvoSpec-managed: opencode-v2 -->
-Load the detailed `evospec` skill and use the EvoSpec tool for context and guidance only, then report the concise recovery dashboard. Status is read-only and local. It does not mutate lifecycle state, repair files, or choose an action automatically. Use its returned guidance to decide what to inspect next, then follow the canonical context before any mutation. User input: $ARGUMENTS
+Load the `evospec` skill and call only `evospec_context` for the current session project. Present a short human-readable status: Feature, Slice, Task, initial agreement, optional later Task report (`REPORTED_UNVERIFIED`), and any authoritative blocker or next permitted step. Explain absent or ambiguous context instead of inventing progress, completion, or criteria. Provide technical detail only on request. This is a local, read-only consultation; do not call continuation, initialize, repair, accept again, or execute work on this query. User input: $ARGUMENTS

@@ -69,6 +69,40 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn("opencode-v2", resources[SKILL])
         self.assertIn("opencode-v2", resources[CONTINUATION])
 
+    def test_natural_recovery_uses_read_only_context_without_extra_user_commands(self) -> None:
+        resources = _resources()
+        plugin = resources[PLUGIN]
+        skill = resources[SKILL]
+
+        # The normal OpenCode context hook and skill discovery must recognize human questions.
+        self.assertIn("¿dónde seguimos?", plugin)
+        self.assertIn("call only evospec_context", plugin)
+        self.assertIn("Read-only questions never initialize", plugin)
+        self.assertIn("¿dónde seguimos?", skill)
+        self.assertIn("Call **only** `evospec_context`", skill)
+        self.assertIn("accepted_slice.checkpoint", skill)
+        self.assertIn("task_progress.checkpoint", skill)
+        self.assertIn("REPORTED_UNVERIFIED", skill)
+        self.assertIn("If state is missing, invalid, from another worktree, or ambiguous", skill)
+
+        # Both slash consultations share the same read-only contract, even when natural
+        # language activates the skill without a slash command.
+        for command in ("evospec.context.md", "evospec.status.md"):
+            resource = resources[f".opencode/commands/{command}"]
+            self.assertIn("call only `evospec_context`", resource)
+            self.assertIn("REPORTED_UNVERIFIED", resource)
+            self.assertIn("read-only", resource)
+            self.assertEqual(
+                resource,
+                (Path(__file__).parents[1] / ".opencode" / "commands" / command).read_text(encoding="utf-8"),
+            )
+
+        # Repository-local skill and the installable distribution have identical guidance.
+        self.assertEqual(
+            skill,
+            (Path(__file__).parents[1] / ".opencode" / "skills" / "evospec" / "SKILL.md").read_text(encoding="utf-8"),
+        )
+
     def test_v2_plugin_registers_and_serializes_provider_neutral_typed_actions(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -124,6 +158,8 @@ assert(JSON.stringify(recoveryTool.input.required) === JSON.stringify(["expected
 const hookEvent = { system: [] }
 runtime.contextHook(hookEvent)
 assert(hookEvent.system[0].text.includes("evospec_context"), "context hook guides agents to canonical EvoSpec context")
+assert(hookEvent.system[0].text.includes("¿dónde seguimos?"), "context hook recognizes natural-language recovery")
+assert(hookEvent.system[0].text.includes("Read-only questions never initialize"), "status questions do not trigger lifecycle actions")
 assert(hookEvent.system[0].text.includes("SAFE_AUTOMATIC_OPERATION"), "context hook installs outcome-driven continuation defaults")
 let exitStatus = 0
 Object.defineProperty(Bun, "spawn", { value(command, options) {
