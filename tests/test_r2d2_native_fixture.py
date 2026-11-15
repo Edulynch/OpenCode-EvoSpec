@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -13,6 +15,28 @@ from tests.r2d2_native_fixture import CHECKPOINT, FEATURE, MARKER, TASK, build_f
 
 
 class R2D2NativeFixtureTests(unittest.TestCase):
+    def test_native_runner_has_valid_powershell_syntax_when_available(self) -> None:
+        pwsh = shutil.which("pwsh")
+        if pwsh is None:
+            self.skipTest("PowerShell is unavailable on this host")
+        runner = (Path(__file__).parent / "r2d2_native_smoke.ps1").resolve()
+        # Parse the script without executing any OpenCode command or creating
+        # a fixture, so CI can catch syntax errors at zero provider cost.
+        literal_path = str(runner).replace("'", "''")
+        syntax_check = (
+            "$tokens = $null; $errors = $null; "
+            "[void][System.Management.Automation.Language.Parser]::ParseFile("
+            f"'{literal_path}', [ref]$tokens, [ref]$errors); "
+            "if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }"
+        )
+        completed = subprocess.run(
+            [pwsh, "-NoProfile", "-NonInteractive", "-Command", syntax_check],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
     def test_native_runner_requires_synthetic_markers_and_never_requests_consent(self) -> None:
         # The host smoke may observe a simulated agreement, but it must never
         # ask a human or the model to authorize a real Core acceptance.
@@ -22,6 +46,11 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         self.assertIn("openai/gpt-6.1-sol#high", runner)
         self.assertIn("--agent build", runner)
         self.assertIn("--auto", runner)
+        self.assertIn("opencode run --standalone", runner)
+        self.assertIn("opencode run --help", runner)
+        self.assertIn("Get-CanonicalContextCalls", runner)
+        self.assertIn("tools\\.evospec_context", runner)
+        self.assertIn("No more model sessions", runner)
         self.assertNotIn("accept-slice", runner)
         self.assertNotIn("accept-fixture.ps1", runner)
         self.assertNotIn("gh pr", runner)

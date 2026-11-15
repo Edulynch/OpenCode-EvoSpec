@@ -25,6 +25,24 @@ function Get-FixtureInventory {
     )
 }
 
+function Get-CanonicalContextCalls {
+    param([Parameter(Mandatory)][string]$EvidencePath)
+
+    # Read the actual native events. A model merely mentioning a tool or
+    # searching for its name is never evidence that the tool was invoked.
+    $events = @(Get-Content -LiteralPath $EvidencePath -Encoding utf8 |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { $_ | ConvertFrom-Json -ErrorAction Stop })
+    return @($events | Where-Object {
+        if ($_.type -ne 'tool_use' -or $_.part.state.status -ne 'completed') {
+            return $false
+        }
+        if ($_.part.tool -eq 'evospec_context') { return $true }
+        if ($_.part.tool -ne 'execute') { return $false }
+        return [string]$_.part.state.input.code -match 'tools\.evospec_context\s*\('
+    })
+}
+
 Push-Location $sourceRoot
 try {
     $branch = (& git branch --show-current).Trim()
@@ -37,6 +55,12 @@ try {
     }
     if (-not (Get-Command opencode -ErrorAction SilentlyContinue)) {
         throw 'STOP: native OpenCode CLI is unavailable.'
+    }
+    # A private server is essential: the shared server previously executed
+    # these prompts against master instead of the temporary fixture.
+    $runHelp = (& opencode run --help | Out-String)
+    if ($LASTEXITCODE -ne 0 -or $runHelp -notmatch '--standalone') {
+        throw 'STOP: this OpenCode run command does not advertise --standalone.'
     }
 
     # Fixture creation runs in the real PowerShell process. OpenCode never
@@ -65,15 +89,22 @@ try {
         if (-not (Test-Path -LiteralPath (Join-Path $fixtureRoot 'EVOSPEC_TEST_FIXTURE_ONLY.txt'))) {
             throw "STOP: missing synthetic fixture marker for $($job.Scenario)."
         }
+        if (-not (Test-Path -LiteralPath (Join-Path $fixtureRoot '.opencode/plugins/evospec/index.ts'))) {
+            throw "STOP: missing EvoSpec local plugin in $fixtureRoot."
+        }
         $before = @(Get-FixtureInventory -Root $fixtureRoot)
         $beforeJson = ConvertTo-Json -InputObject $before -Depth 6 -Compress
         $outputPath = Join-Path $evidenceRoot "$($job.Name).ndjson"
 
         Push-Location $fixtureRoot
         try {
+            if ((Get-Location).ProviderPath -ne $fixtureRoot) {
+                throw "STOP: shell did not enter the isolated fixture $fixtureRoot."
+            }
             # Four independent sessions; --auto handles only non-denied host
-            # permissions. It never substitutes EvoSpec's real human decisions.
-            $outputLines = @(& opencode run --auto --agent build --model $modelName --format json $job.Prompt 2>&1)
+            # permissions. --standalone prevents a shared background server
+            # from silently routing the model into an unrelated worktree.
+            $outputLines = @(& opencode run --standalone --auto --agent build --model $modelName --format json $job.Prompt 2>&1)
             $exitCode = $LASTEXITCODE
         }
         finally { Pop-Location }
@@ -87,6 +118,20 @@ try {
         if ($exitCode -ne 0) {
             throw "BLOCKED: native host exited $exitCode for $($job.Name). Evidence: $outputPath"
         }
+        $contextCalls = @(Get-CanonicalContextCalls -EvidencePath $outputPath)
+        $requiredTitle = if ($job.Scenario -eq 'parked') { 'Fixture temporal R2-D2' } else { 'Another synthetic work item' }
+        $matchedContext = @($contextCalls | Where-Object {
+            [string]$_.part.state.output -match [regex]::Escape($requiredTitle)
+        })
+        if ($matchedContext.Count -eq 0) {
+            throw "STOP: $($job.Name) did not call evospec_context for its fixture. No more model sessions. Evidence: $outputPath"
+        }
+        $ambiguousContexts = @($matchedContext | Where-Object {
+            [string]$_.part.state.output -match 'AMBIGUOUS'
+        })
+        if ($job.Scenario -eq 'ambiguous' -and $ambiguousContexts.Count -eq 0) {
+            throw "STOP: the ambiguous native context was not observed. Evidence: $outputPath"
+        }
         $results += [pscustomobject]@{
             Scenario = $job.Name
             Root = $fixtureRoot
@@ -94,8 +139,8 @@ try {
             HostExitCode = $exitCode
             FilesUnchanged = $true
             Evidence = $outputPath
-            NativeToolCalls = 'NEEDS_REVIEW'
-            Outcome = 'NEEDS_EVIDENCE_REVIEW'
+            CanonicalContextCalls = $contextCalls.Count
+            Outcome = 'NEEDS_ANSWER_REVIEW'
         }
     }
 
@@ -110,6 +155,6 @@ try {
         Results = $results
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding utf8
     Write-Output "EVIDENCE_READY: $reportPath"
-    Write-Output 'All fixture inventories stayed unchanged; review NDJSON tool calls and answers before claiming PASS.'
+    Write-Output 'Canonical context calls and unchanged inventories verified; review agent answers before claiming PASS.'
 }
 finally { Pop-Location }
