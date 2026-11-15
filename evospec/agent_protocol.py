@@ -116,6 +116,24 @@ def context_json(context: AgentContext) -> dict[str, JsonValue]:
                 "checkpoint": context.accepted_slice.checkpoint,
                 "source": context.accepted_slice.source,
                 "source_reference": context.accepted_slice.source_reference,
+                "criteria_status": context.accepted_slice.criteria_status,
+                "criteria_revision": None if context.accepted_slice.criteria_revision is None else {
+                    "id": context.accepted_slice.criteria_revision.id,
+                    "previous_revision_id": context.accepted_slice.criteria_revision.previous_revision_id,
+                    "outcome": context.accepted_slice.criteria_revision.outcome,
+                    "example": context.accepted_slice.criteria_revision.example,
+                    "inclusions": list(context.accepted_slice.criteria_revision.inclusions),
+                    "exclusions": list(context.accepted_slice.criteria_revision.exclusions),
+                    "decisions": list(context.accepted_slice.criteria_revision.decisions),
+                    "criteria": [
+                        {"id": item.id, "expected_result": item.expected_result,
+                         "expected_evidence": item.expected_evidence}
+                        for item in context.accepted_slice.criteria_revision.criteria
+                    ],
+                    "source": context.accepted_slice.criteria_revision.source,
+                    "source_reference": context.accepted_slice.criteria_revision.source_reference,
+                    "reason": context.accepted_slice.criteria_revision.reason,
+                },
             },
             "lifecycle": None if context.lifecycle is None else list(context.lifecycle),
             "feature_id": context.feature_id, "change_id": context.change_id, "classification": context.classification,

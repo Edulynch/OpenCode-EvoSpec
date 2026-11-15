@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from hashlib import sha256
 import sys
 import tomllib
@@ -16,8 +17,11 @@ from .dashboard import DEFAULT_PORT, serve
 from .opencode_integration import IntegrationRegistry, OpenCodeIntegrationInspection, OpenCodeIntegrationProvider
 from .persistence import IntegrationRegistryError, RecoveryError
 from .workflow import ClarificationAnswer, WorkflowError, WorkflowResult, WorkflowService
-from .domain import ExpectedRevision
-from .services import UserAcceptance
+from .domain import ExpectedRevision, SliceCriterion
+from .services import (
+    ServiceError, SliceCriteriaSpec, UserAcceptance, slice_acceptance_statement,
+    slice_criteria_decision_statement, validate_slice_criteria_spec,
+)
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -32,6 +36,37 @@ def _tcp_port(value: str) -> int:
     if not 1 <= port <= 65535:
         raise argparse.ArgumentTypeError("port must be an integer from 1 through 65535")
     return port
+
+
+def _load_criteria_spec(path: str) -> SliceCriteriaSpec:
+    """Read an explicit, bounded JSON proposal; never infer criteria from task state."""
+    source = Path(path)
+    try:
+        if source.stat().st_size > 40000:
+            raise ValueError("criteria file is too large")
+        raw = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("criteria file is missing or not valid JSON") from error
+    expected = {"outcome", "example", "inclusions", "exclusions", "decisions", "criteria"}
+    if type(raw) is not dict or set(raw) != expected:
+        raise ValueError("criteria file must contain exactly outcome, example, inclusions, exclusions, decisions and criteria")
+    for name in ("inclusions", "exclusions", "decisions", "criteria"):
+        if type(raw[name]) is not list:
+            raise ValueError(f"criteria {name} must be an array")
+    criteria: list[SliceCriterion] = []
+    for item in raw["criteria"]:
+        if type(item) is not dict or set(item) != {"id", "expected_result", "expected_evidence"}:
+            raise ValueError("each criterion requires id, expected_result and expected_evidence")
+        criteria.append(SliceCriterion(item["id"], item["expected_result"], item["expected_evidence"]))
+    spec = SliceCriteriaSpec(
+        raw["outcome"], raw["example"], tuple(raw["inclusions"]),
+        tuple(raw["exclusions"]), tuple(raw["decisions"]), tuple(criteria),
+    )
+    try:
+        validate_slice_criteria_spec(spec)
+    except ServiceError as error:
+        raise ValueError(str(error)) from error
+    return spec
 
 
 def _parser() -> _ArgumentParser:
@@ -59,7 +94,13 @@ def _parser() -> _ArgumentParser:
     accept.add_argument("--slice", required=True, help="Human-approved first Slice title")
     accept.add_argument("--task", required=True, help="Initial Task to resume after restart")
     accept.add_argument("--checkpoint", required=True, help="Initial pending verification checkpoint")
+    accept.add_argument("--criteria-file", help="JSON mini-spec included in the same human acceptance")
     accept.add_argument("--expected-revision", required=True, type=int)
+    revise = commands.add_parser("revise-slice-criteria")
+    revise.add_argument("--criteria-file", required=True, help="New complete Slice criteria JSON mini-spec")
+    revise.add_argument("--previous-criteria-revision", required=True, help="Current criteria revision, or NOT_RECORDED")
+    revise.add_argument("--reason", required=True, help="Why this material criterion amendment is needed")
+    revise.add_argument("--expected-revision", required=True, type=int)
     commands.add_parser("doctor")
     commands.add_parser("review")
     ui = commands.add_parser("ui")
@@ -122,35 +163,55 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             print(f"ERROR {error}", file=target)
             return 2
         return 0
-    if arguments.command == "accept-slice":
+    if arguments.command in ("accept-slice", "revise-slice-criteria"):
         # Only a user at a real terminal can cross the first acceptance boundary.
         if not sys.stdin.isatty() or not sys.stdout.isatty():
-            print("ERROR Slice acceptance requires an interactive user terminal", file=target)
+            print("ERROR Slice acceptance or amendment requires an interactive user terminal", file=target)
             return 2
         if arguments.expected_revision < 0:
             print("ERROR expected revision must be nonnegative", file=target)
             return 2
-        statement = (
-            f"Acepto Feature: {arguments.feature}; Slice: {arguments.slice}; "
-            f"Task: {arguments.task}; checkpoint: {arguments.checkpoint}"
-        )
-        token = sha256(statement.encode("utf-8")).hexdigest()[:12]
-        print(f"Acuerdo para aprobación explícita:\n{statement}", file=target)
+        first_acceptance = arguments.command == "accept-slice"
         try:
-            typed = input(f"Para autorizar la escritura, escribe ACEPTO {token}: ").strip()
+            if first_acceptance:
+                criteria = None if not arguments.criteria_file else _load_criteria_spec(arguments.criteria_file)
+                statement = slice_acceptance_statement(
+                    arguments.feature, arguments.slice, arguments.task, arguments.checkpoint, criteria,
+                )
+            else:
+                criteria = _load_criteria_spec(arguments.criteria_file)
+                statement = slice_criteria_decision_statement(
+                    arguments.previous_criteria_revision, arguments.reason, criteria,
+                )
+        except (ValueError, ServiceError) as error:
+            print(f"ERROR {error}", file=target)
+            return 2
+        token = sha256(statement.encode("utf-8")).hexdigest()[:12]
+        verb = "ACEPTO" if first_acceptance else "DECIDO"
+        print(f"{'Acuerdo inicial' if first_acceptance else 'Decisión de modificación'} para aprobación explícita:\n{statement}", file=target)
+        try:
+            typed = input(f"Para autorizar la escritura, escribe {verb} {token}: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("ERROR acceptance cancelled", file=target)
             return 2
-        if typed != f"ACEPTO {token}":
+        if typed != f"{verb} {token}":
             print("ERROR acceptance was not explicitly confirmed", file=target)
             return 2
         workflow = WorkflowService.open(Path(arguments.root))
         try:
-            result = workflow.accept_first_slice(
-                arguments.feature, arguments.slice, arguments.task,
-                arguments.checkpoint, UserAcceptance(statement, f"tty:{token}"),
-                expected_revision=ExpectedRevision(arguments.expected_revision),
-            )
+            if first_acceptance:
+                result = workflow.accept_first_slice(
+                    arguments.feature, arguments.slice, arguments.task,
+                    arguments.checkpoint, UserAcceptance(statement, f"tty:{token}"),
+                    expected_revision=ExpectedRevision(arguments.expected_revision), criteria=criteria,
+                )
+            else:
+                assert criteria is not None
+                result = workflow.revise_slice_criteria(
+                    criteria, arguments.previous_criteria_revision, arguments.reason,
+                    UserAcceptance(statement, f"tty:{token}"),
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
         except (RecoveryError, WorkflowError) as error:
             print(f"ERROR {error}", file=target)
             return 2
@@ -228,6 +289,10 @@ def _render_status(context: AgentContext, output: TextIO) -> None:
                 f"| Pending checkpoint: {context.accepted_slice.checkpoint}",
                 file=output,
             )
+            # Expected evidence is part of the scope, never proof of execution.
+            print(f"Slice criteria: {context.accepted_slice.criteria_status}", file=output)
+            if context.accepted_slice.criteria_revision is not None:
+                print(f"Criteria revision: {context.accepted_slice.criteria_revision.id}", file=output)
     elif context.completed_terminal:
         print("History: DONE", file=output)
     guidance = _next_guidance(context)

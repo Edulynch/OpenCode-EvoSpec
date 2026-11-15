@@ -13,6 +13,9 @@ from typing import TYPE_CHECKING, Never, final
 
 from .domain import (
     AgreementRecord,
+    SliceCriterion,
+    SliceCriteriaRevision,
+    SliceCriteriaHead,
     IDENTITY,
     AssessmentOperation,
     AutonomyAuthorization,
@@ -125,6 +128,86 @@ class UserAcceptance:
     statement: str
     source_reference: str
     source: str = "INTERACTIVE_TERMINAL"
+
+
+@dataclass(frozen=True, slots=True)
+class SliceCriteriaSpec:
+    """Human-readable Slice bounds, before Core assigns an immutable identity."""
+
+    outcome: str
+    example: str
+    inclusions: tuple[str, ...]
+    exclusions: tuple[str, ...]
+    decisions: tuple[str, ...]
+    criteria: tuple[SliceCriterion, ...]
+
+
+def _slice_criteria_json(spec: SliceCriteriaSpec) -> str:
+    """Use one canonical representation for the terminal prompt and Core proof."""
+    return json.dumps({
+        "outcome": spec.outcome, "example": spec.example,
+        "inclusions": list(spec.inclusions), "exclusions": list(spec.exclusions),
+        "decisions": list(spec.decisions),
+        "criteria": [{"id": item.id, "expected_result": item.expected_result,
+                      "expected_evidence": item.expected_evidence} for item in spec.criteria],
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def validate_slice_criteria_spec(spec: SliceCriteriaSpec) -> None:
+    """Reject partial agreements and unbounded specifications before user consent."""
+    if type(spec) is not SliceCriteriaSpec:
+        raise ServiceError("Slice criteria must use the canonical specification shape")
+    if any(type(value) is not str or not value.strip() or len(value) > 2048
+           for value in (spec.outcome, spec.example)):
+        raise ServiceError("Slice outcome and example must be bounded nonblank text")
+    for name, values in (("inclusions", spec.inclusions), ("exclusions", spec.exclusions),
+                         ("decisions", spec.decisions), ("criteria", spec.criteria)):
+        if type(values) is not tuple or not 1 <= len(values) <= 32:
+            raise ServiceError(f"Slice {name} must contain 1 to 32 entries")
+    if any(type(value) is not str or not value.strip() or len(value) > 2048
+           for value in spec.inclusions + spec.exclusions + spec.decisions):
+        raise ServiceError("Slice scope and decisions must be bounded nonblank text")
+    identifiers: set[str] = set()
+    for criterion in spec.criteria:
+        if type(criterion) is not SliceCriterion or not IDENTITY.fullmatch(criterion.id):
+            raise ServiceError("Slice criterion must have a stable ID")
+        if criterion.id in identifiers:
+            raise ServiceError("Slice criterion IDs must be unique")
+        identifiers.add(criterion.id)
+        if any(type(value) is not str or not value.strip() or len(value) > 2048
+               for value in (criterion.expected_result, criterion.expected_evidence)):
+            raise ServiceError("Slice criterion result and expected evidence must be bounded text")
+    if len(_slice_criteria_json(spec)) > 32768:
+        raise ServiceError("Slice criteria specification exceeds the acceptance size limit")
+
+
+def slice_acceptance_statement(
+    feature_title: str, slice_title: str, initial_task: str, checkpoint: str,
+    criteria: SliceCriteriaSpec | None = None,
+) -> str:
+    """Bind the initial TTY acceptance to exactly the agreed Slice specification."""
+    statement = (
+        f"Acepto Feature: {feature_title}; Slice: {slice_title}; "
+        f"Task: {initial_task}; checkpoint: {checkpoint}"
+    )
+    if criteria is not None:
+        validate_slice_criteria_spec(criteria)
+        if any(value != value.strip() for value in (
+            feature_title, slice_title, initial_task, checkpoint,
+        )):
+            raise ServiceError("criteria acceptance requires canonical unpadded Feature, Slice, Task and checkpoint")
+        statement += f"; criterios: {_slice_criteria_json(criteria)}"
+    return statement
+
+
+def slice_criteria_decision_statement(
+    previous_revision_id: str, reason: str, criteria: SliceCriteriaSpec,
+) -> str:
+    """An amendment is a separate human decision, never renewed acceptance."""
+    validate_slice_criteria_spec(criteria)
+    if type(reason) is not str or not reason.strip() or len(reason) > 2048:
+        raise ServiceError("criteria amendment requires a bounded explicit reason")
+    return f"Decido revisar criterios desde {previous_revision_id}; motivo: {reason}; criterios: {_slice_criteria_json(criteria)}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1576,6 +1659,7 @@ class CoreService:
         initial_task: str,
         checkpoint: str,
         acceptance: UserAcceptance,
+        criteria: SliceCriteriaSpec | None = None,
     ) -> State:
         """Persist a human-approved Feature, Slice and Task in one Core commit."""
         current = _authoritative_state(self.__persistence, state)
@@ -1595,9 +1679,8 @@ class CoreService:
             or not acceptance.statement.strip()
         ):
             raise ServiceError("attributable user acceptance evidence is required")
-        accepted_statement = (
-            f"Acepto Feature: {feature_title}; Slice: {slice_title}; "
-            f"Task: {initial_task}; checkpoint: {checkpoint}"
+        accepted_statement = slice_acceptance_statement(
+            feature_title, slice_title, initial_task, checkpoint, criteria,
         )
         expected_reference = f"tty:{sha256(accepted_statement.encode('utf-8')).hexdigest()[:12]}"
         if acceptance.statement != accepted_statement or acceptance.source_reference != expected_reference:
@@ -1632,6 +1715,12 @@ class CoreService:
         )
         candidate = _record_change(_record_feature(current, feature), change)
         assert candidate.active_context is not None
+        criteria_revision = None if criteria is None else SliceCriteriaRevision(
+            f"slice-criteria-{digest}-1", slice_ref, root_identity,
+            criteria.outcome, criteria.example, criteria.inclusions, criteria.exclusions,
+            criteria.decisions, criteria.criteria,
+            acceptance.source, acceptance.source_reference,
+        )
         candidate = replace(
             candidate,
             active_context=replace(
@@ -1643,12 +1732,65 @@ class CoreService:
                 slice_agreement_ref=slice_ref,
             ),
             agreements=(feature_agreement, slice_agreement),
+            slice_criteria_revisions=() if criteria_revision is None else (criteria_revision,),
+            slice_criteria_heads=() if criteria_revision is None else (SliceCriteriaHead(slice_ref, criteria_revision.id),),
         )
         saved = _prepare_state_publication(candidate, current.revision)
         try:
             self.__persistence.publish_first_slice(saved, change, saved.agreements)
         except AtomicFailure as error:
             raise ServiceError("first Slice aggregate publication was rejected") from error
+        return saved
+
+    def revise_slice_criteria(
+        self, state: State, criteria: SliceCriteriaSpec, previous_revision_id: str,
+        reason: str, decision: UserAcceptance,
+    ) -> State:
+        """Supersede accepted Slice criteria via one explicit human decision and CAS."""
+        current = _authoritative_state(self.__persistence, state)
+        if current.initialization is None or current.active_context is None:
+            raise ServiceError("an accepted active Slice is required for criterion amendment")
+        slice_ref = current.active_context.slice_agreement_ref
+        agreement = next((item for item in current.agreements if item.id == slice_ref), None)
+        if agreement is None or agreement.kind != "SLICE":
+            raise ServiceError("Slice criteria cannot amend unaccepted scope")
+        root_identity = sha256(str(self.__repository_root).encode("utf-8")).hexdigest()[:16]
+        if agreement.repository_id != root_identity:
+            raise ServiceError("Slice criteria repository binding does not match the current root")
+        head = next((item for item in current.slice_criteria_heads if item.slice_agreement_ref == slice_ref), None)
+        authoritative_previous = "NOT_RECORDED" if head is None else head.revision_id
+        if previous_revision_id != authoritative_previous:
+            raise ServiceError("Slice criteria revision changed; refresh before deciding")
+        statement = slice_criteria_decision_statement(previous_revision_id, reason, criteria)
+        expected_ref = f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"
+        if (
+            type(decision) is not UserAcceptance
+            or decision.source != "INTERACTIVE_TERMINAL"
+            or decision.statement != statement
+            or decision.source_reference != expected_ref
+        ):
+            raise ServiceError("criteria amendment requires its own explicit terminal decision")
+        digest = sha256(json.dumps([
+            root_identity, slice_ref, previous_revision_id, statement, expected_ref,
+        ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+        revision = SliceCriteriaRevision(
+            f"slice-criteria-{digest}", slice_ref, root_identity,
+            criteria.outcome, criteria.example, criteria.inclusions, criteria.exclusions,
+            criteria.decisions, criteria.criteria,
+            "INTERACTIVE_TERMINAL_DECISION", expected_ref,
+            None if head is None else head.revision_id, reason, statement,
+        )
+        new_heads = tuple(item for item in current.slice_criteria_heads if item.slice_agreement_ref != slice_ref)
+        candidate = replace(
+            current,
+            slice_criteria_revisions=current.slice_criteria_revisions + (revision,),
+            slice_criteria_heads=new_heads + (SliceCriteriaHead(slice_ref, revision.id),),
+        )
+        saved = _prepare_state_publication(candidate, current.revision)
+        try:
+            self.__persistence.publish_slice_criteria_revision(saved, revision)
+        except AtomicFailure as error:
+            raise ServiceError("Slice criteria amendment publication was rejected") from error
         return saved
 
     def record_capability_selection(self, state: State, selection: PendingCapabilitySelection) -> State:

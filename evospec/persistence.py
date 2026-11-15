@@ -15,6 +15,9 @@ from typing import Final, Protocol, TypeAlias, TypeVar
 
 from .domain import (
     AgreementRecord,
+    SliceCriterion,
+    SliceCriteriaRevision,
+    SliceCriteriaHead,
     AssessmentConfidence,
     AssessmentDepth,
     AssessmentDepthValue,
@@ -99,7 +102,9 @@ from .discovery import DiscoveryPolicy
 JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 )
-SCHEMA: Final = 13
+# Schema 14 belongs to the still-draft Slice C integration. Do not reinterpret it
+# as R1 authority or silently discard its task-progress records.
+SCHEMA: Final = 15
 INTEGRATION_REGISTRY_SCHEMA: Final = 1
 
 _STATE_LOCKS: dict[str, threading.RLock] = {}
@@ -140,6 +145,8 @@ STATE_FIELDS: Final = frozenset(
         "pending_autonomy_expansion",
         "autonomy_expansion_history",
         "agreement_refs",
+        "slice_criteria_refs",
+        "slice_criteria_heads",
     )
 )
 CONTEXT_FIELDS: Final = frozenset(
@@ -182,7 +189,8 @@ CONTEXT_FIELDS: Final = frozenset(
 )
 _CAPABILITY_SELECTION_FIELDS: Final = frozenset(("pending_capability_selection", "capability_selection_history"))
 _DISCOVERY_RECOVERY_FIELD: Final = frozenset(("pending_discovery_recovery",))
-STATE_FIELDS_V12: Final = STATE_FIELDS - frozenset(("agreement_refs",))
+STATE_FIELDS_V13: Final = STATE_FIELDS - frozenset(("slice_criteria_refs", "slice_criteria_heads"))
+STATE_FIELDS_V12: Final = STATE_FIELDS_V13 - frozenset(("agreement_refs",))
 STATE_FIELDS_V11: Final = STATE_FIELDS_V12 - frozenset(("pending_autonomy_expansion", "autonomy_expansion_history"))
 STATE_FIELDS_V10: Final = STATE_FIELDS_V11 - frozenset(("irreversible_authorizations",))
 STATE_FIELDS_V9_PRE_SELECTION: Final = STATE_FIELDS_V10 - _CAPABILITY_SELECTION_FIELDS - _DISCOVERY_RECOVERY_FIELD
@@ -713,6 +721,66 @@ def _agreement_from_json(value: JsonValue) -> AgreementRecord:
         _optional_string(raw["task_id"], "agreement task"),
         _optional_string(raw["initial_task"], "agreement initial task"),
         _optional_string(raw["checkpoint"], "agreement checkpoint"),
+    )
+
+
+_SLICE_CRITERIA_REVISION_FIELDS: Final = frozenset((
+    "id", "slice_agreement_ref", "repository_id", "outcome", "example",
+    "inclusions", "exclusions", "decisions", "criteria", "source",
+    "source_reference", "previous_revision_id", "reason", "decision_statement",
+))
+
+
+def _slice_criteria_to_json(revision: SliceCriteriaRevision) -> JsonValue:
+    """Encode immutable intent; outcome evidence is deliberately not a verdict."""
+    return {
+        "id": revision.id,
+        "slice_agreement_ref": revision.slice_agreement_ref,
+        "repository_id": revision.repository_id,
+        "outcome": revision.outcome,
+        "example": revision.example,
+        "inclusions": list(revision.inclusions),
+        "exclusions": list(revision.exclusions),
+        "decisions": list(revision.decisions),
+        "criteria": [
+            {"id": item.id, "expected_result": item.expected_result,
+             "expected_evidence": item.expected_evidence}
+            for item in revision.criteria
+        ],
+        "source": revision.source,
+        "source_reference": revision.source_reference,
+        "previous_revision_id": revision.previous_revision_id,
+        "reason": revision.reason,
+        "decision_statement": revision.decision_statement,
+    }
+
+
+def _slice_criteria_from_json(value: JsonValue) -> SliceCriteriaRevision:
+    raw = _object(value, _SLICE_CRITERIA_REVISION_FIELDS, "Slice criteria revision")
+    criteria = tuple(
+        SliceCriterion(
+            _string(item["id"], "criterion id"),
+            _string(item["expected_result"], "expected result"),
+            _string(item["expected_evidence"], "expected evidence"),
+        )
+        for entry in _array(raw["criteria"], "criteria")
+        for item in (_object(entry, frozenset(("id", "expected_result", "expected_evidence")), "criterion"),)
+    )
+    return SliceCriteriaRevision(
+        _string(raw["id"], "criteria revision id"),
+        _string(raw["slice_agreement_ref"], "criteria agreement ref"),
+        _string(raw["repository_id"], "criteria repository"),
+        _string(raw["outcome"], "criteria outcome"),
+        _string(raw["example"], "criteria example"),
+        tuple(_string(item, "inclusion") for item in _array(raw["inclusions"], "inclusions")),
+        tuple(_string(item, "exclusion") for item in _array(raw["exclusions"], "exclusions")),
+        tuple(_string(item, "decision") for item in _array(raw["decisions"], "decisions")),
+        criteria,
+        _string(raw["source"], "criteria source"),
+        _string(raw["source_reference"], "criteria source reference"),
+        _optional_string(raw["previous_revision_id"], "previous criteria revision"),
+        _optional_string(raw["reason"], "criteria amendment reason"),
+        _optional_string(raw["decision_statement"], "criteria decision statement"),
     )
 
 
@@ -1421,12 +1489,23 @@ def _recover_state(root: Path) -> State:
             raise DecodeError("state fields are not exact")
         schema_value = decoded.get("schema")
         schema = _integer(schema_value, "schema")
+        if schema < SCHEMA:
+            # Legacy fixtures may be derived from a newer blank State. Empty
+            # R1 extension slots carry no authority and can be ignored; never
+            # discard a populated criterion ledger or current head.
+            for field in ("slice_criteria_refs", "slice_criteria_heads"):
+                if field in decoded:
+                    if decoded[field] != []:
+                        raise DecodeError("legacy schema cannot contain Slice criteria authority")
+                    decoded.pop(field)
         if schema in (9, 10):
             raw = _object(decoded, STATE_FIELDS_V10, "state")
-        elif schema in (11, 12, SCHEMA):
+        elif schema in (11, 12, 13, SCHEMA):
             decoded_fields = set(decoded)
             if schema == SCHEMA and decoded_fields == set(STATE_FIELDS):
                 raw = _object(decoded, STATE_FIELDS, "state")
+            elif schema == 13 and decoded_fields == set(STATE_FIELDS_V13):
+                raw = _object(decoded, STATE_FIELDS_V13, "state")
             elif schema == 12 and decoded_fields == set(STATE_FIELDS_V12):
                 raw = _object(decoded, STATE_FIELDS_V12, "state")
             elif schema < SCHEMA and decoded_fields == set(STATE_FIELDS_V11):
@@ -1492,7 +1571,7 @@ def _recover_state(root: Path) -> State:
                 legacy_fields,
                 "state",
             )
-        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, SCHEMA):
+        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, 13, SCHEMA):
             raise DecodeError("unknown state schema")
         (
             initialization, deferred, intake, selection, recovery, selection_history,
@@ -1563,6 +1642,15 @@ def _recover_state(root: Path) -> State:
             pending_autonomy_expansion,
             autonomy_expansion_history,
             agreements=_load_references(root, raw["agreement_refs"], "agreement_refs", "records/agreements", _agreement_from_json) if schema >= 13 else (),
+            slice_criteria_revisions=_load_references(root, raw["slice_criteria_refs"], "slice_criteria_refs", "records/slice-criteria", _slice_criteria_from_json) if schema >= 15 else (),
+            slice_criteria_heads=tuple(
+                SliceCriteriaHead(
+                    _string(item["slice_agreement_ref"], "criteria head agreement"),
+                    _string(item["revision_id"], "criteria head revision"),
+                )
+                for entry in _array(raw["slice_criteria_heads"], "Slice criteria heads")
+                for item in (_object(entry, frozenset(("slice_agreement_ref", "revision_id")), "Slice criteria head"),)
+            ) if schema >= 15 else (),
         )
         validate_state(state)
         _validate_capability_selection_authority(state, schema)
@@ -2047,6 +2135,14 @@ def _state_bytes(state: State) -> bytes:
                 {"id": item.id, "path": f"records/agreements/{item.id}.json"}
                 for item in state.agreements
             ],
+            "slice_criteria_refs": [
+                {"id": item.id, "path": f"records/slice-criteria/{item.id}.json"}
+                for item in state.slice_criteria_revisions
+            ],
+            "slice_criteria_heads": [
+                {"slice_agreement_ref": item.slice_agreement_ref, "revision_id": item.revision_id}
+                for item in state.slice_criteria_heads
+            ],
             "decision_refs": [
                 {"id": item.id, "path": f"records/decisions/{item.id}.json"}
                 for item in state.decisions
@@ -2263,6 +2359,21 @@ class _StateStore:
             self.__publish_immutable(
                 f"records/changes/{change.id}.json", encode_json(_change_to_json(change)),
                 strict_directory=True,
+            )
+            for revision in state.slice_criteria_revisions:
+                self.__publish_immutable(
+                    f"records/slice-criteria/{revision.id}.json",
+                    encode_json(_slice_criteria_to_json(revision)), strict_directory=True,
+                )
+            self.__publish_state_locked(state, strict_directory=True)
+
+    def publish_slice_criteria_revision(self, state: State, revision: SliceCriteriaRevision) -> None:
+        """Publish an amendment under the same State CAS as its new head pointer."""
+        with _state_publish_lock(self.__root):
+            self.__check_state_revision(state)
+            self.__publish_immutable(
+                f"records/slice-criteria/{revision.id}.json",
+                encode_json(_slice_criteria_to_json(revision)), strict_directory=True,
             )
             self.__publish_state_locked(state, strict_directory=True)
 
