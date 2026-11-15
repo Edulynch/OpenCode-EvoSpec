@@ -1,5 +1,7 @@
 # Native R2-D2 evidence must be collected by the invoking terminal, not by
 # the model. Every fixture is synthetic, disposable, and outside the repository.
+param([switch]$IncludeRemainingScenarios)
+
 $ErrorActionPreference = 'Stop'
 
 $sourceRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
@@ -43,6 +45,84 @@ function Get-CanonicalContextCalls {
     })
 }
 
+function Get-FreeLoopbackPort {
+    # Ask the OS for a temporary port so the private host never binds to a
+    # fixed or externally accessible address. A later collision fails closed.
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    try {
+        $listener.Start()
+        return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+    }
+    finally { $listener.Stop() }
+}
+
+function Assert-PrivateHostReady {
+    param(
+        [Parameter(Mandatory)][string]$FixtureRoot,
+        [Parameter(Mandatory)][string]$ServerUrl,
+        [Parameter(Mandatory)][System.Diagnostics.Process]$ServerProcess,
+        [Parameter(Mandatory)][hashtable]$Evidence
+    )
+
+    # No model request is allowed until the private host reports the exact
+    # fixture location and an active EvoSpec plugin. Plugin setup itself
+    # verifies registration of evospec_context in the native tool registry.
+    $location = $null
+    for ($attempt = 0; $attempt -lt 80; $attempt++) {
+        if ($ServerProcess.HasExited) {
+            throw "STOP: private OpenCode server exited before location discovery (exit $($ServerProcess.ExitCode))."
+        }
+        try {
+            $location = Invoke-RestMethod -Method Get -Uri "$ServerUrl/api/location" -TimeoutSec 2
+            break
+        }
+        catch { Start-Sleep -Milliseconds 250 }
+    }
+    if ($null -eq $location) { throw 'STOP: private OpenCode server did not answer /api/location.' }
+
+    $reportedRoot = if ($null -ne $location.location -and $location.location.directory) {
+        [string]$location.location.directory
+    } elseif ($null -ne $location.data -and $location.data.directory) {
+        [string]$location.data.directory
+    } else { [string]$location.directory }
+    $Evidence.ObservedLocation = $reportedRoot
+    $expectedRoot = [System.IO.Path]::GetFullPath($FixtureRoot).TrimEnd('\', '/')
+    if ([string]::IsNullOrWhiteSpace($reportedRoot)) {
+        throw 'STOP: /api/location did not report a directory.'
+    }
+    $actualRoot = [System.IO.Path]::GetFullPath($reportedRoot).TrimEnd('\', '/')
+    if (-not [string]::Equals($expectedRoot, $actualRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "STOP: private host location mismatch: $reportedRoot."
+    }
+    $Evidence.LocationVerified = $true
+
+    # OpenCode V2 activates local plugins asynchronously. Polling this API
+    # cannot consume provider tokens or create agent sessions.
+    $encodedRoot = [uri]::EscapeDataString($FixtureRoot)
+    for ($attempt = 0; $attempt -lt 80; $attempt++) {
+        if ($ServerProcess.HasExited) { throw 'STOP: private OpenCode server stopped during plugin discovery.' }
+        try {
+            $reply = Invoke-RestMethod -Method Get -Uri "$ServerUrl/api/plugin?location%5Bdirectory%5D=$encodedRoot" -TimeoutSec 3
+            $plugin = @($reply.data | Where-Object { $_.id -eq 'evospec' } | Select-Object -First 1)
+            if ($plugin.Count -gt 0) {
+                $state = [string]$plugin[0].state.status
+                $Evidence.PluginState = $state
+                if ($state -eq 'active') {
+                    $Evidence.PluginVerified = $true
+                    return
+                }
+                if ($state -eq 'failed') { throw 'STOP: EvoSpec plugin activation failed in the private host.' }
+            }
+        }
+        catch {
+            if ($_.Exception.Message -like 'STOP:*') { throw }
+            # An initial 503 or connection delay is expected while plugins load.
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw "STOP: EvoSpec plugin did not become active (last state: $($Evidence.PluginState))."
+}
+
 Push-Location $sourceRoot
 try {
     $branch = (& git branch --show-current).Trim()
@@ -59,8 +139,8 @@ try {
     # A private server is essential: the shared server previously executed
     # these prompts against master instead of the temporary fixture.
     $runHelp = (& opencode run --help | Out-String)
-    if ($LASTEXITCODE -ne 0 -or $runHelp -notmatch '--standalone') {
-        throw 'STOP: this OpenCode run command does not advertise --standalone.'
+    if ($LASTEXITCODE -ne 0 -or $runHelp -notmatch '--server') {
+        throw 'STOP: this OpenCode run command does not advertise --server.'
     }
 
     # Fixture creation runs in the real PowerShell process. OpenCode never
@@ -73,12 +153,16 @@ try {
     $evidenceRoot = Join-Path $parent 'evidence'
     New-Item -ItemType Directory -Path $evidenceRoot -ErrorAction Stop | Out-Null
 
-    $jobs = @(
-        [pscustomobject]@{ Name = 'parked-natural'; Scenario = 'parked'; Prompt = '¿dónde seguimos?' },
-        [pscustomobject]@{ Name = 'parked-context'; Scenario = 'parked'; Prompt = '/evospec.context' },
-        [pscustomobject]@{ Name = 'parked-status'; Scenario = 'parked'; Prompt = '/evospec.status' },
-        [pscustomobject]@{ Name = 'ambiguous-natural'; Scenario = 'ambiguous'; Prompt = '¿dónde seguimos?' }
-    )
+    $jobs = @([pscustomobject]@{ Name = 'parked-natural'; Scenario = 'parked'; Prompt = '¿dónde seguimos?' })
+    if ($IncludeRemainingScenarios) {
+        # The other cases are opt-in: a successful first preflight must not
+        # silently spend tokens on unrelated native sessions.
+        $jobs += @(
+            [pscustomobject]@{ Name = 'parked-context'; Scenario = 'parked'; Prompt = '/evospec.context' },
+            [pscustomobject]@{ Name = 'parked-status'; Scenario = 'parked'; Prompt = '/evospec.status' },
+            [pscustomobject]@{ Name = 'ambiguous-natural'; Scenario = 'ambiguous'; Prompt = '¿dónde seguimos?' }
+        )
+    }
     $results = @()
     foreach ($job in $jobs) {
         $fixture = @($prepared.fixtures | Where-Object { $_.scenario -eq $job.Scenario })[0]
@@ -95,19 +179,69 @@ try {
         $before = @(Get-FixtureInventory -Root $fixtureRoot)
         $beforeJson = ConvertTo-Json -InputObject $before -Depth 6 -Compress
         $outputPath = Join-Path $evidenceRoot "$($job.Name).ndjson"
-
-        Push-Location $fixtureRoot
-        try {
-            if ((Get-Location).ProviderPath -ne $fixtureRoot) {
-                throw "STOP: shell did not enter the isolated fixture $fixtureRoot."
-            }
-            # Four independent sessions; --auto handles only non-denied host
-            # permissions. --standalone prevents a shared background server
-            # from silently routing the model into an unrelated worktree.
-            $outputLines = @(& opencode run --standalone --auto --agent build --model $modelName --format json $job.Prompt 2>&1)
-            $exitCode = $LASTEXITCODE
+        $preflightPath = Join-Path $evidenceRoot "preflight-$($job.Name).json"
+        $preflight = @{
+            Scenario = $job.Name
+            ExpectedLocation = $fixtureRoot
+            ObservedLocation = $null
+            LocationVerified = $false
+            PluginState = 'NOT_DISCOVERED'
+            PluginVerified = $false
+            ModelCallsIssuedByRunnerBeforePreflight = 0
         }
-        finally { Pop-Location }
+        $serverProcess = $null
+        try {
+            $port = Get-FreeLoopbackPort
+            $serverUrl = "http://127.0.0.1:$port"
+            # This private server remains alive for the exact session whose
+            # plugin and location we inspect. No shared service is reused.
+            # An encoded command preserves Windows paths and non-ASCII text;
+            # retaining its process handle permits exact process-tree cleanup.
+            $escapedRoot = $fixtureRoot.Replace("'", "''")
+            $serveCommand = "Set-Location -LiteralPath '$escapedRoot'; & opencode serve --hostname 127.0.0.1 --port $port"
+            $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($serveCommand))
+            $serverProcess = Start-Process -FilePath (Get-Command pwsh -CommandType Application).Source `
+                -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand) `
+                -WindowStyle Hidden -PassThru `
+                -RedirectStandardOutput (Join-Path $evidenceRoot "server-$($job.Name).stdout.log") `
+                -RedirectStandardError (Join-Path $evidenceRoot "server-$($job.Name).stderr.log")
+            Assert-PrivateHostReady -FixtureRoot $fixtureRoot -ServerUrl $serverUrl -ServerProcess $serverProcess -Evidence $preflight
+
+            Push-Location $fixtureRoot
+            try {
+                if ((Get-Location).ProviderPath -ne $fixtureRoot) {
+                    throw "STOP: shell did not enter the isolated fixture $fixtureRoot."
+                }
+                # The model connects to the same preflighted private server;
+                # --auto handles only non-denied host permissions.
+                $outputLines = @(& opencode run --server $serverUrl --auto --agent build --model $modelName --format json $job.Prompt 2>&1)
+                $exitCode = $LASTEXITCODE
+            }
+            finally { Pop-Location }
+        }
+        catch {
+            throw "$($_.Exception.Message) Preflight evidence: $preflightPath"
+        }
+        finally {
+            try {
+                # Keep a small, credential-free record even if the host blocks.
+                $preflight | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $preflightPath -Encoding utf8
+            }
+            finally {
+                # Cleanup must run even when evidence cannot be written.
+                if ($null -ne $serverProcess) {
+                    try {
+                        if (-not $serverProcess.HasExited) {
+                            # Kill the exact private server process tree; leave
+                            # shared or unrelated OpenCode servers untouched.
+                            $serverProcess.Kill($true)
+                            [void]$serverProcess.WaitForExit(5000)
+                        }
+                    }
+                    finally { $serverProcess.Dispose() }
+                }
+            }
+        }
         $outputLines | ForEach-Object { $_.ToString() } | Set-Content -LiteralPath $outputPath -Encoding utf8
 
         $after = @(Get-FixtureInventory -Root $fixtureRoot)
@@ -151,6 +285,7 @@ try {
         Model = $modelName
         Agent = 'build'
         SyntheticOnly = $true
+        PrivateServerPreflight = 'PASSED'
         HumanAcceptance = 'NOT_REQUESTED'
         Results = $results
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding utf8

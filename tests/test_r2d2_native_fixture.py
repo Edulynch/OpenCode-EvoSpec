@@ -46,8 +46,9 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         self.assertIn("openai/gpt-6.1-sol#high", runner)
         self.assertIn("--agent build", runner)
         self.assertIn("--auto", runner)
-        self.assertIn("opencode run --standalone", runner)
+        self.assertIn("opencode run --server $serverUrl", runner)
         self.assertIn("opencode run --help", runner)
+        self.assertIn("opencode serve --hostname 127.0.0.1", runner)
         self.assertIn("Get-CanonicalContextCalls", runner)
         self.assertIn("tools\\.evospec_context", runner)
         self.assertIn("No more model sessions", runner)
@@ -55,6 +56,26 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         self.assertNotIn("accept-fixture.ps1", runner)
         self.assertNotIn("gh pr", runner)
         self.assertNotIn("gh issue", runner)
+
+    def test_native_runner_preflights_the_exact_private_host_before_model_use(self) -> None:
+        runner = (Path(__file__).parent / "r2d2_native_smoke.ps1").read_text(encoding="utf-8")
+        # A private server is inspected before the model is allowed to start;
+        # its process tree is then cleaned up regardless of the outcome.
+        self.assertIn("/api/location", runner)
+        self.assertIn("/api/plugin?location%5Bdirectory%5D=", runner)
+        self.assertIn("$Evidence.LocationVerified = $true", runner)
+        self.assertIn("$Evidence.PluginVerified = $true", runner)
+        self.assertIn("$state -eq 'active'", runner)
+        self.assertIn("ModelCallsIssuedByRunnerBeforePreflight = 0", runner)
+        self.assertIn("$serverProcess.Kill($true)", runner)
+        self.assertLess(
+            runner.index("Assert-PrivateHostReady -FixtureRoot $fixtureRoot"),
+            runner.index("& opencode run --server $serverUrl"),
+        )
+        # The full four-case suite remains an explicit opt-in; default runs
+        # only the first natural-language parked case.
+        self.assertIn("param([switch]$IncludeRemainingScenarios)", runner)
+        self.assertIn("if ($IncludeRemainingScenarios)", runner)
 
     def test_parked_fixture_exposes_inactive_agreement_without_read_writes(self) -> None:
         with TemporaryDirectory() as temporary:
