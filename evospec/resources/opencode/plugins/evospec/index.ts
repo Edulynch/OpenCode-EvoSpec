@@ -73,6 +73,54 @@ async function sessionRoot(runtime, context) {
   return session.location.directory
 }
 
+async function authorizeAcceptedTaskProgress(runtime, request, context) {
+  if (typeof runtime?.permission?.assert !== "function") {
+    throw new Error("OpenCode V2 permission API is unavailable")
+  }
+  const requester = {
+    sessionID: context?.sessionID,
+    agent: context?.agent,
+    messageID: context?.messageID,
+    id: context?.id,
+  }
+  if (Object.values(requester).some((value) => typeof value !== "string" || !value.trim())) {
+    throw new Error("OpenCode V2 did not provide complete accepted Task permission context")
+  }
+  if (typeof runtime?.session?.get !== "function") {
+    throw new Error("OpenCode V2 session API is unavailable")
+  }
+  if (![request?.repository_id, request?.task_id].every((value) => typeof value === "string" && value.trim())) {
+    throw new Error("Accepted Task permission requires repository and Task identities")
+  }
+
+  const root = await sessionRoot(runtime, context)
+  if (typeof root !== "string" || !isAbsolute(root)) {
+    throw new Error("OpenCode V2 did not provide an absolute executing repository root")
+  }
+  await runtime.permission.assert({
+    sessionID: requester.sessionID,
+    agent: requester.agent,
+    source: { type: "tool", messageID: requester.messageID, id: requester.id },
+    action: "evospec_accepted_task_progress",
+    resources: [JSON.stringify({
+      operation: request.action,
+      repository_root: resolve(root),
+      repository_id: request.repository_id,
+      task_id: request.task_id,
+    })],
+  })
+
+  if (context.sessionID !== requester.sessionID || context.agent !== requester.agent ||
+      context.messageID !== requester.messageID || context.id !== requester.id) {
+    throw new Error("OpenCode V2 permission requester changed while accepted Task permission was pending")
+  }
+  const currentRoot = await sessionRoot(runtime, context)
+  if (typeof currentRoot !== "string" || !isAbsolute(currentRoot) || resolve(currentRoot) !== resolve(root)) {
+    throw new Error("OpenCode V2 executing repository changed while accepted Task permission was pending")
+  }
+  return root
+}
+
 async function spawnCommand(command, root, context, input) {
   const options = {
     cwd: root,
@@ -86,8 +134,8 @@ async function spawnCommand(command, root, context, input) {
   return capture(process)
 }
 
-async function rawExecuteRequest(runtime, request, context) {
-  const root = await sessionRoot(runtime, context)
+async function rawExecuteRequest(runtime, request, context, rootOverride) {
+  const root = rootOverride ?? await sessionRoot(runtime, context)
   const payload = typeof request === "string" ? request : JSON.stringify(request)
   const result = await spawnCommand([...AGENT_COMMAND, "--root", root], root, context, payload)
   const output = outcome(result)
@@ -205,18 +253,18 @@ function requestStillAuthorized(request, current, original) {
 
 async function executeRequest(runtime, request, context, options = {}) {
   const decodedRequest = staleRequest(request)
-  const root = await sessionRoot(runtime, context)
+  const root = options.authorizedRoot ?? await sessionRoot(runtime, context)
   const baseline = decodedRequest?.expected_revision === undefined
     ? null
     : canonicalSnapshots.get(resolve(root))
-  const output = await rawExecuteRequest(runtime, request, context)
+  const output = await rawExecuteRequest(runtime, request, context, options.authorizedRoot)
   if (options.retryStale === false) return output
   if (decodedRequest === null || !SAFE_STALE_REPLAY_ACTIONS.has(decodedRequest.action)) return output
   let response
   try { response = JSON.parse(output) } catch { return output }
   if (response?.error?.code !== "STALE_REVISION") return output
 
-  const refreshedText = await rawExecuteRequest(runtime, { action: "context" }, context)
+  const refreshedText = await rawExecuteRequest(runtime, { action: "context" }, context, options.authorizedRoot)
   let refreshed
   try { refreshed = JSON.parse(refreshedText) } catch { return output }
   const current = contextFromResponse(refreshed)
@@ -233,7 +281,7 @@ async function executeRequest(runtime, request, context, options = {}) {
     })
   }
   const retry = { ...decodedRequest, expected_revision: current.revision }
-  return rawExecuteRequest(runtime, retry, context)
+  return rawExecuteRequest(runtime, retry, context, options.authorizedRoot)
 }
 
 function parseContextResponse(responseText) {
@@ -551,7 +599,11 @@ const tools = [
       evidence_refs: { type: "array", items: { type: "string", minLength: 1, maxLength: 2048 }, maxItems: 16, uniqueItems: true },
     }),
     // A stale report is never silently rebound to a different accepted revision.
-    (args, context) => executeRequest(context.runtime, { action: "accepted_task_progress", ...args }, context, { retryStale: false }),
+    async (args, context) => {
+      const request = { ...args, action: "accepted_task_progress" }
+      const authorizedRoot = await authorizeAcceptedTaskProgress(context.runtime, request, context)
+      return executeRequest(context.runtime, request, context, { retryStale: false, authorizedRoot })
+    },
   ),
   protocolTool(
     "evospec_work_list",
