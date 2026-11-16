@@ -192,6 +192,56 @@ function Assert-ApprovedModelReady {
     $Evidence.ModelCatalogVerified = $true
 }
 
+function Assert-IsolatedPythonContextReady {
+    param(
+        [Parameter(Mandatory)][string]$FixtureRoot,
+        [Parameter(Mandatory)][string]$PythonExecutable,
+        [Parameter(Mandatory)][hashtable]$Evidence
+    )
+
+    # The generated plugin executes this exact interpreter from the fixture,
+    # not from the source checkout. An import failure must cost zero tokens.
+    $pluginPath = Join-Path $FixtureRoot '.opencode/plugins/evospec/index.ts'
+    $pluginText = Get-Content -LiteralPath $pluginPath -Raw -Encoding utf8
+    $agentMatch = [regex]::Match($pluginText, 'const AGENT_COMMAND = (?<command>\[[^\r\n]+\])')
+    if (-not $agentMatch.Success) {
+        throw 'STOP: isolated fixture plugin has no embedded Python agent command.'
+    }
+    $agentCommand = @($agentMatch.Groups['command'].Value | ConvertFrom-Json)
+    if ($agentCommand.Count -ne 3 -or
+        -not [string]::Equals([string]$agentCommand[0], $PythonExecutable, [StringComparison]::OrdinalIgnoreCase) -or
+        $agentCommand[1] -cne '-m' -or $agentCommand[2] -cne 'evospec.agent_protocol') {
+        throw 'STOP: fixture plugin does not use the isolated Python runtime.'
+    }
+    $Evidence.PythonCommandVerified = $true
+
+    Push-Location $FixtureRoot
+    try {
+        # Resolve the installed package from the interpreter's own site-packages.
+        # A source checkout on sys.path would hide the original Windows failure.
+        $importCheck = 'import pathlib, sys, evospec.agent_protocol as agent; assert pathlib.Path(agent.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve()), "EvoSpec is not installed in the isolated runtime"'
+        $importResult = @(& $PythonExecutable -c $importCheck 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "STOP: isolated Python cannot import its installed EvoSpec module: $($importResult -join ' ')"
+        }
+        $Evidence.PythonImportVerified = $true
+
+        # Invoke the same read-only module path OpenCode will use, with no LLM.
+        $protocolOutput = @('{"action":"context"}' | & $PythonExecutable -m evospec.agent_protocol --root $FixtureRoot 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "STOP: isolated Python context protocol failed: $($protocolOutput -join ' ')"
+        }
+        $contextResponse = ($protocolOutput -join "`n") | ConvertFrom-Json -ErrorAction Stop
+        $accepted = @($contextResponse.context.work_queue.all |
+            Where-Object { $_.accepted_slice.feature_title -ceq 'Fixture temporal R2-D2' })
+        if ($null -ne $contextResponse.error -or $accepted.Count -ne 1) {
+            throw 'STOP: isolated Python did not return the synthetic EvoSpec context.'
+        }
+        $Evidence.PythonContextVerified = $true
+    }
+    finally { Pop-Location }
+}
+
 function New-VerifiedFixtureSession {
     param(
         [Parameter(Mandatory)][string]$FixtureRoot,
@@ -266,6 +316,31 @@ try {
     $evidenceRoot = Join-Path $parent 'evidence'
     New-Item -ItemType Directory -Path $evidenceRoot -ErrorAction Stop | Out-Null
 
+    # Reproduce the documented installed-package path without changing global
+    # Python, provider settings, or the checkout. The runtime lives beside the
+    # disposable evidence; it is never created inside a checked fixture.
+    $runtimeRoot = Join-Path $parent 'python-runtime'
+    $runtimePython = Join-Path $runtimeRoot 'Scripts/python.exe'
+    & python -m venv $runtimeRoot
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $runtimePython)) {
+        throw 'STOP: cannot prepare an isolated Python runtime; no model calls were made.'
+    }
+    $installation = @(& $runtimePython -m pip install --no-deps --no-input --no-cache-dir `
+        --disable-pip-version-check $sourceRoot 2>&1)
+    $installation | ForEach-Object { $_.ToString() } |
+        Set-Content -LiteralPath (Join-Path $evidenceRoot 'python-install.log') -Encoding utf8
+    if ($LASTEXITCODE -ne 0) {
+        throw 'STOP: isolated EvoSpec package installation failed; inspect python-install.log before any model call.'
+    }
+    foreach ($preparedFixture in $prepared.fixtures) {
+        # Refresh the test-owned plugin to embed the installed interpreter.
+        # Core state, synthetic agreements, and unrelated resources are untouched.
+        $refreshOutput = @(& $runtimePython -m evospec.cli --project $preparedFixture.root integrate --refresh 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "STOP: isolated EvoSpec plugin refresh failed for $($preparedFixture.scenario): $($refreshOutput -join ' ')"
+        }
+    }
+
     $jobs = @([pscustomobject]@{ Name = 'parked-natural'; Scenario = 'parked'; Prompt = '¿dónde seguimos?' })
     if ($IncludeRemainingScenarios) {
         # The other cases are opt-in: a successful first preflight must not
@@ -302,6 +377,9 @@ try {
             PluginVerified = $false
             ApprovedRunModel = $ApprovedModel
             ModelCatalogVerified = $false
+            PythonCommandVerified = $false
+            PythonImportVerified = $false
+            PythonContextVerified = $false
             SessionID = $null
             SessionLocation = $null
             SessionVerified = $false
@@ -310,6 +388,7 @@ try {
         }
         $serverProcess = $null
         try {
+            Assert-IsolatedPythonContextReady -FixtureRoot $fixtureRoot -PythonExecutable $runtimePython -Evidence $preflight
             $port = Get-FreeLoopbackPort
             $serverUrl = "http://127.0.0.1:$port"
             # A fresh secret authenticates only this ephemeral loopback server.
@@ -430,6 +509,9 @@ try {
             [string]$_.part.state.output -match [regex]::Escape($requiredTitle)
         })
         if ($matchedContext.Count -eq 0) {
+            if ($contextCalls.Count -gt 0) {
+                throw "STOP: $($job.Name) invoked evospec_context, but it did not return the synthetic fixture context. No more model sessions. Evidence: $outputPath"
+            }
             throw "STOP: $($job.Name) did not call evospec_context for its fixture. No more model sessions. Evidence: $outputPath"
         }
         $ambiguousContexts = @($matchedContext | Where-Object {

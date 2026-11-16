@@ -115,6 +115,37 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         self.assertIn("[string]$ApprovedModel = ''", runner)
         self.assertIn("if ($IncludeRemainingScenarios)", runner)
 
+    def test_native_runner_installs_and_checks_its_private_python_before_inference(self) -> None:
+        """A model cannot be asked to repair a missing test-runtime package."""
+        runner = (Path(__file__).parent / "r2d2_native_smoke.ps1").read_text(encoding="utf-8")
+        # Installing into an evidence-owned venv never changes the user's
+        # system Python or the checked-in project state.
+        self.assertIn("$runtimeRoot = Join-Path $parent 'python-runtime'", runner)
+        self.assertIn("$runtimePython = Join-Path $runtimeRoot 'Scripts/python.exe'", runner)
+        self.assertIn("& python -m venv $runtimeRoot", runner)
+        self.assertIn("& $runtimePython -m pip install --no-deps --no-input --no-cache-dir", runner)
+        self.assertIn("--disable-pip-version-check $sourceRoot", runner)
+        self.assertIn("& $runtimePython -m evospec.cli --project $preparedFixture.root integrate --refresh", runner)
+        # The plugin's embedded Python must be the private interpreter. The
+        # package import and authoritative context are checked from the fixture.
+        self.assertIn("const AGENT_COMMAND = (?<command>", runner)
+        self.assertIn("agentCommand[2] -cne 'evospec.agent_protocol'", runner)
+        self.assertIn("is_relative_to(pathlib.Path(sys.prefix).resolve())", runner)
+        self.assertIn("& $PythonExecutable -m evospec.agent_protocol --root $FixtureRoot", runner)
+        self.assertIn("$Evidence.PythonCommandVerified = $true", runner)
+        self.assertIn("$Evidence.PythonImportVerified = $true", runner)
+        self.assertIn("$Evidence.PythonContextVerified = $true", runner)
+        self.assertIn("if ($contextCalls.Count -gt 0)", runner)
+        self.assertIn("invoked evospec_context, but it did not return the synthetic fixture context", runner)
+        self.assertLess(
+            runner.index("Assert-IsolatedPythonContextReady -FixtureRoot $fixtureRoot"),
+            runner.index("Assert-PrivateHostReady -FixtureRoot $fixtureRoot"),
+        )
+        self.assertLess(
+            runner.index("Assert-IsolatedPythonContextReady -FixtureRoot $fixtureRoot"),
+            runner.index("& opencode run --server $serverUrl"),
+        )
+
     def test_parked_fixture_exposes_inactive_agreement_without_read_writes(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary) / "parked"
