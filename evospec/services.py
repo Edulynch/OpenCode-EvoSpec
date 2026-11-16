@@ -171,7 +171,9 @@ def validate_slice_criteria_spec(spec: SliceCriteriaSpec) -> None:
         raise ServiceError("Slice scope and decisions must be bounded nonblank text")
     identifiers: set[str] = set()
     for criterion in spec.criteria:
-        if type(criterion) is not SliceCriterion or not IDENTITY.fullmatch(criterion.id):
+        # Criteria may come from JSON: reject non-text IDs before using the regex.
+        if (type(criterion) is not SliceCriterion or type(criterion.id) is not str
+                or not IDENTITY.fullmatch(criterion.id)):
             raise ServiceError("Slice criterion must have a stable ID")
         if criterion.id in identifiers:
             raise ServiceError("Slice criterion IDs must be unique")

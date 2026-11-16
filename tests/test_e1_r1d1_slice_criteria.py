@@ -370,6 +370,30 @@ class SliceCriteriaTests(unittest.TestCase):
             self.assertEqual(cli_main(amend_args, io.StringIO()), 0)
         self.assertEqual(len(CoreService.open(self.root).recover().slice_criteria_revisions), 2)
 
+    def test_r1_08b_malformed_criterion_id_fails_as_input_error(self) -> None:
+        """Malformed external IDs must never crash the CLI or cross acceptance."""
+        spec = _spec()
+        payload: dict[str, Any] = {
+            "outcome": spec.outcome, "example": spec.example,
+            "inclusions": list(spec.inclusions), "exclusions": list(spec.exclusions),
+            "decisions": list(spec.decisions),
+            "criteria": [{"id": item.id, "expected_result": item.expected_result,
+                          "expected_evidence": item.expected_evidence} for item in spec.criteria],
+        }
+        criteria_file = self.root / "invalid-criteria.json"
+        args = ["--project", str(self.root), "accept-slice", "--feature", FEATURE,
+                "--slice", SLICE, "--task", TASK, "--checkpoint", CHECKPOINT,
+                "--criteria-file", str(criteria_file), "--expected-revision", str(self.initial.revision)]
+        for invalid_id in (None, 123, [], {}):
+            with self.subTest(invalid_id=invalid_id):
+                payload["criteria"][0]["id"] = invalid_id
+                criteria_file.write_text(json.dumps(payload), encoding="utf-8")
+                output = io.StringIO()
+                with patch("sys.stdin", _TTY()), patch("sys.stdout", _TTY()):
+                    self.assertEqual(cli_main(args, output), 2)
+                self.assertIn("ERROR", output.getvalue())
+                self.assertEqual(CoreService.open(self.root).recover().revision, self.initial.revision)
+
     def test_r1_09_failed_record_durability_keeps_old_head_and_allows_retry(self) -> None:
         first = self._accept(_spec())
         state = CoreService.open(self.root).recover()
