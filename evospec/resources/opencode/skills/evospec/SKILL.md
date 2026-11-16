@@ -14,7 +14,7 @@ Answer briefly in ordinary language: current Feature and Slice titles, the known
 
 When no Task is active, inspect `work_queue` for accepted Slice details attached to parked items. List their available human titles and state as **inactive**; an accepted parked Task is not the current Task. If two or more valid items could resume, or the queue projection is incomplete, report the alternatives or limitation and ask only the clarification needed. Never select, reactivate, or modify a parked item from a status question. No agreement in the queue means no agreed Task title to invent.
 
-If state is missing, invalid, from another worktree, or ambiguous, explain the uncertainty and stop without initialization, repair, search across unrelated worktrees, or a guessed resume point. Ask for a material clarification only when necessary. If the user later explicitly asks to perform work, begin the normal protocol below with fresh context and its legal actions; a read-only answer confers no execution authority.
+If `evospec_context` is unavailable or its call fails, say that canonical state could not be verified and stop. Do not substitute Engram, other agent memories, past messages, an unrelated repository, or a guessed checkpoint for a native context result. If state is missing, invalid, from another worktree, or ambiguous, explain the uncertainty and stop without initialization, repair, search across unrelated worktrees, or a guessed resume point. Ask for a material clarification only when necessary. If the user later explicitly asks to perform work, begin the normal protocol below with fresh context and its legal actions; a read-only answer confers no execution authority.
 
 ## Explicit lifecycle work
 

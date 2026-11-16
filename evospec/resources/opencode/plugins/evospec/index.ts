@@ -468,11 +468,12 @@ async function executeRetry(runtime, args, context) {
   return JSON.stringify(directive)
 }
 
-function protocolTool(name, description, input, execute) {
+function protocolTool(name, description, input, execute, options = undefined) {
   return {
     name,
     description,
     input,
+    ...(options === undefined ? {} : { options }),
     execute: async (args, context) => ({ content: await execute(args, context) }),
   }
 }
@@ -584,6 +585,9 @@ const tools = [
     "Read canonical EvoSpec context and guidance for the executing session's repository.",
     object({}),
     (_, context) => executeRequest(context.runtime, { action: "context" }, context),
+    // The canonical read-only entry point must remain directly discoverable
+    // even when Code Mode's deferred catalog omits other plugin tools.
+    { codemode: false },
   ),
   protocolTool(
     "evospec_accepted_task_progress",
@@ -800,6 +804,7 @@ export default {
       event.system.push({
         type: "text",
         text: "For natural-language questions about where work stands or where to resume (¿dónde seguimos?, ¿en qué quedamos?, where were we?), load the evospec skill and call only evospec_context for the current session project. Report the known Feature, Slice, Task, and next checkpoint plainly; distinguish initial acceptance from later task_progress (REPORTED_UNVERIFIED), and disclose missing or ambiguous context. When there is no active Task, report accepted work_queue items as inactive and never choose or activate one on a status query. Read-only questions never initialize, continue, reaccept, or mutate. " +
+          "If evospec_context is unavailable or fails, report that the authoritative context cannot be verified and stop; never replace it with Engram memories, previous session messages, other repositories, or guessed work. " +
           "For explicit EvoSpec lifecycle work, load the evospec skill and call evospec_context before repository inspection, tests, or lifecycle mutations. Then use evospec_continuation and follow its deterministic adapter directive: SAFE_AUTOMATIC_OPERATION and in-envelope BOUNDED_DELEGATION continue; EXTERNAL_WAIT waits; HUMAN_MATERIAL_DECISION asks exactly Core's decision; STRUCTURAL_DEFECT fails closed; terminal with outcome null completes. Re-read context after every Core mutation, reevaluate STALE_REVISION before any retry, and never edit .evospec manually.",
       })
     })
