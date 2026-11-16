@@ -46,10 +46,13 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         runner = (Path(__file__).parent / "r2d2_native_smoke.ps1").read_text(encoding="utf-8")
         self.assertIn("tests.r2d2_native_fixture --scenario both", runner)
         self.assertIn("EVOSPEC_TEST_FIXTURE_ONLY.txt", runner)
-        # The native test may exercise the selected host route but cannot pick
-        # a replacement model on the user's behalf.
-        self.assertNotIn("--model", runner)
-        self.assertIn("HOST_CONFIGURED_NOT_ATTESTED", runner)
+        # An explicit human-approved test route must never turn into automatic
+        # provider selection or a fallback to a free catalog default.
+        self.assertIn("$authorizedModel = 'openai/gpt-6.1-sol#high'", runner)
+        self.assertIn("if ($ApprovedModel -cne $authorizedModel)", runner)
+        self.assertIn("opencode run --server $serverUrl --model $ApprovedModel", runner)
+        self.assertIn("EXPLICIT_HUMAN_APPROVED_TEST_ONLY", runner)
+        self.assertNotIn("--model openai/gpt-6.1-sol#high", runner)
         self.assertIn("--agent build", runner)
         self.assertIn("--auto", runner)
         self.assertIn("opencode run --server $serverUrl", runner)
@@ -71,9 +74,14 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         self.assertIn("/api/plugin?location%5Bdirectory%5D=", runner)
         self.assertIn("$Evidence.LocationVerified = $true", runner)
         self.assertIn("$Evidence.PluginVerified = $true", runner)
+        self.assertIn("/api/model?location%5Bdirectory%5D=", runner)
+        self.assertIn("/api/model/default?location%5Bdirectory%5D=", runner)
+        self.assertIn("$Evidence.ModelCatalogVerified = $true", runner)
+        self.assertIn("$variants -cnotcontains 'high'", runner)
+        self.assertIn("OPENCODE_DISABLE_FREE_MODELS = '1'", runner)
         self.assertIn("$state -eq 'active'", runner)
         self.assertIn("RandomNumberGenerator]::GetBytes(32)", runner)
-        self.assertIn("-Environment @{ OPENCODE_PASSWORD = $privatePassword }", runner)
+        self.assertIn("-Environment @{ OPENCODE_PASSWORD = $privatePassword; OPENCODE_DISABLE_FREE_MODELS = '1' }", runner)
         self.assertIn("-Headers $headers", runner)
         self.assertIn("$env:OPENCODE_PASSWORD = $privatePassword", runner)
         self.assertIn("Remove-Item Env:OPENCODE_PASSWORD", runner)
@@ -81,11 +89,16 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         self.assertIn("$serverProcess.Kill($true)", runner)
         self.assertLess(
             runner.index("Assert-PrivateHostReady -FixtureRoot $fixtureRoot"),
+            runner.index("Assert-ApprovedModelReady -FixtureRoot $fixtureRoot"),
+        )
+        self.assertLess(
+            runner.index("Assert-ApprovedModelReady -FixtureRoot $fixtureRoot"),
             runner.index("& opencode run --server $serverUrl"),
         )
         # The full four-case suite remains an explicit opt-in; default runs
         # only the first natural-language parked case.
-        self.assertIn("param([switch]$IncludeRemainingScenarios)", runner)
+        self.assertIn("[switch]$IncludeRemainingScenarios", runner)
+        self.assertIn("[string]$ApprovedModel = ''", runner)
         self.assertIn("if ($IncludeRemainingScenarios)", runner)
 
     def test_parked_fixture_exposes_inactive_agreement_without_read_writes(self) -> None:

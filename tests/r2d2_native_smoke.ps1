@@ -1,11 +1,22 @@
 # Native R2-D2 evidence must be collected by the invoking terminal, not by
 # the model. Every fixture is synthetic, disposable, and outside the repository.
-param([switch]$IncludeRemainingScenarios)
+param(
+    [switch]$IncludeRemainingScenarios,
+    [string]$ApprovedModel = ''
+)
 
 $ErrorActionPreference = 'Stop'
 
 $sourceRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $branchName = 'feat/e1-r2d2-parked-context-recovery'
+$authorizedModel = 'openai/gpt-6.1-sol#high'
+
+# This test-only exception is intentionally explicit. A private server does
+# not inherit a model selected in another session, and must never fall back
+# to OpenCode's free tier or silently switch to another paid model.
+if ($ApprovedModel -cne $authorizedModel) {
+    throw "STOP: pass -ApprovedModel '$authorizedModel' for this authorized native qualification."
+}
 
 function Get-FixtureInventory {
     param([Parameter(Mandatory)][string]$Root)
@@ -132,6 +143,55 @@ function Assert-PrivateHostReady {
     throw "STOP: EvoSpec plugin did not become active (last state: $($Evidence.PluginState))."
 }
 
+function Assert-ApprovedModelReady {
+    param(
+        [Parameter(Mandatory)][string]$FixtureRoot,
+        [Parameter(Mandatory)][string]$ServerUrl,
+        [Parameter(Mandatory)][string]$Authorization,
+        [Parameter(Mandatory)][string]$ApprovedModel,
+        [Parameter(Mandatory)][hashtable]$Evidence
+    )
+
+    # Inspect only the isolated host's model catalog. Listing models and the
+    # default does not start an agent or consume inference tokens.
+    $headers = @{ Authorization = $Authorization }
+    $encodedRoot = [uri]::EscapeDataString($FixtureRoot)
+    try {
+        $catalog = Invoke-RestMethod -Method Get -Uri "$ServerUrl/api/model?location%5Bdirectory%5D=$encodedRoot" `
+            -Headers $headers -TimeoutSec 10
+        $default = Invoke-RestMethod -Method Get -Uri "$ServerUrl/api/model/default?location%5Bdirectory%5D=$encodedRoot" `
+            -Headers $headers -TimeoutSec 10
+    }
+    catch {
+        throw "STOP: isolated OpenCode host could not attest its model catalog: $($_.Exception.Message)"
+    }
+
+    $defaultModel = $default.data
+    if ($null -ne $defaultModel -and $defaultModel.providerID -and $defaultModel.id) {
+        $Evidence.UnselectedHostDefault = "$($defaultModel.providerID)/$($defaultModel.id)"
+    }
+    else {
+        $Evidence.UnselectedHostDefault = 'NOT_ATTESTED'
+    }
+
+    $available = @($catalog.data | Where-Object {
+        $_.providerID -ceq 'openai' -and $_.id -ceq 'gpt-6.1-sol'
+    })
+    if ($available.Count -ne 1 -or $available[0].enabled -ne $true -or $available[0].status -ne 'active') {
+        throw 'STOP: openai/gpt-6.1-sol is not an enabled active model in this private project.'
+    }
+    $variants = @($available[0].variants | ForEach-Object { $_.id })
+    if ($variants -cnotcontains 'high') {
+        throw 'STOP: the private host does not advertise the approved Sol high variant.'
+    }
+
+    # The actual run below uses --model only for the model the human approved.
+    # This verifies that route before the first paid request, without changing
+    # any account, provider credentials, project config, or global defaults.
+    $Evidence.ApprovedRunModel = $ApprovedModel
+    $Evidence.ModelCatalogVerified = $true
+}
+
 Push-Location $sourceRoot
 try {
     $branch = (& git branch --show-current).Trim()
@@ -196,6 +256,9 @@ try {
             LocationVerified = $false
             PluginState = 'NOT_DISCOVERED'
             PluginVerified = $false
+            ApprovedRunModel = $ApprovedModel
+            ModelCatalogVerified = $false
+            UnselectedHostDefault = 'NOT_READ'
             ModelCallsIssuedByRunnerBeforePreflight = 0
         }
         $serverProcess = $null
@@ -215,24 +278,24 @@ try {
             $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($serveCommand))
             $serverProcess = Start-Process -FilePath (Get-Command pwsh -CommandType Application).Source `
                 -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand) `
-                -Environment @{ OPENCODE_PASSWORD = $privatePassword } `
+                -Environment @{ OPENCODE_PASSWORD = $privatePassword; OPENCODE_DISABLE_FREE_MODELS = '1' } `
                 -WindowStyle Hidden -PassThru `
                 -RedirectStandardOutput (Join-Path $evidenceRoot "server-$($job.Name).stdout.log") `
                 -RedirectStandardError (Join-Path $evidenceRoot "server-$($job.Name).stderr.log")
             Assert-PrivateHostReady -FixtureRoot $fixtureRoot -ServerUrl $serverUrl -ServerProcess $serverProcess -Authorization "Basic $basicCredential" -Evidence $preflight
+            Assert-ApprovedModelReady -FixtureRoot $fixtureRoot -ServerUrl $serverUrl -Authorization "Basic $basicCredential" -ApprovedModel $ApprovedModel -Evidence $preflight
 
             Push-Location $fixtureRoot
             try {
                 if ((Get-Location).ProviderPath -ne $fixtureRoot) {
                     throw "STOP: shell did not enter the isolated fixture $fixtureRoot."
                 }
-                # The private host owns its model selection; the smoke must not
-                # override the user's provider route to obtain a test result.
+                # This is the human-approved model for this isolated smoke.
                 # --auto handles only non-denied host permissions.
                 $previousPassword = [Environment]::GetEnvironmentVariable('OPENCODE_PASSWORD', 'Process')
                 try {
                     $env:OPENCODE_PASSWORD = $privatePassword
-                    $outputLines = @(& opencode run --server $serverUrl --auto --agent build --format json $job.Prompt 2>&1)
+                    $outputLines = @(& opencode run --server $serverUrl --model $ApprovedModel --auto --agent build --format json $job.Prompt 2>&1)
                     $exitCode = $LASTEXITCODE
                 }
                 finally {
@@ -323,7 +386,8 @@ try {
     [pscustomobject]@{
         SourceBranch = $branch
         SourceHead = (& git rev-parse HEAD).Trim()
-        Model = 'HOST_CONFIGURED_NOT_ATTESTED'
+        Model = $ApprovedModel
+        ModelSelection = 'EXPLICIT_HUMAN_APPROVED_TEST_ONLY'
         Agent = 'build'
         SyntheticOnly = $true
         PrivateServerPreflight = 'PASSED'
