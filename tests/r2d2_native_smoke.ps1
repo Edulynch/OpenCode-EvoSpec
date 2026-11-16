@@ -2,7 +2,8 @@
 # the model. Every fixture is synthetic, disposable, and outside the repository.
 param(
     [switch]$IncludeRemainingScenarios,
-    [string]$ApprovedModel = ''
+    [string]$ApprovedModel = '',
+    [string]$ReplayEvidenceRoot = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,7 +15,7 @@ $authorizedModel = 'openai/gpt-6.1-sol#high'
 # This test-only exception is intentionally explicit. A private server does
 # not inherit a model selected in another session, and must never fall back
 # to OpenCode's free tier or silently switch to another paid model.
-if ($ApprovedModel -cne $authorizedModel) {
+if ([string]::IsNullOrWhiteSpace($ReplayEvidenceRoot) -and $ApprovedModel -cne $authorizedModel) {
     throw "STOP: pass -ApprovedModel '$authorizedModel' for this authorized native qualification."
 }
 
@@ -53,6 +54,95 @@ function Get-CanonicalContextCalls {
         if ($_.part.tool -ne 'execute') { return $false }
         return [string]$_.part.state.input.code -match 'tools\.evospec_context\s*\('
     })
+}
+
+function Test-CanonicalFixtureContext {
+    param(
+        [Parameter(Mandatory)][string]$Output,
+        [Parameter(Mandatory)][ValidateSet('parked', 'ambiguous')][string]$Scenario
+    )
+
+    # Core only exposes an accepted title for the first work item. The second
+    # ambiguous candidate has no acceptance yet, so its title is not evidence.
+    try { $response = $Output | ConvertFrom-Json -ErrorAction Stop }
+    catch { return $false }
+    if ($null -ne $response.error -or $null -eq $response.context) { return $false }
+    $context = $response.context
+    if ($null -ne $context.accepted_slice -or $null -ne $context.work_queue.active) { return $false }
+
+    $items = @($context.work_queue.all)
+    $accepted = @($items | Where-Object {
+        $null -ne $_.accepted_slice -and
+        $_.accepted_slice.feature_title -ceq 'Fixture temporal R2-D2'
+    })
+    if ($accepted.Count -ne 1) { return $false }
+
+    if ($Scenario -eq 'parked') {
+        return ($items.Count -eq 1 -and
+            $context.work_queue.next_code -ceq 'NONE' -and
+            [int]$context.work_queue.next_candidates_total -eq 0)
+    }
+
+    $candidates = @($context.work_queue.next_candidates)
+    $candidateIds = @($candidates | ForEach-Object { [string]$_ })
+    $itemIds = @($items | ForEach-Object { [string]$_.id })
+    # Two distinct, real queue IDs establish ambiguity without inventing
+    # metadata for an unaccepted item or trusting the agent's prose.
+    return ($items.Count -eq 2 -and
+        $context.work_queue.next_code -ceq 'AMBIGUOUS' -and
+        [int]$context.work_queue.next_candidates_total -eq 2 -and
+        $candidateIds.Count -eq 2 -and
+        @($candidateIds | Sort-Object -Unique).Count -eq 2 -and
+        @($candidateIds | Where-Object { $itemIds -ccontains $_ }).Count -eq 2 -and
+        @($items | Where-Object { $null -eq $_.accepted_slice }).Count -eq 1)
+}
+
+function Assert-RecordedFixtureEvidence {
+    param(
+        [Parameter(Mandatory)][string]$EvidencePath,
+        [Parameter(Mandatory)][string]$PreflightPath,
+        [Parameter(Mandatory)][ValidateSet('parked', 'ambiguous')][string]$Scenario,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    # Replay reads previously collected evidence only. It does not start
+    # OpenCode, create fixtures, re-run inference, or update the manifest.
+    if (-not (Test-Path -LiteralPath $EvidencePath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $PreflightPath -PathType Leaf)) {
+        throw "STOP: missing native replay evidence for $Name."
+    }
+    $preflight = Get-Content -LiteralPath $PreflightPath -Raw -Encoding utf8 | ConvertFrom-Json -ErrorAction Stop
+    if ($preflight.Scenario -cne $Name -or $preflight.PluginState -cne 'active' -or
+        $preflight.ApprovedRunModel -cne $authorizedModel -or
+        [int]$preflight.ModelCallsIssuedByRunnerBeforePreflight -ne 0 -or
+        [string]::IsNullOrWhiteSpace([string]$preflight.SessionID)) {
+        throw "STOP: unverified recorded preflight for $Name."
+    }
+    foreach ($flag in @('LocationVerified', 'PluginVerified', 'ModelCatalogVerified',
+        'PythonCommandVerified', 'PythonImportVerified', 'PythonContextVerified', 'SessionVerified')) {
+        if ($preflight.$flag -cne $true) { throw "STOP: $flag was not verified for $Name." }
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$preflight.ExpectedLocation) -or
+        $preflight.ExpectedLocation -cne $preflight.ObservedLocation -or
+        $preflight.ExpectedLocation -cne $preflight.SessionLocation) {
+        throw "STOP: recorded native paths differ for $Name."
+    }
+    $events = @(Get-Content -LiteralPath $EvidencePath -Encoding utf8 |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { $_ | ConvertFrom-Json -ErrorAction Stop })
+    $sessionIds = @($events | Where-Object { $_.type -eq 'step_start' } |
+        ForEach-Object { $_.sessionID } | Sort-Object -Unique)
+    if ($sessionIds.Count -ne 1 -or $sessionIds[0] -cne $preflight.SessionID) {
+        throw "STOP: recorded native session differs from preflight for $Name."
+    }
+    $calls = @(Get-CanonicalContextCalls -EvidencePath $EvidencePath)
+    $matches = @($calls | Where-Object {
+        Test-CanonicalFixtureContext -Output ([string]$_.part.state.output) -Scenario $Scenario
+    })
+    if ($matches.Count -eq 0) {
+        throw "STOP: no canonical $Scenario fixture context in recorded events for $Name."
+    }
+    Write-Output "REPLAY_VALIDATED: $Name (session $($preflight.SessionID))"
 }
 
 function Get-FreeLoopbackPort {
@@ -286,6 +376,24 @@ function New-VerifiedFixtureSession {
     return $sessionId
 }
 
+# The replay path intentionally precedes Git, Python, OpenCode, and all host
+# preparation. Existing traces are the only input to this offline gate.
+if (-not [string]::IsNullOrWhiteSpace($ReplayEvidenceRoot)) {
+    $root = (Resolve-Path -LiteralPath $ReplayEvidenceRoot -ErrorAction Stop).Path
+    foreach ($case in @(
+        @{ Name = 'parked-natural'; Scenario = 'parked' },
+        @{ Name = 'parked-context'; Scenario = 'parked' },
+        @{ Name = 'parked-status'; Scenario = 'parked' },
+        @{ Name = 'ambiguous-natural'; Scenario = 'ambiguous' }
+    )) {
+        Assert-RecordedFixtureEvidence -EvidencePath (Join-Path $root "$($case.Name).ndjson") `
+            -PreflightPath (Join-Path $root "preflight-$($case.Name).json") `
+            -Scenario $case.Scenario -Name $case.Name
+    }
+    Write-Output 'R2D2_EVIDENCE_REPLAY: PASS (4/4; existing sessions only)'
+    return
+}
+
 Push-Location $sourceRoot
 try {
     $branch = (& git branch --show-current).Trim()
@@ -504,21 +612,14 @@ try {
             throw "STOP: native events do not belong to the preflight-verified fixture session. Evidence: $outputPath"
         }
         $contextCalls = @(Get-CanonicalContextCalls -EvidencePath $outputPath)
-        $requiredTitle = if ($job.Scenario -eq 'parked') { 'Fixture temporal R2-D2' } else { 'Another synthetic work item' }
         $matchedContext = @($contextCalls | Where-Object {
-            [string]$_.part.state.output -match [regex]::Escape($requiredTitle)
+            Test-CanonicalFixtureContext -Output ([string]$_.part.state.output) -Scenario $job.Scenario
         })
         if ($matchedContext.Count -eq 0) {
             if ($contextCalls.Count -gt 0) {
                 throw "STOP: $($job.Name) invoked evospec_context, but it did not return the synthetic fixture context. No more model sessions. Evidence: $outputPath"
             }
             throw "STOP: $($job.Name) did not call evospec_context for its fixture. No more model sessions. Evidence: $outputPath"
-        }
-        $ambiguousContexts = @($matchedContext | Where-Object {
-            [string]$_.part.state.output -match 'AMBIGUOUS'
-        })
-        if ($job.Scenario -eq 'ambiguous' -and $ambiguousContexts.Count -eq 0) {
-            throw "STOP: the ambiguous native context was not observed. Evidence: $outputPath"
         }
         $results += [pscustomobject]@{
             Scenario = $job.Name

@@ -18,6 +18,96 @@ from tests.r2d2_native_fixture import CHECKPOINT, FEATURE, MARKER, TASK, build_f
 
 
 class R2D2NativeFixtureTests(unittest.TestCase):
+    def test_native_gate_uses_canonical_ambiguity_without_unaccepted_title(self) -> None:
+        runner = (Path(__file__).parent / "r2d2_native_smoke.ps1").read_text(encoding="utf-8")
+        # Only accepted agreements have titles in Core's canonical response.
+        # Requiring the second item's human-readable label was a false negative.
+        self.assertIn("function Test-CanonicalFixtureContext", runner)
+        self.assertIn("$Output | ConvertFrom-Json -ErrorAction Stop", runner)
+        self.assertIn("$context.work_queue.next_code -ceq 'AMBIGUOUS'", runner)
+        self.assertIn("$context.work_queue.next_candidates_total -eq 2", runner)
+        self.assertIn("$itemIds -ccontains $_", runner)
+        self.assertNotIn("Another synthetic work item", runner)
+
+    def test_ambiguous_canonical_context_has_no_title_for_unaccepted_candidate(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "ambiguous"
+            build_fixture(root, "ambiguous")
+            payload = json.loads(execute(root, '{"action":"context"}'))
+            queue = payload["context"]["work_queue"]
+            # Match actual native evidence: two IDs, one accepted agreement,
+            # and no second title to search for in a tool's JSON output.
+            self.assertEqual(queue["next_code"], "AMBIGUOUS")
+            self.assertEqual(queue["next_candidates_total"], 2)
+            self.assertEqual(set(queue["next_candidates"]), {item["id"] for item in queue["all"]})
+            self.assertEqual(sum(item["accepted_slice"] is None for item in queue["all"]), 1)
+            self.assertNotIn("Another synthetic work item", json.dumps(payload))
+
+    def test_existing_native_evidence_can_be_replayed_without_model_calls(self) -> None:
+        pwsh = shutil.which("pwsh")
+        if pwsh is None:
+            self.skipTest("PowerShell is unavailable on this host")
+        runner = (Path(__file__).parent / "r2d2_native_smoke.ps1").resolve()
+        with TemporaryDirectory() as temporary:
+            evidence = Path(temporary) / "evidence"
+            evidence.mkdir()
+            for name, scenario in (
+                ("parked-natural", "parked"),
+                ("parked-context", "parked"),
+                ("parked-status", "parked"),
+                ("ambiguous-natural", "ambiguous"),
+            ):
+                root = Path(temporary) / name
+                build_fixture(root, scenario)
+                output = execute(root, '{"action":"context"}')
+                session_id = f"ses_fixture_{name}"
+                # A completed tool event and a matching preflight prove the
+                # recorded session, independently of any model answer text.
+                events = [
+                    {"type": "step_start", "sessionID": session_id},
+                    {"type": "tool_use", "part": {"tool": "evospec_context", "state": {
+                        "status": "completed", "output": output,
+                    }}},
+                ]
+                (evidence / f"{name}.ndjson").write_text(
+                    "\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8"
+                )
+                preflight = {
+                    "Scenario": name,
+                    "PluginState": "active",
+                    "ApprovedRunModel": "openai/gpt-6.1-sol#high",
+                    "ModelCallsIssuedByRunnerBeforePreflight": 0,
+                    "SessionID": session_id,
+                    "ExpectedLocation": str(root),
+                    "ObservedLocation": str(root),
+                    "SessionLocation": str(root),
+                    **{key: True for key in (
+                        "LocationVerified", "PluginVerified", "ModelCatalogVerified",
+                        "PythonCommandVerified", "PythonImportVerified",
+                        "PythonContextVerified", "SessionVerified",
+                    )},
+                }
+                (evidence / f"preflight-{name}.json").write_text(
+                    json.dumps(preflight), encoding="utf-8"
+                )
+
+            replay = [pwsh, "-NoProfile", "-NonInteractive", "-File", str(runner),
+                      "-ReplayEvidenceRoot", str(evidence)]
+            completed = subprocess.run(replay, capture_output=True, text=True, check=False)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertIn("R2D2_EVIDENCE_REPLAY: PASS (4/4", completed.stdout)
+
+            # A plausible tool call with corrupted ambiguity must fail closed.
+            bad_path = evidence / "ambiguous-natural.ndjson"
+            recorded = [json.loads(line) for line in bad_path.read_text(encoding="utf-8").splitlines()]
+            bad_context = json.loads(recorded[1]["part"]["state"]["output"])
+            bad_context["context"]["work_queue"]["next_code"] = "NONE"
+            recorded[1]["part"]["state"]["output"] = json.dumps(bad_context)
+            bad_path.write_text("\n".join(json.dumps(event) for event in recorded) + "\n", encoding="utf-8")
+            rejected = subprocess.run(replay, capture_output=True, text=True, check=False)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("no canonical ambiguous fixture context", rejected.stdout + rejected.stderr)
+
     def test_native_runner_has_valid_powershell_syntax_when_available(self) -> None:
         pwsh = shutil.which("pwsh")
         if pwsh is None:
@@ -49,7 +139,7 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         # An explicit human-approved test route must never turn into automatic
         # provider selection or a fallback to a free catalog default.
         self.assertIn("$authorizedModel = 'openai/gpt-6.1-sol#high'", runner)
-        self.assertIn("if ($ApprovedModel -cne $authorizedModel)", runner)
+        self.assertIn("-and $ApprovedModel -cne $authorizedModel)", runner)
         self.assertIn("opencode run --server $serverUrl --session $fixtureSessionId --model $ApprovedModel", runner)
         self.assertIn("EXPLICIT_HUMAN_APPROVED_TEST_ONLY", runner)
         self.assertNotIn("--model openai/gpt-6.1-sol#high", runner)
