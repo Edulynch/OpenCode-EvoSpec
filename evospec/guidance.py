@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from .domain import IrreversibleAuthorizationStatus, OperationalState, ReviewInspection, WorkingContext
+from .domain import IrreversibleAuthorizationStatus, OperationalState, ReviewInspection, WorkingContext, canonical_autonomy_operation
 from .lifecycle import LifecycleState, Phase, can_converge, has_acceptable_review
 
 
@@ -82,6 +82,7 @@ class Action(StrEnum):
     REMOVE_WORK_RELATION = "remove_work_relation"
     REJECT = "reject"
     PROGRESS = "progress"
+    ACCEPTED_TASK_PROGRESS = "accepted_task_progress"
     ASSESS_LOCKS = "assess_locks"
     REVIEW = "review"
     VERIFY = "verify"
@@ -112,7 +113,7 @@ _ACTION_ORDER = {
     Action.CONTEXT: 0, Action.NEW: 1, Action.CHANGE: 2, Action.CONTINUE: 3, Action.RESUME: 4,
     Action.LIST_WORK: 5, Action.NEXT_WORK: 6, Action.ACTIVATE_WORK: 7,
     Action.SET_WORK_STATE: 8, Action.ADD_WORK_RELATION: 9, Action.REMOVE_WORK_RELATION: 10,
-    Action.PARK: 11, Action.CLARIFY: 12, Action.PROGRESS: 12, Action.ASSESS_LOCKS: 13,
+    Action.PARK: 11, Action.CLARIFY: 12, Action.PROGRESS: 12, Action.ACCEPTED_TASK_PROGRESS: 12, Action.ASSESS_LOCKS: 13,
     Action.REVIEW: 14, Action.INVALIDATE_ASSURANCE: 15, Action.REJECT: 16,
     Action.VERIFY: 17, Action.CONVERGE: 18,
     Action.AUTHORIZE_IRREVERSIBLE: 19, Action.EXECUTE_IRREVERSIBLE: 20,
@@ -121,23 +122,24 @@ _ACTION_ORDER = {
 
 
 def project(
-    inspection: ReviewInspection, *, queue_activation_available: bool = False
+    inspection: ReviewInspection, *, queue_activation_available: bool = False, e1_schema_ready: bool | None = None,
 ) -> tuple[ActionGuidance, ...]:
     """Project all canonical action facts from one durable inspection snapshot."""
     return tuple(
         for_action(
-            inspection, action, queue_activation_available=queue_activation_available
+            inspection, action, queue_activation_available=queue_activation_available,
+            e1_schema_ready=e1_schema_ready,
         )
         for action in _ACTIONS
     )
 
 
 def allowed_actions(
-    inspection: ReviewInspection, *, queue_activation_available: bool = False
+    inspection: ReviewInspection, *, queue_activation_available: bool = False, e1_schema_ready: bool | None = None,
 ) -> tuple[str, ...]:
     """Return canonical protocol action names that are currently available."""
     guidance = project(
-        inspection, queue_activation_available=queue_activation_available
+        inspection, queue_activation_available=queue_activation_available, e1_schema_ready=e1_schema_ready,
     )
     if inspection.state.initialization is None:
         return tuple(item.action.value for item in guidance if item.allowed and item.action is Action.INIT) + (Action.CONTEXT.value,)
@@ -152,6 +154,7 @@ def for_action(
     action: Action | str,
     *,
     queue_activation_available: bool = False,
+    e1_schema_ready: bool | None = None,
 ) -> ActionGuidance:
     """Return the deterministic non-mutating action decision for one request."""
     selected = Action(action)
@@ -159,6 +162,12 @@ def for_action(
     context = state.active_context
     if selected is Action.CONTEXT:
         return _allow(selected, "authoritative workflow context is available")
+    if state.agreements and e1_schema_ready is False:
+        return _block(
+            selected, "E1_SCHEMA_UPGRADE_REQUIRED",
+            "accepted schema-13 E1 is read-only until explicit human CLI opt-in",
+            (), None,
+        )
     if state.initialization is None and selected is Action.INIT:
         return _allow(selected, "repository authority can be initialized")
     if state.initialization is None:
@@ -279,15 +288,42 @@ def for_action(
         return _block(selected, "NO_ACTIVE_WORK", "the action requires active work", (Action.NEW, Action.CHANGE), Action.NEW)
     if context.status is LifecycleState.PAUSED:
         return _block(selected, "NOTHING_TO_RESUME", "paused work must resume before this action", (Action.CONTINUE,), Action.CONTINUE, _scope(context))
-    return _active_guidance(inspection, selected, context)
+    return _active_guidance(inspection, selected, context, e1_schema_ready)
 
 
-def _active_guidance(inspection: ReviewInspection, action: Action, context: WorkingContext) -> ActionGuidance:
+def _active_guidance(
+    inspection: ReviewInspection, action: Action, context: WorkingContext,
+    e1_schema_ready: bool | None = None,
+) -> ActionGuidance:
     scope = _scope(context)
     if action is Action.PROGRESS:
+        if context.slice_agreement_ref is not None:
+            return _block(action, "ACCEPTED_TASK_TYPED_ONLY", "accepted Task reports require the dedicated typed action", (Action.ACCEPTED_TASK_PROGRESS,), Action.ACCEPTED_TASK_PROGRESS, scope)
         if context.phase in (Phase.RESEARCH, Phase.READY, Phase.IMPLEMENT):
             return _allow(action, "implementation progress can be recorded", scope)
         return _block(action, "REVIEW_REQUIRED", "progress is unavailable after implementation review begins", (Action.REVIEW,), Action.REVIEW, scope)
+    if action is Action.ACCEPTED_TASK_PROGRESS:
+        if context.slice_agreement_ref is None or context.feature_agreement_ref is None:
+            return _block(action, "NO_ACCEPTED_TASK", "no user-approved Task authorizes this action", (), None, scope)
+        # Keep the advertised action tied to the original human-approved focus;
+        # Core repeats this check under the writer lock before any mutation.
+        accepted_slice = next(
+            (item for item in inspection.state.agreements if item.id == context.slice_agreement_ref and item.kind == "SLICE"),
+            None,
+        )
+        if (accepted_slice is None or context.focus != accepted_slice.title
+                or context.current_work != accepted_slice.initial_task):
+            return _block(action, "E1_SCOPE_MISMATCH", "current focus no longer matches the accepted Task", (), None, scope)
+        envelope = context.autonomy_envelope
+        permitted = canonical_autonomy_operation("progress") in {
+            canonical_autonomy_operation(value) for value in envelope.reversible_actions
+        }
+        budget_available = not envelope.operation_budget or context.autonomy_metrics.automatic_operations < envelope.operation_budget
+        if (e1_schema_ready is True and permitted and budget_available
+                and not context.unresolved_material_decision
+                and context.phase in (Phase.RESEARCH, Phase.READY, Phase.IMPLEMENT)):
+            return _allow(action, "exact accepted Task may report unverified progress", scope)
+        return _block(action, "E1_PROGRESS_UNAVAILABLE", "typed Task progress requires schema 14, current autonomy, and implementation scope", (), None, scope)
     if action is Action.REVIEW:
         if context.phase in (Phase.RESEARCH, Phase.READY, Phase.IMPLEMENT, Phase.REVIEW):
             return _allow(action, "review can be recorded", scope)
@@ -340,9 +376,10 @@ def _scope(context: WorkingContext) -> tuple[str, ...]:
 def _next_for_context(context: WorkingContext) -> Action | None:
     if context.unresolved_material_decision:
         return Action.CLARIFY
+    progress_action = Action.ACCEPTED_TASK_PROGRESS if context.slice_agreement_ref else Action.PROGRESS
     return {
-        Phase.RESEARCH: Action.PROGRESS,
-        Phase.READY: Action.PROGRESS,
+        Phase.RESEARCH: progress_action,
+        Phase.READY: progress_action,
         Phase.IMPLEMENT: Action.REVIEW,
         Phase.REVIEW: Action.VERIFY if has_acceptable_review(context.review) else Action.REVIEW,
         Phase.VERIFY: Action.CONVERGE if can_converge(context.review, context.verification) else Action.VERIFY,
@@ -360,9 +397,10 @@ def _next_after_continue(context: WorkingContext) -> Action | None:
     if paused_pair is None:
         return None
     _, phase = paused_pair
+    progress_action = Action.ACCEPTED_TASK_PROGRESS if context.slice_agreement_ref else Action.PROGRESS
     return {
-        Phase.RESEARCH: Action.PROGRESS,
-        Phase.READY: Action.PROGRESS,
+        Phase.RESEARCH: progress_action,
+        Phase.READY: progress_action,
         Phase.IMPLEMENT: Action.REVIEW,
         Phase.REVIEW: Action.VERIFY if has_acceptable_review(context.review) else Action.REVIEW,
         Phase.VERIFY: Action.CONVERGE if can_converge(context.review, context.verification) else Action.VERIFY,

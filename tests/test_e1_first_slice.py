@@ -223,6 +223,7 @@ class FirstSliceTests(unittest.TestCase):
         legacy = json.loads(state_path.read_text(encoding="utf-8"))
         legacy["schema"] = 12
         legacy.pop("agreement_refs")
+        legacy.pop("e1_schema_upgrade")
         state_path.write_text(json.dumps(legacy), encoding="utf-8")
         self.assertEqual(CoreService.open(self.root).recover().revision, self.initial.revision)
         with self.assertRaises(WorkflowError):

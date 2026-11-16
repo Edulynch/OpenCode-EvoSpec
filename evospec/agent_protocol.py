@@ -106,6 +106,7 @@ def _autonomy_delta_json(delta: AutonomyEnvelopeDelta) -> dict[str, JsonValue]:
 def context_json(context: AgentContext) -> dict[str, JsonValue]:
     """Return the stable JSON-safe representation of an agent context."""
     payload: dict[str, JsonValue] = {"revision": context.revision, "repository_id": context.repository_id, "initialization_state": context.initialization_state,
+            "e1_schema_ready": context.e1_schema_ready,
             "accepted_slice": None if context.accepted_slice is None else {
                 "feature_agreement_ref": context.accepted_slice.feature_agreement_ref,
                 "slice_agreement_ref": context.accepted_slice.slice_agreement_ref,
@@ -122,6 +123,16 @@ def context_json(context: AgentContext) -> dict[str, JsonValue]:
             "progress": {"current_action": context.progress.current_action, "focus": context.progress.focus,
                           "completed_work": list(context.progress.completed_work), "current_work": context.progress.current_work,
                           "pending_work": list(context.progress.pending_work), "resume_point": context.progress.resume_point},
+            "task_progress": None if context.task_progress is None else {
+                "task_id": context.task_progress.task_id,
+                "checkpoint": context.task_progress.checkpoint,
+                "statement": context.task_progress.statement,
+                "report_kind": context.task_progress.report_kind,
+                "source_kind": context.task_progress.source_kind,
+                "source_reference": context.task_progress.source_reference,
+                "evidence_refs": list(context.task_progress.evidence_refs),
+                "recorded_revision": context.task_progress.recorded_revision,
+            },
              "decision_state": {"unresolved_material_decision": context.decision_state.unresolved_material_decision,
                                 "clarification_count": context.decision_state.clarification_count,
                                 "constraint_count": context.decision_state.constraint_count,
@@ -412,6 +423,17 @@ def _dispatch(
                 parse_optional_string(request, "current_work"),
                 parse_strings(request, "pending_work"),
                 parse_optional_string(request, "resume_point"),
+                expected_revision=parse_expected_revision(request),
+            )
+        case "accepted_task_progress":
+            return workflow.accepted_task_progress(
+                parse_nonblank_string(request, "repository_id"),
+                parse_nonblank_string(request, "task_id"),
+                parse_nonblank_string(request, "feature_agreement_ref"),
+                parse_nonblank_string(request, "slice_agreement_ref"),
+                parse_nonblank_string(request, "checkpoint"),
+                parse_nonblank_string(request, "statement"),
+                parse_nonblank_strings(request, "evidence_refs"),
                 expected_revision=parse_expected_revision(request),
             )
         case "assess_locks":
