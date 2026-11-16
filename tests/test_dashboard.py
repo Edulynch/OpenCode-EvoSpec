@@ -255,7 +255,12 @@ class DashboardTests(unittest.TestCase):
                 first.close()
                 _ = workflow.new("Add independent dashboard client")
                 changed_revision = workflow.status().revision
-                changed = second.wait_for(lambda frame: frame.event == "revision")
+                # El cliente puede recibir revisiones intermedias ya encoladas;
+                # comprobamos que converge a la revisión final persistida.
+                changed = second.wait_for(
+                    lambda frame: frame.event == "revision"
+                    and json.loads(frame.data) == {"revision": changed_revision}
+                )
                 self.assertEqual(json.loads(changed.data), {"revision": changed_revision})
             finally:
                 first.close()

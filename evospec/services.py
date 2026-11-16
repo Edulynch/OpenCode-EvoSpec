@@ -13,6 +13,9 @@ from typing import TYPE_CHECKING, Never, final
 
 from .domain import (
     AgreementRecord,
+    SliceCriterion,
+    SliceCriteriaRevision,
+    SliceCriteriaHead,
     IDENTITY,
     AssessmentOperation,
     AutonomyAuthorization,
@@ -72,6 +75,8 @@ from .domain import (
     SharedIntent,
     State,
     StateValidationError,
+    E1SchemaUpgradeReceipt,
+    TaskProgress,
     TerminalArchive,
     VerificationEvidence,
     WorkingContext,
@@ -128,6 +133,88 @@ class UserAcceptance:
 
 
 @dataclass(frozen=True, slots=True)
+class SliceCriteriaSpec:
+    """Human-readable Slice bounds, before Core assigns an immutable identity."""
+
+    outcome: str
+    example: str
+    inclusions: tuple[str, ...]
+    exclusions: tuple[str, ...]
+    decisions: tuple[str, ...]
+    criteria: tuple[SliceCriterion, ...]
+
+
+def _slice_criteria_json(spec: SliceCriteriaSpec) -> str:
+    """Use one canonical representation for the terminal prompt and Core proof."""
+    return json.dumps({
+        "outcome": spec.outcome, "example": spec.example,
+        "inclusions": list(spec.inclusions), "exclusions": list(spec.exclusions),
+        "decisions": list(spec.decisions),
+        "criteria": [{"id": item.id, "expected_result": item.expected_result,
+                      "expected_evidence": item.expected_evidence} for item in spec.criteria],
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def validate_slice_criteria_spec(spec: SliceCriteriaSpec) -> None:
+    """Reject partial agreements and unbounded specifications before user consent."""
+    if type(spec) is not SliceCriteriaSpec:
+        raise ServiceError("Slice criteria must use the canonical specification shape")
+    if any(type(value) is not str or not value.strip() or len(value) > 2048
+           for value in (spec.outcome, spec.example)):
+        raise ServiceError("Slice outcome and example must be bounded nonblank text")
+    for name, values in (("inclusions", spec.inclusions), ("exclusions", spec.exclusions),
+                         ("decisions", spec.decisions), ("criteria", spec.criteria)):
+        if type(values) is not tuple or not 1 <= len(values) <= 32:
+            raise ServiceError(f"Slice {name} must contain 1 to 32 entries")
+    if any(type(value) is not str or not value.strip() or len(value) > 2048
+           for value in spec.inclusions + spec.exclusions + spec.decisions):
+        raise ServiceError("Slice scope and decisions must be bounded nonblank text")
+    identifiers: set[str] = set()
+    for criterion in spec.criteria:
+        # Criteria may come from JSON: reject non-text IDs before using the regex.
+        if (type(criterion) is not SliceCriterion or type(criterion.id) is not str
+                or not IDENTITY.fullmatch(criterion.id)):
+            raise ServiceError("Slice criterion must have a stable ID")
+        if criterion.id in identifiers:
+            raise ServiceError("Slice criterion IDs must be unique")
+        identifiers.add(criterion.id)
+        if any(type(value) is not str or not value.strip() or len(value) > 2048
+               for value in (criterion.expected_result, criterion.expected_evidence)):
+            raise ServiceError("Slice criterion result and expected evidence must be bounded text")
+    if len(_slice_criteria_json(spec)) > 32768:
+        raise ServiceError("Slice criteria specification exceeds the acceptance size limit")
+
+
+def slice_acceptance_statement(
+    feature_title: str, slice_title: str, initial_task: str, checkpoint: str,
+    criteria: SliceCriteriaSpec | None = None,
+) -> str:
+    """Bind the initial TTY acceptance to exactly the agreed Slice specification."""
+    statement = (
+        f"Acepto Feature: {feature_title}; Slice: {slice_title}; "
+        f"Task: {initial_task}; checkpoint: {checkpoint}"
+    )
+    if criteria is not None:
+        validate_slice_criteria_spec(criteria)
+        if any(value != value.strip() for value in (
+            feature_title, slice_title, initial_task, checkpoint,
+        )):
+            raise ServiceError("criteria acceptance requires canonical unpadded Feature, Slice, Task and checkpoint")
+        statement += f"; criterios: {_slice_criteria_json(criteria)}"
+    return statement
+
+
+def slice_criteria_decision_statement(
+    previous_revision_id: str, reason: str, criteria: SliceCriteriaSpec,
+) -> str:
+    """An amendment is a separate human decision, never renewed acceptance."""
+    validate_slice_criteria_spec(criteria)
+    if type(reason) is not str or not reason.strip() or len(reason) > 2048:
+        raise ServiceError("criteria amendment requires a bounded explicit reason")
+    return f"Decido revisar criterios desde {previous_revision_id}; motivo: {reason}; criterios: {_slice_criteria_json(criteria)}"
+
+
+@dataclass(frozen=True, slots=True)
 class StaleRevisionError(ServiceError):
     """Raised when a mutation was based on an obsolete state revision."""
 
@@ -139,6 +226,34 @@ class StaleRevisionError(ServiceError):
             f"expected state revision {self.expected_revision}, "
             f"but authority is revision {self.actual_revision}"
         )
+
+
+class DurabilityUncertainError(ServiceError):
+    """The state replacement may have committed; recovery must precede retry."""
+
+
+def _accepted_e1_scope(state: State, root: Path) -> tuple[WorkingContext, AgreementRecord, AgreementRecord]:
+    """Resolve a single accepted primary Task without trusting caller-provided scope."""
+    context = state.active_context
+    initialization = state.initialization
+    root_identity = sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+    if initialization is None or initialization.repository_id != root_identity:
+        raise ServiceError("E1 repository authority does not match the exact local root")
+    if (context is None or context.side_of is not None or context.change_id is None
+            or state.preserved_primary_context is not None or state.preserved_primary_work_id is not None
+            or state.work_items or state.parked_work is not None or state.pending_intake is not None
+            or state.deferred_side_request is not None or len(state.agreements) != 2):
+        raise ServiceError("E1 Task progress requires one active primary accepted Slice")
+    feature = next((item for item in state.agreements if item.id == context.feature_agreement_ref), None)
+    slice_record = next((item for item in state.agreements if item.id == context.slice_agreement_ref), None)
+    if (feature is None or slice_record is None or feature.kind != "FEATURE" or slice_record.kind != "SLICE"
+            or feature.change_id != context.change_id or slice_record.change_id != context.change_id
+            or feature.feature_id != context.feature_id or slice_record.feature_id != context.feature_id
+            or feature.repository_id != root_identity or slice_record.repository_id != root_identity
+            or not slice_record.task_id or not slice_record.initial_task or not slice_record.checkpoint
+            or context.current_work != slice_record.initial_task or context.focus != slice_record.title):
+        raise ServiceError("E1 Task progress cannot expand or replace the human-approved scope")
+    return context, feature, slice_record
 
 
 def _validated(candidate: State, message: str) -> State:
@@ -1576,6 +1691,7 @@ class CoreService:
         initial_task: str,
         checkpoint: str,
         acceptance: UserAcceptance,
+        criteria: SliceCriteriaSpec | None = None,
     ) -> State:
         """Persist a human-approved Feature, Slice and Task in one Core commit."""
         current = _authoritative_state(self.__persistence, state)
@@ -1595,9 +1711,8 @@ class CoreService:
             or not acceptance.statement.strip()
         ):
             raise ServiceError("attributable user acceptance evidence is required")
-        accepted_statement = (
-            f"Acepto Feature: {feature_title}; Slice: {slice_title}; "
-            f"Task: {initial_task}; checkpoint: {checkpoint}"
+        accepted_statement = slice_acceptance_statement(
+            feature_title, slice_title, initial_task, checkpoint, criteria,
         )
         expected_reference = f"tty:{sha256(accepted_statement.encode('utf-8')).hexdigest()[:12]}"
         if acceptance.statement != accepted_statement or acceptance.source_reference != expected_reference:
@@ -1632,6 +1747,12 @@ class CoreService:
         )
         candidate = _record_change(_record_feature(current, feature), change)
         assert candidate.active_context is not None
+        criteria_revision = None if criteria is None else SliceCriteriaRevision(
+            f"slice-criteria-{digest}-1", slice_ref, root_identity,
+            criteria.outcome, criteria.example, criteria.inclusions, criteria.exclusions,
+            criteria.decisions, criteria.criteria,
+            acceptance.source, acceptance.source_reference,
+        )
         candidate = replace(
             candidate,
             active_context=replace(
@@ -1643,6 +1764,8 @@ class CoreService:
                 slice_agreement_ref=slice_ref,
             ),
             agreements=(feature_agreement, slice_agreement),
+            slice_criteria_revisions=() if criteria_revision is None else (criteria_revision,),
+            slice_criteria_heads=() if criteria_revision is None else (SliceCriteriaHead(slice_ref, criteria_revision.id),),
         )
         saved = _prepare_state_publication(candidate, current.revision)
         try:
@@ -1650,6 +1773,181 @@ class CoreService:
         except AtomicFailure as error:
             raise ServiceError("first Slice aggregate publication was rejected") from error
         return saved
+
+    def revise_slice_criteria(
+        self, state: State, criteria: SliceCriteriaSpec, previous_revision_id: str,
+        reason: str, decision: UserAcceptance,
+    ) -> State:
+        """Supersede accepted Slice criteria via one explicit human decision and CAS."""
+        current = _authoritative_state(self.__persistence, state)
+        if current.initialization is None or current.active_context is None:
+            raise ServiceError("an accepted active Slice is required for criterion amendment")
+        slice_ref = current.active_context.slice_agreement_ref
+        if slice_ref is None:
+            raise ServiceError("an accepted Slice reference is required for criterion amendment")
+        agreement = next((item for item in current.agreements if item.id == slice_ref), None)
+        if agreement is None or agreement.kind != "SLICE":
+            raise ServiceError("Slice criteria cannot amend unaccepted scope")
+        root_identity = sha256(str(self.__repository_root).encode("utf-8")).hexdigest()[:16]
+        if agreement.repository_id != root_identity:
+            raise ServiceError("Slice criteria repository binding does not match the current root")
+        head = next((item for item in current.slice_criteria_heads if item.slice_agreement_ref == slice_ref), None)
+        authoritative_previous = "NOT_RECORDED" if head is None else head.revision_id
+        if previous_revision_id != authoritative_previous:
+            raise ServiceError("Slice criteria revision changed; refresh before deciding")
+        statement = slice_criteria_decision_statement(previous_revision_id, reason, criteria)
+        expected_ref = f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"
+        if (
+            type(decision) is not UserAcceptance
+            or decision.source != "INTERACTIVE_TERMINAL"
+            or decision.statement != statement
+            or decision.source_reference != expected_ref
+        ):
+            raise ServiceError("criteria amendment requires its own explicit terminal decision")
+        digest = sha256(json.dumps([
+            root_identity, slice_ref, previous_revision_id, statement, expected_ref,
+        ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+        revision = SliceCriteriaRevision(
+            f"slice-criteria-{digest}", slice_ref, root_identity,
+            criteria.outcome, criteria.example, criteria.inclusions, criteria.exclusions,
+            criteria.decisions, criteria.criteria,
+            "INTERACTIVE_TERMINAL_DECISION", expected_ref,
+            None if head is None else head.revision_id, reason, statement,
+        )
+        new_heads = tuple(item for item in current.slice_criteria_heads if item.slice_agreement_ref != slice_ref)
+        candidate = replace(
+            current,
+            slice_criteria_revisions=current.slice_criteria_revisions + (revision,),
+            slice_criteria_heads=new_heads + (SliceCriteriaHead(slice_ref, revision.id),),
+        )
+        saved = _prepare_state_publication(candidate, current.revision)
+        try:
+            self.__persistence.publish_slice_criteria_revision(saved, revision)
+        except AtomicFailure as error:
+            raise ServiceError("Slice criteria amendment publication was rejected") from error
+        return saved
+    def e1_upgrade_statement(self, state: State) -> str:
+        """Show the exact authority-bound decision the human must confirm."""
+        current = _authoritative_state(self.__persistence, state)
+        if self.__persistence.e1_schema_ready():
+            raise ServiceError("accepted E1 authority already uses schema 14")
+        _, feature, slice_record = _accepted_e1_scope(current, self.__repository_root)
+        assert current.initialization is not None
+        return (
+            f"Autorizo migrar E1 a schema 14; repository: {current.initialization.repository_id}; "
+            f"revision: {current.revision}; Feature: {feature.id}; Slice: {slice_record.id}; "
+            f"Task: {slice_record.task_id}; source-sha256: {self.__persistence.state_source_sha256()}"
+        )
+
+    def confirmed_e1_upgrade(self, source_revision: int) -> State | None:
+        """Recognize an already committed conversion using its immutable in-state receipt."""
+        current = self.__persistence.recover()
+        receipt = current.e1_schema_upgrade
+        if (type(source_revision) is int and source_revision >= 0 and receipt is not None
+                and receipt.source_revision == source_revision and self.__persistence.e1_schema_ready()):
+            return current
+        return None
+
+    def upgrade_e1_schema(self, state: State, acceptance: UserAcceptance) -> State:
+        """Convert accepted E1 schema 13 only after a revision-bound terminal decision."""
+        current = _authoritative_state(self.__persistence, state)
+        _, feature, slice_record = _accepted_e1_scope(current, self.__repository_root)
+        statement = self.e1_upgrade_statement(current)
+        token = sha256(statement.encode("utf-8")).hexdigest()[:12]
+        if (type(acceptance) is not UserAcceptance or acceptance.source != "INTERACTIVE_TERMINAL"
+                or acceptance.statement != statement or acceptance.source_reference != f"tty:{token}"):
+            raise ServiceError("schema upgrade requires exact attributable human confirmation")
+
+        def convert(locked: State) -> State:
+            # Rebind the accepted identity and revision while holding the writer lock.
+            _accepted_e1_scope(locked, self.__repository_root)
+            if locked != current:
+                raise ServiceError("accepted E1 authority changed before schema conversion")
+            assert locked.initialization is not None
+            receipt = E1SchemaUpgradeReceipt(
+                locked.revision, locked.revision + 1, source_digest,
+                acceptance.statement, acceptance.source, acceptance.source_reference,
+                locked.initialization.repository_id, feature.id, slice_record.id,
+            )
+            return _prepare_state_publication(replace(locked, e1_schema_upgrade=receipt), locked.revision)
+
+        try:
+            # A concurrent in-place rewrite with the same revision invalidates consent too.
+            source_digest = statement.rsplit("source-sha256: ", 1)[1]
+            return self.__persistence.transact_e1(
+                current.revision, convert, upgrade=True, source_digest=source_digest,
+            )
+        except AtomicFailure as error:
+            self.__raise_e1_publication_error(current.revision, error)
+
+    def record_accepted_task_progress(
+        self, state: State, repository_id: str, task_id: str,
+        feature_agreement_ref: str, slice_agreement_ref: str,
+        checkpoint: str, statement: str, evidence_refs: tuple[str, ...],
+    ) -> State:
+        """Commit one unverified Task report and in-memory lifecycle transitions in one CAS."""
+        current = _authoritative_state(self.__persistence, state)
+        values = (repository_id, task_id, feature_agreement_ref, slice_agreement_ref, checkpoint, statement)
+        if any(type(item) is not str or not item.strip() or len(item) > 2048 for item in values):
+            raise ServiceError("E1 Task progress requires bounded nonblank identity and text")
+        if (type(evidence_refs) is not tuple or len(evidence_refs) > 16
+                or len(set(evidence_refs)) != len(evidence_refs)
+                or any(type(item) is not str or not item.strip() or len(item) > 2048 for item in evidence_refs)):
+            raise ServiceError("E1 evidence references must be bounded distinct leads")
+
+        def record(locked: State) -> State:
+            context, feature, slice_record = _accepted_e1_scope(locked, self.__repository_root)
+            if (locked != current or repository_id != slice_record.repository_id
+                    or feature_agreement_ref != feature.id or slice_agreement_ref != slice_record.id
+                    or task_id != slice_record.task_id):
+                raise ServiceError("E1 Task identity, root, agreement or revision does not match authority")
+            if _evaluate_autonomy(context, "progress", (), False).authorization is not AutonomyAuthorization.ALLOWED:
+                raise ServiceError("E1 Task progress is outside the current autonomy budget or permissions")
+            if context.unresolved_material_decision:
+                raise ServiceError("E1 Task progress cannot bypass an unresolved human decision")
+            pair = (context.status, context.phase)
+            try:
+                if pair == (LifecycleState.PROPOSED, Phase.RESEARCH):
+                    pair = advance(*pair, LifecycleState.READY, Phase.READY,
+                                   context.unresolved_material_decision, context.review, context.verification,
+                                   context.convergence_complete)
+                if pair == (LifecycleState.READY, Phase.READY):
+                    pair = advance(*pair, LifecycleState.IN_PROGRESS, Phase.IMPLEMENT,
+                                   context.unresolved_material_decision, context.review, context.verification,
+                                   context.convergence_complete)
+            except LifecycleError as error:
+                raise ServiceError("E1 Task progress lifecycle transition is invalid") from error
+            if pair != (LifecycleState.IN_PROGRESS, Phase.IMPLEMENT):
+                raise ServiceError("E1 Task progress is permitted only during implementation")
+            report = TaskProgress(
+                task_id, checkpoint.strip(), statement.strip(), "REPORTED_UNVERIFIED",
+                # Same-user protocol clients cannot prove they were invoked by the host.
+                "UNKNOWN", None, evidence_refs, locked.revision + 1,
+            )
+            updated = replace(
+                context, status=pair[0], phase=pair[1], task_progress=report,
+                current_action="accepted Task progress reported",
+                resume_point=None,
+                autonomy_metrics=replace(context.autonomy_metrics,
+                                         automatic_operations=context.autonomy_metrics.automatic_operations + 1),
+            )
+            return _prepare_state_publication(replace(locked, active_context=updated), locked.revision)
+
+        try:
+            return self.__persistence.transact_e1(current.revision, record)
+        except AtomicFailure as error:
+            self.__raise_e1_publication_error(current.revision, error)
+
+    def __raise_e1_publication_error(self, expected_revision: int, error: AtomicFailure) -> Never:
+        """Preserve uncertainty; a failed fsync after replacement is not proof of rollback."""
+        if "durability is uncertain" in str(error):
+            raise DurabilityUncertainError(
+                "E1_DURABILITY_UNKNOWN: state may have committed; recover and inspect revision before retry"
+            ) from error
+        actual_revision = self.__persistence.recover().revision
+        if actual_revision != expected_revision:
+            raise StaleRevisionError(expected_revision, actual_revision) from error
+        raise ServiceError(str(error)) from error
 
     def record_capability_selection(self, state: State, selection: PendingCapabilitySelection) -> State:
         current = _authoritative_state(self.__persistence, state)
@@ -1763,6 +2061,10 @@ class CoreService:
 
     def recover(self) -> State:
         return self.__persistence.recover()
+
+    def e1_schema_ready(self) -> bool:
+        """Inspect the persisted writer format without changing Core authority."""
+        return self.__persistence.e1_schema_ready()
 
     def mutation_state(self, expected_revision: ExpectedRevision) -> State:
         """Recover authority only when the caller's mutation revision is current."""
@@ -2646,6 +2948,8 @@ class CoreService:
         resume_point: str | None,
     ) -> State:
         current = _authoritative_state(self.__persistence, state)
+        if current.active_context is not None and current.active_context.slice_agreement_ref is not None:
+            raise ServiceError("accepted E1 Task progress requires the guarded typed operation")
         active = current.active_context
         if active is None:
             raise ServiceError("progress recording requires active work")
@@ -2917,7 +3221,8 @@ class CoreService:
         return saved
 
     def inspect_review(self) -> ReviewInspection:
-        return inspect(self.__persistence.recover())
+        state, e1_schema_ready = self.__persistence.recover_snapshot()
+        return replace(inspect(state), e1_schema_ready=e1_schema_ready)
 
     def lock_gate(self, state: State) -> str | None:
         return _lock_gate(_authoritative_state(self.__persistence, state))

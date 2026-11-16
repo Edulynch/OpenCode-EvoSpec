@@ -6,10 +6,13 @@ import json
 import shutil
 import subprocess
 import unittest
+from hashlib import sha256
 from pathlib import Path
 
 from evospec.agent_protocol import execute
-from evospec.services import CoreService
+from evospec.domain import ExpectedRevision, SliceCriterion
+from evospec.services import CoreService, SliceCriteriaSpec, UserAcceptance, slice_acceptance_statement
+from evospec.workflow import WorkflowService
 from tests._tempdir import TemporaryDirectory
 from tests.r2d2_native_fixture import CHECKPOINT, FEATURE, MARKER, TASK, build_fixture
 
@@ -43,7 +46,10 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         runner = (Path(__file__).parent / "r2d2_native_smoke.ps1").read_text(encoding="utf-8")
         self.assertIn("tests.r2d2_native_fixture --scenario both", runner)
         self.assertIn("EVOSPEC_TEST_FIXTURE_ONLY.txt", runner)
-        self.assertIn("openai/gpt-6.1-sol#high", runner)
+        # The native test may exercise the selected host route but cannot pick
+        # a replacement model on the user's behalf.
+        self.assertNotIn("--model", runner)
+        self.assertIn("HOST_CONFIGURED_NOT_ATTESTED", runner)
         self.assertIn("--agent build", runner)
         self.assertIn("--auto", runner)
         self.assertIn("opencode run --server $serverUrl", runner)
@@ -109,6 +115,36 @@ class R2D2NativeFixtureTests(unittest.TestCase):
                 for item in (root / ".evospec").rglob("*") if item.is_file()
             }
             self.assertEqual(before, after)
+
+    def test_parked_schema15_criteria_remain_read_only_and_inactive(self) -> None:
+        """A parked Task retains R1 criteria without inheriting active authority."""
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "parked-with-criteria"
+            root.mkdir()
+            workflow = WorkflowService.open(root)
+            initial = workflow.init()
+            spec = SliceCriteriaSpec(
+                "Recuperar el trabajo acordado", "Un Task aparcado conserva sus criterios",
+                ("Mostrar el acuerdo",), ("No activar automáticamente",),
+                ("Conservar el estado del Task",),
+                (SliceCriterion("AC-PARKED", "Criterios visibles", "Lectura nativa del contexto"),),
+            )
+            statement = slice_acceptance_statement(FEATURE, "Slice temporal", TASK, CHECKPOINT, spec)
+            # This provenance is simulated solely inside the disposable test root.
+            synthetic = UserAcceptance(statement, f"tty:{sha256(statement.encode()).hexdigest()[:12]}")
+            workflow.accept_first_slice(
+                FEATURE, "Slice temporal", TASK, CHECKPOINT, synthetic,
+                expected_revision=ExpectedRevision(initial.revision), criteria=spec,
+            )
+            self.assertEqual(workflow.park("test fixture parked").code, "PARKED")
+            original = CoreService.open(root).recover()
+            context = json.loads(execute(root, '{"action":"context"}'))["context"]
+            self.assertIsNone(context["accepted_slice"])
+            self.assertIsNone(context["work_queue"]["active"])
+            parked = context["work_queue"]["all"][0]["accepted_slice"]
+            self.assertEqual(parked["criteria_status"], "RECORDED")
+            self.assertEqual(parked["criteria_revision"]["criteria"][0]["id"], "AC-PARKED")
+            self.assertEqual(CoreService.open(root).recover(), original)
 
     def test_ambiguous_fixture_never_selects_a_candidate(self) -> None:
         with TemporaryDirectory() as temporary:

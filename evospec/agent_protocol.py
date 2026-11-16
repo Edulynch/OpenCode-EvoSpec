@@ -104,8 +104,8 @@ def _autonomy_delta_json(delta: AutonomyEnvelopeDelta) -> dict[str, JsonValue]:
 
 
 def _accepted_slice_json(accepted: AcceptedSliceContext | None) -> dict[str, JsonValue] | None:
-    # Active and parked Tasks share one projection so both preserve exactly
-    # the agreement's original meaning and checkpoint.
+    # Active and parked Tasks use the same contract, including the current
+    # criteria head, without promoting parked work into active authority.
     if accepted is None:
         return None
     return {
@@ -118,18 +118,47 @@ def _accepted_slice_json(accepted: AcceptedSliceContext | None) -> dict[str, Jso
         "checkpoint": accepted.checkpoint,
         "source": accepted.source,
         "source_reference": accepted.source_reference,
+        "criteria_status": accepted.criteria_status,
+        "criteria_revision": None if accepted.criteria_revision is None else {
+            "id": accepted.criteria_revision.id,
+            "previous_revision_id": accepted.criteria_revision.previous_revision_id,
+            "outcome": accepted.criteria_revision.outcome,
+            "example": accepted.criteria_revision.example,
+            "inclusions": list(accepted.criteria_revision.inclusions),
+            "exclusions": list(accepted.criteria_revision.exclusions),
+            "decisions": list(accepted.criteria_revision.decisions),
+            "criteria": [
+                {"id": item.id, "expected_result": item.expected_result,
+                 "expected_evidence": item.expected_evidence}
+                for item in accepted.criteria_revision.criteria
+            ],
+            "source": accepted.criteria_revision.source,
+            "source_reference": accepted.criteria_revision.source_reference,
+            "reason": accepted.criteria_revision.reason,
+        },
     }
 
 
 def context_json(context: AgentContext) -> dict[str, JsonValue]:
     """Return the stable JSON-safe representation of an agent context."""
     payload: dict[str, JsonValue] = {"revision": context.revision, "repository_id": context.repository_id, "initialization_state": context.initialization_state,
+            "e1_schema_ready": context.e1_schema_ready,
             "accepted_slice": _accepted_slice_json(context.accepted_slice),
             "lifecycle": None if context.lifecycle is None else list(context.lifecycle),
             "feature_id": context.feature_id, "change_id": context.change_id, "classification": context.classification,
             "progress": {"current_action": context.progress.current_action, "focus": context.progress.focus,
                           "completed_work": list(context.progress.completed_work), "current_work": context.progress.current_work,
                           "pending_work": list(context.progress.pending_work), "resume_point": context.progress.resume_point},
+            "task_progress": None if context.task_progress is None else {
+                "task_id": context.task_progress.task_id,
+                "checkpoint": context.task_progress.checkpoint,
+                "statement": context.task_progress.statement,
+                "report_kind": context.task_progress.report_kind,
+                "source_kind": context.task_progress.source_kind,
+                "source_reference": context.task_progress.source_reference,
+                "evidence_refs": list(context.task_progress.evidence_refs),
+                "recorded_revision": context.task_progress.recorded_revision,
+            },
              "decision_state": {"unresolved_material_decision": context.decision_state.unresolved_material_decision,
                                 "clarification_count": context.decision_state.clarification_count,
                                 "constraint_count": context.decision_state.constraint_count,
@@ -421,6 +450,17 @@ def _dispatch(
                 parse_optional_string(request, "current_work"),
                 parse_strings(request, "pending_work"),
                 parse_optional_string(request, "resume_point"),
+                expected_revision=parse_expected_revision(request),
+            )
+        case "accepted_task_progress":
+            return workflow.accepted_task_progress(
+                parse_nonblank_string(request, "repository_id"),
+                parse_nonblank_string(request, "task_id"),
+                parse_nonblank_string(request, "feature_agreement_ref"),
+                parse_nonblank_string(request, "slice_agreement_ref"),
+                parse_nonblank_string(request, "checkpoint"),
+                parse_nonblank_string(request, "statement"),
+                parse_nonblank_strings(request, "evidence_refs"),
                 expected_revision=parse_expected_revision(request),
             )
         case "assess_locks":

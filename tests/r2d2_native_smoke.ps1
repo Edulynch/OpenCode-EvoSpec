@@ -6,7 +6,6 @@ $ErrorActionPreference = 'Stop'
 
 $sourceRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $branchName = 'feat/e1-r2d2-parked-context-recovery'
-$modelName = 'openai/gpt-6.1-sol#high'
 
 function Get-FixtureInventory {
     param([Parameter(Mandatory)][string]$Root)
@@ -227,12 +226,13 @@ try {
                 if ((Get-Location).ProviderPath -ne $fixtureRoot) {
                     throw "STOP: shell did not enter the isolated fixture $fixtureRoot."
                 }
-                # The model connects to the same preflighted private server;
+                # The private host owns its model selection; the smoke must not
+                # override the user's provider route to obtain a test result.
                 # --auto handles only non-denied host permissions.
                 $previousPassword = [Environment]::GetEnvironmentVariable('OPENCODE_PASSWORD', 'Process')
                 try {
                     $env:OPENCODE_PASSWORD = $privatePassword
-                    $outputLines = @(& opencode run --server $serverUrl --auto --agent build --model $modelName --format json $job.Prompt 2>&1)
+                    $outputLines = @(& opencode run --server $serverUrl --auto --agent build --format json $job.Prompt 2>&1)
                     $exitCode = $LASTEXITCODE
                 }
                 finally {
@@ -323,7 +323,7 @@ try {
     [pscustomobject]@{
         SourceBranch = $branch
         SourceHead = (& git rev-parse HEAD).Trim()
-        Model = $modelName
+        Model = 'HOST_CONFIGURED_NOT_ATTESTED'
         Agent = 'build'
         SyntheticOnly = $true
         PrivateServerPreflight = 'PASSED'

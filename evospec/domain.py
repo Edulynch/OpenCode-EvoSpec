@@ -209,6 +209,43 @@ class AgreementRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class SliceCriterion:
+    """Observable acceptance condition; this is a promise, not a test result."""
+
+    id: str
+    expected_result: str
+    expected_evidence: str
+
+
+@dataclass(frozen=True, slots=True)
+class SliceCriteriaRevision:
+    """Immutable, attributable version of the agreed Slice boundaries."""
+
+    id: str
+    slice_agreement_ref: str
+    repository_id: str
+    outcome: str
+    example: str
+    inclusions: tuple[str, ...]
+    exclusions: tuple[str, ...]
+    decisions: tuple[str, ...]
+    criteria: tuple[SliceCriterion, ...]
+    source: str
+    source_reference: str
+    previous_revision_id: str | None = None
+    reason: str | None = None
+    decision_statement: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SliceCriteriaHead:
+    """Core-owned current pointer; old criterion revisions remain accessible."""
+
+    slice_agreement_ref: str
+    revision_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class DeferredSideRequest:
     id: IntakeId
     intent: str
@@ -776,6 +813,35 @@ class ConvergenceAssessment:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskProgress:
+    """One unverified operational report, never acceptance of completed value."""
+
+    task_id: str
+    checkpoint: str
+    statement: str
+    report_kind: str
+    source_kind: str
+    source_reference: str | None
+    evidence_refs: tuple[str, ...]
+    recorded_revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class E1SchemaUpgradeReceipt:
+    """Durable proof of exactly which old E1 authority the human converted."""
+
+    source_revision: int
+    converted_revision: int
+    source_sha256: str
+    statement: str
+    source: str
+    source_reference: str
+    repository_id: str
+    feature_agreement_ref: str
+    slice_agreement_ref: str
+
+
+@dataclass(frozen=True, slots=True)
 class WorkingContext:
     feature_id: FeatureId
     change_id: ChangeId | None
@@ -813,6 +879,7 @@ class WorkingContext:
     autonomy_metrics: AutonomyMetrics = field(default=AutonomyMetrics(), compare=False)
     feature_agreement_ref: str | None = None
     slice_agreement_ref: str | None = None
+    task_progress: TaskProgress | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -897,6 +964,9 @@ class State:
     pending_autonomy_expansion: PendingAutonomyExpansion | None = None
     autonomy_expansion_history: tuple[AutonomyExpansionRecord, ...] = ()
     agreements: tuple[AgreementRecord, ...] = ()
+    e1_schema_upgrade: E1SchemaUpgradeReceipt | None = None
+    slice_criteria_revisions: tuple[SliceCriteriaRevision, ...] = ()
+    slice_criteria_heads: tuple[SliceCriteriaHead, ...] = ()
 
 
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -1499,6 +1569,29 @@ def _context_shape(context: WorkingContext) -> None:
         raise StateValidationError("autonomy metrics are invalid")
     if context.publication is not None:
         _publication_shape(context.publication)
+    if context.task_progress is not None:
+        report = context.task_progress
+        if type(report) is not TaskProgress:
+            raise StateValidationError("Task progress must use the typed E1 record")
+        for value, label in (
+            (report.task_id, "Task progress id"),
+            (report.checkpoint, "Task progress checkpoint"),
+            (report.statement, "Task progress statement"),
+        ):
+            if type(value) is not str or not value.strip() or len(value) > 2048:
+                raise StateValidationError(f"{label} must be bounded nonblank text")
+        if report.report_kind != "REPORTED_UNVERIFIED" or report.source_kind not in ("UNKNOWN", "AGENT_REPORTED"):
+            raise StateValidationError("Task progress cannot claim verification or host attestation")
+        if report.source_reference is not None:
+            raise StateValidationError("unattested Task progress cannot claim a source reference")
+        if (type(report.evidence_refs) is not tuple or len(report.evidence_refs) > 16
+                or len(set(report.evidence_refs)) != len(report.evidence_refs)
+                or any(type(item) is not str or not item.strip() or len(item) > 2048 for item in report.evidence_refs)):
+            raise StateValidationError("Task progress evidence references must be bounded leads")
+        if type(report.recorded_revision) is not int or report.recorded_revision < 1:
+            raise StateValidationError("Task progress revision is invalid")
+        if context.resume_point is not None:
+            raise StateValidationError("E1 Task progress cannot duplicate its checkpoint in resume_point")
 
 
 def _publication_shape(publication: LivingSpecPublication) -> None:
@@ -2115,6 +2208,32 @@ def validate_state(state: State) -> None:
             not agreement.task_id or not agreement.initial_task or not agreement.checkpoint
         ):
             raise StateValidationError("Slice agreement requires its initial Task and checkpoint")
+    receipt = state.e1_schema_upgrade
+    if receipt is not None:
+        if type(receipt) is not E1SchemaUpgradeReceipt:
+            raise StateValidationError("E1 schema upgrade receipt is not typed authority")
+        if (type(receipt.source_revision) is not int or receipt.source_revision < 1
+                or type(receipt.converted_revision) is not int
+                or receipt.converted_revision != receipt.source_revision + 1
+                or receipt.converted_revision > state.revision
+                or type(receipt.source_sha256) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", receipt.source_sha256) is None):
+            raise StateValidationError("E1 schema upgrade source identity is invalid")
+        if (initialization is None or receipt.repository_id != initialization.repository_id
+                or len(state.agreements) != 2):
+            raise StateValidationError("E1 schema upgrade receipt does not bind accepted authority")
+        feature = next((item for item in state.agreements if item.id == receipt.feature_agreement_ref), None)
+        slice_record = next((item for item in state.agreements if item.id == receipt.slice_agreement_ref), None)
+        if feature is None or slice_record is None or feature.kind != "FEATURE" or slice_record.kind != "SLICE":
+            raise StateValidationError("E1 schema upgrade receipt must bind the exact Feature and Slice")
+        statement = (
+            f"Autorizo migrar E1 a schema 14; repository: {receipt.repository_id}; "
+            f"revision: {receipt.source_revision}; Feature: {feature.id}; Slice: {slice_record.id}; "
+            f"Task: {slice_record.task_id}; source-sha256: {receipt.source_sha256}"
+        )
+        if (receipt.statement != statement or receipt.source != "INTERACTIVE_TERMINAL"
+                or receipt.source_reference != f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"):
+            raise StateValidationError("E1 schema upgrade human approval evidence is invalid")
     parked = state.parked_work
     if parked is not None:
         if type(parked) is not ParkedWork:
@@ -2386,11 +2505,114 @@ def validate_state(state: State) -> None:
                 or feature_agreement.change_id != context.change_id
             ):
                 raise StateValidationError("context agreement references are not authoritative")
+        if context.task_progress is not None:
+            report = context.task_progress
+            slice_agreement = agreement_index.get(slice_ref) if slice_ref is not None else None
+            if (
+                slice_agreement is None
+                or slice_agreement.task_id != report.task_id
+                or report.recorded_revision > state.revision
+            ):
+                raise StateValidationError("Task progress does not belong to the accepted Slice")
     for agreement in state.agreements:
         if agreement.kind == "SLICE" and not any(
             context.slice_agreement_ref == agreement.id for context in agreement_contexts
         ):
             raise StateValidationError("Slice agreement has no owning context")
+    if type(state.slice_criteria_revisions) is not tuple or type(state.slice_criteria_heads) is not tuple:
+        raise StateValidationError("Slice criteria authority must be immutable tuples")
+    if any(type(item) is not SliceCriteriaRevision for item in state.slice_criteria_revisions):
+        raise StateValidationError("Slice criteria revision shape is invalid")
+    if any(type(item) is not SliceCriteriaHead for item in state.slice_criteria_heads):
+        raise StateValidationError("Slice criteria head shape is invalid")
+    _unique((revision.id for revision in state.slice_criteria_revisions), "Slice criteria revision")
+    _unique((head.slice_agreement_ref for head in state.slice_criteria_heads), "Slice criteria head")
+    revision_index = {revision.id: revision for revision in state.slice_criteria_revisions}
+    for revision in state.slice_criteria_revisions:
+        _identity(revision.id, "Slice criteria revision")
+        agreement = agreement_index.get(revision.slice_agreement_ref)
+        if agreement is None or agreement.kind != "SLICE" or revision.repository_id != agreement.repository_id:
+            raise StateValidationError("Slice criteria must be bound to the accepted Slice and repository")
+        for value in (revision.outcome, revision.example, revision.source, revision.source_reference):
+            _text(value, "Slice criteria content or provenance")
+        for name, values in (("inclusions", revision.inclusions), ("exclusions", revision.exclusions),
+                             ("decisions", revision.decisions), ("criteria", revision.criteria)):
+            if type(values) is not tuple or not values:
+                raise StateValidationError(f"Slice criteria {name} must be a nonempty tuple")
+        if any(type(value) is not str or not value.strip() for value in
+               revision.inclusions + revision.exclusions + revision.decisions):
+            raise StateValidationError("Slice criteria scope and decisions must be nonblank text")
+        _unique((item.id for item in revision.criteria), "Slice criterion")
+        for criterion in revision.criteria:
+            if type(criterion) is not SliceCriterion:
+                raise StateValidationError("Slice criterion shape is invalid")
+            _identity(criterion.id, "Slice criterion")
+            _text(criterion.expected_result, "expected result")
+            _text(criterion.expected_evidence, "expected evidence")
+        # Reconstruct the exact mini-spec that the human saw. A changed JSON
+        # record must not silently retain the old terminal authorization.
+        canonical_spec = json.dumps({
+            "outcome": revision.outcome, "example": revision.example,
+            "inclusions": list(revision.inclusions), "exclusions": list(revision.exclusions),
+            "decisions": list(revision.decisions),
+            "criteria": [{"id": item.id, "expected_result": item.expected_result,
+                          "expected_evidence": item.expected_evidence} for item in revision.criteria],
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if revision.previous_revision_id is None:
+            initial = revision.reason is None and revision.source == "INTERACTIVE_TERMINAL"
+            legacy_first_amendment = bool(revision.reason) and revision.source == "INTERACTIVE_TERMINAL_DECISION"
+            if not (initial or legacy_first_amendment):
+                raise StateValidationError("first criteria require initial acceptance or a separate decision")
+            if initial:
+                owning_feature = next(
+                    (item for item in state.agreements
+                     if item.kind == "FEATURE" and item.feature_id == agreement.feature_id),
+                    None,
+                )
+                if (
+                    owning_feature is None
+                    or
+                    revision.decision_statement is not None
+                    or revision.source_reference != agreement.source_reference
+                    or revision.id != f"slice-criteria-{agreement.id.removeprefix('agreement-slice-')}-1"
+                    or agreement.statement != (
+                        f"Acepto Feature: {owning_feature.title if owning_feature is not None else ''}; "
+                        f"Slice: {agreement.title}; Task: {agreement.initial_task}; "
+                        f"checkpoint: {agreement.checkpoint}; criterios: {canonical_spec}"
+                    )
+                ):
+                    raise StateValidationError("initial criteria must match the exact accepted agreement")
+        else:
+            predecessor = revision_index.get(revision.previous_revision_id)
+            if predecessor is None or predecessor.slice_agreement_ref != revision.slice_agreement_ref:
+                raise StateValidationError("Slice criteria predecessor is missing or belongs elsewhere")
+            if not revision.reason or revision.source != "INTERACTIVE_TERMINAL_DECISION":
+                raise StateValidationError("criteria amendment requires an attributable separate decision")
+        if revision.source == "INTERACTIVE_TERMINAL_DECISION":
+            previous = revision.previous_revision_id or "NOT_RECORDED"
+            statement = f"Decido revisar criterios desde {previous}; motivo: {revision.reason}; criterios: {canonical_spec}"
+            expected_ref = f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"
+            digest = sha256(json.dumps([
+                revision.repository_id, revision.slice_agreement_ref, previous, statement, expected_ref,
+            ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+            if (
+                revision.decision_statement != statement
+                or revision.source_reference != expected_ref
+                or revision.id != f"slice-criteria-{digest}"
+            ):
+                raise StateValidationError("amended criteria must match the exact recorded human decision")
+    reachable: set[str] = set()
+    for head in state.slice_criteria_heads:
+        revision = revision_index.get(head.revision_id)
+        if revision is None or revision.slice_agreement_ref != head.slice_agreement_ref:
+            raise StateValidationError("Slice criteria head must target its accepted Slice")
+        while revision is not None:
+            if revision.id in reachable:
+                raise StateValidationError("Slice criteria revision history must be linear and acyclic")
+            reachable.add(revision.id)
+            revision = revision_index.get(revision.previous_revision_id) if revision.previous_revision_id else None
+    if reachable != set(revision_index):
+        raise StateValidationError("Slice criteria history must be reachable from Core-owned heads")
     _unique(
         (agreement.task_id for agreement in state.agreements if agreement.task_id is not None),
         "Slice Task",
@@ -2555,6 +2777,8 @@ class ReviewInspection:
     lock_revisions: tuple[SemanticLockRevision, ...] = ()
     lock_releases: tuple[LockRelease, ...] = ()
     lock_authorizations: tuple[LockAuthorization, ...] = ()
+    # This read-only value comes from the same state.json read as `state`.
+    e1_schema_ready: bool | None = None
 
     @property
     def context(self) -> WorkingContext | None:
