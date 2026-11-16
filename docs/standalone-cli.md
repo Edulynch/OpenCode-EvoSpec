@@ -71,7 +71,7 @@ The package installation above is the normal source-based path and also provides
 
 ## Lifecycle Commands
 
-The lifecycle surface contains `init`, `new`, `change`, `clarify`, `continue`, `status`, and `review`, plus a narrowly scoped E1 `accept-slice` user-confirmation command. The separate `ui` dashboard and `doctor` diagnostic are read-only local commands.
+The lifecycle surface contains `init`, `new`, `change`, `clarify`, `continue`, `status`, and `review`, plus narrowly scoped E1 `accept-slice` and `revise-slice-criteria` terminal-confirmed commands. The separate `ui` dashboard and `doctor` diagnostic are read-only local commands.
 
 ### `accept-slice` (E1 first Slice, explicit human consent)
 
@@ -85,6 +85,50 @@ evospec accept-slice --feature "Task manager" --slice "Local task list" --task "
 ```
 
 After acceptance, restart OpenCode V2 or run `evospec status` in another local session. The OpenCode `evospec_context` tool recovers the same immutable agreement references, Task ID and initial Task through Core's read-only context projection. State lives only in the selected repository's `.evospec` directory; copying the state to another root is rejected and cross-computer synchronization is out of scope. Older state schemas remain readable but cannot enter this first-Slice writer automatically. This path is not yet a native OpenCode approval-dialog implementation and does not prove OpenCode host permission parity.
+
+### `accept-slice --criteria-file` (R1-D1 criteria in the **same** acceptance)
+
+Prepare a JSON mini-spec for **only the next useful Slice**. Each stable criterion identifies observable behavior and the evidence expected later; describing evidence here does not assert that tests ran or passed.
+
+```json
+{
+  "outcome": "Users see their locally saved tasks after reopening the app",
+  "example": "A saved task appears again when the app restarts",
+  "inclusions": ["Show existing tasks", "Persist local tasks"],
+  "exclusions": ["No account system", "No cross-device sync"],
+  "decisions": ["Use local storage for this Slice"],
+  "criteria": [
+    {
+      "id": "AC-1",
+      "expected_result": "A saved task reappears after restart",
+      "expected_evidence": "Local restart test"
+    }
+  ]
+}
+```
+
+Save the object as `slice-criteria.json`. From a PowerShell terminal in the target repository:
+
+```powershell
+cd 'D:\WORKSPACE\Personal\Tools\YourConsumerProject'
+git branch --show-current
+evospec status
+evospec accept-slice --feature 'Task manager' --slice 'Local task list' --task 'Implement task list' --checkpoint 'Local list verified' --criteria-file '.\slice-criteria.json' --expected-revision 1
+```
+
+The CLI displays the entire canonical agreement and prompts for one `ACEPTO <token>` confirmation. Core publishes the Feature, Slice, initial Task, pending checkpoint, and immutable criteria revision under one State CAS. The model/agent cannot silently accept on the user's behalf.
+
+For a material amendment, first read `evospec status` or the read-only `evospec_context` result to obtain the **current** criteria revision. Write the replacement complete JSON mini-spec and use:
+
+```powershell
+cd 'D:\WORKSPACE\Personal\Tools\YourConsumerProject'
+git branch --show-current
+evospec revise-slice-criteria --criteria-file '.\slice-criteria.json' --previous-criteria-revision 'slice-criteria-EXAMPLE' --reason 'Approved material scope change' --expected-revision 2
+```
+
+This is a **separate `DECIDO <token>` decision**, not a repeat of the initial acceptance. The predecessor remains immutable, and both the State revision and criteria head are checked before committing. Substitute the actual values read from Core; example identities and revisions are not defaults. Previously accepted states without criteria report `NOT_RECORDED`; a deliberate decision may add their first revision with `--previous-criteria-revision NOT_RECORDED`. Lightweight work need not use the criteria command.
+
+**Schema compatibility boundary:** Historical schema **13** remains supported with its existing behavior. An accepted E1 Task on schema 13 requires an explicit, revision- and source-bound human upgrade to schema **14**; this does not repeat Slice acceptance. Schema 14 preserves accepted Task progress, checkpoints, and the upgrade receipt, while criteria remain `NOT_RECORDED` until a separate explicit material criteria decision promotes the state to schema **15**. Schema 15 retains Task progress and immutable agreements alongside the canonical criteria history and head. A technical PASS, native PASS, evidence record, or Task completion never implies criterion-outcome acceptance. R3 evidence evaluation and R4 dashboards remain out of scope.
 
 ### `init`
 

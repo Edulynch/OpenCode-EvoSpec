@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .domain import AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, State, WorkItem
+from .domain import AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, SliceCriteriaRevision, State, WorkItem
 from .guidance import (
     ActionGuidance,
     MaterialDecisionEvidence,
@@ -201,6 +201,8 @@ class AcceptedSliceContext:
     checkpoint: str
     source: str
     source_reference: str
+    criteria_status: str = "NOT_RECORDED"
+    criteria_revision: SliceCriteriaRevision | None = None
 
 
 def project_context(workflow: WorkflowService, inspection: ReviewInspection | None = None) -> AgentContext:
@@ -394,10 +396,15 @@ def _accepted_slice_context(state: State) -> AcceptedSliceContext | None:
     assert slice_record.task_id is not None
     assert slice_record.initial_task is not None
     assert slice_record.checkpoint is not None
+    head = next((item for item in state.slice_criteria_heads if item.slice_agreement_ref == slice_record.id), None)
+    revision = None if head is None else next(
+        (item for item in state.slice_criteria_revisions if item.id == head.revision_id), None
+    )
     return AcceptedSliceContext(
         feature.id, slice_record.id, feature.title, slice_record.title,
         slice_record.task_id, slice_record.initial_task, slice_record.checkpoint,
         slice_record.source, slice_record.source_reference,
+        "NOT_RECORDED" if revision is None else "RECORDED", revision,
     )
 
 

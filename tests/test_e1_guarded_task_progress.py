@@ -105,9 +105,11 @@ class GuardedTaskProgressTests(unittest.TestCase):
         """Model the exact valid E1 schema-13 state produced by the earlier release."""
         state_path = self.root / ".evospec/state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(state["schema"], 14)
+        self.assertEqual(state["schema"], SCHEMA)
         state["schema"] = 13
         state.pop("e1_schema_upgrade")
+        state.pop("slice_criteria_refs")
+        state.pop("slice_criteria_heads")
 
         def strip_report(value: object) -> None:
             if isinstance(value, dict):
@@ -373,7 +375,7 @@ class GuardedTaskProgressTests(unittest.TestCase):
         self.assertIn("error", refused)
         self.assertEqual(before, self._authority_snapshot())
 
-    def test_c16_new_schema14_without_e1_keeps_legacy_working(self) -> None:
+    def test_c16_new_schema15_without_e1_keeps_legacy_working(self) -> None:
         with tempfile.TemporaryDirectory(prefix="evospec-non-e1-v14-") as other:
             root = Path(other)
             workflow = WorkflowService.open(root)
@@ -381,7 +383,7 @@ class GuardedTaskProgressTests(unittest.TestCase):
             workflow.new("Standard non-E1 local feature")
             workflow.record_progress("implement", "standard feature", (), "current task", (), "resume")
             state_path = root / ".evospec/state.json"
-            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["schema"], 14)
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["schema"], SCHEMA)
             recovered = project_context(WorkflowService.open(root))
             self.assertIsNone(recovered.accepted_slice)
             self.assertIsNone(recovered.task_progress)

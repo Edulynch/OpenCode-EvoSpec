@@ -88,7 +88,7 @@ from .discovery import (
     _WORDS,
 )
 from .policies import AssurancePolicy, CapabilityRoute, IntakeOperation, IntakePolicy
-from .services import CoreService, NextActionable, ServiceError, StaleRevisionError, UserAcceptance
+from .services import CoreService, NextActionable, ServiceError, StaleRevisionError, UserAcceptance, SliceCriteriaSpec
 
 
 class WorkflowError(Exception):
@@ -174,17 +174,31 @@ class WorkflowService:
         acceptance: UserAcceptance,
         *,
         expected_revision: ExpectedRevision,
+        criteria: SliceCriteriaSpec | None = None,
     ) -> WorkflowResult:
         """Accept one human-approved Slice; never infer consent from lifecycle state."""
         state = self._mutation_state(expected_revision)
         try:
             saved = self.__core.accept_first_slice(
-                state, feature_title, slice_title, initial_task, checkpoint, acceptance,
+                state, feature_title, slice_title, initial_task, checkpoint, acceptance, criteria,
             )
         except ServiceError as error:
             raise WorkflowError(str(error)) from error
         return self._result("SLICE_ACCEPTED", saved, "accepted Feature, Slice and first Task persisted")
 
+    def revise_slice_criteria(
+        self, criteria: SliceCriteriaSpec, previous_revision_id: str,
+        reason: str, decision: UserAcceptance, *, expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        """A separate human decision supersedes criteria without reopening acceptance."""
+        state = self._mutation_state(expected_revision)
+        try:
+            saved = self.__core.revise_slice_criteria(
+                state, criteria, previous_revision_id, reason, decision,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        return self._result("SLICE_CRITERIA_REVISED", saved, "accepted Slice criteria superseded; prior revisions preserved")
     def e1_upgrade_agreement(self, *, expected_revision: ExpectedRevision) -> str:
         """Present a specific accepted authority to the terminal without changing it."""
         committed = self.__core.confirmed_e1_upgrade(expected_revision)

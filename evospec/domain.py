@@ -209,6 +209,43 @@ class AgreementRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class SliceCriterion:
+    """Observable acceptance condition; this is a promise, not a test result."""
+
+    id: str
+    expected_result: str
+    expected_evidence: str
+
+
+@dataclass(frozen=True, slots=True)
+class SliceCriteriaRevision:
+    """Immutable, attributable version of the agreed Slice boundaries."""
+
+    id: str
+    slice_agreement_ref: str
+    repository_id: str
+    outcome: str
+    example: str
+    inclusions: tuple[str, ...]
+    exclusions: tuple[str, ...]
+    decisions: tuple[str, ...]
+    criteria: tuple[SliceCriterion, ...]
+    source: str
+    source_reference: str
+    previous_revision_id: str | None = None
+    reason: str | None = None
+    decision_statement: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SliceCriteriaHead:
+    """Core-owned current pointer; old criterion revisions remain accessible."""
+
+    slice_agreement_ref: str
+    revision_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class DeferredSideRequest:
     id: IntakeId
     intent: str
@@ -928,6 +965,8 @@ class State:
     autonomy_expansion_history: tuple[AutonomyExpansionRecord, ...] = ()
     agreements: tuple[AgreementRecord, ...] = ()
     e1_schema_upgrade: E1SchemaUpgradeReceipt | None = None
+    slice_criteria_revisions: tuple[SliceCriteriaRevision, ...] = ()
+    slice_criteria_heads: tuple[SliceCriteriaHead, ...] = ()
 
 
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -2480,6 +2519,100 @@ def validate_state(state: State) -> None:
             context.slice_agreement_ref == agreement.id for context in agreement_contexts
         ):
             raise StateValidationError("Slice agreement has no owning context")
+    if type(state.slice_criteria_revisions) is not tuple or type(state.slice_criteria_heads) is not tuple:
+        raise StateValidationError("Slice criteria authority must be immutable tuples")
+    if any(type(item) is not SliceCriteriaRevision for item in state.slice_criteria_revisions):
+        raise StateValidationError("Slice criteria revision shape is invalid")
+    if any(type(item) is not SliceCriteriaHead for item in state.slice_criteria_heads):
+        raise StateValidationError("Slice criteria head shape is invalid")
+    _unique((revision.id for revision in state.slice_criteria_revisions), "Slice criteria revision")
+    _unique((head.slice_agreement_ref for head in state.slice_criteria_heads), "Slice criteria head")
+    revision_index = {revision.id: revision for revision in state.slice_criteria_revisions}
+    for revision in state.slice_criteria_revisions:
+        _identity(revision.id, "Slice criteria revision")
+        agreement = agreement_index.get(revision.slice_agreement_ref)
+        if agreement is None or agreement.kind != "SLICE" or revision.repository_id != agreement.repository_id:
+            raise StateValidationError("Slice criteria must be bound to the accepted Slice and repository")
+        for value in (revision.outcome, revision.example, revision.source, revision.source_reference):
+            _text(value, "Slice criteria content or provenance")
+        for name, values in (("inclusions", revision.inclusions), ("exclusions", revision.exclusions),
+                             ("decisions", revision.decisions), ("criteria", revision.criteria)):
+            if type(values) is not tuple or not values:
+                raise StateValidationError(f"Slice criteria {name} must be a nonempty tuple")
+        if any(type(value) is not str or not value.strip() for value in
+               revision.inclusions + revision.exclusions + revision.decisions):
+            raise StateValidationError("Slice criteria scope and decisions must be nonblank text")
+        _unique((item.id for item in revision.criteria), "Slice criterion")
+        for criterion in revision.criteria:
+            if type(criterion) is not SliceCriterion:
+                raise StateValidationError("Slice criterion shape is invalid")
+            _identity(criterion.id, "Slice criterion")
+            _text(criterion.expected_result, "expected result")
+            _text(criterion.expected_evidence, "expected evidence")
+        # Reconstruct the exact mini-spec that the human saw. A changed JSON
+        # record must not silently retain the old terminal authorization.
+        canonical_spec = json.dumps({
+            "outcome": revision.outcome, "example": revision.example,
+            "inclusions": list(revision.inclusions), "exclusions": list(revision.exclusions),
+            "decisions": list(revision.decisions),
+            "criteria": [{"id": item.id, "expected_result": item.expected_result,
+                          "expected_evidence": item.expected_evidence} for item in revision.criteria],
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if revision.previous_revision_id is None:
+            initial = revision.reason is None and revision.source == "INTERACTIVE_TERMINAL"
+            legacy_first_amendment = bool(revision.reason) and revision.source == "INTERACTIVE_TERMINAL_DECISION"
+            if not (initial or legacy_first_amendment):
+                raise StateValidationError("first criteria require initial acceptance or a separate decision")
+            if initial:
+                owning_feature = next(
+                    (item for item in state.agreements
+                     if item.kind == "FEATURE" and item.feature_id == agreement.feature_id),
+                    None,
+                )
+                if (
+                    owning_feature is None
+                    or
+                    revision.decision_statement is not None
+                    or revision.source_reference != agreement.source_reference
+                    or revision.id != f"slice-criteria-{agreement.id.removeprefix('agreement-slice-')}-1"
+                    or agreement.statement != (
+                        f"Acepto Feature: {owning_feature.title if owning_feature is not None else ''}; "
+                        f"Slice: {agreement.title}; Task: {agreement.initial_task}; "
+                        f"checkpoint: {agreement.checkpoint}; criterios: {canonical_spec}"
+                    )
+                ):
+                    raise StateValidationError("initial criteria must match the exact accepted agreement")
+        else:
+            predecessor = revision_index.get(revision.previous_revision_id)
+            if predecessor is None or predecessor.slice_agreement_ref != revision.slice_agreement_ref:
+                raise StateValidationError("Slice criteria predecessor is missing or belongs elsewhere")
+            if not revision.reason or revision.source != "INTERACTIVE_TERMINAL_DECISION":
+                raise StateValidationError("criteria amendment requires an attributable separate decision")
+        if revision.source == "INTERACTIVE_TERMINAL_DECISION":
+            previous = revision.previous_revision_id or "NOT_RECORDED"
+            statement = f"Decido revisar criterios desde {previous}; motivo: {revision.reason}; criterios: {canonical_spec}"
+            expected_ref = f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"
+            digest = sha256(json.dumps([
+                revision.repository_id, revision.slice_agreement_ref, previous, statement, expected_ref,
+            ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+            if (
+                revision.decision_statement != statement
+                or revision.source_reference != expected_ref
+                or revision.id != f"slice-criteria-{digest}"
+            ):
+                raise StateValidationError("amended criteria must match the exact recorded human decision")
+    reachable: set[str] = set()
+    for head in state.slice_criteria_heads:
+        revision = revision_index.get(head.revision_id)
+        if revision is None or revision.slice_agreement_ref != head.slice_agreement_ref:
+            raise StateValidationError("Slice criteria head must target its accepted Slice")
+        while revision is not None:
+            if revision.id in reachable:
+                raise StateValidationError("Slice criteria revision history must be linear and acyclic")
+            reachable.add(revision.id)
+            revision = revision_index.get(revision.previous_revision_id) if revision.previous_revision_id else None
+    if reachable != set(revision_index):
+        raise StateValidationError("Slice criteria history must be reachable from Core-owned heads")
     _unique(
         (agreement.task_id for agreement in state.agreements if agreement.task_id is not None),
         "Slice Task",
