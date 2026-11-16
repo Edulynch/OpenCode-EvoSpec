@@ -76,6 +76,8 @@ from .domain import (
     State,
     StateValidationError,
     E1SchemaUpgradeReceipt,
+    R3SchemaUpgradeReceipt,
+    CriterionTestReceipt,
     TaskProgress,
     TerminalArchive,
     VerificationEvidence,
@@ -1935,6 +1937,105 @@ class CoreService:
 
         try:
             return self.__persistence.transact_e1(current.revision, record)
+        except AtomicFailure as error:
+            self.__raise_e1_publication_error(current.revision, error)
+
+    def r3_upgrade_statement(self, state: State) -> str:
+        """Bind terminal approval to exact schema-15 bytes and repository authority."""
+        current = _authoritative_state(self.__persistence, state)
+        if self.__persistence.r3_schema_ready():
+            raise ServiceError("R3 schema 16 is already enabled")
+        if not self.__persistence.r3_upgrade_eligible() or current.initialization is None:
+            raise ServiceError("R3 upgrade requires initialized schema-15 authority")
+        _, _, accepted = _accepted_e1_scope(current, self.__repository_root)
+        if not any(head.slice_agreement_ref == accepted.id for head in current.slice_criteria_heads):
+            raise ServiceError("R3 requires a current human-accepted criterion revision")
+        return (f"Acepto habilitar verificaciones R3-A desde revision {current.revision}; "
+                f"sha256: {self.__persistence.state_source_sha256()}")
+
+    def confirmed_r3_upgrade(self, source_revision: int) -> State | None:
+        """Support safe read-only recovery of a previously committed conversion."""
+        current = self.__persistence.recover()
+        receipt = current.r3_schema_upgrade
+        if (type(source_revision) is int and receipt is not None
+                and receipt.source_revision == source_revision and self.__persistence.r3_schema_ready()):
+            return current
+        return None
+
+    def upgrade_r3_schema(self, state: State, decision: UserAcceptance) -> State:
+        """Allow R3 writes only after exact interactive human schema consent."""
+        current = _authoritative_state(self.__persistence, state)
+        statement = self.r3_upgrade_statement(current)
+        source_digest = statement.rsplit("sha256: ", 1)[1]
+        expected_ref = f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"
+        if (type(decision) is not UserAcceptance or decision.source != "INTERACTIVE_TERMINAL"
+                or decision.statement != statement or decision.source_reference != expected_ref):
+            raise ServiceError("R3 migration requires its exact interactive terminal decision")
+
+        def convert(locked: State) -> State:
+            if locked != current or locked.initialization is None:
+                raise ServiceError("R3 conversion authority changed after user approval")
+            receipt = R3SchemaUpgradeReceipt(
+                locked.revision, locked.revision + 1, source_digest, statement,
+                expected_ref, locked.initialization.repository_id,
+            )
+            return _prepare_state_publication(replace(locked, r3_schema_upgrade=receipt), locked.revision)
+
+        try:
+            return self.__persistence.transact_r3(
+                current.revision, convert, upgrade=True, source_digest=source_digest,
+            )
+        except AtomicFailure as error:
+            self.__raise_e1_publication_error(current.revision, error)
+
+    def record_criterion_test(
+        self, state: State, repository_id: str, slice_agreement_ref: str,
+        criteria_revision_id: str, criterion_id: str, test_kind: str,
+        test_target: str, exit_code: int, output_sha256: str,
+    ) -> State:
+        """Record one host-reported test observation against the current accepted head."""
+        current = _authoritative_state(self.__persistence, state)
+        values = (repository_id, slice_agreement_ref, criteria_revision_id, criterion_id,
+                  test_kind, test_target, output_sha256)
+        if any(type(item) is not str or not item or len(item) > 2048 for item in values):
+            raise ServiceError("R3 test result identity must be bounded and nonblank")
+        if type(exit_code) is not int or not 0 <= exit_code <= 255:
+            raise ServiceError("R3 test process exit code is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", output_sha256):
+            raise ServiceError("R3 test output must have an exact SHA256 digest")
+
+        def record(locked: State) -> State:
+            if locked != current or locked.r3_schema_upgrade is None:
+                raise ServiceError("R3 requires exact converted schema-16 authority")
+            context, _, accepted = _accepted_e1_scope(locked, self.__repository_root)
+            if repository_id != accepted.repository_id or slice_agreement_ref != accepted.id:
+                raise ServiceError("R3 test result does not match the accepted repository and Slice")
+            head = next((item for item in locked.slice_criteria_heads if item.slice_agreement_ref == accepted.id), None)
+            if head is None or head.revision_id != criteria_revision_id:
+                raise ServiceError("R3 criterion revision is not the current accepted head")
+            revision = next((item for item in locked.slice_criteria_revisions if item.id == head.revision_id), None)
+            criterion = next((item for item in revision.criteria if item.id == criterion_id), None) if revision else None
+            if criterion is None or criterion.expected_evidence != f"{test_kind}:{test_target}":
+                raise ServiceError("R3 test does not match the human-accepted evidence descriptor")
+            if test_kind not in ("python-unittest", "node-test"):
+                raise ServiceError("R3 only supports host-run deterministic test evidence")
+            digest = sha256(json.dumps([
+                accepted.id, criteria_revision_id, criterion_id, test_kind,
+                test_target, exit_code, output_sha256, locked.revision,
+            ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:20]
+            observation = CriterionTestReceipt(
+                f"criterion-test-{digest}", accepted.id, criteria_revision_id,
+                criterion_id, test_kind, test_target, exit_code, output_sha256,
+                locked.revision, locked.revision + 1,
+            )
+            # A test result does not approve the Slice, change legacy verification,
+            # or claim the model itself can attest to host execution.
+            return _prepare_state_publication(replace(
+                locked, criterion_test_receipts=locked.criterion_test_receipts + (observation,),
+            ), locked.revision)
+
+        try:
+            return self.__persistence.transact_r3(current.revision, record)
         except AtomicFailure as error:
             self.__raise_e1_publication_error(current.revision, error)
 

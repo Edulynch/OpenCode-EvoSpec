@@ -103,6 +103,8 @@ def _parser() -> _ArgumentParser:
     revise.add_argument("--expected-revision", required=True, type=int)
     upgrade = commands.add_parser("upgrade-e1-schema")
     upgrade.add_argument("--expected-revision", required=True, type=int)
+    upgrade_r3 = commands.add_parser("upgrade-r3-schema")
+    upgrade_r3.add_argument("--expected-revision", required=True, type=int)
     commands.add_parser("doctor")
     commands.add_parser("review")
     ui = commands.add_parser("ui")
@@ -165,7 +167,7 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             print(f"ERROR {error}", file=target)
             return 2
         return 0
-    if arguments.command in ("accept-slice", "revise-slice-criteria", "upgrade-e1-schema"):
+    if arguments.command in ("accept-slice", "revise-slice-criteria", "upgrade-e1-schema", "upgrade-r3-schema"):
         workflow = WorkflowService.open(Path(arguments.root))
         if arguments.command == "upgrade-e1-schema":
             try:
@@ -177,6 +179,17 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
                 return 2
             if already is not None:
                 # An already committed conversion is an inspection, not a second approval.
+                _render(already, target)
+                return 0
+        if arguments.command == "upgrade-r3-schema":
+            try:
+                already = workflow.confirmed_r3_schema_upgrade(
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            except RecoveryError as error:
+                print(f"ERROR {error}", file=target)
+                return 2
+            if already is not None:
                 _render(already, target)
                 return 0
         # Only a human in a real terminal may accept or change durable authority.
@@ -197,6 +210,11 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
                 statement = slice_criteria_decision_statement(
                     arguments.previous_criteria_revision, arguments.reason, criteria,
                 )
+            elif arguments.command == "upgrade-r3-schema":
+                criteria = None
+                statement = workflow.r3_upgrade_agreement(
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
             else:
                 criteria = None
                 statement = workflow.e1_upgrade_agreement(
@@ -211,6 +229,7 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             "accept-slice": "Acuerdo inicial",
             "revise-slice-criteria": "Decisión de modificación",
             "upgrade-e1-schema": "Acuerdo de migración",
+            "upgrade-r3-schema": "Acuerdo de migración R3-A",
         }[arguments.command]
         print(f"{description} para aprobación explícita:\n{statement}", file=target)
         try:
@@ -235,8 +254,13 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
                     UserAcceptance(statement, f"tty:{token}"),
                     expected_revision=ExpectedRevision(arguments.expected_revision),
                 )
-            else:
+            elif arguments.command == "upgrade-e1-schema":
                 result = workflow.upgrade_e1_schema(
+                    UserAcceptance(statement, f"tty:{token}"),
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            else:
+                result = workflow.upgrade_r3_schema(
                     UserAcceptance(statement, f"tty:{token}"),
                     expected_revision=ExpectedRevision(arguments.expected_revision),
                 )

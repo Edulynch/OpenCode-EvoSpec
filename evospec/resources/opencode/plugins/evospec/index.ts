@@ -1,6 +1,7 @@
 // EvoSpec-managed: opencode-v2
 
 import { lstat, realpath } from "node:fs/promises"
+import { createHash } from "node:crypto"
 import { isAbsolute, relative, resolve } from "node:path"
 import {
   abortableDelay,
@@ -119,6 +120,76 @@ async function authorizeAcceptedTaskProgress(runtime, request, context) {
     throw new Error("OpenCode V2 executing repository changed while accepted Task permission was pending")
   }
   return root
+}
+
+function criterionCommand(kind, target) {
+  // Only a human-accepted, bounded test module or test file may become argv.
+  // No shell or free-form command text ever enters this verifier.
+  if (kind === "python-unittest" && /^tests(?:\.[A-Za-z_][A-Za-z0-9_]*)+$/.test(target)) {
+    return [AGENT_COMMAND[0], "-m", "unittest", "-q", target]
+  }
+  if (kind === "node-test" && /^tests\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*\.test\.mjs$/.test(target)) {
+    return ["node", "--test", target]
+  }
+  throw new Error("R3 test descriptor is not an approved deterministic test target")
+}
+
+async function executeCriterionTest(runtime, args, context) {
+  if (typeof runtime?.permission?.assert !== "function" || typeof runtime?.session?.get !== "function") {
+    throw new Error("R3 host permission/session API is unavailable")
+  }
+  const requester = {
+    sessionID: context?.sessionID, agent: context?.agent,
+    messageID: context?.messageID, id: context?.id,
+  }
+  if (Object.values(requester).some((value) => typeof value !== "string" || !value.trim())) {
+    throw new Error("R3 host permission requester is incomplete")
+  }
+  const root = await sessionRoot(runtime, context)
+  if (typeof root !== "string" || !isAbsolute(root)) throw new Error("R3 executing root is invalid")
+  const command = criterionCommand(args.test_kind, args.test_target)
+  const inspect = async () => {
+    const snapshot = parseContextResponse(await rawExecuteRequest(runtime, { action: "context" }, context, root))
+    const scope = snapshot.accepted_slice
+    const criterion = scope?.criteria_revision?.criteria?.find((item) => item.id === args.criterion_id)
+    if (snapshot.revision !== args.expected_revision || snapshot.repository_id !== args.repository_id ||
+        snapshot.r3_schema_ready !== true || scope?.slice_agreement_ref !== args.slice_agreement_ref ||
+        scope.criteria_revision?.id !== args.criteria_revision_id ||
+        criterion?.expected_evidence !== `${args.test_kind}:${args.test_target}`) {
+      throw new Error("R3 test request is stale or differs from current human-accepted criterion authority")
+    }
+    return snapshot
+  }
+  await inspect()
+  await runtime.permission.assert({
+    sessionID: requester.sessionID,
+    agent: requester.agent,
+    source: { type: "tool", messageID: requester.messageID, id: requester.id },
+    action: "evospec_criterion_test",
+    resources: [JSON.stringify({ repository_root: resolve(root), repository_id: args.repository_id,
+      slice_agreement_ref: args.slice_agreement_ref, criteria_revision_id: args.criteria_revision_id,
+      criterion_id: args.criterion_id, command })],
+  })
+  if (Object.entries(requester).some(([key, value]) => context?.[key] !== value) ||
+      resolve(await sessionRoot(runtime, context)) !== resolve(root)) {
+    throw new Error("R3 host permission session/root changed before the test")
+  }
+  await inspect()
+  const process = await spawnCommand(command, root, context)
+  if (!Number.isInteger(process.exitStatus) || process.exitStatus < 0 || process.exitStatus > 255) {
+    throw new Error("R3 deterministic test did not return a supported process exit code")
+  }
+  const outputDigest = createHash("sha256").update(`${process.output}\n${process.error}`).digest("hex")
+  const request = {
+    action: "criterion_test_result", ...args,
+    exit_code: process.exitStatus, output_sha256: outputDigest,
+  }
+  const recorded = await executeRequest(runtime, request, context, { retryStale: false, authorizedRoot: root })
+  return JSON.stringify({
+    test: { command, exit_code: process.exitStatus, stdout: process.output,
+      stderr: process.error, output_sha256: outputDigest },
+    recording: JSON.parse(recorded),
+  })
 }
 
 async function spawnCommand(command, root, context, input) {
@@ -519,10 +590,10 @@ const tools = [
     object({ request: string }),
     (args, context) => {
       // Keep the E1 capability visible to the host as its own permission-controlled tool.
-      if (staleRequest(args.request)?.action === "accepted_task_progress") {
+      if (["accepted_task_progress", "criterion_test_result"].includes(staleRequest(args.request)?.action)) {
         return JSON.stringify({ error: {
           code: "DEDICATED_TOOL_REQUIRED",
-          detail: "Use evospec_accepted_task_progress for accepted E1 Task reports",
+          detail: "Use the dedicated host-authorized tool for accepted Task or criterion test evidence",
         } })
       }
       return executeRequest(context.runtime, args.request, context)
@@ -608,6 +679,20 @@ const tools = [
       const authorizedRoot = await authorizeAcceptedTaskProgress(context.runtime, request, context)
       return executeRequest(context.runtime, request, context, { retryStale: false, authorizedRoot })
     },
+  ),
+  protocolTool(
+    "evospec_criterion_test",
+    "Run a host-permitted deterministic test named by the current human-accepted criterion; record its actual exit code and output digest without model attestation, auto-acceptance, or stale retries.",
+    object({
+      expected_revision: nonnegativeInteger,
+      repository_id: { type: "string", minLength: 1 },
+      slice_agreement_ref: { type: "string", minLength: 1 },
+      criteria_revision_id: { type: "string", minLength: 1 },
+      criterion_id: { type: "string", minLength: 1 },
+      test_kind: { type: "string", enum: ["python-unittest", "node-test"] },
+      test_target: { type: "string", minLength: 1, maxLength: 256 },
+    }),
+    (args, context) => executeCriterionTest(context.runtime, args, context),
   ),
   protocolTool(
     "evospec_work_list",
