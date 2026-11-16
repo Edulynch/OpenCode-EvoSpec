@@ -285,6 +285,52 @@ class SliceCriteriaTests(unittest.TestCase):
             for file in (self.root / ".evospec/records/agreements").iterdir()
         })
 
+    def test_r1_07c_schema15_task_progress_preserves_criteria_history_and_head(self) -> None:
+        revision = self._accept(_spec())
+        before = CoreService.open(self.root).recover()
+        state_path = self.root / ".evospec/state.json"
+        self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["schema"], 15)
+        self.assertEqual(len(before.slice_criteria_revisions), 1)
+        self.assertEqual(len(before.slice_criteria_heads), 1)
+        feature, slice_record = before.agreements
+        assert before.initialization is not None
+        criteria_record_files = {
+            path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in (self.root / ".evospec/records/slice-criteria").glob("*.json")
+        }
+        self.assertEqual(len(criteria_record_files), 1)
+
+        progress = self.workflow.accepted_task_progress(
+            before.initialization.repository_id,
+            str(slice_record.task_id),
+            feature.id,
+            slice_record.id,
+            "Lista visible",
+            "Implementaci\u00f3n reportada sin verificar",
+            ("tests/task-list.test.ts",),
+            expected_revision=ExpectedRevision(revision),
+        )
+        self.assertEqual(progress.revision, revision + 1)
+        recovered = CoreService.open(self.root).recover()
+        self.assertEqual(recovered.revision, progress.revision)
+        self.assertEqual(recovered.agreements, before.agreements)
+        self.assertEqual(recovered.slice_criteria_revisions, before.slice_criteria_revisions)
+        self.assertEqual(recovered.slice_criteria_heads, before.slice_criteria_heads)
+        self.assertEqual(criteria_record_files, {
+            path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in (self.root / ".evospec/records/slice-criteria").glob("*.json")
+        })
+        assert recovered.active_context is not None
+        report = recovered.active_context.task_progress
+        self.assertIsNotNone(report)
+        assert report is not None
+        self.assertEqual(report.report_kind, "REPORTED_UNVERIFIED")
+        self.assertEqual(report.recorded_revision, progress.revision)
+        self.assertEqual(report.checkpoint, "Lista visible")
+        context = self._context()
+        self.assertEqual(context["criteria_status"], "RECORDED")
+        self.assertEqual(context["criteria_revision"]["id"], before.slice_criteria_heads[0].revision_id)
+
     def test_r1_07b_old_schema_cannot_discard_nonempty_criteria(self) -> None:
         self._accept(_spec())
         path = self.root / ".evospec/state.json"
