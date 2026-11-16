@@ -53,6 +53,7 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn('windowsHide: globalThis.process.platform === "win32"', plugin)
         self.assertIn("runtime.tool.transform", plugin)
         self.assertIn('"evospec_context"', plugin)
+        self.assertIn('{ codemode: false }', plugin)
         self.assertIn('"evospec_start"', plugin)
         self.assertIn('"evospec_assessed_start"', plugin)
         self.assertIn('"evospec_continuation"', plugin)
@@ -84,6 +85,12 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn("task_progress.checkpoint", skill)
         self.assertIn("REPORTED_UNVERIFIED", skill)
         self.assertIn("If state is missing, invalid, from another worktree, or ambiguous", skill)
+        self.assertIn("If `evospec_context` is unavailable or its call fails", skill)
+        self.assertIn("Do not substitute Engram", skill)
+        self.assertIn("If evospec_context is unavailable or fails", plugin)
+        self.assertIn("accepted Slice details attached to parked items", skill)
+        self.assertIn("never select, reactivate", skill.lower())
+        self.assertIn("accepted work_queue items as inactive", plugin)
 
         # Both slash consultations share the same read-only contract, even when natural
         # language activates the skill without a slash command.
@@ -92,6 +99,8 @@ class OpenCodeIntegrationTests(unittest.TestCase):
             self.assertIn("call only `evospec_context`", resource)
             self.assertIn("REPORTED_UNVERIFIED", resource)
             self.assertIn("read-only", resource)
+            self.assertIn("work_queue", resource)
+            self.assertIn("inactive", resource)
             self.assertEqual(
                 resource,
                 (Path(__file__).parents[1] / ".opencode" / "commands" / command).read_text(encoding="utf-8"),
@@ -152,6 +161,9 @@ await plugin.setup(runtime)
 assert(definitions.length === 25, "raw protocol tool and all typed helpers register")
 const names = new Set(definitions.map((definition) => definition.name))
 for (const name of ["evospec", "evospec_start", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
+const contextEntry = definitions.find((definition) => definition.name === "evospec_context")
+assert(contextEntry.options?.codemode === false, "canonical read-only context bypasses deferred Code Mode discovery")
+assert(definitions.filter((definition) => definition.options?.codemode === false).length === 1, "only canonical context is directly exposed")
 const recoveryTool = definitions.find((definition) => definition.name === "evospec_recover_legacy_non_material_detail")
 assert(recoveryTool.input.additionalProperties === false, "typed recovery tool rejects undeclared replacement prose")
 assert(JSON.stringify(recoveryTool.input.required) === JSON.stringify(["expected_revision", "repository_id", "feature_id", "change_id", "legacy_detail"]), "typed recovery tool requires exact recovery identity and detail only")

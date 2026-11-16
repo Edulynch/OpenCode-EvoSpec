@@ -71,6 +71,8 @@ test("synthetic E1 tool gates accepted Task dispatch with OpenCode permission an
     assert.equal(dedicated.input.additionalProperties, false)
     const contextTool = definitions.find((item) => item.name === "evospec_context")
     assert.ok(contextTool, "the read-only context route stays available")
+    assert.deepEqual(contextTool.options, { codemode: false }, "canonical recovery stays directly visible to the model")
+    assert.equal(dedicated.options?.codemode, undefined, "guarded Task mutations retain Code Mode registration")
 
     const args = {
       expected_revision: 2, repository_id: "repo-1", task_id: "task-1",

@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 from evospec.agent_protocol import execute
 from evospec.cli import main as cli_main
-from evospec.domain import ExpectedRevision
+from evospec.domain import ExpectedRevision, OperationalState
 from evospec.persistence import FileOperations, RecoveryError
 from evospec.services import CoreService, ServiceError, StaleRevisionError, UserAcceptance
 from evospec.workflow import WorkflowError, WorkflowService
@@ -134,6 +134,57 @@ class FirstSliceTests(unittest.TestCase):
             for path in (self.root / ".evospec").rglob("*") if path.is_file()
         }
         self.assertEqual(before, after)
+
+    def test_b03a_parked_agreement_is_readable_without_reactivating_work(self) -> None:
+        self._accept()
+        parked = self.workflow.park("awaiting owner feedback")
+        self.assertEqual(parked.code, "PARKED")
+        state = CoreService.open(self.root).recover()
+        self.assertIsNone(state.active_context)
+        before = {
+            path.relative_to(self.root): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in (self.root / ".evospec").rglob("*") if path.is_file()
+        }
+
+        # An inactive agreement is visible as a queued item, not as a newly
+        # selected active Task. Reading it must preserve the accepted revision.
+        context = self._context()
+        self.assertIsNone(context["accepted_slice"])
+        self.assertIsNone(context["work_queue"]["active"])
+        self.assertEqual(context["revision"], state.revision)
+        item = context["work_queue"]["all"][0]
+        self.assertEqual(item["operational_state"], "FROZEN")
+        self.assertEqual(item["accepted_slice"]["feature_title"], FEATURE)
+        self.assertEqual(item["accepted_slice"]["slice_title"], SLICE)
+        self.assertEqual(item["accepted_slice"]["initial_task"], TASK)
+        self.assertEqual(item["accepted_slice"]["checkpoint"], CHECKPOINT)
+
+        after = {
+            path.relative_to(self.root): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in (self.root / ".evospec").rglob("*") if path.is_file()
+        }
+        self.assertEqual(before, after)
+
+    def test_b03b_multiple_valid_queued_works_do_not_select_a_task(self) -> None:
+        self._accept()
+        self.workflow.park("deferred")
+        self.workflow.new("Another valid capability")
+        self.workflow.park("deferred")
+        core = CoreService.open(self.root)
+        state = core.recover()
+        for item in state.work_items:
+            # Equal READY items intentionally produce an ambiguous continuation.
+            state = core.set_work_state(state, item.id, OperationalState.READY)
+
+        context = self._context()
+        self.assertIsNone(context["work_queue"]["active"])
+        self.assertIsNone(context["accepted_slice"])
+        self.assertEqual(context["work_queue"]["next_code"], "AMBIGUOUS")
+        self.assertEqual(context["work_queue"]["next_candidates_total"], 2)
+        self.assertEqual(
+            sum(item["accepted_slice"] is not None for item in context["work_queue"]["all"]), 1,
+        )
+        self.assertEqual(core.recover(), state)
 
     def test_b04_copied_repository_root_is_not_trusted(self) -> None:
         self._accept()
