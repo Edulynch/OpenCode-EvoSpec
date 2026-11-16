@@ -50,7 +50,7 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         # provider selection or a fallback to a free catalog default.
         self.assertIn("$authorizedModel = 'openai/gpt-6.1-sol#high'", runner)
         self.assertIn("if ($ApprovedModel -cne $authorizedModel)", runner)
-        self.assertIn("opencode run --server $serverUrl --model $ApprovedModel", runner)
+        self.assertIn("opencode run --server $serverUrl --session $fixtureSessionId --model $ApprovedModel", runner)
         self.assertIn("EXPLICIT_HUMAN_APPROVED_TEST_ONLY", runner)
         self.assertNotIn("--model openai/gpt-6.1-sol#high", runner)
         self.assertIn("--agent build", runner)
@@ -61,6 +61,13 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         self.assertIn("Get-CanonicalContextCalls", runner)
         self.assertIn("tools\\.evospec_context", runner)
         self.assertIn("No more model sessions", runner)
+        # A private server can be on the correct directory while the CLI
+        # still targets a stale session selected through the inherited PWD.
+        self.assertIn("$env:PWD = $fixtureRoot", runner)
+        self.assertIn("Remove-Item Env:PWD", runner)
+        self.assertIn("$env:PWD = $previousPwd", runner)
+        self.assertIn("--session $fixtureSessionId", runner)
+        self.assertIn("observedSessionIds[0] -cne $fixtureSessionId", runner)
         self.assertNotIn("accept-slice", runner)
         self.assertNotIn("accept-fixture.ps1", runner)
         self.assertNotIn("gh pr", runner)
@@ -74,6 +81,9 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         self.assertIn("/api/plugin?location%5Bdirectory%5D=", runner)
         self.assertIn("$Evidence.LocationVerified = $true", runner)
         self.assertIn("$Evidence.PluginVerified = $true", runner)
+        self.assertIn('Invoke-RestMethod -Method Post -Uri "$ServerUrl/api/session"', runner)
+        self.assertIn('Invoke-RestMethod -Method Get -Uri "$ServerUrl/api/session/$sessionId"', runner)
+        self.assertIn("$Evidence.SessionVerified = $true", runner)
         self.assertIn("/api/model?location%5Bdirectory%5D=", runner)
         self.assertIn("/api/model/default?location%5Bdirectory%5D=", runner)
         self.assertIn("$Evidence.ModelCatalogVerified = $true", runner)
@@ -93,6 +103,10 @@ class R2D2NativeFixtureTests(unittest.TestCase):
         )
         self.assertLess(
             runner.index("Assert-ApprovedModelReady -FixtureRoot $fixtureRoot"),
+            runner.index("New-VerifiedFixtureSession -FixtureRoot $fixtureRoot"),
+        )
+        self.assertLess(
+            runner.index("New-VerifiedFixtureSession -FixtureRoot $fixtureRoot"),
             runner.index("& opencode run --server $serverUrl"),
         )
         # The full four-case suite remains an explicit opt-in; default runs

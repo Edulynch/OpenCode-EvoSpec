@@ -192,6 +192,50 @@ function Assert-ApprovedModelReady {
     $Evidence.ModelCatalogVerified = $true
 }
 
+function New-VerifiedFixtureSession {
+    param(
+        [Parameter(Mandatory)][string]$FixtureRoot,
+        [Parameter(Mandatory)][string]$ServerUrl,
+        [Parameter(Mandatory)][string]$Authorization,
+        [Parameter(Mandatory)][hashtable]$Evidence
+    )
+
+    # Give the private host an explicit session location. The CLI process
+    # directory alone is not reliable when Windows inherits a stale PWD.
+    $headers = @{ Authorization = $Authorization }
+    $body = @{ location = @{ directory = $FixtureRoot }; title = 'EvoSpec R2-D2 synthetic qualification' } |
+        ConvertTo-Json -Depth 4 -Compress
+    try {
+        $created = Invoke-RestMethod -Method Post -Uri "$ServerUrl/api/session" `
+            -Headers $headers -ContentType 'application/json' -Body $body -TimeoutSec 10
+        $newSession = if ($null -ne $created.data) { $created.data } else { $created }
+        $sessionId = [string]$newSession.id
+        if ([string]::IsNullOrWhiteSpace($sessionId) -or $sessionId -notmatch '^ses_[A-Za-z0-9]+$') {
+            throw 'private host returned no valid session identifier'
+        }
+        $read = Invoke-RestMethod -Method Get -Uri "$ServerUrl/api/session/$sessionId" `
+            -Headers $headers -TimeoutSec 10
+        $session = if ($null -ne $read.data) { $read.data } else { $read }
+    }
+    catch {
+        throw "STOP: cannot create and inspect an explicit fixture session: $($_.Exception.Message)"
+    }
+
+    $reported = [string]$session.location.directory
+    $expected = [System.IO.Path]::GetFullPath($FixtureRoot).TrimEnd('\', '/')
+    if ([string]::IsNullOrWhiteSpace($reported)) {
+        throw 'STOP: the explicitly created session did not report a directory.'
+    }
+    $actual = [System.IO.Path]::GetFullPath($reported).TrimEnd('\', '/')
+    if (-not [string]::Equals($expected, $actual, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "STOP: session location differs from the synthetic fixture: $reported"
+    }
+    $Evidence.SessionID = $sessionId
+    $Evidence.SessionLocation = $reported
+    $Evidence.SessionVerified = $true
+    return $sessionId
+}
+
 Push-Location $sourceRoot
 try {
     $branch = (& git branch --show-current).Trim()
@@ -208,8 +252,8 @@ try {
     # A private server is essential: the shared server previously executed
     # these prompts against master instead of the temporary fixture.
     $runHelp = (& opencode run --help | Out-String)
-    if ($LASTEXITCODE -ne 0 -or $runHelp -notmatch '--server') {
-        throw 'STOP: this OpenCode run command does not advertise --server.'
+    if ($LASTEXITCODE -ne 0 -or $runHelp -notmatch '--server' -or $runHelp -notmatch '--session') {
+        throw 'STOP: this OpenCode run command does not advertise --server and --session.'
     }
 
     # Fixture creation runs in the real PowerShell process. OpenCode never
@@ -258,6 +302,9 @@ try {
             PluginVerified = $false
             ApprovedRunModel = $ApprovedModel
             ModelCatalogVerified = $false
+            SessionID = $null
+            SessionLocation = $null
+            SessionVerified = $false
             UnselectedHostDefault = 'NOT_READ'
             ModelCallsIssuedByRunnerBeforePreflight = 0
         }
@@ -284,6 +331,7 @@ try {
                 -RedirectStandardError (Join-Path $evidenceRoot "server-$($job.Name).stderr.log")
             Assert-PrivateHostReady -FixtureRoot $fixtureRoot -ServerUrl $serverUrl -ServerProcess $serverProcess -Authorization "Basic $basicCredential" -Evidence $preflight
             Assert-ApprovedModelReady -FixtureRoot $fixtureRoot -ServerUrl $serverUrl -Authorization "Basic $basicCredential" -ApprovedModel $ApprovedModel -Evidence $preflight
+            $fixtureSessionId = New-VerifiedFixtureSession -FixtureRoot $fixtureRoot -ServerUrl $serverUrl -Authorization "Basic $basicCredential" -Evidence $preflight
 
             Push-Location $fixtureRoot
             try {
@@ -293,9 +341,13 @@ try {
                 # This is the human-approved model for this isolated smoke.
                 # --auto handles only non-denied host permissions.
                 $previousPassword = [Environment]::GetEnvironmentVariable('OPENCODE_PASSWORD', 'Process')
+                $previousPwd = [Environment]::GetEnvironmentVariable('PWD', 'Process')
                 try {
                     $env:OPENCODE_PASSWORD = $privatePassword
-                    $outputLines = @(& opencode run --server $serverUrl --model $ApprovedModel --auto --agent build --format json $job.Prompt 2>&1)
+                    # OpenCode V2 may prefer the inherited PWD over process cwd.
+                    # Set it only for this call, then restore the exact prior value.
+                    $env:PWD = $fixtureRoot
+                    $outputLines = @(& opencode run --server $serverUrl --session $fixtureSessionId --model $ApprovedModel --auto --agent build --format json $job.Prompt 2>&1)
                     $exitCode = $LASTEXITCODE
                 }
                 finally {
@@ -304,6 +356,11 @@ try {
                         Remove-Item Env:OPENCODE_PASSWORD -ErrorAction SilentlyContinue
                     } else {
                         $env:OPENCODE_PASSWORD = $previousPassword
+                    }
+                    if ($null -eq $previousPwd) {
+                        Remove-Item Env:PWD -ErrorAction SilentlyContinue
+                    } else {
+                        $env:PWD = $previousPwd
                     }
                 }
             }
@@ -355,6 +412,17 @@ try {
         }
         if ($exitCode -ne 0) {
             throw "BLOCKED: native host exited $exitCode for $($job.Name). Evidence: $outputPath"
+        }
+        $observedSessionIds = @(
+            Get-Content -LiteralPath $outputPath -Encoding utf8 |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                ForEach-Object { $_ | ConvertFrom-Json -ErrorAction Stop } |
+                Where-Object { $_.type -eq 'step_start' } |
+                ForEach-Object { $_.sessionID } |
+                Sort-Object -Unique
+        )
+        if ($observedSessionIds.Count -ne 1 -or $observedSessionIds[0] -cne $fixtureSessionId) {
+            throw "STOP: native events do not belong to the preflight-verified fixture session. Evidence: $outputPath"
         }
         $contextCalls = @(Get-CanonicalContextCalls -EvidencePath $outputPath)
         $requiredTitle = if ($job.Scenario -eq 'parked') { 'Fixture temporal R2-D2' } else { 'Another synthetic work item' }
