@@ -139,17 +139,7 @@ def _verify_protocols(bundle: Path, workspace: Path, pythonless_path: Path, suff
             raise AssertionError(f"{name} did not preserve initialized context")
 
 
-def _verify_integration(bundle: Path, workspace: Path, pythonless_path: Path, suffix: str) -> None:
-    subprocess.run(
-        (str(bundle / f"evospec{suffix}"), "--project", str(workspace), "integrate", "opencode"),
-        check=True,
-        cwd=workspace.parent,
-        env=_native_environment(pythonless_path),
-    )
-    plugin_path = workspace / ".opencode" / "plugins" / "evospec" / "index.ts"
-    plugin = plugin_path.read_text(encoding="utf-8")
-    manifest = json.loads((workspace / ".evospec" / "opencode-resources.json").read_text(encoding="utf-8"))
-    expected_agent = str(bundle / f"evospec-agent{suffix}")
+def verify_native_commands(plugin: str, bundle: Path, suffix: str) -> None:
     match = re.search(r"const AGENT_COMMAND = (\[[^\n]+\])", plugin)
     if match is None:
         raise AssertionError("generated V2 plugin does not declare AGENT_COMMAND as JSON")
@@ -162,21 +152,39 @@ def _verify_integration(bundle: Path, workspace: Path, pythonless_path: Path, su
     ):
         raise AssertionError("generated AGENT_COMMAND must contain exactly one nonempty string")
     generated_agent = Path(agent_command[0])
+    expected_agent = bundle / f"evospec-agent{suffix}"
     if not generated_agent.exists():
         raise AssertionError("generated V2 plugin references a missing native agent")
-    if generated_agent.name != Path(expected_agent).name:
+    if generated_agent.name != expected_agent.name:
         raise AssertionError("generated V2 plugin references the wrong native agent basename")
     if not os.path.samefile(generated_agent, expected_agent):
         raise AssertionError("generated V2 plugin does not reference the sibling native agent")
+
     cli_match = re.search(r"const CLI_COMMAND = (\[[^\n]+\])", plugin)
     if cli_match is None:
         raise AssertionError("generated V2 plugin does not declare CLI_COMMAND as JSON")
     cli_command = json.loads(cli_match.group(1))
     expected_cli = bundle / f"evospec{suffix}"
-    if len(cli_command) != 1 or not isinstance(cli_command[0], str) or not os.path.samefile(cli_command[0], expected_cli):
+    if (
+        not isinstance(cli_command, list)
+        or len(cli_command) != 1
+        or not isinstance(cli_command[0], str)
+        or not os.path.samefile(cli_command[0], expected_cli)
+    ):
         raise AssertionError("generated V2 plugin does not reference the sibling native CLI")
-    if "evospec.agent_protocol" in plugin:
-        raise AssertionError("generated V2 plugin still invokes the Python protocol module")
+
+
+def _verify_integration(bundle: Path, workspace: Path, pythonless_path: Path, suffix: str) -> None:
+    subprocess.run(
+        (str(bundle / f"evospec{suffix}"), "--project", str(workspace), "integrate", "opencode"),
+        check=True,
+        cwd=workspace.parent,
+        env=_native_environment(pythonless_path),
+    )
+    plugin_path = workspace / ".opencode" / "plugins" / "evospec" / "index.ts"
+    plugin = plugin_path.read_text(encoding="utf-8")
+    manifest = json.loads((workspace / ".evospec" / "opencode-resources.json").read_text(encoding="utf-8"))
+    verify_native_commands(plugin, bundle, suffix)
     if set(manifest["resources"]) != {
         ".opencode/plugins/evospec/index.ts",
         ".opencode/plugins/evospec/continuation.mjs",

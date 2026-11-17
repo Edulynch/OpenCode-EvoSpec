@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import unittest
 from pathlib import Path
@@ -13,6 +14,74 @@ POSIX_EXECUTABLES = frozenset({"evospec", "evospec-agent", "evospec-agent-protoc
 
 
 class NativeBundleContractTests(unittest.TestCase):
+    def test_native_smoke_accepts_harmless_protocol_module_comparison_text(self) -> None:
+        from tests.native_bundle_smoke import verify_native_commands
+
+        bundle, suffix = self._native_command_fixture()
+        agent = bundle / f"evospec-agent{suffix}"
+        cli = bundle / f"evospec{suffix}"
+        plugin = (
+            f"const AGENT_COMMAND = {json.dumps([str(agent)])}\n"
+            f"const CLI_COMMAND = {json.dumps([str(cli)])}\n"
+            'if (AGENT_COMMAND.length < 3 || AGENT_COMMAND[2] !== "evospec.agent_protocol") '
+            '{ throw new Error("source runtime check") }\n'
+        )
+
+        verify_native_commands(plugin, bundle, suffix)
+
+    def test_native_smoke_rejects_python_protocol_module_command(self) -> None:
+        from tests.native_bundle_smoke import verify_native_commands
+
+        bundle, suffix = self._native_command_fixture()
+        cli = bundle / f"evospec{suffix}"
+        plugin = (
+            'const AGENT_COMMAND = ["python", "-m", "evospec.agent_protocol"]\n'
+            f"const CLI_COMMAND = {json.dumps([str(cli)])}\n"
+        )
+
+        with self.assertRaisesRegex(AssertionError, "exactly one nonempty string"):
+            verify_native_commands(plugin, bundle, suffix)
+
+    def test_native_smoke_preserves_native_executable_identity_checks(self) -> None:
+        from tests.native_bundle_smoke import verify_native_commands
+
+        bundle, suffix = self._native_command_fixture()
+        agent = bundle / f"evospec-agent{suffix}"
+        cli = bundle / f"evospec{suffix}"
+        wrong = bundle / f"wrong{suffix}"
+        wrong.touch()
+
+        missing_agent = (
+            f"const AGENT_COMMAND = {json.dumps([str(bundle / f'evospec-agent{suffix}')])}\n"
+            f"const CLI_COMMAND = {json.dumps([str(cli)])}\n"
+        )
+        agent.unlink()
+        with self.assertRaisesRegex(AssertionError, "missing native agent"):
+            verify_native_commands(missing_agent, bundle, suffix)
+        agent.touch()
+
+        wrong_agent = (
+            f"const AGENT_COMMAND = {json.dumps([str(wrong)])}\n"
+            f"const CLI_COMMAND = {json.dumps([str(cli)])}\n"
+        )
+        with self.assertRaisesRegex(AssertionError, "wrong native agent basename"):
+            verify_native_commands(wrong_agent, bundle, suffix)
+
+        wrong_cli = (
+            f"const AGENT_COMMAND = {json.dumps([str(agent)])}\n"
+            f"const CLI_COMMAND = {json.dumps([str(wrong)])}\n"
+        )
+        with self.assertRaisesRegex(AssertionError, "sibling native CLI"):
+            verify_native_commands(wrong_cli, bundle, suffix)
+
+    def _native_command_fixture(self) -> tuple[Path, str]:
+        temporary = self.enterContext(self._temporary_directory())
+        bundle = Path(temporary)
+        suffix = ".exe" if os.name == "nt" else ""
+        for name in (f"evospec{suffix}", f"evospec-agent{suffix}"):
+            (bundle / name).touch()
+        return bundle, suffix
+
     def test_spec_uses_one_shared_multiprogram_collection_with_resources(self) -> None:
         # Given: the checked-in native bundle specification
         specification = (ROOT / "packaging" / "evospec.spec").read_text(encoding="utf-8")
