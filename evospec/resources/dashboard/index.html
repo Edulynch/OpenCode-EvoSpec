@@ -26,6 +26,18 @@
     </header>
 
     <main id="dashboard-main" tabindex="-1">
+      <section id="active-slice-section" class="active-slice-section" aria-labelledby="active-slice-heading" aria-live="polite">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Acceptance index</p>
+            <h2 id="active-slice-heading">Active Slice</h2>
+          </div>
+          <span id="active-slice-status" class="status-label" data-status="waiting">Loading</span>
+        </div>
+        <div id="active-slice-content" class="active-slice-content">
+          <p class="empty-state">Loading the active Slice and acceptance criteria.</p>
+        </div>
+      </section>
       <section id="current-work-section" class="operational-section current-work-section" aria-labelledby="current-work-heading" hidden>
         <div class="section-heading">
           <p class="eyebrow">Happening now</p>

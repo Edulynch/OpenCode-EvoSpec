@@ -5,6 +5,7 @@ import json
 import os
 import re
 import select
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -19,8 +20,11 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from evospec.dashboard import DEFAULT_HOST, DashboardServer, create_server
+from evospec.domain import ExpectedRevision
+from evospec.services import slice_acceptance_statement
 from evospec.workflow import WorkflowService
 from tests._tempdir import TemporaryDirectory
+from tests.test_e1_r1d1_slice_criteria import CHECKPOINT, FEATURE, SLICE, TASK, _provenance, _spec
 
 
 class _SseFrame(NamedTuple):
@@ -122,6 +126,8 @@ class DashboardTests(unittest.TestCase):
                     context = json.loads(response.read())
                     self.assertEqual(response.status, 200)
                     self.assertEqual(response.headers.get_content_type(), "application/json")
+                with urlopen(f"{base}/api/context") as refreshed:
+                    self.assertEqual(json.loads(refreshed.read())["revision"], context["revision"])
                 self.assertEqual(context["initialization_state"], "INITIALIZED")
                 self.assertIn("completed_terminal", context)
 
@@ -130,16 +136,60 @@ class DashboardTests(unittest.TestCase):
                 self.assertEqual(unknown.exception.code, 404)
                 self.assertEqual(json.loads(unknown.exception.read()), {"error": "endpoint not found"})
 
-                with self.assertRaises(HTTPError) as write:
-                    urlopen(Request(f"{base}/api/context", method="POST"))
-                self.assertEqual(write.exception.code, 405)
-                self.assertEqual(write.exception.headers["Allow"], "GET")
-                self.assertEqual(json.loads(write.exception.read()), {"error": "dashboard is read-only"})
+                for method in ("POST", "PUT", "PATCH", "DELETE", "HEAD"):
+                    with self.subTest(method=method), self.assertRaises(HTTPError) as write:
+                        urlopen(Request(f"{base}/api/context", method=method))
+                    self.assertEqual(write.exception.code, 405)
+                    self.assertEqual(write.exception.headers["Allow"], "GET")
+                    if method != "HEAD":
+                        self.assertEqual(json.loads(write.exception.read()), {"error": "dashboard is read-only"})
             finally:
                 server.shutdown()
                 server.server_close()
                 thread.join()
             self.assertEqual(self._files(root), before)
+
+    def test_active_slice_index_projects_canonical_get_snapshot_and_is_read_only(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is required for the dependency-free dashboard UI regressions")
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = WorkflowService.open(root)
+            initial = workflow.init()
+            criteria = _spec()
+            statement = slice_acceptance_statement(FEATURE, SLICE, TASK, CHECKPOINT, criteria)
+            _ = workflow.accept_first_slice(
+                FEATURE, SLICE, TASK, CHECKPOINT, _provenance(statement),
+                expected_revision=ExpectedRevision(initial.revision), criteria=criteria,
+            )
+            before = self._files(root)
+            server, thread, base = self._start_server(root)
+            try:
+                with urlopen(f"{base}/api/context") as response:
+                    self.assertEqual(response.status, 200)
+                    context = json.loads(response.read())
+            finally:
+                self._stop_server(server, thread)
+            self.assertEqual(self._files(root), before)
+            accepted = context["accepted_slice"]
+            self.assertEqual(accepted["feature_title"], FEATURE)
+            self.assertEqual(accepted["slice_title"], SLICE)
+            self.assertEqual(len(accepted["criteria_revision"]["criteria"]), 2)
+            self.assertEqual(len(context["criterion_verification"]), 2)
+            self.assertTrue(all(
+                item["criteria_revision_id"] == accepted["criteria_revision"]["id"]
+                and item["status"] == "UNVERIFIED"
+                for item in context["criterion_verification"]
+            ))
+            environment = os.environ.copy()
+            environment["EVOSPEC_DASHBOARD_ACCEPTANCE_CONTEXT"] = json.dumps(context, separators=(",", ":"))
+            completed = subprocess.run(
+                (node, "--test", str(Path(__file__).with_name("dashboard_acceptance_index.test.mjs"))),
+                cwd=Path(__file__).resolve().parents[1], env=environment, capture_output=True,
+                text=True, timeout=30, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
     def test_static_shell_and_assets_are_served_from_packaged_resources(self) -> None:
         resources = files("evospec").joinpath("resources", "dashboard")
