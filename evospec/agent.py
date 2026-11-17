@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .domain import AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, SliceCriteriaRevision, State, WorkItem, WorkingContext
+from .domain import AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, CriterionTestReceipt, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, SliceCriteriaRevision, State, WorkItem, WorkingContext
 from .guidance import (
     ActionGuidance,
     MaterialDecisionEvidence,
@@ -187,6 +187,8 @@ class AgentContext:
     accepted_slice: AcceptedSliceContext | None = None
     task_progress: AgentTaskProgress | None = None
     e1_schema_ready: bool | None = None
+    criterion_test_receipts: tuple[CriterionTestReceipt, ...] = ()
+    r3_schema_ready: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +253,7 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
              None,
              None,
               Outcome(OutcomeKind.STRUCTURAL_DEFECT, "repository authority initialization is required"),
+              r3_schema_ready=inspection.state.r3_schema_upgrade is not None,
         )
     external_sdd_discovery = workflow.external_sdd_evidence()
     external_sdd_evidence = tuple(
@@ -300,6 +303,7 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
               _pending_capability_selection(inspection.state),
               _outcome(inspection, (), work_queue),
               irreversible_authorizations=_irreversible_authorization_summaries(inspection.state.irreversible_authorizations),
+              r3_schema_ready=inspection.state.r3_schema_upgrade is not None,
         )
     locks = tuple(lock for lock in inspection.locks if lock.active and lock.feature_id == context.feature_id)
     change = next((item for item in inspection.changes if item.id == context.change_id), None)
@@ -383,6 +387,8 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
                 context.task_progress.recorded_revision,
             ),
             e1_schema_ready,
+            inspection.state.criterion_test_receipts,
+            inspection.state.r3_schema_upgrade is not None,
     )
 
 

@@ -158,9 +158,9 @@ const runtime = {
   },
 }
 await plugin.setup(runtime)
-assert(definitions.length === 25, "raw protocol tool and all typed helpers register")
+assert(definitions.length === 26, "raw protocol tool and all typed helpers register")
 const names = new Set(definitions.map((definition) => definition.name))
-for (const name of ["evospec", "evospec_start", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
+for (const name of ["evospec", "evospec_start", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_criterion_test", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
 const contextEntry = definitions.find((definition) => definition.name === "evospec_context")
 assert(contextEntry.options?.codemode === false, "canonical read-only context bypasses deferred Code Mode discovery")
 assert(definitions.filter((definition) => definition.options?.codemode === false).length === 1, "only canonical context is directly exposed")

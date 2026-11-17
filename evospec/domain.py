@@ -246,6 +246,34 @@ class SliceCriteriaHead:
 
 
 @dataclass(frozen=True, slots=True)
+class R3SchemaUpgradeReceipt:
+    """A terminal-approved conversion of an exact schema-15 authority snapshot."""
+
+    source_revision: int
+    converted_revision: int
+    source_sha256: str
+    statement: str
+    source_reference: str
+    repository_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class CriterionTestReceipt:
+    """One host-authorized test observation, not final Slice acceptance."""
+
+    id: str
+    slice_agreement_ref: str
+    criteria_revision_id: str
+    criterion_id: str
+    test_kind: str
+    test_target: str
+    exit_code: int
+    output_sha256: str
+    source_revision: int
+    recorded_revision: int
+
+
+@dataclass(frozen=True, slots=True)
 class DeferredSideRequest:
     id: IntakeId
     intent: str
@@ -967,6 +995,8 @@ class State:
     e1_schema_upgrade: E1SchemaUpgradeReceipt | None = None
     slice_criteria_revisions: tuple[SliceCriteriaRevision, ...] = ()
     slice_criteria_heads: tuple[SliceCriteriaHead, ...] = ()
+    r3_schema_upgrade: R3SchemaUpgradeReceipt | None = None
+    criterion_test_receipts: tuple[CriterionTestReceipt, ...] = ()
 
 
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -2613,6 +2643,62 @@ def validate_state(state: State) -> None:
             revision = revision_index.get(revision.previous_revision_id) if revision.previous_revision_id else None
     if reachable != set(revision_index):
         raise StateValidationError("Slice criteria history must be reachable from Core-owned heads")
+    receipt = state.r3_schema_upgrade
+    if receipt is not None:
+        if type(receipt) is not R3SchemaUpgradeReceipt or state.initialization is None:
+            raise StateValidationError("R3 schema receipt has no initialized authority")
+        expected_statement = (
+            f"Acepto habilitar verificaciones R3-A desde revision {receipt.source_revision}; "
+            f"sha256: {receipt.source_sha256}"
+        )
+        if (
+            receipt.source_revision < 0
+            or receipt.converted_revision != receipt.source_revision + 1
+            or receipt.converted_revision > state.revision
+            or not re.fullmatch(r"[0-9a-f]{64}", receipt.source_sha256)
+            or receipt.statement != expected_statement
+            or receipt.source_reference != f"tty:{sha256(expected_statement.encode('utf-8')).hexdigest()[:12]}"
+            or receipt.repository_id != state.initialization.repository_id
+        ):
+            raise StateValidationError("R3 schema upgrade does not match its exact human approval")
+    if type(state.criterion_test_receipts) is not tuple:
+        raise StateValidationError("R3 test observations must be immutable")
+    if any(type(item) is not CriterionTestReceipt for item in state.criterion_test_receipts):
+        raise StateValidationError("R3 test receipt shape is invalid")
+    _unique((item.id for item in state.criterion_test_receipts), "R3 criterion test receipt")
+    if state.criterion_test_receipts and receipt is None:
+        raise StateValidationError("R3 test evidence requires explicit schema authority")
+    for observation in state.criterion_test_receipts:
+        revision = revision_index.get(observation.criteria_revision_id)
+        if (revision is None or revision.slice_agreement_ref != observation.slice_agreement_ref
+                or not any(item.id == observation.criterion_id for item in revision.criteria)):
+            raise StateValidationError("R3 test evidence must target an accepted criterion revision")
+        if not any(
+            item.expected_evidence == f"{observation.test_kind}:{observation.test_target}"
+            for item in revision.criteria if item.id == observation.criterion_id
+        ):
+            raise StateValidationError("R3 test command differs from the accepted evidence contract")
+        if observation.test_kind not in ("python-unittest", "node-test"):
+            raise StateValidationError("R3 evidence type is not an approved deterministic test")
+        if (observation.test_kind == "python-unittest" and
+                not re.fullmatch(r"tests(?:\.[A-Za-z_][A-Za-z0-9_]*)+", observation.test_target)):
+            raise StateValidationError("R3 Python test target is not a supported test module")
+        if (observation.test_kind == "node-test" and
+                not re.fullmatch(r"tests/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\.test\.mjs", observation.test_target)):
+            raise StateValidationError("R3 Node test target must be a relative test file")
+        if (observation.exit_code < 0 or observation.source_revision < 0
+                or observation.recorded_revision != observation.source_revision + 1
+                or observation.recorded_revision > state.revision
+                or receipt is None or observation.source_revision < receipt.converted_revision
+                or not re.fullmatch(r"[0-9a-f]{64}", observation.output_sha256)):
+            raise StateValidationError("R3 test result has invalid revision or output identity")
+        expected_id = "criterion-test-" + sha256(json.dumps([
+            observation.slice_agreement_ref, observation.criteria_revision_id,
+            observation.criterion_id, observation.test_kind, observation.test_target,
+            observation.exit_code, observation.output_sha256, observation.source_revision,
+        ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:20]
+        if observation.id != expected_id:
+            raise StateValidationError("R3 test receipt identity does not match its recorded result")
     _unique(
         (agreement.task_id for agreement in state.agreements if agreement.task_id is not None),
         "Slice Task",

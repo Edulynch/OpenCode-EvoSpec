@@ -79,6 +79,8 @@ from .domain import (
     State,
     StateValidationError,
     E1SchemaUpgradeReceipt,
+    R3SchemaUpgradeReceipt,
+    CriterionTestReceipt,
     TaskProgress,
     TerminalArchive,
     PendingIntake,
@@ -107,6 +109,7 @@ JsonValue: TypeAlias = (
 # Schema 14 contains the accepted Task-progress contract; schema 15 additionally
 # records Slice criteria. Keep distinct decoders for both durable layouts.
 SCHEMA: Final = 15
+R3_SCHEMA: Final = 16
 LEGACY_WRITE_SCHEMA: Final = 13
 E1_TASK_PROGRESS_SCHEMA: Final = 14
 INTEGRATION_REGISTRY_SCHEMA: Final = 1
@@ -152,6 +155,8 @@ STATE_FIELDS: Final = frozenset(
         "slice_criteria_refs",
         "slice_criteria_heads",
         "e1_schema_upgrade",
+        "r3_schema_upgrade",
+        "criterion_test_receipts",
     )
 )
 CONTEXT_FIELDS: Final = frozenset(
@@ -195,7 +200,8 @@ CONTEXT_FIELDS: Final = frozenset(
 )
 _CAPABILITY_SELECTION_FIELDS: Final = frozenset(("pending_capability_selection", "capability_selection_history"))
 _DISCOVERY_RECOVERY_FIELD: Final = frozenset(("pending_discovery_recovery",))
-STATE_FIELDS_V14: Final = STATE_FIELDS - frozenset(("slice_criteria_refs", "slice_criteria_heads"))
+STATE_FIELDS_V15: Final = STATE_FIELDS - frozenset(("r3_schema_upgrade", "criterion_test_receipts"))
+STATE_FIELDS_V14: Final = STATE_FIELDS_V15 - frozenset(("slice_criteria_refs", "slice_criteria_heads"))
 STATE_FIELDS_V13: Final = STATE_FIELDS_V14 - frozenset(("e1_schema_upgrade",))
 STATE_FIELDS_V12: Final = STATE_FIELDS_V13 - frozenset(("agreement_refs",))
 STATE_FIELDS_V11: Final = STATE_FIELDS_V12 - frozenset(("pending_autonomy_expansion", "autonomy_expansion_history"))
@@ -1547,6 +1553,54 @@ def _legacy_preserved_work_id(value: JsonValue, schema: int) -> WorkId | None:
     return None if context is None else _work_id(context)
 
 
+def _r3_upgrade_to_json(receipt: R3SchemaUpgradeReceipt | None) -> JsonValue:
+    if receipt is None:
+        return None
+    return {"source_revision": receipt.source_revision, "converted_revision": receipt.converted_revision,
+            "source_sha256": receipt.source_sha256, "statement": receipt.statement,
+            "source_reference": receipt.source_reference, "repository_id": receipt.repository_id}
+
+
+def _r3_upgrade_from_json(value: JsonValue) -> R3SchemaUpgradeReceipt | None:
+    if value is None:
+        return None
+    raw = _object(value, frozenset(("source_revision", "converted_revision", "source_sha256",
+                                    "statement", "source_reference", "repository_id")), "R3 upgrade")
+    return R3SchemaUpgradeReceipt(
+        _integer(raw["source_revision"], "R3 source revision"),
+        _integer(raw["converted_revision"], "R3 converted revision"),
+        _string(raw["source_sha256"], "R3 source digest"),
+        _string(raw["statement"], "R3 approval"),
+        _string(raw["source_reference"], "R3 approval reference"),
+        _string(raw["repository_id"], "R3 repository identity"),
+    )
+
+
+def _criterion_test_to_json(receipt: CriterionTestReceipt) -> JsonValue:
+    return {"id": receipt.id, "slice_agreement_ref": receipt.slice_agreement_ref,
+            "criteria_revision_id": receipt.criteria_revision_id, "criterion_id": receipt.criterion_id,
+            "test_kind": receipt.test_kind, "test_target": receipt.test_target,
+            "exit_code": receipt.exit_code, "output_sha256": receipt.output_sha256,
+            "source_revision": receipt.source_revision, "recorded_revision": receipt.recorded_revision}
+
+
+def _criterion_test_from_json(value: JsonValue) -> CriterionTestReceipt:
+    raw = _object(value, frozenset(("id", "slice_agreement_ref", "criteria_revision_id", "criterion_id",
+                                    "test_kind", "test_target", "exit_code", "output_sha256",
+                                    "source_revision", "recorded_revision")), "R3 criterion test")
+    return CriterionTestReceipt(
+        _string(raw["id"], "R3 test id"), _string(raw["slice_agreement_ref"], "R3 Slice"),
+        _string(raw["criteria_revision_id"], "R3 criteria revision"),
+        _string(raw["criterion_id"], "R3 criterion"),
+        _string(raw["test_kind"], "R3 test kind"),
+        _string(raw["test_target"], "R3 test target"),
+        _integer(raw["exit_code"], "R3 test exit code"),
+        _string(raw["output_sha256"], "R3 test output digest"),
+        _integer(raw["source_revision"], "R3 source revision"),
+        _integer(raw["recorded_revision"], "R3 recorded revision"),
+    )
+
+
 def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
     """Read the persisted schema and its state from the same authority snapshot."""
     state_path = _artifact_path(root, "state.json")
@@ -1569,10 +1623,12 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                     decoded.pop(field)
         if schema in (9, 10):
             raw = _object(decoded, STATE_FIELDS_V10, "state")
-        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA):
+        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA):
             decoded_fields = set(decoded)
-            if schema == SCHEMA and decoded_fields == set(STATE_FIELDS):
+            if schema == R3_SCHEMA and decoded_fields == set(STATE_FIELDS):
                 raw = _object(decoded, STATE_FIELDS, "state")
+            elif schema == SCHEMA and decoded_fields == set(STATE_FIELDS_V15):
+                raw = _object(decoded, STATE_FIELDS_V15, "state")
             elif schema == E1_TASK_PROGRESS_SCHEMA and decoded_fields == set(STATE_FIELDS_V14):
                 raw = _object(decoded, STATE_FIELDS_V14, "state")
             elif schema == LEGACY_WRITE_SCHEMA and decoded_fields == set(STATE_FIELDS_V13):
@@ -1613,7 +1669,7 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
             else:
                 raise DecodeError("state fields are not exact")
         else:
-            legacy_fields = STATE_FIELDS_V5 if schema == 5 else STATE_FIELDS_V7 if schema in (6, 7) else STATE_FIELDS_V8 if schema == 8 else STATE_FIELDS_V10 if schema == 10 else STATE_FIELDS_V11 if schema == 11 else STATE_FIELDS
+            legacy_fields = STATE_FIELDS_V5 if schema == 5 else STATE_FIELDS_V7 if schema in (6, 7) else STATE_FIELDS_V8 if schema == 8 else STATE_FIELDS_V10 if schema == 10 else STATE_FIELDS_V11 if schema == 11 else STATE_FIELDS_V15
             legacy_extras = set(decoded) - set(legacy_fields)
             legacy_extension_fields = _CAPABILITY_SELECTION_FIELDS | _DISCOVERY_RECOVERY_FIELD
             raw = _object(
@@ -1642,7 +1698,7 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 legacy_fields,
                 "state",
             )
-        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA):
+        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA):
             raise DecodeError("unknown state schema")
         (
             initialization, deferred, intake, selection, recovery, selection_history,
@@ -1723,6 +1779,11 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 for entry in _array(raw["slice_criteria_heads"], "Slice criteria heads")
                 for item in (_object(entry, frozenset(("slice_agreement_ref", "revision_id")), "Slice criteria head"),)
             ) if schema >= 15 else (),
+            r3_schema_upgrade=_r3_upgrade_from_json(raw["r3_schema_upgrade"]) if schema >= R3_SCHEMA else None,
+            criterion_test_receipts=tuple(
+                _criterion_test_from_json(item)
+                for item in _array(raw["criterion_test_receipts"], "R3 criterion tests")
+            ) if schema >= R3_SCHEMA else (),
         )
         validate_state(state)
         _validate_capability_selection_authority(state, schema)
@@ -2196,7 +2257,7 @@ def _pending_intake_from_json(value: JsonValue) -> PendingIntake | None:
 
 def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
     """Preserve each accepted layout until a scoped authority decision changes it."""
-    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA):
+    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA):
         raise ValueError("unsupported state writer schema")
     if schema < SCHEMA and (state.slice_criteria_revisions or state.slice_criteria_heads):
         raise ValueError("Slice criteria cannot be silently downgraded")
@@ -2259,6 +2320,13 @@ def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
         value["e1_schema_upgrade"] = _e1_upgrade_to_json(state.e1_schema_upgrade)
     elif state.e1_schema_upgrade is not None:
         raise ValueError("human E1 schema upgrade receipt cannot be downgraded")
+    if schema >= R3_SCHEMA:
+        value["r3_schema_upgrade"] = _r3_upgrade_to_json(state.r3_schema_upgrade)
+        value["criterion_test_receipts"] = [
+            _criterion_test_to_json(item) for item in state.criterion_test_receipts
+        ]
+    elif state.r3_schema_upgrade is not None or state.criterion_test_receipts:
+        raise ValueError("R3 approval or criterion test evidence cannot be downgraded")
     return encode_json(value)
 
 
@@ -2431,12 +2499,22 @@ class _StateStore:
             expected_id = sha256(str(self.__root).encode("utf-8")).hexdigest()[:16]
             if state.initialization is None or state.initialization.repository_id != expected_id:
                 raise RecoveryError("accepted Slice state belongs to a different repository root")
-        return state, (schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA) if state.agreements else None)
+        return state, (schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA) if state.agreements else None)
 
     def e1_schema_ready(self) -> bool:
         """Legacy state remains readable but cannot silently enter the E1 writer path."""
         raw = _read_json(_artifact_path(self.__root, "state.json"))
-        return isinstance(raw, dict) and raw.get("schema") in (E1_TASK_PROGRESS_SCHEMA, SCHEMA)
+        return isinstance(raw, dict) and raw.get("schema") in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA)
+
+    def r3_schema_ready(self) -> bool:
+        """Schema 15 stays readable; it never becomes an R3 writer without consent."""
+        raw = _read_json(_artifact_path(self.__root, "state.json"))
+        return isinstance(raw, dict) and raw.get("schema") == R3_SCHEMA
+
+    def r3_upgrade_eligible(self) -> bool:
+        """Only actual schema-15 bytes can be considered for R3 conversion."""
+        raw = _read_json(_artifact_path(self.__root, "state.json"))
+        return isinstance(raw, dict) and raw.get("schema") == SCHEMA
 
     def state_source_sha256(self) -> str:
         """Bind a human schema decision to exact source-state bytes, not only revision."""
@@ -2450,7 +2528,7 @@ class _StateStore:
         with _state_publish_lock(self.__root):
             # Validate the CAS before creating records that may become inert orphans.
             current = self.__check_state_revision(state)
-            if self.__writer_schema_locked(current) != SCHEMA:
+            if self.__writer_schema_locked(current) not in (SCHEMA, R3_SCHEMA):
                 raise AtomicFailure("first E1 Slice requires the current state schema")
             for agreement in agreements:
                 self.__publish_immutable(
@@ -2552,12 +2630,32 @@ class _StateStore:
             if upgrade and (source_digest is None or self.state_source_sha256() != source_digest):
                 raise AtomicFailure("E1 conversion source identity changed after human approval")
             source_schema = self.__writer_schema_locked(current, allow_e1_upgrade=upgrade)
-            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA):
+            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA):
                 raise AtomicFailure("E1_TASK_PROGRESS_REQUIRES_SCHEMA_14")
             candidate = transform(current)
             if candidate.revision != current.revision + 1:
                 raise AtomicFailure("E1 operation must publish exactly one revision")
             self.__publish_state_locked(candidate, strict_directory=True, allow_e1_upgrade=upgrade)
+            return candidate
+
+    def transact_r3(
+        self, expected_revision: int, transform: Callable[[State], State], *,
+        upgrade: bool = False, source_digest: str | None = None,
+    ) -> State:
+        """Publish R3 authority under the exact state lock and explicit schema gate."""
+        with _state_publish_lock(self.__root):
+            current = self.recover()
+            if current.revision != expected_revision:
+                raise AtomicFailure("R3 expected revision is stale")
+            if upgrade and (source_digest is None or self.state_source_sha256() != source_digest):
+                raise AtomicFailure("R3 conversion source identity changed after human approval")
+            output_schema = self.__writer_schema_locked(current, allow_r3_upgrade=upgrade)
+            if output_schema != R3_SCHEMA:
+                raise AtomicFailure("R3_SCHEMA_UPGRADE_REQUIRED")
+            candidate = transform(current)
+            if candidate.revision != current.revision + 1:
+                raise AtomicFailure("R3 operation must publish exactly one revision")
+            self.__publish_state_locked(candidate, strict_directory=True, allow_r3_upgrade=upgrade)
             return candidate
 
     def publish_primary_convergence(
@@ -2582,11 +2680,12 @@ class _StateStore:
 
     def __writer_schema_locked(
         self, current: State, *, allow_e1_upgrade: bool = False, allow_criteria_upgrade: bool = False,
+        allow_r3_upgrade: bool = False,
     ) -> int:
         """Choose the output version from persisted authority, never caller input."""
         state_path = _artifact_path(self.__root, "state.json")
         if not state_path.exists():
-            if allow_e1_upgrade:
+            if allow_e1_upgrade or allow_r3_upgrade:
                 raise AtomicFailure("E1 conversion requires existing schema-13 authority")
             return SCHEMA
         raw = _read_json(state_path)
@@ -2597,21 +2696,26 @@ class _StateStore:
             if source_schema != LEGACY_WRITE_SCHEMA or not current.agreements:
                 raise AtomicFailure("only accepted E1 schema-13 authority may be converted")
             return E1_TASK_PROGRESS_SCHEMA
+        if allow_r3_upgrade:
+            if source_schema != SCHEMA or current.r3_schema_upgrade is not None:
+                raise AtomicFailure("only unconverted schema-15 authority may enter R3")
+            return R3_SCHEMA
         if source_schema == LEGACY_WRITE_SCHEMA and current.agreements:
             raise AtomicFailure("E1_SCHEMA_UPGRADE_REQUIRED: ordinary writers are read-only")
         if allow_criteria_upgrade:
-            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA):
+            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA):
                 raise AtomicFailure("Slice criteria amendment requires E1 schema 14 or 15")
-            return SCHEMA
-        return source_schema if source_schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA) else LEGACY_WRITE_SCHEMA
+            return max(SCHEMA, source_schema)
+        return source_schema if source_schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA) else LEGACY_WRITE_SCHEMA
 
     def __publish_state_locked(
         self, state: State, *, strict_directory: bool = False, allow_e1_upgrade: bool = False,
-        allow_criteria_upgrade: bool = False,
+        allow_criteria_upgrade: bool = False, allow_r3_upgrade: bool = False,
     ) -> None:
         current = self.__check_state_revision(state)
         output_schema = self.__writer_schema_locked(
-            current, allow_e1_upgrade=allow_e1_upgrade, allow_criteria_upgrade=allow_criteria_upgrade,
+            current, allow_e1_upgrade=allow_e1_upgrade,
+            allow_criteria_upgrade=allow_criteria_upgrade, allow_r3_upgrade=allow_r3_upgrade,
         )
         if current.agreements and state.agreements != current.agreements:
             raise AtomicFailure("the original accepted E1 agreements cannot be replaced")
@@ -2619,6 +2723,12 @@ class _StateStore:
                 and not (allow_e1_upgrade and current.e1_schema_upgrade is None
                          and state.e1_schema_upgrade is not None)):
             raise AtomicFailure("the human E1 conversion receipt is immutable")
+        if (current.r3_schema_upgrade != state.r3_schema_upgrade
+                and not (allow_r3_upgrade and current.r3_schema_upgrade is None
+                         and state.r3_schema_upgrade is not None)):
+            raise AtomicFailure("the human R3 conversion receipt is immutable")
+        if state.criterion_test_receipts[:len(current.criterion_test_receipts)] != current.criterion_test_receipts:
+            raise AtomicFailure("R3 criterion test results are append-only")
         ready = tuple(
             item for item in current.irreversible_authorizations
             if item.status is IrreversibleAuthorizationStatus.READY

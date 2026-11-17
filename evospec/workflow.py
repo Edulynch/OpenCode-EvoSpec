@@ -258,6 +258,56 @@ class WorkflowService:
             raise WorkflowError(str(error)) from error
         return self._result("TASK_PROGRESS_RECORDED", saved, "accepted Task report persisted as unverified")
 
+    def r3_upgrade_agreement(self, *, expected_revision: ExpectedRevision) -> str:
+        """Show the byte-bound R3 decision to the interactive terminal."""
+        committed = self.__core.confirmed_r3_upgrade(expected_revision)
+        if committed is not None and committed.r3_schema_upgrade is not None:
+            return committed.r3_schema_upgrade.statement
+        state = self._mutation_state(expected_revision)
+        try:
+            return self.__core.r3_upgrade_statement(state)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+
+    def confirmed_r3_schema_upgrade(self, *, expected_revision: ExpectedRevision) -> WorkflowResult | None:
+        committed = self.__core.confirmed_r3_upgrade(expected_revision)
+        return None if committed is None else self._result(
+            "R3_SCHEMA_ALREADY_UPGRADED", committed, "previous approved R3 schema conversion recovered",
+        )
+
+    def upgrade_r3_schema(
+        self, decision: UserAcceptance, *, expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        committed = self.__core.confirmed_r3_upgrade(expected_revision)
+        if committed is not None and committed.r3_schema_upgrade is not None:
+            receipt = committed.r3_schema_upgrade
+            if decision.statement != receipt.statement or decision.source_reference != receipt.source_reference:
+                raise WorkflowError("R3 retry approval differs from its committed authority")
+            return self._result("R3_SCHEMA_ALREADY_UPGRADED", committed, "approved R3 conversion recovered")
+        state = self._mutation_state(expected_revision)
+        try:
+            saved = self.__core.upgrade_r3_schema(state, decision)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        return self._result("R3_SCHEMA_UPGRADED", saved, "schema 16 enabled by explicit human decision")
+
+    def criterion_test_result(
+        self, repository_id: str, slice_agreement_ref: str,
+        criteria_revision_id: str, criterion_id: str, test_kind: str,
+        test_target: str, exit_code: int, output_sha256: str, *,
+        expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        """Commit the exact result of an authorized host test, not model prose."""
+        state = self._mutation_state(expected_revision)
+        try:
+            saved = self.__core.record_criterion_test(
+                state, repository_id, slice_agreement_ref, criteria_revision_id,
+                criterion_id, test_kind, test_target, exit_code, output_sha256,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        return self._result("CRITERION_TEST_RECORDED", saved, "host test observation recorded per accepted criterion")
+
     def new(
         self,
         intent: str,

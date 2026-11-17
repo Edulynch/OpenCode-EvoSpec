@@ -18,6 +18,7 @@ from .agent_protocol_schema import (
     parse_clarification_answers,
     parse_convergence_assessment,
     parse_expected_revision,
+    parse_test_exit_code,
     parse_irreversible_operation_kind,
     parse_git_history_rewrite_policy,
     parse_git_commit_rewrites,
@@ -142,8 +143,34 @@ def _accepted_slice_json(accepted: AcceptedSliceContext | None) -> dict[str, Jso
 def context_json(context: AgentContext) -> dict[str, JsonValue]:
     """Return the stable JSON-safe representation of an agent context."""
     payload: dict[str, JsonValue] = {"revision": context.revision, "repository_id": context.repository_id, "initialization_state": context.initialization_state,
+            "r3_schema_ready": context.r3_schema_ready,
             "e1_schema_ready": context.e1_schema_ready,
             "accepted_slice": _accepted_slice_json(context.accepted_slice),
+            "criterion_verification": (
+                None if context.accepted_slice is None or context.accepted_slice.criteria_revision is None else [
+                    {
+                        "criterion_id": criterion.id,
+                        "criteria_revision_id": context.accepted_slice.criteria_revision.id,
+                        "status": "UNVERIFIED" if not observations else
+                                  "VERIFIED" if observations[-1].exit_code == 0 else "FAILED",
+                        "evidence_source": None if not observations else "HOST_REPORTED_TEST",
+                        "last_test": None if not observations else {
+                            "receipt_id": observations[-1].id,
+                            "kind": observations[-1].test_kind,
+                            "target": observations[-1].test_target,
+                            "exit_code": observations[-1].exit_code,
+                            "output_sha256": observations[-1].output_sha256,
+                            "recorded_revision": observations[-1].recorded_revision,
+                        },
+                    }
+                    for criterion in context.accepted_slice.criteria_revision.criteria
+                    for observations in ([
+                        item for item in context.criterion_test_receipts
+                        if item.criteria_revision_id == context.accepted_slice.criteria_revision.id
+                        and item.criterion_id == criterion.id
+                    ],)
+                ]
+            ),
             "lifecycle": None if context.lifecycle is None else list(context.lifecycle),
             "feature_id": context.feature_id, "change_id": context.change_id, "classification": context.classification,
             "progress": {"current_action": context.progress.current_action, "focus": context.progress.focus,
@@ -461,6 +488,18 @@ def _dispatch(
                 parse_nonblank_string(request, "checkpoint"),
                 parse_nonblank_string(request, "statement"),
                 parse_nonblank_strings(request, "evidence_refs"),
+                expected_revision=parse_expected_revision(request),
+            )
+        case "criterion_test_result":
+            return workflow.criterion_test_result(
+                parse_nonblank_string(request, "repository_id"),
+                parse_nonblank_string(request, "slice_agreement_ref"),
+                parse_nonblank_string(request, "criteria_revision_id"),
+                parse_nonblank_string(request, "criterion_id"),
+                parse_nonblank_string(request, "test_kind"),
+                parse_nonblank_string(request, "test_target"),
+                parse_test_exit_code(request),
+                parse_nonblank_string(request, "output_sha256"),
                 expected_revision=parse_expected_revision(request),
             )
         case "assess_locks":

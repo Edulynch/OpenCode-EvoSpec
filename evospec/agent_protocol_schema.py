@@ -39,6 +39,11 @@ ACTION_KEYS = {
         "feature_agreement_ref", "slice_agreement_ref", "checkpoint",
         "statement", "evidence_refs",
     )),
+    "criterion_test_result": frozenset((
+        "action", "expected_revision", "repository_id", "slice_agreement_ref",
+        "criteria_revision_id", "criterion_id", "test_kind", "test_target",
+        "exit_code", "output_sha256",
+    )),
     "assess_locks": frozenset(("action", "expected_revision", "assessments")),
     "review": frozenset(("action", "expected_revision", "review")),
     "verify": frozenset(("action", "expected_revision", "verification")),
@@ -103,6 +108,14 @@ def parse_expected_revision(request: dict[str, JsonValue]) -> domain.ExpectedRev
     if revision < 0:
         raise ProtocolError("expected_revision must be nonnegative")
     return domain.ExpectedRevision(revision)
+
+
+def parse_test_exit_code(request: dict[str, JsonValue]) -> int:
+    """Only a completed host process may supply its bounded integer exit code."""
+    value = _integer(request, "exit_code")
+    if not 0 <= value <= 255:
+        raise ProtocolError("test exit_code must be between 0 and 255")
+    return value
 
 
 def parse_repository_paths(request: dict[str, JsonValue], name: str) -> tuple[domain.RepositoryPath, ...]:
