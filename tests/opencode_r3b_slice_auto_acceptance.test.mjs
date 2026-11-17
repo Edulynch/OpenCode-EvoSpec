@@ -1,7 +1,7 @@
 // Synthetic host-boundary tests: no native OpenCode session or real permission prompt.
 import test from "node:test"
 import assert from "node:assert/strict"
-import { readFile, writeFile, copyFile, mkdtemp, rm } from "node:fs/promises"
+import { readFile, writeFile, copyFile, mkdtemp, realpath, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { pathToFileURL, fileURLToPath } from "node:url"
@@ -104,6 +104,8 @@ test("R3-B test binds permission to exact inputs, executes sanitized runtime, an
   let sessionPath = root
   let current = context()
   try {
+    // Compare canonical identity while allowing the session path to retain Windows 8.3 aliases.
+    const canonicalRoot = await realpath(root)
     const content = (await readFile(source, "utf8"))
       .replace("__EVOSPEC_AGENT_COMMAND__", JSON.stringify(["python", "-m", "evospec.agent_protocol"]))
       .replace("__EVOSPEC_CLI_COMMAND__", JSON.stringify(["python", "-m", "evospec.cli"]))
@@ -215,15 +217,15 @@ test("R3-B test binds permission to exact inputs, executes sanitized runtime, an
     assert.equal(parsed.recording.result.code, "CRITERION_TEST_RECORDED")
     const resource = JSON.parse(permissions.at(-1).resources[0])
     assert.equal(resource.operation, "run_criterion_test_r3b")
-    assert.equal(resource.repository_root, root)
+    assert.equal(resource.repository_root, canonicalRoot)
     assert.equal(resource.input_fingerprint, snapshot().fingerprint)
     assert.equal(resource.coverage_approval.id, approvedCoverage().id)
     assert.equal(resource.coverage_approval.contract_digest, approvedCoverage().contract_digest)
     assert.deepEqual(resource.command.slice(1), ["--test", args.test_target])
     const childTest = commands.find((item) => item.command[1] === "--test")
     assert.deepEqual(childTest.options.env.PATH, resolve(process.execPath, ".."))
-    assert.equal(childTest.options.env.TEMP, root)
-    assert.equal(childTest.options.env.TMP, root)
+    assert.equal(childTest.options.env.TEMP, canonicalRoot)
+    assert.equal(childTest.options.env.TMP, canonicalRoot)
     assert.equal(childTest.options.env.HOME, undefined)
     assert.equal(childTest.options.env.API_KEY, undefined)
     assert.equal(sentRequests.at(-1).action, "criterion_test_result_r3b")
