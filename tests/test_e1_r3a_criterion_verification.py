@@ -111,7 +111,7 @@ class CriterionVerificationTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         with patch("sys.stdin", _TTY()), patch("sys.stdout", _TTY()), patch("builtins.input", return_value="ACEPTO wrong"):
             self.assertEqual(cli_main(["--project", str(self.root), "upgrade-r3-schema",
-                                       "--expected-revision", "2"], io.StringIO()), 2)
+                                       "--expected-revision", "2"], _TTY()), 2)
         self.assertEqual(self.snapshot(), before)
 
     def test_r3_04_actual_result_is_per_criterion_not_global_slice_approval(self) -> None:

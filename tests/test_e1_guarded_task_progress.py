@@ -230,12 +230,12 @@ class GuardedTaskProgressTests(unittest.TestCase):
         self.assertEqual(cli_main(args, output), 2)
         self.assertIn("interactive user terminal", output.getvalue())
         with patch("sys.stdin", _TTY()), patch("sys.stdout", _TTY()), patch("builtins.input", return_value="NO"):
-            self.assertEqual(cli_main(args, io.StringIO()), 2)
+            self.assertEqual(cli_main(args, _TTY()), 2)
         self.assertEqual(before, self._authority_snapshot())
         statement = self.workflow.e1_upgrade_agreement(expected_revision=ExpectedRevision(2))
         token = sha256(statement.encode("utf-8")).hexdigest()[:12]
         with patch("sys.stdin", _TTY()), patch("sys.stdout", _TTY()), patch("builtins.input", return_value=f"ACEPTO {token}"):
-            self.assertEqual(cli_main(args, io.StringIO()), 0)
+            self.assertEqual(cli_main(args, _TTY()), 0)
         self.assertEqual(CoreService.open(self.root).recover().revision, 3)
         state_path = self.root / ".evospec/state.json"
         self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["schema"], 14)

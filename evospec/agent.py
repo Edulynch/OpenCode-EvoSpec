@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .domain import AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, CriterionTestReceipt, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, SliceCriteriaRevision, State, WorkItem, WorkingContext
+from .domain import AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, CriterionCoverageApproval, CriterionTestReceipt, ExpectedRevision, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, SliceCriteriaRevision, SliceOutcomeReceipt, State, WorkItem, WorkingContext
 from .guidance import (
     ActionGuidance,
     MaterialDecisionEvidence,
@@ -13,7 +13,8 @@ from .guidance import (
     allowed_actions,
     project,
 )
-from .workflow import ClarificationQuestion, WorkflowService
+from .input_fingerprint import InputSnapshot
+from .workflow import ClarificationQuestion, WorkflowError, WorkflowService
 
 MAX_ACCEPTED_CAPABILITIES = 32
 MAX_ACTIVE_LOCKS = 32
@@ -45,6 +46,14 @@ class AgentTaskProgress:
     source_reference: str | None
     evidence_refs: tuple[str, ...]
     recorded_revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class SliceOutcomeSummary:
+    status: str
+    latest_receipt_id: str | None
+    blockers: tuple[str, ...]
+    receipt: SliceOutcomeReceipt | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +198,10 @@ class AgentContext:
     e1_schema_ready: bool | None = None
     criterion_test_receipts: tuple[CriterionTestReceipt, ...] = ()
     r3_schema_ready: bool = False
+    r3b_schema_ready: bool = False
+    input_snapshot: InputSnapshot | None = None
+    slice_outcome: SliceOutcomeSummary | None = None
+    criterion_coverage_approvals: tuple[CriterionCoverageApproval, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,10 +221,24 @@ class AcceptedSliceContext:
     criteria_revision: SliceCriteriaRevision | None = None
 
 
-def project_context(workflow: WorkflowService, inspection: ReviewInspection | None = None) -> AgentContext:
+def project_context(
+    workflow: WorkflowService,
+    inspection: ReviewInspection | None = None,
+    input_snapshot: InputSnapshot | None = None,
+) -> AgentContext:
     """Return a concise, deterministic projection of current workflow authority."""
     if inspection is None:
         inspection = workflow.inspect_locks()
+    if input_snapshot is None and inspection.state.r3b_schema_upgrade is not None:
+        try:
+            _, input_snapshot = workflow.input_snapshot(
+                expected_revision=ExpectedRevision(inspection.state.revision),
+            )
+        except WorkflowError:
+            pass
+    snapshot_unavailable = (
+        inspection.state.r3b_schema_upgrade is not None and input_snapshot is None
+    )
     # A separate schema read could advertise a newer writer gate with an older revision.
     e1_schema_ready = inspection.e1_schema_ready
     queue_activation_available = (
@@ -254,7 +281,8 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
              None,
               Outcome(OutcomeKind.STRUCTURAL_DEFECT, "repository authority initialization is required"),
               r3_schema_ready=inspection.state.r3_schema_upgrade is not None,
-        )
+              r3b_schema_ready=inspection.state.r3b_schema_upgrade is not None,
+         )
     external_sdd_discovery = workflow.external_sdd_evidence()
     external_sdd_evidence = tuple(
         ExternalSDDSummary(framework, paths)
@@ -301,10 +329,12 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
              ),
               _pending_discovery_recovery(inspection.state),
               _pending_capability_selection(inspection.state),
-              _outcome(inspection, (), work_queue),
-              irreversible_authorizations=_irreversible_authorization_summaries(inspection.state.irreversible_authorizations),
-              r3_schema_ready=inspection.state.r3_schema_upgrade is not None,
-        )
+               _outcome(inspection, (), work_queue),
+               irreversible_authorizations=_irreversible_authorization_summaries(inspection.state.irreversible_authorizations),
+               r3_schema_ready=inspection.state.r3_schema_upgrade is not None,
+               r3b_schema_ready=inspection.state.r3b_schema_upgrade is not None,
+               input_snapshot=input_snapshot,
+         )
     locks = tuple(lock for lock in inspection.locks if lock.active and lock.feature_id == context.feature_id)
     change = next((item for item in inspection.changes if item.id == context.change_id), None)
     current_assessments = () if change is None else change.lock_assessments
@@ -386,14 +416,56 @@ def project_context(workflow: WorkflowService, inspection: ReviewInspection | No
                 context.task_progress.evidence_refs,
                 context.task_progress.recorded_revision,
             ),
-            e1_schema_ready,
-            inspection.state.criterion_test_receipts,
-            inspection.state.r3_schema_upgrade is not None,
-    )
+             e1_schema_ready,
+             inspection.state.criterion_test_receipts,
+             inspection.state.r3_schema_upgrade is not None,
+             inspection.state.r3b_schema_upgrade is not None,
+             input_snapshot,
+              _slice_outcome_summary(
+                   workflow, inspection.state, context, input_snapshot, snapshot_unavailable,
+               ),
+              criterion_coverage_approvals=(
+                  ()
+                  if input_snapshot is None
+                  else workflow.current_r3b_coverage_approvals(inspection.state, input_snapshot)
+              ),
+      )
 
 
 def _accepted_slice_context(state: State) -> AcceptedSliceContext | None:
     return _accepted_slice_for_context(state, state.active_context)
+
+
+def _slice_outcome_summary(
+    workflow: WorkflowService,
+    state: State,
+    context: WorkingContext,
+    snapshot: InputSnapshot | None,
+    snapshot_unavailable: bool = False,
+) -> SliceOutcomeSummary | None:
+    if context.slice_agreement_ref is None or state.r3b_schema_upgrade is None:
+        return None
+    history = tuple(
+        item for item in state.slice_outcome_receipts
+        if item.slice_agreement_ref == context.slice_agreement_ref
+    )
+    latest_id = None if not history else history[-1].id
+    latest_receipt = None if not history else history[-1]
+    if snapshot is None:
+        return SliceOutcomeSummary(
+            "BLOCKED" if snapshot_unavailable else "REVALIDATION_REQUIRED",
+            latest_id,
+            ("INPUT_SNAPSHOT_UNAVAILABLE",) if snapshot_unavailable else (),
+            latest_receipt,
+        )
+    eligibility = workflow.slice_outcome_eligibility(state, snapshot)
+    canonical_receipt = next(
+        (item for item in history if item.id == eligibility.latest_receipt_id),
+        latest_receipt,
+    )
+    return SliceOutcomeSummary(
+        eligibility.status, eligibility.latest_receipt_id, eligibility.blockers, canonical_receipt,
+    )
 
 
 def _accepted_slice_for_context(state: State, context: WorkingContext | None) -> AcceptedSliceContext | None:

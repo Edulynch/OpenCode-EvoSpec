@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from typing import TypeVar
 
 from . import domain
 from .lifecycle import Classification, ReviewVerdict
+from .input_fingerprint import (
+    INPUT_FINGERPRINT_VERSION,
+    INPUT_POLICY_DIGEST,
+    INPUT_POLICY_ID,
+    MAX_INPUT_BYTES,
+    MAX_INPUT_FILES,
+    MAX_INPUT_ENTRIES,
+    InputSnapshot,
+)
 from .persistence import JsonValue
 
 T = TypeVar("T")
@@ -44,6 +54,17 @@ ACTION_KEYS = {
         "criteria_revision_id", "criterion_id", "test_kind", "test_target",
         "exit_code", "output_sha256",
     )),
+    "criterion_test_result_r3b": frozenset((
+        "action", "expected_revision", "repository_id", "slice_agreement_ref",
+        "criteria_revision_id", "criterion_id", "test_kind", "test_target",
+        "exit_code", "output_sha256", "input_fingerprint_before",
+        "input_fingerprint_after", "input_policy_id", "input_policy_digest",
+        "admission_policy_id", "admission_policy_digest", "runtime_executable",
+        "runtime_executable_sha256", "runtime_version",
+        "runtime_argv", "environment_profile_id", "environment_profile_digest",
+        "coverage_approval_id", "coverage_contract_digest",
+    )),
+    "accept_slice_outcome": frozenset(("action", "expected_revision", "input_snapshot")),
     "assess_locks": frozenset(("action", "expected_revision", "assessments")),
     "review": frozenset(("action", "expected_revision", "review")),
     "verify": frozenset(("action", "expected_revision", "verification")),
@@ -116,6 +137,39 @@ def parse_test_exit_code(request: dict[str, JsonValue]) -> int:
     if not 0 <= value <= 255:
         raise ProtocolError("test exit_code must be between 0 and 255")
     return value
+
+
+def parse_input_snapshot(request: dict[str, JsonValue]) -> InputSnapshot:
+    raw = _mapping(_value(request, "input_snapshot"), "input_snapshot")
+    _keys(raw, "input_snapshot", frozenset((
+        "version", "policy_id", "policy_digest", "repository_id",
+        "fingerprint", "file_count", "directory_count", "total_bytes",
+    )))
+    snapshot = InputSnapshot(
+        _string(raw, "version"),
+        _string(raw, "policy_id"),
+        _string(raw, "policy_digest"),
+        _string(raw, "repository_id"),
+        _string(raw, "fingerprint"),
+        _integer(raw, "file_count"),
+        _integer(raw, "directory_count"),
+        _integer(raw, "total_bytes"),
+    )
+    if (
+        snapshot.version != INPUT_FINGERPRINT_VERSION
+        or snapshot.policy_id != INPUT_POLICY_ID
+        or snapshot.policy_digest != INPUT_POLICY_DIGEST
+        or not snapshot.repository_id
+        or re.fullmatch(r"[0-9a-f]{64}", snapshot.fingerprint) is None
+        or snapshot.file_count < 0
+        or snapshot.file_count > MAX_INPUT_FILES
+        or snapshot.directory_count < 0
+        or snapshot.directory_count > MAX_INPUT_ENTRIES
+        or snapshot.total_bytes < 0
+        or snapshot.total_bytes > MAX_INPUT_BYTES
+    ):
+        raise ProtocolError("input_snapshot is invalid")
+    return snapshot
 
 
 def parse_repository_paths(request: dict[str, JsonValue], name: str) -> tuple[domain.RepositoryPath, ...]:
@@ -328,6 +382,18 @@ def parse_nonblank_strings(raw: dict[str, JsonValue], name: str) -> tuple[str, .
     values = _strings(raw, name)
     if any(not value.strip() for value in values):
         raise ProtocolError(f"{name} must contain nonblank strings")
+    return values
+
+
+def parse_bounded_strings(
+    raw: dict[str, JsonValue], name: str, *, maximum_items: int, maximum_length: int,
+) -> tuple[str, ...]:
+    values = _strings(raw, name)
+    if (
+        len(values) > maximum_items
+        or any(not value.strip() or len(value) > maximum_length for value in values)
+    ):
+        raise ProtocolError(f"{name} exceeds its fixed item or text limit")
     return values
 
 

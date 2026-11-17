@@ -80,7 +80,11 @@ from .domain import (
     StateValidationError,
     E1SchemaUpgradeReceipt,
     R3SchemaUpgradeReceipt,
+    R3BSchemaUpgradeReceipt,
     CriterionTestReceipt,
+    CoverageInput,
+    CriterionCoverageApproval,
+    SliceOutcomeReceipt,
     TaskProgress,
     TerminalArchive,
     PendingIntake,
@@ -102,6 +106,7 @@ from .domain import (
 )
 from .lifecycle import Classification, LifecycleState, Phase, ReviewVerdict
 from .discovery import DiscoveryPolicy
+from .input_fingerprint import InputFingerprintError, InputSnapshot, repository_input_snapshot
 
 JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
@@ -110,6 +115,7 @@ JsonValue: TypeAlias = (
 # records Slice criteria. Keep distinct decoders for both durable layouts.
 SCHEMA: Final = 15
 R3_SCHEMA: Final = 16
+R3B_SCHEMA: Final = 17
 LEGACY_WRITE_SCHEMA: Final = 13
 E1_TASK_PROGRESS_SCHEMA: Final = 14
 INTEGRATION_REGISTRY_SCHEMA: Final = 1
@@ -159,6 +165,9 @@ STATE_FIELDS: Final = frozenset(
         "criterion_test_receipts",
     )
 )
+STATE_FIELDS_V16: Final = STATE_FIELDS
+STATE_FIELDS_V17_LEGACY: Final = STATE_FIELDS | frozenset(("r3b_schema_upgrade", "slice_outcome_receipts"))
+STATE_FIELDS_V17: Final = STATE_FIELDS_V17_LEGACY | frozenset(("criterion_coverage_approvals",))
 CONTEXT_FIELDS: Final = frozenset(
     (
         "feature_id",
@@ -200,7 +209,7 @@ CONTEXT_FIELDS: Final = frozenset(
 )
 _CAPABILITY_SELECTION_FIELDS: Final = frozenset(("pending_capability_selection", "capability_selection_history"))
 _DISCOVERY_RECOVERY_FIELD: Final = frozenset(("pending_discovery_recovery",))
-STATE_FIELDS_V15: Final = STATE_FIELDS - frozenset(("r3_schema_upgrade", "criterion_test_receipts"))
+STATE_FIELDS_V15: Final = STATE_FIELDS_V16 - frozenset(("r3_schema_upgrade", "criterion_test_receipts"))
 STATE_FIELDS_V14: Final = STATE_FIELDS_V15 - frozenset(("slice_criteria_refs", "slice_criteria_heads"))
 STATE_FIELDS_V13: Final = STATE_FIELDS_V14 - frozenset(("e1_schema_upgrade",))
 STATE_FIELDS_V12: Final = STATE_FIELDS_V13 - frozenset(("agreement_refs",))
@@ -1576,18 +1585,192 @@ def _r3_upgrade_from_json(value: JsonValue) -> R3SchemaUpgradeReceipt | None:
     )
 
 
-def _criterion_test_to_json(receipt: CriterionTestReceipt) -> JsonValue:
-    return {"id": receipt.id, "slice_agreement_ref": receipt.slice_agreement_ref,
-            "criteria_revision_id": receipt.criteria_revision_id, "criterion_id": receipt.criterion_id,
-            "test_kind": receipt.test_kind, "test_target": receipt.test_target,
-            "exit_code": receipt.exit_code, "output_sha256": receipt.output_sha256,
-            "source_revision": receipt.source_revision, "recorded_revision": receipt.recorded_revision}
+_CRITERION_TEST_FIELDS: Final = frozenset((
+    "id", "slice_agreement_ref", "criteria_revision_id", "criterion_id",
+    "test_kind", "test_target", "exit_code", "output_sha256",
+    "source_revision", "recorded_revision",
+))
+_CRITERION_TEST_R3B_FIELDS: Final = frozenset((
+    "input_fingerprint_before", "input_fingerprint_after", "input_policy_id",
+    "input_policy_digest", "admission_policy_id", "admission_policy_digest",
+    "external_inputs", "runtime_executable", "runtime_executable_sha256",
+    "runtime_version", "runtime_argv", "environment_profile_id",
+    "environment_profile_digest",
+))
+_CRITERION_TEST_COVERAGE_FIELDS: Final = frozenset((
+    "coverage_approval_id", "coverage_contract_digest",
+))
 
 
-def _criterion_test_from_json(value: JsonValue) -> CriterionTestReceipt:
-    raw = _object(value, frozenset(("id", "slice_agreement_ref", "criteria_revision_id", "criterion_id",
-                                    "test_kind", "test_target", "exit_code", "output_sha256",
-                                    "source_revision", "recorded_revision")), "R3 criterion test")
+def _coverage_input_to_json(value: CoverageInput) -> JsonValue:
+    return {"kind": value.kind, "path": value.path}
+
+
+def _coverage_input_from_json(value: JsonValue) -> CoverageInput:
+    raw = _object(value, frozenset(("kind", "path")), "coverage input")
+    return CoverageInput(
+        _string(raw["kind"], "coverage input kind"),
+        _string(raw["path"], "coverage input path"),
+    )
+
+
+def _coverage_approval_to_json(approval: CriterionCoverageApproval) -> JsonValue:
+    return {
+        "id": approval.id,
+        "contract_digest": approval.contract_digest,
+        "repository_id": approval.repository_id,
+        "slice_agreement_ref": approval.slice_agreement_ref,
+        "criteria_revision_id": approval.criteria_revision_id,
+        "criterion_id": approval.criterion_id,
+        "test_kind": approval.test_kind,
+        "test_target": approval.test_target,
+        "known_inputs": [_coverage_input_to_json(item) for item in approval.known_inputs],
+        "root_fingerprint": approval.root_fingerprint,
+        "input_policy_id": approval.input_policy_id,
+        "input_policy_digest": approval.input_policy_digest,
+        "admission_policy_id": approval.admission_policy_id,
+        "admission_policy_digest": approval.admission_policy_digest,
+        "environment_profile_id": approval.environment_profile_id,
+        "environment_profile_policy_digest": approval.environment_profile_policy_digest,
+        "statement": approval.statement,
+        "source_reference": approval.source_reference,
+        "source": approval.source,
+        "source_revision": approval.source_revision,
+        "recorded_revision": approval.recorded_revision,
+    }
+
+
+def _coverage_approval_from_json(value: JsonValue) -> CriterionCoverageApproval:
+    raw = _object(value, frozenset((
+        "id", "contract_digest", "repository_id", "slice_agreement_ref",
+        "criteria_revision_id", "criterion_id", "test_kind", "test_target",
+        "known_inputs", "root_fingerprint", "input_policy_id", "input_policy_digest",
+        "admission_policy_id", "admission_policy_digest", "environment_profile_id",
+        "environment_profile_policy_digest", "statement", "source_reference", "source",
+        "source_revision", "recorded_revision",
+    )), "criterion coverage approval")
+    return CriterionCoverageApproval(
+        _string(raw["id"], "coverage approval id"),
+        _string(raw["contract_digest"], "coverage contract digest"),
+        _string(raw["repository_id"], "coverage repository"),
+        _string(raw["slice_agreement_ref"], "coverage Slice"),
+        _string(raw["criteria_revision_id"], "coverage criteria revision"),
+        _string(raw["criterion_id"], "coverage criterion"),
+        _string(raw["test_kind"], "coverage test kind"),
+        _string(raw["test_target"], "coverage test target"),
+        tuple(_coverage_input_from_json(item) for item in _array(raw["known_inputs"], "known inputs")),
+        _string(raw["root_fingerprint"], "coverage root fingerprint"),
+        _string(raw["input_policy_id"], "coverage input policy"),
+        _string(raw["input_policy_digest"], "coverage input policy digest"),
+        _string(raw["admission_policy_id"], "coverage admission policy"),
+        _string(raw["admission_policy_digest"], "coverage admission policy digest"),
+        _string(raw["environment_profile_id"], "coverage environment profile"),
+        _string(raw["environment_profile_policy_digest"], "coverage environment policy digest"),
+        _string(raw["statement"], "coverage approval statement"),
+        _string(raw["source_reference"], "coverage approval reference"),
+        _string(raw["source"], "coverage approval source"),
+        _integer(raw["source_revision"], "coverage source revision"),
+        _integer(raw["recorded_revision"], "coverage recorded revision"),
+    )
+
+
+def _r3b_upgrade_to_json(receipt: R3BSchemaUpgradeReceipt | None) -> JsonValue:
+    if receipt is None:
+        return None
+    value: dict[str, JsonValue] = {
+        "source_revision": receipt.source_revision,
+        "converted_revision": receipt.converted_revision,
+        "source_sha256": receipt.source_sha256,
+        "statement": receipt.statement,
+        "source_reference": receipt.source_reference,
+        "repository_id": receipt.repository_id,
+        "slice_agreement_ref": receipt.slice_agreement_ref,
+        "criteria_revision_id": receipt.criteria_revision_id,
+    }
+    if receipt.input_fingerprint is not None or receipt.coverage_contract_digest is not None:
+        value["input_fingerprint"] = receipt.input_fingerprint
+        value["coverage_contract_digest"] = receipt.coverage_contract_digest
+    return value
+
+
+def _r3b_upgrade_from_json(value: JsonValue) -> R3BSchemaUpgradeReceipt | None:
+    if value is None:
+        return None
+    fields = frozenset((
+        "source_revision", "converted_revision", "source_sha256", "statement",
+        "source_reference", "repository_id", "slice_agreement_ref", "criteria_revision_id",
+    ))
+    extended = fields | frozenset(("input_fingerprint", "coverage_contract_digest"))
+    actual = set(value) if isinstance(value, dict) else set()
+    raw = _object(value, extended if actual == extended else fields, "R3-B upgrade")
+    return R3BSchemaUpgradeReceipt(
+        _integer(raw["source_revision"], "R3-B source revision"),
+        _integer(raw["converted_revision"], "R3-B converted revision"),
+        _string(raw["source_sha256"], "R3-B source digest"),
+        _string(raw["statement"], "R3-B approval"),
+        _string(raw["source_reference"], "R3-B approval reference"),
+        _string(raw["repository_id"], "R3-B repository identity"),
+        _string(raw["slice_agreement_ref"], "R3-B Slice"),
+        _string(raw["criteria_revision_id"], "R3-B criteria revision"),
+        None if "input_fingerprint" not in raw else _string(raw["input_fingerprint"], "R3-B input fingerprint"),
+        None if "coverage_contract_digest" not in raw else _string(raw["coverage_contract_digest"], "R3-B coverage digest"),
+    )
+
+
+def _criterion_test_to_json(receipt: CriterionTestReceipt, schema: int) -> JsonValue:
+    value: dict[str, JsonValue] = {
+        "id": receipt.id, "slice_agreement_ref": receipt.slice_agreement_ref,
+        "criteria_revision_id": receipt.criteria_revision_id, "criterion_id": receipt.criterion_id,
+        "test_kind": receipt.test_kind, "test_target": receipt.test_target,
+        "exit_code": receipt.exit_code, "output_sha256": receipt.output_sha256,
+        "source_revision": receipt.source_revision, "recorded_revision": receipt.recorded_revision,
+    }
+    provenance = (
+        receipt.input_fingerprint_before, receipt.input_fingerprint_after, receipt.input_policy_id,
+        receipt.input_policy_digest, receipt.admission_policy_id, receipt.admission_policy_digest,
+        receipt.runtime_executable, receipt.runtime_executable_sha256, receipt.runtime_version,
+        receipt.environment_profile_id, receipt.environment_profile_digest,
+        receipt.coverage_approval_id, receipt.coverage_contract_digest,
+    )
+    if schema < R3B_SCHEMA:
+        if any(item is not None for item in provenance) or receipt.external_inputs or receipt.runtime_argv:
+            raise ValueError("R3-B test provenance cannot be encoded in an older schema")
+        return value
+    if any(item is not None for item in provenance):
+        value.update({
+            "input_fingerprint_before": receipt.input_fingerprint_before,
+            "input_fingerprint_after": receipt.input_fingerprint_after,
+            "input_policy_id": receipt.input_policy_id,
+            "input_policy_digest": receipt.input_policy_digest,
+            "admission_policy_id": receipt.admission_policy_id,
+            "admission_policy_digest": receipt.admission_policy_digest,
+            "external_inputs": list(receipt.external_inputs),
+            "runtime_executable": receipt.runtime_executable,
+            "runtime_executable_sha256": receipt.runtime_executable_sha256,
+            "runtime_version": receipt.runtime_version,
+            "runtime_argv": list(receipt.runtime_argv),
+            "environment_profile_id": receipt.environment_profile_id,
+            "environment_profile_digest": receipt.environment_profile_digest,
+        })
+        if receipt.coverage_approval_id is not None or receipt.coverage_contract_digest is not None:
+            value["coverage_approval_id"] = receipt.coverage_approval_id
+            value["coverage_contract_digest"] = receipt.coverage_contract_digest
+    return value
+
+
+def _criterion_test_from_json(value: JsonValue, schema: int) -> CriterionTestReceipt:
+    if not isinstance(value, dict):
+        raise DecodeError("R3 criterion test fields are not exact")
+    fields = _CRITERION_TEST_FIELDS
+    extended = fields | _CRITERION_TEST_R3B_FIELDS
+    covered = extended | _CRITERION_TEST_COVERAGE_FIELDS
+    actual = set(value)
+    allowed = (
+        covered if schema >= R3B_SCHEMA and actual == covered
+        else extended if schema >= R3B_SCHEMA and actual == extended
+        else fields
+    )
+    raw = _object(value, allowed, "R3 criterion test")
     return CriterionTestReceipt(
         _string(raw["id"], "R3 test id"), _string(raw["slice_agreement_ref"], "R3 Slice"),
         _string(raw["criteria_revision_id"], "R3 criteria revision"),
@@ -1598,6 +1781,77 @@ def _criterion_test_from_json(value: JsonValue) -> CriterionTestReceipt:
         _string(raw["output_sha256"], "R3 test output digest"),
         _integer(raw["source_revision"], "R3 source revision"),
         _integer(raw["recorded_revision"], "R3 recorded revision"),
+        None if "input_fingerprint_before" not in raw else _string(raw["input_fingerprint_before"], "R3 input fingerprint before"),
+        None if "input_fingerprint_after" not in raw else _string(raw["input_fingerprint_after"], "R3 input fingerprint after"),
+        None if "input_policy_id" not in raw else _string(raw["input_policy_id"], "R3 input policy id"),
+        None if "input_policy_digest" not in raw else _string(raw["input_policy_digest"], "R3 input policy digest"),
+        None if "admission_policy_id" not in raw else _string(raw["admission_policy_id"], "R3 admission policy id"),
+        None if "admission_policy_digest" not in raw else _string(raw["admission_policy_digest"], "R3 admission policy digest"),
+        () if "external_inputs" not in raw else _strings(raw["external_inputs"], "R3 external inputs"),
+        None if "runtime_executable" not in raw else _string(raw["runtime_executable"], "R3 runtime executable"),
+        None if "runtime_executable_sha256" not in raw else _string(raw["runtime_executable_sha256"], "R3 runtime executable digest"),
+        None if "runtime_version" not in raw else _string(raw["runtime_version"], "R3 runtime version"),
+        () if "runtime_argv" not in raw else _strings(raw["runtime_argv"], "R3 runtime argv"),
+        None if "environment_profile_id" not in raw else _string(raw["environment_profile_id"], "R3 environment profile"),
+        None if "environment_profile_digest" not in raw else _string(raw["environment_profile_digest"], "R3 environment profile digest"),
+        None if "coverage_approval_id" not in raw else _string(raw["coverage_approval_id"], "R3 coverage approval id"),
+        None if "coverage_contract_digest" not in raw else _string(raw["coverage_contract_digest"], "R3 coverage contract digest"),
+    )
+
+
+_SLICE_OUTCOME_FIELDS: Final = frozenset((
+    "id", "repository_id", "slice_agreement_ref", "criteria_revision_id",
+    "evidence_receipt_ids", "input_fingerprint", "input_policy_id",
+    "input_policy_digest", "admission_policy_id", "admission_policy_digest",
+    "relevant_drift_digest", "basis", "source", "source_revision", "recorded_revision",
+))
+
+
+def _slice_outcome_to_json(receipt: SliceOutcomeReceipt) -> JsonValue:
+    value: dict[str, JsonValue] = {
+        "id": receipt.id,
+        "repository_id": receipt.repository_id,
+        "slice_agreement_ref": receipt.slice_agreement_ref,
+        "criteria_revision_id": receipt.criteria_revision_id,
+        "evidence_receipt_ids": list(receipt.evidence_receipt_ids),
+        "input_fingerprint": receipt.input_fingerprint,
+        "input_policy_id": receipt.input_policy_id,
+        "input_policy_digest": receipt.input_policy_digest,
+        "admission_policy_id": receipt.admission_policy_id,
+        "admission_policy_digest": receipt.admission_policy_digest,
+        "relevant_drift_digest": receipt.relevant_drift_digest,
+        "basis": receipt.basis,
+        "source": receipt.source,
+        "source_revision": receipt.source_revision,
+        "recorded_revision": receipt.recorded_revision,
+    }
+    if receipt.coverage_contract_digest is not None:
+        value["coverage_contract_digest"] = receipt.coverage_contract_digest
+    return value
+
+
+def _slice_outcome_from_json(value: JsonValue) -> SliceOutcomeReceipt:
+    if not isinstance(value, dict):
+        raise DecodeError("Slice outcome receipt fields are not exact")
+    covered = _SLICE_OUTCOME_FIELDS | frozenset(("coverage_contract_digest",))
+    raw = _object(value, covered if set(value) == covered else _SLICE_OUTCOME_FIELDS, "Slice outcome receipt")
+    return SliceOutcomeReceipt(
+        _string(raw["id"], "Slice outcome id"),
+        _string(raw["repository_id"], "Slice outcome repository"),
+        _string(raw["slice_agreement_ref"], "Slice outcome agreement"),
+        _string(raw["criteria_revision_id"], "Slice outcome criteria revision"),
+        _strings(raw["evidence_receipt_ids"], "Slice outcome evidence receipts"),
+        _string(raw["input_fingerprint"], "Slice outcome fingerprint"),
+        _string(raw["input_policy_id"], "Slice outcome input policy"),
+        _string(raw["input_policy_digest"], "Slice outcome input policy digest"),
+        _string(raw["admission_policy_id"], "Slice outcome admission policy"),
+        _string(raw["admission_policy_digest"], "Slice outcome admission policy digest"),
+        _string(raw["relevant_drift_digest"], "Slice outcome drift digest"),
+        _string(raw["basis"], "Slice outcome basis"),
+        _string(raw["source"], "Slice outcome source"),
+        _integer(raw["source_revision"], "Slice outcome source revision"),
+        _integer(raw["recorded_revision"], "Slice outcome recorded revision"),
+        None if "coverage_contract_digest" not in raw else _string(raw["coverage_contract_digest"], "Slice outcome coverage digest"),
     )
 
 
@@ -1623,9 +1877,13 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                     decoded.pop(field)
         if schema in (9, 10):
             raw = _object(decoded, STATE_FIELDS_V10, "state")
-        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA):
+        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA):
             decoded_fields = set(decoded)
-            if schema == R3_SCHEMA and decoded_fields == set(STATE_FIELDS):
+            if schema == R3B_SCHEMA and decoded_fields == set(STATE_FIELDS_V17):
+                raw = _object(decoded, STATE_FIELDS_V17, "state")
+            elif schema == R3B_SCHEMA and decoded_fields == set(STATE_FIELDS_V17_LEGACY):
+                raw = {**_object(decoded, STATE_FIELDS_V17_LEGACY, "state"), "criterion_coverage_approvals": []}
+            elif schema == R3_SCHEMA and decoded_fields == set(STATE_FIELDS_V16):
                 raw = _object(decoded, STATE_FIELDS, "state")
             elif schema == SCHEMA and decoded_fields == set(STATE_FIELDS_V15):
                 raw = _object(decoded, STATE_FIELDS_V15, "state")
@@ -1698,7 +1956,7 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 legacy_fields,
                 "state",
             )
-        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA):
+        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA):
             raise DecodeError("unknown state schema")
         (
             initialization, deferred, intake, selection, recovery, selection_history,
@@ -1781,10 +2039,21 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
             ) if schema >= 15 else (),
             r3_schema_upgrade=_r3_upgrade_from_json(raw["r3_schema_upgrade"]) if schema >= R3_SCHEMA else None,
             criterion_test_receipts=tuple(
-                _criterion_test_from_json(item)
+                _criterion_test_from_json(item, schema)
                 for item in _array(raw["criterion_test_receipts"], "R3 criterion tests")
             ) if schema >= R3_SCHEMA else (),
+            r3b_schema_upgrade=_r3b_upgrade_from_json(raw["r3b_schema_upgrade"]) if schema >= R3B_SCHEMA else None,
+            slice_outcome_receipts=tuple(
+                _slice_outcome_from_json(item)
+                for item in _array(raw["slice_outcome_receipts"], "Slice outcome receipts")
+            ) if schema >= R3B_SCHEMA else (),
+            criterion_coverage_approvals=tuple(
+                _coverage_approval_from_json(item)
+                for item in _array(raw.get("criterion_coverage_approvals", []), "criterion coverage approvals")
+            ) if schema >= R3B_SCHEMA else (),
         )
+        if schema == R3B_SCHEMA and state.r3b_schema_upgrade is None:
+            raise DecodeError("schema 17 requires an explicit R3-B conversion receipt")
         validate_state(state)
         _validate_capability_selection_authority(state, schema)
         contexts = tuple(
@@ -2257,10 +2526,12 @@ def _pending_intake_from_json(value: JsonValue) -> PendingIntake | None:
 
 def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
     """Preserve each accepted layout until a scoped authority decision changes it."""
-    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA):
+    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA):
         raise ValueError("unsupported state writer schema")
     if schema < SCHEMA and (state.slice_criteria_revisions or state.slice_criteria_heads):
         raise ValueError("Slice criteria cannot be silently downgraded")
+    if schema == R3B_SCHEMA and state.r3b_schema_upgrade is None:
+        raise ValueError("schema 17 requires its separate human-approved conversion receipt")
     value: dict[str, JsonValue] = {
             "schema": schema,
             "revision": state.revision,
@@ -2323,10 +2594,20 @@ def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
     if schema >= R3_SCHEMA:
         value["r3_schema_upgrade"] = _r3_upgrade_to_json(state.r3_schema_upgrade)
         value["criterion_test_receipts"] = [
-            _criterion_test_to_json(item) for item in state.criterion_test_receipts
+            _criterion_test_to_json(item, schema) for item in state.criterion_test_receipts
         ]
     elif state.r3_schema_upgrade is not None or state.criterion_test_receipts:
         raise ValueError("R3 approval or criterion test evidence cannot be downgraded")
+    if schema >= R3B_SCHEMA:
+        value["r3b_schema_upgrade"] = _r3b_upgrade_to_json(state.r3b_schema_upgrade)
+        value["slice_outcome_receipts"] = [
+            _slice_outcome_to_json(item) for item in state.slice_outcome_receipts
+        ]
+        value["criterion_coverage_approvals"] = [
+            _coverage_approval_to_json(item) for item in state.criterion_coverage_approvals
+        ]
+    elif state.r3b_schema_upgrade is not None or state.slice_outcome_receipts or state.criterion_coverage_approvals:
+        raise ValueError("R3-B approval or Slice outcome evidence cannot be downgraded")
     return encode_json(value)
 
 
@@ -2499,17 +2780,42 @@ class _StateStore:
             expected_id = sha256(str(self.__root).encode("utf-8")).hexdigest()[:16]
             if state.initialization is None or state.initialization.repository_id != expected_id:
                 raise RecoveryError("accepted Slice state belongs to a different repository root")
-        return state, (schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA) if state.agreements else None)
+        return state, (schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA) if state.agreements else None)
 
     def e1_schema_ready(self) -> bool:
         """Legacy state remains readable but cannot silently enter the E1 writer path."""
         raw = _read_json(_artifact_path(self.__root, "state.json"))
-        return isinstance(raw, dict) and raw.get("schema") in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA)
+        return isinstance(raw, dict) and raw.get("schema") in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA)
 
     def r3_schema_ready(self) -> bool:
         """Schema 15 stays readable; it never becomes an R3 writer without consent."""
         raw = _read_json(_artifact_path(self.__root, "state.json"))
+        return isinstance(raw, dict) and raw.get("schema") in (R3_SCHEMA, R3B_SCHEMA)
+
+    def r3b_schema_ready(self) -> bool:
+        """Schema 16 stays readable; schema 17 requires its own explicit decision."""
+        raw = _read_json(_artifact_path(self.__root, "state.json"))
+        return isinstance(raw, dict) and raw.get("schema") == R3B_SCHEMA
+
+    def r3b_upgrade_eligible(self) -> bool:
+        raw = _read_json(_artifact_path(self.__root, "state.json"))
         return isinstance(raw, dict) and raw.get("schema") == R3_SCHEMA
+
+    def input_snapshot(self, expected_revision: int | None = None) -> tuple[State, InputSnapshot]:
+        """Scan the exact current initialized root while state publication is excluded."""
+        with _state_publish_lock(self.__root):
+            current = self.recover()
+            if expected_revision is not None and current.revision != expected_revision:
+                raise AtomicFailure("R3-B input snapshot revision is stale")
+            if current.initialization is None:
+                raise AtomicFailure("R3-B input snapshot requires initialized repository authority")
+            try:
+                snapshot = repository_input_snapshot(
+                    self.__root, current.initialization.repository_id,
+                )
+            except InputFingerprintError as error:
+                raise AtomicFailure(f"R3-B input snapshot failed: {error}") from error
+            return current, snapshot
 
     def r3_upgrade_eligible(self) -> bool:
         """Only actual schema-15 bytes can be considered for R3 conversion."""
@@ -2528,7 +2834,7 @@ class _StateStore:
         with _state_publish_lock(self.__root):
             # Validate the CAS before creating records that may become inert orphans.
             current = self.__check_state_revision(state)
-            if self.__writer_schema_locked(current) not in (SCHEMA, R3_SCHEMA):
+            if self.__writer_schema_locked(current) not in (SCHEMA, R3_SCHEMA, R3B_SCHEMA):
                 raise AtomicFailure("first E1 Slice requires the current state schema")
             for agreement in agreements:
                 self.__publish_immutable(
@@ -2630,7 +2936,7 @@ class _StateStore:
             if upgrade and (source_digest is None or self.state_source_sha256() != source_digest):
                 raise AtomicFailure("E1 conversion source identity changed after human approval")
             source_schema = self.__writer_schema_locked(current, allow_e1_upgrade=upgrade)
-            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA):
+            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA):
                 raise AtomicFailure("E1_TASK_PROGRESS_REQUIRES_SCHEMA_14")
             candidate = transform(current)
             if candidate.revision != current.revision + 1:
@@ -2658,6 +2964,49 @@ class _StateStore:
             self.__publish_state_locked(candidate, strict_directory=True, allow_r3_upgrade=upgrade)
             return candidate
 
+    def transact_r3b(
+        self,
+        expected_revision: int,
+        transform: Callable[[State], State],
+        *,
+        expected_input_fingerprint: str | None = None,
+        upgrade: bool = False,
+        source_digest: str | None = None,
+        allow_noop: bool = False,
+    ) -> State:
+        """Publish one schema-17 action after a fresh in-lock workspace scan."""
+        with _state_publish_lock(self.__root):
+            current = self.recover()
+            if current.revision != expected_revision:
+                raise AtomicFailure("R3-B expected revision is stale")
+            if source_digest is not None and self.state_source_sha256() != source_digest:
+                raise AtomicFailure("R3-B conversion source identity changed after human approval")
+            output_schema = self.__writer_schema_locked(current, allow_r3b_upgrade=upgrade)
+            if output_schema != R3B_SCHEMA:
+                raise AtomicFailure("R3B_SCHEMA_UPGRADE_REQUIRED")
+            if not upgrade and expected_input_fingerprint is None:
+                raise AtomicFailure("R3-B operation requires its observed workspace fingerprint")
+            if expected_input_fingerprint is not None:
+                if current.initialization is None:
+                    raise AtomicFailure("R3-B operation requires initialized repository authority")
+                try:
+                    snapshot = repository_input_snapshot(
+                        self.__root, current.initialization.repository_id,
+                    )
+                except InputFingerprintError as error:
+                    raise AtomicFailure(f"R3-B fresh input scan failed: {error}") from error
+                if snapshot.fingerprint != expected_input_fingerprint:
+                    raise AtomicFailure("R3-B workspace fingerprint changed before publication")
+            candidate = transform(current)
+            if allow_noop and candidate == current:
+                return current
+            if candidate.revision != current.revision + 1:
+                raise AtomicFailure("R3-B operation must publish exactly one revision")
+            self.__publish_state_locked(
+                candidate, strict_directory=True, allow_r3b_upgrade=upgrade,
+            )
+            return candidate
+
     def publish_primary_convergence(
         self, state: State, publication: LivingSpecPublication, content: str
     ) -> None:
@@ -2680,12 +3029,12 @@ class _StateStore:
 
     def __writer_schema_locked(
         self, current: State, *, allow_e1_upgrade: bool = False, allow_criteria_upgrade: bool = False,
-        allow_r3_upgrade: bool = False,
+        allow_r3_upgrade: bool = False, allow_r3b_upgrade: bool = False,
     ) -> int:
         """Choose the output version from persisted authority, never caller input."""
         state_path = _artifact_path(self.__root, "state.json")
         if not state_path.exists():
-            if allow_e1_upgrade or allow_r3_upgrade:
+            if allow_e1_upgrade or allow_r3_upgrade or allow_r3b_upgrade:
                 raise AtomicFailure("E1 conversion requires existing schema-13 authority")
             return SCHEMA
         raw = _read_json(state_path)
@@ -2700,22 +3049,28 @@ class _StateStore:
             if source_schema != SCHEMA or current.r3_schema_upgrade is not None:
                 raise AtomicFailure("only unconverted schema-15 authority may enter R3")
             return R3_SCHEMA
+        if allow_r3b_upgrade:
+            if source_schema != R3_SCHEMA or current.r3b_schema_upgrade is not None:
+                raise AtomicFailure("only unconverted schema-16 authority may enter R3-B")
+            return R3B_SCHEMA
         if source_schema == LEGACY_WRITE_SCHEMA and current.agreements:
             raise AtomicFailure("E1_SCHEMA_UPGRADE_REQUIRED: ordinary writers are read-only")
         if allow_criteria_upgrade:
-            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA):
+            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA):
                 raise AtomicFailure("Slice criteria amendment requires E1 schema 14 or 15")
             return max(SCHEMA, source_schema)
-        return source_schema if source_schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA) else LEGACY_WRITE_SCHEMA
+        return source_schema if source_schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA) else LEGACY_WRITE_SCHEMA
 
     def __publish_state_locked(
         self, state: State, *, strict_directory: bool = False, allow_e1_upgrade: bool = False,
         allow_criteria_upgrade: bool = False, allow_r3_upgrade: bool = False,
+        allow_r3b_upgrade: bool = False,
     ) -> None:
         current = self.__check_state_revision(state)
         output_schema = self.__writer_schema_locked(
             current, allow_e1_upgrade=allow_e1_upgrade,
             allow_criteria_upgrade=allow_criteria_upgrade, allow_r3_upgrade=allow_r3_upgrade,
+            allow_r3b_upgrade=allow_r3b_upgrade,
         )
         if current.agreements and state.agreements != current.agreements:
             raise AtomicFailure("the original accepted E1 agreements cannot be replaced")
@@ -2727,8 +3082,16 @@ class _StateStore:
                 and not (allow_r3_upgrade and current.r3_schema_upgrade is None
                          and state.r3_schema_upgrade is not None)):
             raise AtomicFailure("the human R3 conversion receipt is immutable")
+        if (current.r3b_schema_upgrade != state.r3b_schema_upgrade
+                and not (allow_r3b_upgrade and current.r3b_schema_upgrade is None
+                         and state.r3b_schema_upgrade is not None)):
+            raise AtomicFailure("the human R3-B conversion receipt is immutable")
         if state.criterion_test_receipts[:len(current.criterion_test_receipts)] != current.criterion_test_receipts:
             raise AtomicFailure("R3 criterion test results are append-only")
+        if state.slice_outcome_receipts[:len(current.slice_outcome_receipts)] != current.slice_outcome_receipts:
+            raise AtomicFailure("Slice outcome receipts are append-only")
+        if state.criterion_coverage_approvals[:len(current.criterion_coverage_approvals)] != current.criterion_coverage_approvals:
+            raise AtomicFailure("criterion coverage approvals are append-only")
         ready = tuple(
             item for item in current.irreversible_authorizations
             if item.status is IrreversibleAuthorizationStatus.READY

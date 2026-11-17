@@ -1,8 +1,8 @@
 // EvoSpec-managed: opencode-v2
 
-import { lstat, realpath } from "node:fs/promises"
+import { lstat, open, realpath } from "node:fs/promises"
 import { createHash } from "node:crypto"
-import { isAbsolute, relative, resolve } from "node:path"
+import { dirname, isAbsolute, relative, resolve } from "node:path"
 import {
   abortableDelay,
   deriveContinuationDirective,
@@ -18,6 +18,9 @@ const nullableString = { type: ["string", "null"] }
 const boolean = { type: "boolean" }
 const nonnegativeInteger = { type: "integer", minimum: 0 }
 const stringArray = { type: "array", items: string }
+const sha256 = { type: "string", pattern: "^[0-9a-f]{64}$" }
+const PYTHON_TEST_RUNNER =
+  "import sys,unittest; root,module=sys.argv[1:3]; sys.path.insert(0,root); unittest.main(module=module,argv=[sys.argv[0]])"
 const commitRewrite = object({ old_sha: string, new_sha: string, identity_normalized: boolean })
 
 function object(properties, required = Object.keys(properties)) {
@@ -192,7 +195,460 @@ async function executeCriterionTest(runtime, args, context) {
   })
 }
 
-async function spawnCommand(command, root, context, input) {
+function canonicalR3BPolicy(snapshot) {
+  const policy = snapshot?.r3b_policy
+  if (!policy || typeof policy !== "object" ||
+      policy.coverage_contract_version !== "r3-known-input-contract-v1" ||
+      typeof policy.input_version !== "string" || typeof policy.input_policy_id !== "string" ||
+      !/^[0-9a-f]{64}$/.test(policy.input_policy_digest || "") ||
+      typeof policy.admission_policy_id !== "string" ||
+      !/^[0-9a-f]{64}$/.test(policy.admission_policy_digest || "") ||
+      typeof policy.environment_profile_id !== "string" ||
+      !/^[0-9a-f]{64}$/.test(policy.environment_profile_policy_digest || "") ||
+      typeof policy.coverage_contract !== "string" || !policy.coverage_contract) {
+    throw new Error("Core did not provide the fixed schema-17 admission policy")
+  }
+  return policy
+}
+
+function canonicalR3BSnapshot(snapshot, repositoryID) {
+  const value = snapshot?.input_snapshot
+  if (!value || typeof value !== "object" ||
+      typeof value.fingerprint !== "string" || !/^[0-9a-f]{64}$/.test(value.fingerprint) ||
+      typeof value.repository_id !== "string" || value.repository_id !== repositoryID ||
+      typeof value.version !== "string" || typeof value.policy_id !== "string" ||
+      !/^[0-9a-f]{64}$/.test(value.policy_digest || "") ||
+      !Number.isSafeInteger(value.file_count) || value.file_count < 0 ||
+      !Number.isSafeInteger(value.directory_count) || value.directory_count < 0 ||
+      !Number.isSafeInteger(value.total_bytes) || value.total_bytes < 0) {
+    throw new Error("Core did not provide a complete schema-17 input snapshot")
+  }
+  const policy = canonicalR3BPolicy(snapshot)
+  if (value.version !== policy.input_version || value.policy_id !== policy.input_policy_id ||
+      value.policy_digest !== policy.input_policy_digest) {
+    throw new Error("Core input snapshot differs from the approved schema-17 policy")
+  }
+  return value
+}
+
+function approvedR3BCoverage(snapshot, args, inputSnapshot) {
+  const policy = canonicalR3BPolicy(snapshot)
+  const matches = snapshot.r3b_coverage_approvals?.filter((approval) =>
+    approval?.repository_id === args.repository_id &&
+    approval?.slice_agreement_ref === args.slice_agreement_ref &&
+    approval?.criteria_revision_id === args.criteria_revision_id &&
+    approval?.criterion_id === args.criterion_id &&
+    approval?.test_kind === args.test_kind &&
+    approval?.test_target === args.test_target &&
+    approval?.root_fingerprint === inputSnapshot.fingerprint &&
+    approval?.input_policy_id === policy.input_policy_id &&
+    approval?.input_policy_digest === policy.input_policy_digest &&
+    approval?.admission_policy_id === policy.admission_policy_id &&
+    approval?.admission_policy_digest === policy.admission_policy_digest &&
+    approval?.environment_profile_id === policy.environment_profile_id &&
+    approval?.environment_profile_policy_digest === policy.environment_profile_policy_digest
+  ) || []
+  if (matches.length !== 1) {
+    throw new Error("R3-B criterion has no unique current human-approved known-input contract")
+  }
+  const approval = matches[0]
+  if (!/^coverage-[0-9a-f]{20}$/.test(approval.id || "") ||
+      !/^[0-9a-f]{64}$/.test(approval.contract_digest || "") ||
+      approval.source !== "INTERACTIVE_TERMINAL" ||
+      !/^tty:[0-9a-f]{12}$/.test(approval.source_reference || "") ||
+      !Number.isSafeInteger(approval.source_revision) ||
+      !Number.isSafeInteger(approval.recorded_revision) ||
+      !Array.isArray(approval.known_inputs) ||
+      approval.known_inputs.some((item) =>
+        !item || !["root-file", "root-directory"].includes(item.kind) ||
+        typeof item.path !== "string" || !item.path ||
+        item.path.includes("\\") || item.path.includes(":") ||
+        item.path.startsWith("/") ||
+        item.path.split("/").some((part) => !part || part === "." || part === "..") ||
+        [".git", ".evospec"].includes(item.path.split("/", 1)[0].toLowerCase())
+      ) ||
+      !approval.statement.includes(`repository: ${approval.repository_id};`) ||
+      !approval.statement.includes(`Slice: ${approval.slice_agreement_ref};`) ||
+      !approval.statement.includes(`criterios: ${approval.criteria_revision_id};`) ||
+      !approval.statement.includes(`root-input-fingerprint: ${approval.root_fingerprint};`)) {
+    throw new Error("R3-B approved known-input contract is malformed or unsupported")
+  }
+  return approval
+}
+
+function coverageApprovalIdentity(approval) {
+  return JSON.stringify([
+    approval.id, approval.contract_digest, approval.repository_id,
+    approval.slice_agreement_ref, approval.criteria_revision_id,
+    approval.criterion_id, approval.test_kind, approval.test_target,
+    approval.known_inputs.map((item) => [item.kind, item.path]),
+    approval.root_fingerprint, approval.input_policy_id,
+    approval.input_policy_digest, approval.admission_policy_id,
+    approval.admission_policy_digest, approval.environment_profile_id,
+    approval.environment_profile_policy_digest, approval.statement,
+    approval.source_reference, approval.source, approval.source_revision,
+    approval.recorded_revision,
+  ])
+}
+
+function currentR3BCoverageSet(snapshot, accepted) {
+  const criteria = accepted?.criteria_revision?.criteria
+  if (!Array.isArray(criteria) || !criteria.length) {
+    throw new Error("R3-B current criteria have no approved known-input contracts")
+  }
+  return criteria.map((criterion) => {
+    const [test_kind, test_target] = criterion.expected_evidence.split(":", 2)
+    return approvedR3BCoverage(snapshot, {
+      repository_id: snapshot.repository_id,
+      slice_agreement_ref: accepted.slice_agreement_ref,
+      criteria_revision_id: accepted.criteria_revision.id,
+      criterion_id: criterion.id,
+      test_kind,
+      test_target,
+    }, canonicalR3BSnapshot(snapshot, snapshot.repository_id))
+  }).sort((left, right) => left.criterion_id.localeCompare(right.criterion_id))
+}
+
+function coverageSetIdentity(approvals) {
+  return JSON.stringify(approvals.map(coverageApprovalIdentity))
+}
+
+function acceptedR3BCriterion(snapshot, args) {
+  if (snapshot.revision !== args.expected_revision || snapshot.repository_id !== args.repository_id ||
+      snapshot.r3b_schema_ready !== true) {
+    throw new Error("R3-B test request is stale or schema 17 is not enabled")
+  }
+  const scope = snapshot.accepted_slice
+  const criterion = scope?.criteria_revision?.criteria?.find((item) => item.id === args.criterion_id)
+  if (scope?.slice_agreement_ref !== args.slice_agreement_ref ||
+      scope.criteria_revision?.id !== args.criteria_revision_id ||
+      criterion?.expected_evidence !== `${args.test_kind}:${args.test_target}`) {
+    throw new Error("R3-B test differs from the current human-accepted criterion authority")
+  }
+  return canonicalR3BSnapshot(snapshot, args.repository_id)
+}
+
+function r3bEnvironment(root, executable) {
+  const environment = {
+    PATH: dirname(executable),
+    PYTHONHASHSEED: "0",
+    PYTHONDONTWRITEBYTECODE: "1",
+    PYTHONNOUSERSITE: "1",
+    TEMP: root,
+    TMP: root,
+    TMPDIR: root,
+    TZ: "UTC",
+  }
+  if (process.platform === "win32") {
+    for (const name of ["SystemRoot", "WINDIR"]) {
+      const value = process.env[name]
+      if (typeof value === "string" && value) environment[name] = value
+    }
+  }
+  const sorted = Object.fromEntries(Object.entries(environment).sort(([left], [right]) =>
+    left < right ? -1 : left > right ? 1 : 0))
+  const environmentProfileDigest = createHash("sha256")
+    .update(JSON.stringify({ environment: sorted, profile_id: "evospec-sanitized-test-env-v1" }))
+    .digest("hex")
+  return { environment: sorted, environmentProfileDigest }
+}
+
+async function runtimeDigest(executable) {
+  const before = await lstat(executable, { bigint: true })
+  if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1n ||
+      before.size < 0n || before.size > 1_073_741_824n) {
+    throw new Error("R3-B runtime executable is not a bounded regular file")
+  }
+  const handle = await open(executable, "r")
+  try {
+    const opened = await handle.stat({ bigint: true })
+    if (!opened.isFile() || opened.nlink !== 1n || opened.dev !== before.dev ||
+        opened.ino !== before.ino || opened.size !== before.size) {
+      throw new Error("R3-B runtime executable changed during verification")
+    }
+    const digest = createHash("sha256")
+    const buffer = Buffer.allocUnsafe(1024 * 1024)
+    let readBytes = 0n
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null)
+      if (bytesRead === 0) break
+      readBytes += BigInt(bytesRead)
+      if (readBytes > 1_073_741_824n) throw new Error("R3-B runtime executable exceeds the fixed limit")
+      digest.update(buffer.subarray(0, bytesRead))
+    }
+    const after = await handle.stat({ bigint: true })
+    const current = await lstat(executable, { bigint: true })
+    if (readBytes !== after.size || after.dev !== opened.dev || after.ino !== opened.ino ||
+        after.size !== opened.size || after.mtimeNs !== opened.mtimeNs || after.ctimeNs !== opened.ctimeNs ||
+        current.dev !== after.dev || current.ino !== after.ino || current.size !== after.size ||
+        current.mtimeNs !== after.mtimeNs || current.ctimeNs !== after.ctimeNs) {
+      throw new Error("R3-B runtime executable changed during verification")
+    }
+    return digest.digest("hex")
+  } finally {
+    await handle.close()
+  }
+}
+
+async function runtimeExecutable(kind) {
+  let candidate
+  if (kind === "python-unittest") {
+    if (AGENT_COMMAND.length < 3 || AGENT_COMMAND[1] !== "-m" ||
+        AGENT_COMMAND[2] !== "evospec.agent_protocol") {
+      throw new Error("R3-B Python tests require the exact source Python agent runtime")
+    }
+    candidate = AGENT_COMMAND[0]
+  } else {
+    candidate = Bun.which("node")
+  }
+  if (typeof candidate !== "string" || !candidate) {
+    throw new Error("R3-B test runtime is unavailable")
+  }
+  if (!isAbsolute(candidate)) candidate = Bun.which(candidate)
+  if (typeof candidate !== "string" || !isAbsolute(candidate)) {
+    throw new Error("R3-B test runtime must resolve to an absolute executable")
+  }
+  const executable = await realpath(candidate)
+  if (executable !== candidate) candidate = executable
+  return candidate
+}
+
+async function inspectR3B(runtime, root, context, expectedRevision) {
+  const response = parseContextResponse(await rawExecuteRequest(runtime, { action: "context" }, context, root))
+  if (response.revision !== expectedRevision || response.r3b_schema_ready !== true) {
+    throw new Error("R3-B authority changed or schema 17 is unavailable")
+  }
+  return response
+}
+
+async function executeCriterionTestR3B(runtime, args, context) {
+  if (typeof runtime?.permission?.assert !== "function" || typeof runtime?.session?.get !== "function") {
+    throw new Error("R3-B host permission/session API is unavailable")
+  }
+  const requester = {
+    sessionID: context?.sessionID, agent: context?.agent,
+    messageID: context?.messageID, id: context?.id,
+  }
+  if (Object.values(requester).some((value) => typeof value !== "string" || !value.trim())) {
+    throw new Error("R3-B permission requester is incomplete")
+  }
+  const sessionPath = await sessionRoot(runtime, context)
+  if (typeof sessionPath !== "string" || !isAbsolute(sessionPath)) {
+    throw new Error("R3-B executing repository root is invalid")
+  }
+  const root = await realpath(sessionPath)
+  const commandExecutable = await runtimeExecutable(args.test_kind)
+  const executableDigest = await runtimeDigest(commandExecutable)
+  const command = args.test_kind === "python-unittest"
+    ? [commandExecutable, "-I", "-B", "-c", PYTHON_TEST_RUNNER, root, args.test_target]
+    : [commandExecutable, "--test", args.test_target]
+  if (!(args.test_kind === "python-unittest" &&
+        /^tests(?:\.[A-Za-z_][A-Za-z0-9_]*)+$/.test(args.test_target)) &&
+      !(args.test_kind === "node-test" &&
+        /^tests\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*\.test\.mjs$/.test(args.test_target))) {
+    throw new Error("R3-B test descriptor is not an approved deterministic test target")
+  }
+  let before = await inspectR3B(runtime, root, context, args.expected_revision)
+  let inputSnapshot = acceptedR3BCriterion(before, args)
+  const authorizedFingerprint = inputSnapshot.fingerprint
+  let coverage = approvedR3BCoverage(before, args, inputSnapshot)
+  const policy = canonicalR3BPolicy(before)
+  const profile = r3bEnvironment(root, commandExecutable)
+  await runtime.permission.assert({
+    sessionID: requester.sessionID,
+    agent: requester.agent,
+    source: { type: "tool", messageID: requester.messageID, id: requester.id },
+    action: "evospec_criterion_test_r3b",
+    resources: [JSON.stringify({
+      operation: "run_criterion_test_r3b",
+      repository_root: root,
+      repository_id: args.repository_id,
+      slice_agreement_ref: args.slice_agreement_ref,
+      criteria_revision_id: args.criteria_revision_id,
+      criterion_id: args.criterion_id,
+      test_kind: args.test_kind,
+      test_target: args.test_target,
+      command,
+      runtime_executable: commandExecutable,
+      runtime_executable_sha256: executableDigest,
+      runtime_version_argv: [commandExecutable, "--version"],
+      input_fingerprint: inputSnapshot.fingerprint,
+      coverage_approval: coverage,
+      input_policy_id: policy.input_policy_id,
+      input_policy_digest: policy.input_policy_digest,
+      admission_policy_id: policy.admission_policy_id,
+      admission_policy_digest: policy.admission_policy_digest,
+      environment_profile_id: policy.environment_profile_id,
+      environment_profile_policy_digest: policy.environment_profile_policy_digest,
+      environment_profile_digest: profile.environmentProfileDigest,
+    })],
+  })
+  if (Object.entries(requester).some(([key, value]) => context?.[key] !== value) ||
+      resolve(await realpath(await sessionRoot(runtime, context))) !== resolve(root)) {
+    throw new Error("R3-B permission session/root changed before the test")
+  }
+  before = await inspectR3B(runtime, root, context, args.expected_revision)
+  inputSnapshot = acceptedR3BCriterion(before, args)
+  if (inputSnapshot.fingerprint !== authorizedFingerprint ||
+      inputSnapshot.fingerprint !== canonicalR3BSnapshot(before, args.repository_id).fingerprint) {
+    throw new Error("R3-B input snapshot changed while permission was pending")
+  }
+  const permissionCoverage = approvedR3BCoverage(before, args, inputSnapshot)
+  if (coverageApprovalIdentity(permissionCoverage) !== coverageApprovalIdentity(coverage)) {
+    throw new Error("R3-B known-input contract changed while permission was pending")
+  }
+  coverage = permissionCoverage
+  const versionProcess = await spawnCommand(
+    [commandExecutable, "--version"], root, context, undefined, profile.environment,
+  )
+  const runtimeVersion = `${versionProcess.output}${versionProcess.error}`.trim()
+  const versionPattern = args.test_kind === "python-unittest"
+    ? /^Python \d+\.\d+\.\d+(?:[-+].*)?$/
+    : /^v\d+\.\d+\.\d+(?:[-+].*)?$/
+  if (versionProcess.exitStatus !== 0 || !versionPattern.test(runtimeVersion)) {
+    throw new Error("R3-B test runtime version is unsupported")
+  }
+  const afterVersion = await inspectR3B(runtime, root, context, args.expected_revision)
+  const versionSnapshot = canonicalR3BSnapshot(afterVersion, args.repository_id)
+  if (versionSnapshot.fingerprint !== authorizedFingerprint) {
+    throw new Error("R3-B workspace changed while verifying the runtime")
+  }
+  const versionCoverage = approvedR3BCoverage(afterVersion, args, versionSnapshot)
+  if (coverageApprovalIdentity(versionCoverage) !== coverageApprovalIdentity(coverage)) {
+    throw new Error("R3-B known-input contract changed while verifying the runtime")
+  }
+  const testProcess = await spawnCommand(command, root, context, undefined, profile.environment)
+  if (!Number.isInteger(testProcess.exitStatus) || testProcess.exitStatus < 0 || testProcess.exitStatus > 255) {
+    throw new Error("R3-B deterministic test did not return a supported process exit code")
+  }
+  const outputDigest = createHash("sha256")
+    .update(`${testProcess.output}\n${testProcess.error}`).digest("hex")
+  const assertOriginalRequesterAndRoot = async () => {
+    if (Object.entries(requester).some(([key, value]) => context?.[key] !== value)) {
+      throw new Error("R3-B post-test requester changed; no result was submitted")
+    }
+    const currentSessionPath = await sessionRoot(runtime, context)
+    if (typeof currentSessionPath !== "string" ||
+        resolve(await realpath(currentSessionPath)) !== resolve(root)) {
+      throw new Error("R3-B post-test session root changed; no result was submitted")
+    }
+  }
+  await assertOriginalRequesterAndRoot()
+  const afterTest = await inspectR3B(runtime, root, context, args.expected_revision)
+  const afterSnapshot = canonicalR3BSnapshot(afterTest, args.repository_id)
+  if (afterSnapshot.fingerprint !== authorizedFingerprint) {
+    throw new Error("R3-B workspace changed during the test")
+  }
+  const afterCoverage = approvedR3BCoverage(afterTest, args, afterSnapshot)
+  if (coverageApprovalIdentity(afterCoverage) !== coverageApprovalIdentity(coverage)) {
+    throw new Error("R3-B known-input contract changed during the test")
+  }
+  const request = {
+    action: "criterion_test_result_r3b",
+    ...args,
+    exit_code: testProcess.exitStatus,
+    output_sha256: outputDigest,
+    input_fingerprint_before: inputSnapshot.fingerprint,
+    input_fingerprint_after: afterSnapshot.fingerprint,
+    input_policy_id: policy.input_policy_id,
+    input_policy_digest: policy.input_policy_digest,
+    admission_policy_id: policy.admission_policy_id,
+    admission_policy_digest: policy.admission_policy_digest,
+    runtime_executable: commandExecutable,
+    runtime_executable_sha256: executableDigest,
+    runtime_version: runtimeVersion,
+    runtime_argv: command.slice(1),
+    environment_profile_id: policy.environment_profile_id,
+    environment_profile_digest: profile.environmentProfileDigest,
+    coverage_approval_id: coverage.id,
+    coverage_contract_digest: coverage.contract_digest,
+  }
+  await assertOriginalRequesterAndRoot()
+  const recording = await executeRequest(runtime, request, context, {
+    retryStale: false, authorizedRoot: root,
+  })
+  return JSON.stringify({
+    test: { command, runtime_version: runtimeVersion, exit_code: testProcess.exitStatus,
+      stdout: testProcess.output, stderr: testProcess.error, output_sha256: outputDigest },
+    recording: JSON.parse(recording),
+  })
+}
+
+async function executeAcceptSliceOutcome(runtime, args, context) {
+  if (typeof runtime?.permission?.assert !== "function" || typeof runtime?.session?.get !== "function") {
+    throw new Error("Slice outcome acceptance requires the host permission/session API")
+  }
+  const requester = {
+    sessionID: context?.sessionID, agent: context?.agent,
+    messageID: context?.messageID, id: context?.id,
+  }
+  if (Object.values(requester).some((value) => typeof value !== "string" || !value.trim())) {
+    throw new Error("Slice outcome permission requester is incomplete")
+  }
+  const sessionPath = await sessionRoot(runtime, context)
+  if (typeof sessionPath !== "string" || !isAbsolute(sessionPath)) {
+    throw new Error("Slice outcome repository root is invalid")
+  }
+  const root = await realpath(sessionPath)
+  let before = await inspectR3B(runtime, root, context, args.expected_revision)
+  const policy = canonicalR3BPolicy(before)
+  const inputSnapshot = canonicalR3BSnapshot(before, before.repository_id)
+  const accepted = before.accepted_slice
+  const criteriaRevision = accepted?.criteria_revision?.id
+  if (!accepted?.slice_agreement_ref || !criteriaRevision) {
+    throw new Error("Core has no current accepted Slice criteria head")
+  }
+  if (!["READY", "CURRENT"].includes(before.slice_outcome?.status)) {
+    throw new Error(`Slice outcome is not eligible: ${before.slice_outcome?.status || "UNKNOWN"}`)
+  }
+  const coverage = currentR3BCoverageSet(before, accepted)
+  await runtime.permission.assert({
+    sessionID: requester.sessionID,
+    agent: requester.agent,
+    source: { type: "tool", messageID: requester.messageID, id: requester.id },
+    action: "evospec_accept_slice_outcome",
+    resources: [JSON.stringify({
+      operation: "accept_slice_outcome",
+      repository_root: root,
+      repository_id: before.repository_id,
+      slice_agreement_ref: accepted.slice_agreement_ref,
+      criteria_revision_id: criteriaRevision,
+      expected_revision: args.expected_revision,
+      input_fingerprint: inputSnapshot.fingerprint,
+      input_policy_id: policy.input_policy_id,
+       input_policy_digest: policy.input_policy_digest,
+       admission_policy_id: policy.admission_policy_id,
+       admission_policy_digest: policy.admission_policy_digest,
+       coverage_approvals: coverage,
+       environment_profile_id: policy.environment_profile_id,
+      environment_profile_policy_digest: policy.environment_profile_policy_digest,
+    })],
+  })
+  if (Object.entries(requester).some(([key, value]) => context?.[key] !== value) ||
+      resolve(await realpath(await sessionRoot(runtime, context))) !== resolve(root)) {
+    throw new Error("Slice outcome permission session/root changed before acceptance")
+  }
+  before = await inspectR3B(runtime, root, context, args.expected_revision)
+  const afterSnapshot = canonicalR3BSnapshot(before, before.repository_id)
+  const afterPolicy = canonicalR3BPolicy(before)
+  if (before.accepted_slice?.slice_agreement_ref !== accepted.slice_agreement_ref ||
+      before.accepted_slice?.criteria_revision?.id !== criteriaRevision ||
+      afterSnapshot.fingerprint !== inputSnapshot.fingerprint ||
+      JSON.stringify(afterPolicy) !== JSON.stringify(policy)) {
+    throw new Error("Slice outcome scope, policy, or inputs changed while permission was pending")
+  }
+  const afterCoverage = currentR3BCoverageSet(before, before.accepted_slice)
+  if (coverageSetIdentity(afterCoverage) !== coverageSetIdentity(coverage)) {
+    throw new Error("Slice outcome known-input contracts changed while permission was pending")
+  }
+  return executeRequest(runtime, {
+    action: "accept_slice_outcome",
+    expected_revision: args.expected_revision,
+    input_snapshot: inputSnapshot,
+  }, context, { retryStale: false, authorizedRoot: root })
+}
+
+async function spawnCommand(command, root, context, input, env) {
   const options = {
     cwd: root,
     signal: context.signal,
@@ -201,6 +657,7 @@ async function spawnCommand(command, root, context, input) {
     stderr: "pipe",
   }
   if (input !== undefined) options.stdin = new Blob([new TextEncoder().encode(input)])
+  if (env !== undefined) options.env = env
   const process = Bun.spawn(command, options)
   return capture(process)
 }
@@ -590,10 +1047,11 @@ const tools = [
     object({ request: string }),
     (args, context) => {
       // Keep the E1 capability visible to the host as its own permission-controlled tool.
-      if (["accepted_task_progress", "criterion_test_result"].includes(staleRequest(args.request)?.action)) {
+      if (["accepted_task_progress", "criterion_test_result", "criterion_test_result_r3b",
+        "accept_slice_outcome"].includes(staleRequest(args.request)?.action)) {
         return JSON.stringify({ error: {
           code: "DEDICATED_TOOL_REQUIRED",
-          detail: "Use the dedicated host-authorized tool for accepted Task or criterion test evidence",
+          detail: "Use the dedicated host-authorized tool for accepted Task, criterion test evidence, or Slice outcome acceptance",
         } })
       }
       return executeRequest(context.runtime, args.request, context)
@@ -693,6 +1151,26 @@ const tools = [
       test_target: { type: "string", minLength: 1, maxLength: 256 },
     }),
     (args, context) => executeCriterionTest(context.runtime, args, context),
+  ),
+  protocolTool(
+    "evospec_criterion_test_r3b",
+    "Run one supported human-accepted deterministic test under schema 17; bind native permission to the exact Core snapshot and sanitized runtime profile, then record fresh evidence without accepting the Slice. This is trusted-local evidence, not a sandbox.",
+    object({
+      expected_revision: nonnegativeInteger,
+      repository_id: { type: "string", minLength: 1, maxLength: 2048 },
+      slice_agreement_ref: { type: "string", minLength: 1, maxLength: 2048 },
+      criteria_revision_id: { type: "string", minLength: 1, maxLength: 2048 },
+      criterion_id: { type: "string", minLength: 1, maxLength: 2048 },
+      test_kind: { type: "string", enum: ["python-unittest", "node-test"] },
+      test_target: { type: "string", minLength: 1, maxLength: 256 },
+    }),
+    (args, context) => executeCriterionTestR3B(context.runtime, args, context),
+  ),
+  protocolTool(
+    "evospec_accept_slice_outcome",
+    "Accept the current schema-17 Slice outcome only when Core proves fresh passing evidence for every accepted criterion; require exact-scope host permission and return its immutable receipt.",
+    object({ expected_revision: nonnegativeInteger }),
+    (args, context) => executeAcceptSliceOutcome(context.runtime, args, context),
   ),
   protocolTool(
     "evospec_work_list",
@@ -876,7 +1354,18 @@ export default {
   async setup(runtime) {
     const runtimeTools = tools.map((definition) => ({
       ...definition,
-      execute: (args, context) => definition.execute(args, { ...context, runtime }),
+      execute: (args, context) => definition.execute(
+        args,
+        definition.name === "evospec_criterion_test_r3b"
+          ? new Proxy(context, {
+              get(target, property, receiver) {
+                return property === "runtime"
+                  ? runtime
+                  : Reflect.get(target, property, receiver)
+              },
+            })
+          : { ...context, runtime },
+      ),
     }))
     await runtime.tool.transform((editor) => {
       for (const definition of runtimeTools) editor.add(definition)
