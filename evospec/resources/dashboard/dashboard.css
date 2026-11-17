@@ -54,7 +54,20 @@ h2 { margin-bottom: var(--space-2); font-size: clamp(1.4rem, 3vw, 2rem); }
 .header-status { display: grid; gap: var(--space-1); justify-items: end; }
 .load-status, .project-summary { margin: 0; }
 .project-summary { max-width: 26rem; color: var(--color-text-muted); font-size: 0.875rem; text-align: right; }
-.operational-section, .dashboard-tabs { margin-bottom: var(--space-5); }
+.operational-section, .dashboard-tabs, .active-slice-section { margin-bottom: var(--space-5); }
+.active-slice-section { padding: var(--space-4); background: var(--color-surface); border: var(--border-standard); border-radius: var(--radius-medium); }
+.active-slice-section .section-heading { align-items: center; }
+.active-slice-content { display: grid; gap: var(--space-4); padding-top: var(--space-4); }
+.active-slice-identity { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); }
+.active-slice-identity h3 { margin: 0; overflow-wrap: anywhere; font-size: 1.125rem; }
+.active-slice-identity .eyebrow { margin-bottom: var(--space-1); }
+.active-slice-note { margin: 0; color: var(--color-text-muted); }
+.active-slice-criteria { display: grid; padding: 0; margin: 0; list-style: none; border-top: var(--border-standard); }
+.active-slice-criterion { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4); padding: var(--space-3); border-bottom: var(--border-standard); }
+.active-slice-criterion-result { min-width: 0; overflow-wrap: anywhere; }
+.status-label[data-status="accepted"], .status-label[data-status="verified"] { color: var(--color-success); border-color: rgb(114 214 160 / 0.4); background: rgb(114 214 160 / 0.1); }
+.status-label[data-status="ready"] { color: var(--color-info); border-color: rgb(141 183 255 / 0.4); background: rgb(141 183 255 / 0.1); }
+.status-label[data-status="failed"], .status-label[data-status="stale"] { color: var(--color-warning); border-color: rgb(229 181 103 / 0.4); background: rgb(229 181 103 / 0.1); }
 .section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); padding-bottom: var(--space-3); border-bottom: var(--border-standard); }
 .section-heading h2 { margin: 0; font-size: 1.125rem; }
 .section-heading .eyebrow { margin: 0; color: var(--color-text-subtle); }
@@ -91,6 +104,6 @@ h2 { margin-bottom: var(--space-2); font-size: clamp(1.4rem, 3vw, 2rem); }
 .technical-list li { padding: var(--space-2); color: var(--color-text-muted); background: var(--color-canvas-overlay); border-left: 0.125rem solid var(--color-surface-muted); overflow-wrap: anywhere; }
 .technical-list strong { color: var(--color-text); }
 .technical-record pre { max-height: 22rem; padding: var(--space-3); margin: 0; overflow: auto; color: var(--color-text-muted); background: var(--color-canvas-overlay); border: var(--border-standard); border-radius: var(--radius-small); font-family: var(--font-mono); font-size: 0.75rem; white-space: pre-wrap; overflow-wrap: anywhere; }
-@media (max-width: 44rem) { .site-header { display: grid; align-items: flex-start; } .header-status { justify-items: start; } .project-summary { text-align: left; } .current-work-summary, .blocked-item { display: grid; gap: var(--space-2); } .current-work-summary .status-label { width: fit-content; } }
+@media (max-width: 44rem) { .active-slice-identity { grid-template-columns: minmax(0, 1fr); gap: var(--space-3); } .site-header { display: grid; align-items: flex-start; } .header-status { justify-items: start; } .project-summary { text-align: left; } .current-work-summary, .blocked-item { display: grid; gap: var(--space-2); } .current-work-summary .status-label { width: fit-content; } }
 @media (max-width: 30rem) { .site-header, main { width: min(calc(100% - var(--space-6)), var(--content-width)); } .current-work-section .section-heading, .blocked-section .section-heading { align-items: flex-start; flex-direction: column; gap: var(--space-1); } .feature-row { gap: var(--space-2); } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto; transition-duration: 0.01ms; } }

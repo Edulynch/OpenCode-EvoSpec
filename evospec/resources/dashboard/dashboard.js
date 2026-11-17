@@ -6,6 +6,7 @@
     loadStatus: byId("load-status"), projectSummary: byId("project-summary"),
     currentWorkSection: byId("current-work-section"), currentWorkTitle: byId("current-work-title"),
     currentWorkStatus: byId("current-work-status"), currentWorkExplanation: byId("current-work-explanation"),
+    activeSliceStatus: byId("active-slice-status"), activeSliceContent: byId("active-slice-content"),
     blockedSection: byId("blocked-section"),
     blockedList: byId("blocked-list"), featuresList: byId("features-list"),
     featureFilterButtons: Array.from(document.querySelectorAll("[data-feature-filter]")),
@@ -18,6 +19,10 @@
   let selectedTab = "features";
   const technicalOpenState = new Map();
   let latestFeatureRender;
+  let activeSliceMessage;
+  let activeCriterionStatuses = [];
+  let displayedRevision;
+  let signaledRevision = null;
   const objectValue = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const arrayValue = (value) => Array.isArray(value) ? value : [];
   const textValue = (value, fallback = "Not available") => value === null || value === undefined || value === "" ? fallback : String(value);
@@ -28,7 +33,11 @@
     if (value !== undefined) element.textContent = value;
     return element;
   };
-  const appendEmpty = (element, message) => element.append(create("p", "empty-state", message));
+  const appendEmpty = (element, message) => {
+    const empty = create("p", "empty-state", message);
+    element.append(empty);
+    return empty;
+  };
   const safeId = (value) => String(value).replace(/[^a-zA-Z0-9_-]+/g, "-");
 
   function humanStatus(work) {
@@ -99,6 +108,134 @@
     elements.currentWorkStatus.textContent = phase;
     elements.currentWorkStatus.dataset.status = statusTone(phase);
     elements.currentWorkExplanation.textContent = currentExplanation(progress, work);
+  }
+
+  function criterionPresentation(verification) {
+    const status = String(objectValue(verification).status || "").toUpperCase();
+    if (status === "UNVERIFIED") return ["Pending", "waiting"];
+    if (status === "FAILED") return ["Failed", "failed"];
+    if (status === "STALE" || status === "REVALIDATION_REQUIRED") return ["Revalidate", "stale"];
+    if (status === "VERIFIED") {
+      return verification.fresh_for_current_workspace === true
+        ? ["Verified (current)", "verified"]
+        : ["Verified (freshness unavailable)", "waiting"];
+    }
+    return ["Status unavailable", "waiting"];
+  }
+
+  function outcomePresentation(outcome) {
+    const value = objectValue(outcome);
+    const status = String(value.status || "").toUpperCase();
+    if (status === "CURRENT") {
+      const receipt = objectValue(value.receipt);
+      if (typeof value.latest_receipt_id === "string" && value.latest_receipt_id !== "" && receipt.id === value.latest_receipt_id) {
+        return ["Slice accepted", "accepted", "Current canonical acceptance is recorded."];
+      }
+      return ["Acceptance status unavailable", "waiting", "The canonical acceptance receipt is unavailable."];
+    }
+    if (status === "READY") return ["Ready for acceptance", "ready", "Ready for acceptance; this Slice is not yet accepted."];
+    if (status === "BLOCKED") return ["Blocked", "blocked", "Acceptance is blocked by unresolved requirements."];
+    if (status === "STALE" || status === "REVALIDATION_REQUIRED") {
+      return ["Revalidate", "stale", "Evidence needs revalidation before acceptance."];
+    }
+    return ["Acceptance status unavailable", "waiting", "The canonical acceptance status is not available."];
+  }
+
+  function renderAcceptanceIndex(context) {
+    clear(elements.activeSliceContent);
+    activeSliceMessage = undefined;
+    activeCriterionStatuses = [];
+    const setStatus = (label, tone) => {
+      elements.activeSliceStatus.textContent = label;
+      elements.activeSliceStatus.dataset.status = tone;
+    };
+    const unavailable = (message) => {
+      setStatus("Status unavailable", "waiting");
+      activeSliceMessage = appendEmpty(elements.activeSliceContent, message);
+    };
+    if (context.dashboard_error) {
+      unavailable("The active Slice status could not be loaded.");
+      return;
+    }
+    if (!Object.prototype.hasOwnProperty.call(context, "accepted_slice")) {
+      unavailable("Active Slice information is not available in this schema.");
+      return;
+    }
+    if (context.accepted_slice === null) {
+      setStatus("No active Slice", "waiting");
+      activeSliceMessage = appendEmpty(elements.activeSliceContent, "No active accepted Slice.");
+      return;
+    }
+    const accepted = objectValue(context.accepted_slice);
+    const featureTitle = typeof accepted.feature_title === "string" ? accepted.feature_title.trim() : "";
+    const sliceTitle = typeof accepted.slice_title === "string" ? accepted.slice_title.trim() : "";
+    if (!featureTitle || !sliceTitle || Array.isArray(context.accepted_slice)) {
+      unavailable("Active Slice details are not available for this context.");
+      return;
+    }
+    const identity = create("div", "active-slice-identity");
+    const feature = create("div");
+    feature.append(create("p", "eyebrow", "Feature"), create("h3", "", featureTitle));
+    const slice = create("div");
+    slice.append(create("p", "eyebrow", "Active Slice"), create("h3", "", sliceTitle));
+    identity.append(feature, slice);
+    elements.activeSliceContent.append(identity);
+
+    const criteriaRevision = accepted.criteria_revision;
+    if (criteriaRevision === null || criteriaRevision === undefined) {
+      setStatus("Criteria not recorded", "waiting");
+      activeSliceMessage = appendEmpty(elements.activeSliceContent, "Acceptance criteria are not recorded yet.");
+      return;
+    }
+    const revision = objectValue(criteriaRevision);
+    if (!Array.isArray(revision.criteria)) {
+      unavailable("Acceptance criteria are not available for this context.");
+      return;
+    }
+    if (!revision.criteria.length) {
+      setStatus("Criteria not recorded", "waiting");
+      activeSliceMessage = appendEmpty(elements.activeSliceContent, "Acceptance criteria are not registered yet.");
+      return;
+    }
+    const criteria = revision.criteria.map(objectValue);
+    if (criteria.some((criterion) => typeof criterion.expected_result !== "string" || !criterion.expected_result.trim())) {
+      unavailable("Acceptance criteria are not available for this context.");
+      return;
+    }
+    const [outcomeLabel, outcomeTone, outcomeMessage] = outcomePresentation(context.slice_outcome);
+    setStatus(outcomeLabel, outcomeTone);
+    activeSliceMessage = create("p", "active-slice-note", outcomeMessage);
+    elements.activeSliceContent.append(activeSliceMessage);
+    elements.activeSliceContent.append(create("h3", "active-slice-criteria-heading", "Acceptance criteria"));
+    const verificationRecords = Array.isArray(context.criterion_verification)
+      ? context.criterion_verification.map(objectValue)
+      : [];
+    const revisionId = typeof revision.id === "string" && revision.id ? revision.id : null;
+    const list = create("ul", "active-slice-criteria");
+    list.setAttribute("aria-label", "Current acceptance criteria");
+    criteria.forEach((criterion) => {
+      const matches = revisionId === null ? [] : verificationRecords.filter((item) =>
+        item.criterion_id === criterion.id && item.criteria_revision_id === revisionId
+      );
+      const [label, tone] = criterionPresentation(matches.length === 1 ? matches[0] : null);
+      const row = create("li", "active-slice-criterion");
+      const status = create("span", "status-label", label);
+      status.dataset.status = tone;
+      activeCriterionStatuses.push(status);
+      row.append(create("span", "active-slice-criterion-result", criterion.expected_result.trim()), status);
+      list.append(row);
+    });
+    elements.activeSliceContent.append(list);
+  }
+
+  function markAcceptanceUpdating() {
+    elements.activeSliceStatus.textContent = "Updating";
+    elements.activeSliceStatus.dataset.status = "waiting";
+    if (activeSliceMessage) activeSliceMessage.textContent = "A newer project revision is being checked.";
+    activeCriterionStatuses.forEach((status) => {
+      status.textContent = "Updating";
+      status.dataset.status = "waiting";
+    });
   }
 
   function blockedRecords(queue) {
@@ -242,10 +379,13 @@
 
   function render(contextPayload) {
     const context = objectValue(contextPayload);
+    displayedRevision = Number.isSafeInteger(context.revision) ? context.revision : null;
+    if (signaledRevision !== null && displayedRevision !== null && displayedRevision >= signaledRevision) signaledRevision = null;
     const queue = objectValue(context.work_queue);
     const progress = objectValue(context.progress);
     const capabilities = arrayValue(context.accepted_capabilities).map(objectValue);
     renderHeader(context, queue);
+    renderAcceptanceIndex(context);
     renderCurrentWork(queue, progress, capabilities);
     renderBlocked(queue, capabilities);
     renderFeatures(context, queue, progress);
@@ -309,9 +449,16 @@
       try {
         const response = await fetch("/api/context", { headers: { Accept: "application/json" } });
         if (!response.ok) throw new Error(`Context request failed with status ${response.status}.`);
-        render(await response.json());
+        const context = await response.json();
+        const revision = objectValue(context).revision;
+        if (signaledRevision !== null && Number.isSafeInteger(revision) && revision < signaledRevision) {
+          contextRequestQueued = true;
+        }
+        if (!contextRequestQueued && !pageHidden) render(context);
       } catch (error) {
-        render({ dashboard_error: textValue(error && error.message, "GET /api/context failed."), initialization_state: "UNAVAILABLE", work_queue: {}, progress: {} });
+        if (!contextRequestQueued && !pageHidden) {
+          render({ dashboard_error: textValue(error && error.message, "GET /api/context failed."), initialization_state: "UNAVAILABLE", work_queue: {}, progress: {} });
+        }
       }
     } while (contextRequestQueued && !pageHidden);
     contextRequestInFlight = false;
@@ -329,7 +476,18 @@
       stopFallback();
       loadContext();
     });
-    eventSource.addEventListener("revision", () => { loadContext(); });
+    eventSource.addEventListener("revision", (event) => {
+      try {
+        const revision = objectValue(JSON.parse(event.data)).revision;
+        if (Number.isSafeInteger(revision) && (displayedRevision === undefined || revision > displayedRevision)) {
+          signaledRevision = Math.max(signaledRevision === null ? revision : signaledRevision, revision);
+          if (displayedRevision !== undefined && displayedRevision !== null) markAcceptanceUpdating();
+        }
+      } catch {
+        // A malformed revision event still triggers a canonical refetch.
+      }
+      loadContext();
+    });
     eventSource.addEventListener("error", () => {
       setLoadStatus(eventSource.readyState === EventSource.CLOSED ? "Polling" : "Reconnecting");
       startFallback();
