@@ -108,6 +108,7 @@ class Phase4CValidationWorkflowTests(unittest.TestCase):
             self.assertIn(step, validate)
         self.assertIn("uv python install ${{ matrix.python }}", validate)
         self.assertIn("tests/installed_runtime_smoke.py", validate)
+        self.assertIn("tests/opencode_r3b_slice_auto_acceptance.test.mjs", validate)
         native = job_block("native")
         for step in ("Build native bundle", "Smoke native bundle", "Test PowerShell installer", "Test documented Windows native bootstrap", "Test POSIX installer", "Create versioned native archive", "Validate native archive before upload"):
             self.assertIn(step, native)

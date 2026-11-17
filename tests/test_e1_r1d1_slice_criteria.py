@@ -357,7 +357,7 @@ class SliceCriteriaTests(unittest.TestCase):
         with patch("sys.stdin", _TTY()), patch("sys.stdout", _TTY()), patch(
             "builtins.input", return_value=f"ACEPTO {sha256(statement.encode()).hexdigest()[:12]}"
         ):
-            self.assertEqual(cli_main(args, io.StringIO()), 0)
+            self.assertEqual(cli_main(args, _TTY()), 0)
         head = self._context()["criteria_revision"]["id"]
         reason = "Ajuste de prioridad"
         decision = slice_criteria_decision_statement(head, reason, spec)
@@ -367,7 +367,7 @@ class SliceCriteriaTests(unittest.TestCase):
         with patch("sys.stdin", _TTY()), patch("sys.stdout", _TTY()), patch(
             "builtins.input", return_value=f"DECIDO {sha256(decision.encode()).hexdigest()[:12]}"
         ):
-            self.assertEqual(cli_main(amend_args, io.StringIO()), 0)
+            self.assertEqual(cli_main(amend_args, _TTY()), 0)
         self.assertEqual(len(CoreService.open(self.root).recover().slice_criteria_revisions), 2)
 
     def test_r1_08b_malformed_criterion_id_fails_as_input_error(self) -> None:
@@ -388,7 +388,7 @@ class SliceCriteriaTests(unittest.TestCase):
             with self.subTest(invalid_id=invalid_id):
                 payload["criteria"][0]["id"] = invalid_id
                 criteria_file.write_text(json.dumps(payload), encoding="utf-8")
-                output = io.StringIO()
+                output = _TTY()
                 with patch("sys.stdin", _TTY()), patch("sys.stdout", _TTY()):
                     self.assertEqual(cli_main(args, output), 2)
                 self.assertIn("ERROR", output.getvalue())

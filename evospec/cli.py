@@ -5,19 +5,27 @@ from __future__ import annotations
 import argparse
 import json
 from hashlib import sha256
+from pathlib import Path
+import stat
 import sys
 import tomllib
 from collections.abc import Sequence
 from importlib import metadata
-from pathlib import Path
 from typing import TextIO
+import unicodedata
 
 from .agent import AgentContext, project_context
 from .dashboard import DEFAULT_PORT, serve
 from .opencode_integration import IntegrationRegistry, OpenCodeIntegrationInspection, OpenCodeIntegrationProvider
 from .persistence import IntegrationRegistryError, RecoveryError
 from .workflow import ClarificationAnswer, WorkflowError, WorkflowResult, WorkflowService
-from .domain import ExpectedRevision, SliceCriterion
+from .domain import (
+    CriterionCoverageDeclaration,
+    CoverageInput,
+    ExpectedRevision,
+    SliceCriterion,
+)
+from .input_fingerprint import COVERAGE_CONTRACT_VERSION
 from .services import (
     ServiceError, SliceCriteriaSpec, UserAcceptance, slice_acceptance_statement,
     slice_criteria_decision_statement, validate_slice_criteria_spec,
@@ -69,6 +77,77 @@ def _load_criteria_spec(path: str) -> SliceCriteriaSpec:
     return spec
 
 
+def _load_coverage_declarations(
+    path: str,
+    project_root: Path,
+) -> tuple[CriterionCoverageDeclaration, ...]:
+    """Read only a bounded, non-symlink proposal beneath the selected project root."""
+    if (
+        type(path) is not str
+        or not path
+        or "\\" in path
+        or ":" in path
+        or path.startswith("/")
+        or unicodedata.normalize("NFC", path) != path
+        or any(part in ("", ".", "..") for part in path.split("/"))
+        or path.split("/", 1)[0].casefold() in (".git", ".evospec")
+    ):
+        raise ValueError("coverage file must be a normalized project-relative path outside managed directories")
+    try:
+        root = project_root.resolve(strict=True)
+        source = root.joinpath(*path.split("/"))
+        cursor = root
+        parts = path.split("/")
+        for index, part in enumerate(parts):
+            cursor = cursor / part
+            info = cursor.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise ValueError("coverage file path cannot traverse a symlink or reparse point")
+            if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+                raise ValueError("coverage file parent is not a directory")
+        info = source.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("coverage file must be a regular file without hard links")
+        if info.st_size > 40000:
+            raise ValueError("coverage file is too large")
+        canonical = source.resolve(strict=True)
+        if not canonical.is_relative_to(root):
+            raise ValueError("coverage file resolves outside the selected project")
+        raw = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, RuntimeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("coverage file is missing or not valid JSON") from error
+    if (
+        type(raw) is not dict
+        or set(raw) != {"version", "criteria"}
+        or raw["version"] != COVERAGE_CONTRACT_VERSION
+        or type(raw["criteria"]) is not list
+        or not raw["criteria"]
+    ):
+        raise ValueError(f"coverage file must explicitly use version {COVERAGE_CONTRACT_VERSION} and list criteria")
+    declarations: list[CriterionCoverageDeclaration] = []
+    for item in raw["criteria"]:
+        if type(item) is not dict or set(item) != {
+            "criterion_id", "test_kind", "test_target", "known_inputs",
+        } or type(item["known_inputs"]) is not list:
+            raise ValueError("each coverage criterion requires its exact test descriptor and known_inputs array")
+        inputs: list[CoverageInput] = []
+        for known in item["known_inputs"]:
+            if (
+                type(known) is not dict
+                or set(known) != {"kind", "path"}
+                or known["kind"] not in ("root-file", "root-directory")
+                or type(known["path"]) is not str
+            ):
+                raise ValueError("known_inputs only accepts root-file/root-directory objects with a path")
+            inputs.append(CoverageInput(known["kind"], known["path"]))
+        if any(type(item[name]) is not str for name in ("criterion_id", "test_kind", "test_target")):
+            raise ValueError("coverage criterion identity and descriptor must be strings")
+        declarations.append(CriterionCoverageDeclaration(
+            item["criterion_id"], item["test_kind"], item["test_target"], tuple(inputs),
+        ))
+    return tuple(declarations)
+
+
 def _parser() -> _ArgumentParser:
     parser = _ArgumentParser(prog="evospec")
     parser.version = _version()
@@ -105,6 +184,12 @@ def _parser() -> _ArgumentParser:
     upgrade.add_argument("--expected-revision", required=True, type=int)
     upgrade_r3 = commands.add_parser("upgrade-r3-schema")
     upgrade_r3.add_argument("--expected-revision", required=True, type=int)
+    upgrade_r3b = commands.add_parser("upgrade-r3-outcome-schema")
+    upgrade_r3b.add_argument("--expected-revision", required=True, type=int)
+    upgrade_r3b.add_argument("--coverage-file", required=True, help="Explicit per-criterion root-input contract JSON")
+    renew_r3b = commands.add_parser("renew-r3b-coverage")
+    renew_r3b.add_argument("--expected-revision", required=True, type=int)
+    renew_r3b.add_argument("--coverage-file", required=True, help="Explicit per-criterion root-input contract JSON")
     commands.add_parser("doctor")
     commands.add_parser("review")
     ui = commands.add_parser("ui")
@@ -167,7 +252,10 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             print(f"ERROR {error}", file=target)
             return 2
         return 0
-    if arguments.command in ("accept-slice", "revise-slice-criteria", "upgrade-e1-schema", "upgrade-r3-schema"):
+    if arguments.command in (
+        "accept-slice", "revise-slice-criteria", "upgrade-e1-schema",
+        "upgrade-r3-schema", "upgrade-r3-outcome-schema", "renew-r3b-coverage",
+    ):
         workflow = WorkflowService.open(Path(arguments.root))
         if arguments.command == "upgrade-e1-schema":
             try:
@@ -192,13 +280,25 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             if already is not None:
                 _render(already, target)
                 return 0
+        if arguments.command == "upgrade-r3-outcome-schema":
+            try:
+                already = workflow.confirmed_r3b_schema_upgrade(
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            except RecoveryError as error:
+                print(f"ERROR {error}", file=target)
+                return 2
+            if already is not None:
+                _render(already, target)
+                return 0
         # Only a human in a real terminal may accept or change durable authority.
-        if not sys.stdin.isatty() or not sys.stdout.isatty():
-            print("ERROR E1 approval requires an interactive user terminal", file=target)
+        if not sys.stdin.isatty() or not sys.stdout.isatty() or not target.isatty():
+            print("ERROR approval requires an interactive user terminal", file=target)
             return 2
         if arguments.expected_revision < 0:
             print("ERROR expected revision must be nonnegative", file=target)
             return 2
+        coverage = None
         try:
             if arguments.command == "accept-slice":
                 criteria = None if not arguments.criteria_file else _load_criteria_spec(arguments.criteria_file)
@@ -215,8 +315,23 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
                 statement = workflow.r3_upgrade_agreement(
                     expected_revision=ExpectedRevision(arguments.expected_revision),
                 )
+            elif arguments.command == "upgrade-r3-outcome-schema":
+                criteria = None
+                coverage = _load_coverage_declarations(arguments.coverage_file, Path(arguments.root))
+                statement = workflow.r3b_upgrade_agreement(
+                    coverage,
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            elif arguments.command == "renew-r3b-coverage":
+                criteria = None
+                coverage = _load_coverage_declarations(arguments.coverage_file, Path(arguments.root))
+                statement = workflow.r3b_coverage_renewal_agreement(
+                    coverage,
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
             else:
                 criteria = None
+                coverage = None
                 statement = workflow.e1_upgrade_agreement(
                     expected_revision=ExpectedRevision(arguments.expected_revision),
                 )
@@ -230,6 +345,8 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             "revise-slice-criteria": "Decisión de modificación",
             "upgrade-e1-schema": "Acuerdo de migración",
             "upgrade-r3-schema": "Acuerdo de migración R3-A",
+            "upgrade-r3-outcome-schema": "Acuerdo de migración R3-B esquema 16→17",
+            "renew-r3b-coverage": "Acuerdo de renovación de cobertura R3-B",
         }[arguments.command]
         print(f"{description} para aprobación explícita:\n{statement}", file=target)
         try:
@@ -257,6 +374,20 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             elif arguments.command == "upgrade-e1-schema":
                 result = workflow.upgrade_e1_schema(
                     UserAcceptance(statement, f"tty:{token}"),
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            elif arguments.command == "upgrade-r3-outcome-schema":
+                assert coverage is not None
+                result = workflow.upgrade_r3b_schema(
+                    UserAcceptance(statement, f"tty:{token}"),
+                    coverage,
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            elif arguments.command == "renew-r3b-coverage":
+                assert coverage is not None
+                result = workflow.renew_r3b_coverage(
+                    UserAcceptance(statement, f"tty:{token}"),
+                    coverage,
                     expected_revision=ExpectedRevision(arguments.expected_revision),
                 )
             else:

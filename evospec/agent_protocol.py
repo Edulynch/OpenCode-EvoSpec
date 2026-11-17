@@ -14,6 +14,7 @@ from .agent_protocol_schema import (
     parse_action,
     parse_autonomy_envelope_delta,
     parse_autonomy_expansion_decision,
+    parse_bounded_strings,
     parse_boolean,
     parse_clarification_answers,
     parse_convergence_assessment,
@@ -26,6 +27,7 @@ from .agent_protocol_schema import (
     parse_lock_assessments,
     parse_nonblank_string,
     parse_nonblank_strings,
+    parse_input_snapshot,
     parse_narrowed_autonomy_envelope,
     parse_operational_state,
     parse_optional_string,
@@ -38,7 +40,19 @@ from .agent_protocol_schema import (
     parse_work_relation_kind,
     validate_action_request,
 )
-from .domain import AssessmentOperation, AutonomyEnvelope, AutonomyEnvelopeDelta
+from .domain import AssessmentOperation, AutonomyEnvelope, AutonomyEnvelopeDelta, CriterionCoverageApproval, SliceOutcomeReceipt
+from .input_fingerprint import (
+    COVERAGE_CONTRACT_VERSION,
+    INPUT_FINGERPRINT_VERSION,
+    INPUT_POLICY_DIGEST,
+    INPUT_POLICY_ID,
+    TEST_ADMISSION_POLICY_DIGEST,
+    TEST_ADMISSION_POLICY_ID,
+    R3B_COVERAGE_CONTRACT,
+    TEST_ENVIRONMENT_PROFILE_DIGEST,
+    TEST_ENVIRONMENT_PROFILE_ID,
+    InputSnapshot,
+)
 from .persistence import JsonValue, RecoveryError
 from .services import ServiceError, StaleRevisionError
 from .workflow import (
@@ -68,15 +82,91 @@ def _encode(value: dict[str, JsonValue]) -> str:
 
 
 def _result_json(result: WorkflowResult) -> dict[str, JsonValue]:
-    return {"code": result.code, "revision": result.revision, "feature_id": result.feature_id,
-            "change_id": result.change_id, "phase": result.phase, "message": result.message,
-            "questions": [{"id": question.id, "prompt": question.prompt, "options": list(question.options)} for question in result.questions],
-            "pending_intake_id": result.pending_intake_id, "focus": result.focus,
-            "current_work": result.current_work, "pending_work": list(result.pending_work),
-            "blocker": result.blocker, "classification": result.classification,
-            "review_verdict": result.review_verdict, "verification_sufficient": result.verification_sufficient,
-            "review_depth": result.review_depth, "verification_depth": result.verification_depth,
-            "convergence_depth": result.convergence_depth}
+    value: dict[str, JsonValue] = {
+        "code": result.code, "revision": result.revision, "feature_id": result.feature_id,
+        "change_id": result.change_id, "phase": result.phase, "message": result.message,
+        "questions": [{"id": question.id, "prompt": question.prompt, "options": list(question.options)} for question in result.questions],
+        "pending_intake_id": result.pending_intake_id, "focus": result.focus,
+        "current_work": result.current_work, "pending_work": list(result.pending_work),
+        "blocker": result.blocker, "classification": result.classification,
+        "review_verdict": result.review_verdict, "verification_sufficient": result.verification_sufficient,
+        "review_depth": result.review_depth, "verification_depth": result.verification_depth,
+        "convergence_depth": result.convergence_depth,
+    }
+    if result.slice_outcome_receipt is not None:
+        value["slice_outcome_receipt"] = _slice_outcome_receipt_json(result.slice_outcome_receipt)
+    return value
+
+
+def _slice_outcome_receipt_json(receipt: SliceOutcomeReceipt) -> dict[str, JsonValue]:
+    return {
+        "id": receipt.id,
+        "repository_id": receipt.repository_id,
+        "slice_agreement_ref": receipt.slice_agreement_ref,
+        "criteria_revision_id": receipt.criteria_revision_id,
+        "evidence_receipt_ids": list(receipt.evidence_receipt_ids),
+        "input_fingerprint": receipt.input_fingerprint,
+        "input_policy_id": receipt.input_policy_id,
+        "input_policy_digest": receipt.input_policy_digest,
+        "admission_policy_id": receipt.admission_policy_id,
+        "admission_policy_digest": receipt.admission_policy_digest,
+        "relevant_drift_digest": receipt.relevant_drift_digest,
+        "basis": receipt.basis,
+        "source": receipt.source,
+        "source_revision": receipt.source_revision,
+        "recorded_revision": receipt.recorded_revision,
+        "coverage_contract_digest": receipt.coverage_contract_digest,
+    }
+
+
+def _slice_outcome_receipt_json(receipt: SliceOutcomeReceipt) -> dict[str, JsonValue]:
+    return {
+        "id": receipt.id,
+        "repository_id": receipt.repository_id,
+        "slice_agreement_ref": receipt.slice_agreement_ref,
+        "criteria_revision_id": receipt.criteria_revision_id,
+        "evidence_receipt_ids": list(receipt.evidence_receipt_ids),
+        "input_fingerprint": receipt.input_fingerprint,
+        "input_policy_id": receipt.input_policy_id,
+        "input_policy_digest": receipt.input_policy_digest,
+        "admission_policy_id": receipt.admission_policy_id,
+        "admission_policy_digest": receipt.admission_policy_digest,
+        "relevant_drift_digest": receipt.relevant_drift_digest,
+        "basis": receipt.basis,
+        "source": receipt.source,
+        "source_revision": receipt.source_revision,
+        "recorded_revision": receipt.recorded_revision,
+        "coverage_contract_digest": receipt.coverage_contract_digest,
+    }
+
+
+def _coverage_approval_json(approval: CriterionCoverageApproval) -> dict[str, JsonValue]:
+    return {
+        "id": approval.id,
+        "contract_digest": approval.contract_digest,
+        "repository_id": approval.repository_id,
+        "slice_agreement_ref": approval.slice_agreement_ref,
+        "criteria_revision_id": approval.criteria_revision_id,
+        "criterion_id": approval.criterion_id,
+        "test_kind": approval.test_kind,
+        "test_target": approval.test_target,
+        "known_inputs": [
+            {"kind": item.kind, "path": item.path}
+            for item in approval.known_inputs
+        ],
+        "root_fingerprint": approval.root_fingerprint,
+        "input_policy_id": approval.input_policy_id,
+        "input_policy_digest": approval.input_policy_digest,
+        "admission_policy_id": approval.admission_policy_id,
+        "admission_policy_digest": approval.admission_policy_digest,
+        "environment_profile_id": approval.environment_profile_id,
+        "environment_profile_policy_digest": approval.environment_profile_policy_digest,
+        "statement": approval.statement,
+        "source_reference": approval.source_reference,
+        "source": approval.source,
+        "source_revision": approval.source_revision,
+        "recorded_revision": approval.recorded_revision,
+    }
 
 
 def _autonomy_envelope_json(envelope: AutonomyEnvelope) -> dict[str, JsonValue]:
@@ -140,37 +230,149 @@ def _accepted_slice_json(accepted: AcceptedSliceContext | None) -> dict[str, Jso
     }
 
 
+def _criterion_verification_json(context: AgentContext) -> JsonValue:
+    accepted = context.accepted_slice
+    if accepted is None or accepted.criteria_revision is None:
+        return None
+    result: list[JsonValue] = []
+    for criterion in accepted.criteria_revision.criteria:
+        observations = tuple(
+            item for item in context.criterion_test_receipts
+            if item.criteria_revision_id == accepted.criteria_revision.id
+            and item.criterion_id == criterion.id
+        )
+        receipt = None if not observations else observations[-1]
+        strong = receipt is not None and receipt.input_fingerprint_before is not None
+        criterion_blockers = () if context.slice_outcome is None else context.slice_outcome.blockers
+        admission_blocked = any(
+            blocker in {
+                f"COVERAGE_APPROVAL_REQUIRED:{criterion.id}",
+                f"UNSUPPORTED_CRITERION:{criterion.id}",
+                f"CRITERION_PROVENANCE_STALE:{criterion.id}",
+                f"CRITERION_RUNTIME_UNVERIFIABLE:{criterion.id}",
+            }
+            for blocker in criterion_blockers
+        )
+        fresh = bool(
+            strong
+            and not admission_blocked
+            and context.input_snapshot is not None
+            and receipt is not None
+            and receipt.input_fingerprint_before == context.input_snapshot.fingerprint
+            and receipt.input_fingerprint_after == context.input_snapshot.fingerprint
+            and receipt.input_policy_id == INPUT_POLICY_ID
+            and receipt.input_policy_digest == INPUT_POLICY_DIGEST
+            and receipt.admission_policy_id == TEST_ADMISSION_POLICY_ID
+            and receipt.admission_policy_digest == TEST_ADMISSION_POLICY_DIGEST
+            and receipt.environment_profile_id == TEST_ENVIRONMENT_PROFILE_ID
+            and any(
+                approval.id == receipt.coverage_approval_id
+                and approval.contract_digest == receipt.coverage_contract_digest
+                and approval.criterion_id == criterion.id
+                and context.input_snapshot is not None
+                and approval.root_fingerprint == context.input_snapshot.fingerprint
+                for approval in context.criterion_coverage_approvals
+            )
+            and not receipt.external_inputs
+        )
+        if receipt is None:
+            status = "UNVERIFIED"
+        elif receipt.exit_code != 0:
+            status = "FAILED"
+        elif not strong:
+            status = "VERIFIED"
+        elif context.input_snapshot is None:
+            status = "REVALIDATION_REQUIRED"
+        elif admission_blocked:
+            status = "STALE"
+        else:
+            status = "VERIFIED" if fresh else "STALE"
+        last_test: dict[str, JsonValue] | None = None
+        if receipt is not None:
+            last_test = {
+                "receipt_id": receipt.id,
+                "kind": receipt.test_kind,
+                "target": receipt.test_target,
+                "exit_code": receipt.exit_code,
+                "output_sha256": receipt.output_sha256,
+                "recorded_revision": receipt.recorded_revision,
+            }
+            if strong:
+                last_test.update({
+                    "input_fingerprint_before": receipt.input_fingerprint_before,
+                    "input_fingerprint_after": receipt.input_fingerprint_after,
+                    "input_policy_id": receipt.input_policy_id,
+                    "input_policy_digest": receipt.input_policy_digest,
+                    "admission_policy_id": receipt.admission_policy_id,
+                    "admission_policy_digest": receipt.admission_policy_digest,
+                    "external_inputs": list(receipt.external_inputs),
+                    "runtime_executable": receipt.runtime_executable,
+                    "runtime_executable_sha256": receipt.runtime_executable_sha256,
+                    "runtime_version": receipt.runtime_version,
+                    "runtime_argv": list(receipt.runtime_argv),
+                    "environment_profile_id": receipt.environment_profile_id,
+                    "environment_profile_digest": receipt.environment_profile_digest,
+                    "coverage_approval_id": receipt.coverage_approval_id,
+                    "coverage_contract_digest": receipt.coverage_contract_digest,
+                })
+        result.append({
+            "criterion_id": criterion.id,
+            "criteria_revision_id": accepted.criteria_revision.id,
+            "status": status,
+            "evidence_source": None if receipt is None else (
+                "CORE_VALIDATED_LOCAL_TEST" if strong and not admission_blocked else "HOST_REPORTED_TEST"
+            ),
+            "fresh_for_current_workspace": fresh,
+            "enables_slice_outcome": bool(
+                fresh and receipt is not None and receipt.exit_code == 0
+                and context.slice_outcome is not None
+                and context.slice_outcome.status in ("READY", "CURRENT")
+            ),
+            "last_test": last_test,
+        })
+    return result
+
+
 def context_json(context: AgentContext) -> dict[str, JsonValue]:
     """Return the stable JSON-safe representation of an agent context."""
     payload: dict[str, JsonValue] = {"revision": context.revision, "repository_id": context.repository_id, "initialization_state": context.initialization_state,
             "r3_schema_ready": context.r3_schema_ready,
+            "r3b_schema_ready": context.r3b_schema_ready,
+            "r3b_policy": None if not context.r3b_schema_ready else {
+                "coverage_contract_version": COVERAGE_CONTRACT_VERSION,
+                "input_version": INPUT_FINGERPRINT_VERSION,
+                "input_policy_id": INPUT_POLICY_ID,
+                "input_policy_digest": INPUT_POLICY_DIGEST,
+                "admission_policy_id": TEST_ADMISSION_POLICY_ID,
+                "admission_policy_digest": TEST_ADMISSION_POLICY_DIGEST,
+                "environment_profile_id": TEST_ENVIRONMENT_PROFILE_ID,
+                "environment_profile_policy_digest": TEST_ENVIRONMENT_PROFILE_DIGEST,
+                "coverage_contract": R3B_COVERAGE_CONTRACT,
+            },
             "e1_schema_ready": context.e1_schema_ready,
             "accepted_slice": _accepted_slice_json(context.accepted_slice),
-            "criterion_verification": (
-                None if context.accepted_slice is None or context.accepted_slice.criteria_revision is None else [
-                    {
-                        "criterion_id": criterion.id,
-                        "criteria_revision_id": context.accepted_slice.criteria_revision.id,
-                        "status": "UNVERIFIED" if not observations else
-                                  "VERIFIED" if observations[-1].exit_code == 0 else "FAILED",
-                        "evidence_source": None if not observations else "HOST_REPORTED_TEST",
-                        "last_test": None if not observations else {
-                            "receipt_id": observations[-1].id,
-                            "kind": observations[-1].test_kind,
-                            "target": observations[-1].test_target,
-                            "exit_code": observations[-1].exit_code,
-                            "output_sha256": observations[-1].output_sha256,
-                            "recorded_revision": observations[-1].recorded_revision,
-                        },
-                    }
-                    for criterion in context.accepted_slice.criteria_revision.criteria
-                    for observations in ([
-                        item for item in context.criterion_test_receipts
-                        if item.criteria_revision_id == context.accepted_slice.criteria_revision.id
-                        and item.criterion_id == criterion.id
-                    ],)
-                ]
-            ),
+            "input_snapshot": None if context.input_snapshot is None else {
+                "version": context.input_snapshot.version,
+                "policy_id": context.input_snapshot.policy_id,
+                "policy_digest": context.input_snapshot.policy_digest,
+                "repository_id": context.input_snapshot.repository_id,
+                "fingerprint": context.input_snapshot.fingerprint,
+                "file_count": context.input_snapshot.file_count,
+                "directory_count": context.input_snapshot.directory_count,
+                "total_bytes": context.input_snapshot.total_bytes,
+            },
+            "r3b_coverage_approvals": [
+                _coverage_approval_json(item)
+                for item in context.criterion_coverage_approvals
+            ],
+            "slice_outcome": None if context.slice_outcome is None else {
+                "status": context.slice_outcome.status,
+                "latest_receipt_id": context.slice_outcome.latest_receipt_id,
+                "blockers": list(context.slice_outcome.blockers),
+                "receipt": None if context.slice_outcome.receipt is None
+                else _slice_outcome_receipt_json(context.slice_outcome.receipt),
+            },
+            "criterion_verification": _criterion_verification_json(context),
             "lifecycle": None if context.lifecycle is None else list(context.lifecycle),
             "feature_id": context.feature_id, "change_id": context.change_id, "classification": context.classification,
             "progress": {"current_action": context.progress.current_action, "focus": context.progress.focus,
@@ -500,6 +702,37 @@ def _dispatch(
                 parse_nonblank_string(request, "test_target"),
                 parse_test_exit_code(request),
                 parse_nonblank_string(request, "output_sha256"),
+                expected_revision=parse_expected_revision(request),
+            )
+        case "criterion_test_result_r3b":
+            return workflow.criterion_test_result_r3b(
+                parse_nonblank_string(request, "repository_id"),
+                parse_nonblank_string(request, "slice_agreement_ref"),
+                parse_nonblank_string(request, "criteria_revision_id"),
+                parse_nonblank_string(request, "criterion_id"),
+                parse_nonblank_string(request, "test_kind"),
+                parse_nonblank_string(request, "test_target"),
+                parse_test_exit_code(request),
+                parse_nonblank_string(request, "output_sha256"),
+                parse_nonblank_string(request, "input_fingerprint_before"),
+                parse_nonblank_string(request, "input_fingerprint_after"),
+                parse_nonblank_string(request, "input_policy_id"),
+                parse_nonblank_string(request, "input_policy_digest"),
+                parse_nonblank_string(request, "admission_policy_id"),
+                parse_nonblank_string(request, "admission_policy_digest"),
+                parse_nonblank_string(request, "runtime_executable"),
+                parse_nonblank_string(request, "runtime_executable_sha256"),
+                parse_nonblank_string(request, "runtime_version"),
+                parse_bounded_strings(request, "runtime_argv", maximum_items=16, maximum_length=2048),
+                parse_nonblank_string(request, "environment_profile_id"),
+                parse_nonblank_string(request, "environment_profile_digest"),
+                parse_nonblank_string(request, "coverage_approval_id"),
+                parse_nonblank_string(request, "coverage_contract_digest"),
+                expected_revision=parse_expected_revision(request),
+            )
+        case "accept_slice_outcome":
+            return workflow.accept_slice_outcome(
+                parse_input_snapshot(request),
                 expected_revision=parse_expected_revision(request),
             )
         case "assess_locks":

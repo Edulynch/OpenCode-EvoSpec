@@ -75,6 +75,41 @@ Read-only context now exposes `r3_schema_ready` and `criterion_verification` by 
 
 This gate verifies logical atomicity and process recovery. Physical power-loss durability on Windows remains **not certified**, because directory `fsync` is not implemented there; after a post-replace uncertainty, inspect the recovered state before taking another action.
 
+### R3-B: separately authorized objective Slice outcome
+
+Schemas 13–16 remain readable under their existing migration and agreement rules; schema 16 retains R3-A's evidence-only behavior and never upgrades silently to schema 17. The 16→17 migration is a separate, explicit, single-revision human decision. Before running it, create a project-relative JSON coverage proposal, for example `r3b-coverage.json`:
+
+```json
+{
+  "version": "r3-known-input-contract-v1",
+  "criteria": [
+    {
+      "criterion_id": "AC-1",
+      "test_kind": "python-unittest",
+      "test_target": "tests.test_module",
+      "known_inputs": [
+        {"kind": "root-file", "path": "tests/test_module.py"},
+        {"kind": "root-directory", "path": "tests/fixtures"}
+      ]
+    }
+  ]
+}
+```
+
+List every current criterion exactly once, with its exact human-accepted test descriptor and an explicit `known_inputs` array. Each known input is an exact normalized root-relative regular-file or directory path; an empty array is permitted only as an explicit, TTY-approved declaration. The CLI rejects absolute paths, traversal, managed paths, symlinks/reparse points and non-regular files for `--coverage-file`. The proposal file itself must be inside the selected project and is part of the whole-root fingerprint; changing or removing it later makes approval stale.
+
+Run `evospec --project <repository> upgrade-r3-outcome-schema --expected-revision <revision> --coverage-file r3b-coverage.json` in a real interactive terminal and confirm the exact displayed statement. The approval binds schema-16 source bytes, repository identity, accepted Slice and criteria head, `r3-root-input-v2` policy, admission and environment-profile policies, the canonical per-criterion coverage proposal, and the complete root fingerprint. The migration receipt and initial coverage approvals commit in one +1 CAS. It does not repeat Feature/Slice acceptance.
+
+The fixed `r3-root-input-v2` policy scans every regular file and directory below the canonical repository root, including ignored and untracked entries. Files bind normalized relative paths, size, executable bit, and content digest; directories bind normalized relative paths and presence, so adding or removing an empty directory changes the fingerprint. It excludes only root `.git` and `.evospec`. Symlinks, reparse points/junctions, hard links, special or unreadable entries, path collisions, concurrent changes, and inputs beyond 50,000 files, 100,000 entries, 1 GiB, or 128 path levels fail closed. The read-only `context` projection exposes the exact current snapshot and policy; the OpenCode adapter does not duplicate or author the workspace fingerprint.
+
+With schema 17 enabled, `evospec_criterion_test_r3b` runs only the exact human-accepted Python unittest-module or Node test-file descriptor, with an exact executable path/hash/version and fixed argv. Each current criterion needs a current immutable TTY-approved known-input contract bound to its Slice, criteria head, exact descriptor, policy, and whole-root fingerprint. Any root change, including directory-presence changes, stales all those approvals and test evidence; `renew-r3b-coverage --expected-revision <revision> --coverage-file r3b-coverage.json` requires a separate interactive approval, after which every criterion must be tested again. A fresh test never renews coverage. The plugin binds permission to the root, repository, accepted Slice/head/criterion, exact coverage approval, policies, runtime and environment, then rechecks requester, session root, scope, policies, coverage and fingerprint after permission and after the process; it submits no result if requester or root changes after the test. Core independently rescans inside the result-recording lock and rejects missing, stale, unsupported, or incomplete coverage/provenance. The child environment contains only the runtime directory in `PATH`, fixed Python/TZ settings, the repository root as `TEMP`/`TMP`/`TMPDIR`, and on Windows only `SystemRoot`/`WINDIR` when present. It omits ambient home directories, credentials, user configuration and every other inherited variable. Known external, credential, excluded-managed, unprofiled-environment, and unsupported-metadata dependencies are unsupported.
+
+This evidence is **bounded trusted-local operational evidence**, not an observed-read closure, OS sandbox or universal proof about arbitrary test code. A same-user client or test may hide filesystem/network reads or otherwise misrepresent its execution; declarations are human-approved leads, not instrumentation of actual reads. The root fingerprint covers repository files and directory presence only; it does not hash arbitrary host state, the OS, runtime libraries, network services, or reads of excluded managed `.git`/`.evospec` trees. Do not describe R3-B as proving those inputs closed. Unsupported or unverifiable runtimes/profiles and missing, stale, or unsupported known-input contracts fail closed; the accepted test descriptor remains human-authorized scope, not a claim generated by the model.
+
+R3-A `criterion_test_result` remains separate and evidence-only, including after schema 17; legacy receipts without R3-B provenance never qualify for automatic acceptance. The dedicated `evospec_accept_slice_outcome` OpenCode tool performs a second native permission check bound to the current root, repository, accepted Slice/head, revision, policy and input fingerprint. Core then derives the accepted scope, requires a latest successful fresh supported R3-B receipt for every current criterion, rejects pending material decisions and unresolved relevant drift, rescans under its writer lock, and appends one immutable Slice outcome receipt in a separate +1 CAS. It never changes global verification, Feature status, Product Truth, another Slice, lifecycle state, or activation. `ALREADY_ACCEPTED` returns the canonical receipt without a write; stale expected revisions are rejected, not rebound.
+
+Read-only context exposes `slice_outcome` as `BLOCKED`, `READY`, `CURRENT`, or `STALE`, with blockers and the latest historical receipt. Changes to the accepted criteria head, covered workspace inputs, or relevant drift make a prior outcome historical/stale; they do not rewrite or delete its receipt. Neither the R3-A nor R3-B test-recording action accepts the Slice.
+
 `outcome.kind` is exactly one of `HUMAN_MATERIAL_DECISION`, `SAFE_AUTOMATIC_OPERATION`, `BOUNDED_DELEGATION`, `EXTERNAL_WAIT`, or `STRUCTURAL_DEFECT`. It is derived from Core facts, not from an action name. `outcome.intervention` preserves the compatibility projection: `HUMAN_MATERIAL_DECISION` maps to `USER`; `SAFE_AUTOMATIC_OPERATION`, `BOUNDED_DELEGATION`, and `EXTERNAL_WAIT` map to `AUTOMATIC`; and `STRUCTURAL_DEFECT` maps to `NONE`. A `HUMAN_MATERIAL_DECISION` outcome always carries `material_decision` with one concrete decision and at least two distinct Core-offered options. Nonhuman outcomes cannot carry material-decision evidence. `BOUNDED_DELEGATION` is a typed disposition only; it does not create or persist authority. Missing decision choices are surfaced as `STRUCTURAL_DEFECT`, never as a user handoff. A terminal context has `outcome: null`; existing terminal and completion facts remain authoritative.
 
 When `initialization_state` is `UNINITIALIZED`, `context`, `new`, and `change` return a normal success envelope whose result code is `INIT_REQUIRED`. The legal actions are exactly `init` and `context`; initialize with the returned revision before submitting intake. This state does not inspect repository capabilities or external SDD structure. Persisted authority that cannot be recovered remains a `WORKFLOW_ERROR`.

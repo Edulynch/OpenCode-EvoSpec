@@ -28,6 +28,8 @@ from .domain import (
     Change,
     ChangeId,
     ConvergenceAssessment,
+    CriterionCoverageApproval,
+    CriterionCoverageDeclaration,
     Decision,
     DecisionId,
     DeferredSideRequest,
@@ -59,6 +61,7 @@ from .domain import (
     ReviewInspection,
     State,
     ReviewResult,
+    SliceOutcomeReceipt,
     SharedIntent,
     SharedIntentId,
     SemanticLock,
@@ -88,7 +91,16 @@ from .discovery import (
     _WORDS,
 )
 from .policies import AssurancePolicy, CapabilityRoute, IntakeOperation, IntakePolicy
-from .services import CoreService, NextActionable, ServiceError, StaleRevisionError, UserAcceptance, SliceCriteriaSpec
+from .services import (
+    CoreService,
+    NextActionable,
+    ServiceError,
+    SliceCriteriaSpec,
+    SliceOutcomeEligibility,
+    StaleRevisionError,
+    UserAcceptance,
+)
+from .input_fingerprint import InputSnapshot
 
 
 class WorkflowError(Exception):
@@ -115,6 +127,7 @@ class WorkflowResult:
     review_depth: str | None = None
     verification_depth: str | None = None
     convergence_depth: str | None = None
+    slice_outcome_receipt: SliceOutcomeReceipt | None = None
 
 
 InitResult = WorkflowResult
@@ -307,6 +320,187 @@ class WorkflowService:
         except ServiceError as error:
             raise WorkflowError(str(error)) from error
         return self._result("CRITERION_TEST_RECORDED", saved, "host test observation recorded per accepted criterion")
+
+    def criterion_test_result_r3b(
+        self,
+        repository_id: str,
+        slice_agreement_ref: str,
+        criteria_revision_id: str,
+        criterion_id: str,
+        test_kind: str,
+        test_target: str,
+        exit_code: int,
+        output_sha256: str,
+        input_fingerprint_before: str,
+        input_fingerprint_after: str,
+        input_policy_id: str,
+        input_policy_digest: str,
+        admission_policy_id: str,
+        admission_policy_digest: str,
+        runtime_executable: str,
+        runtime_executable_sha256: str,
+        runtime_version: str,
+        runtime_argv: tuple[str, ...],
+        environment_profile_id: str,
+        environment_profile_digest: str,
+        coverage_approval_id: str,
+        coverage_contract_digest: str,
+        *,
+        expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        state = self._mutation_state(expected_revision)
+        try:
+            saved = self.__core.record_criterion_test_r3b(
+                state, repository_id, slice_agreement_ref, criteria_revision_id,
+                criterion_id, test_kind, test_target, exit_code, output_sha256,
+                input_fingerprint_before, input_fingerprint_after, input_policy_id,
+                input_policy_digest, admission_policy_id, admission_policy_digest,
+                runtime_executable, runtime_executable_sha256,
+                runtime_version, runtime_argv, environment_profile_id,
+                environment_profile_digest,
+                coverage_approval_id, coverage_contract_digest,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        return self._result(
+            "CRITERION_TEST_RECORDED",
+            saved,
+            "fresh host test evidence recorded without accepting the Slice",
+        )
+
+    def r3b_upgrade_agreement(
+        self,
+        declarations: tuple[CriterionCoverageDeclaration, ...],
+        *,
+        expected_revision: ExpectedRevision,
+    ) -> str:
+        committed = self.__core.confirmed_r3b_upgrade(expected_revision)
+        if committed is not None and committed.r3b_schema_upgrade is not None:
+            return committed.r3b_schema_upgrade.statement
+        state = self._mutation_state(expected_revision)
+        try:
+            return self.__core.r3b_upgrade_statement(state, declarations)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+
+    def confirmed_r3b_schema_upgrade(
+        self, *, expected_revision: ExpectedRevision,
+    ) -> WorkflowResult | None:
+        committed = self.__core.confirmed_r3b_upgrade(expected_revision)
+        return None if committed is None else self._result(
+            "R3B_SCHEMA_ALREADY_UPGRADED",
+            committed,
+            "previous human-approved schema-17 conversion recovered",
+        )
+
+    def upgrade_r3b_schema(
+        self,
+        decision: UserAcceptance,
+        declarations: tuple[CriterionCoverageDeclaration, ...],
+        *,
+        expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        committed = self.__core.confirmed_r3b_upgrade(expected_revision)
+        if committed is not None and committed.r3b_schema_upgrade is not None:
+            receipt = committed.r3b_schema_upgrade
+            if decision.statement != receipt.statement or decision.source_reference != receipt.source_reference:
+                raise WorkflowError("R3-B retry approval differs from its committed authority")
+            return self._result(
+                "R3B_SCHEMA_ALREADY_UPGRADED", committed, "approved schema-17 conversion recovered",
+            )
+        state = self._mutation_state(expected_revision)
+        try:
+            saved = self.__core.upgrade_r3b_schema(state, decision, declarations)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        return self._result(
+            "R3B_SCHEMA_UPGRADED", saved, "schema 17 enabled by explicit human decision",
+        )
+
+    def r3b_coverage_renewal_agreement(
+        self,
+        declarations: tuple[CriterionCoverageDeclaration, ...],
+        *,
+        expected_revision: ExpectedRevision,
+    ) -> str:
+        state = self._mutation_state(expected_revision)
+        try:
+            return self.__core.r3b_coverage_renewal_statement(state, declarations)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+
+    def renew_r3b_coverage(
+        self,
+        decision: UserAcceptance,
+        declarations: tuple[CriterionCoverageDeclaration, ...],
+        *,
+        expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        state = self._mutation_state(expected_revision)
+        try:
+            saved = self.__core.renew_r3b_coverage(state, decision, declarations)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        code = "COVERAGE_ALREADY_CURRENT" if saved.revision == state.revision else "R3B_COVERAGE_RENEWED"
+        return self._result(
+            code,
+            saved,
+            "current human-approved known-input contracts retained"
+            if code == "COVERAGE_ALREADY_CURRENT"
+            else "human-approved known-input contracts appended",
+        )
+
+    def current_r3b_coverage_approvals(
+        self, state: State, snapshot: InputSnapshot,
+    ) -> tuple[CriterionCoverageApproval, ...]:
+        try:
+            return self.__core.current_r3b_coverage_approvals(state, snapshot)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+
+    def input_snapshot(
+        self, *, expected_revision: ExpectedRevision | None = None,
+    ) -> tuple[State, InputSnapshot]:
+        try:
+            return self.__core.input_snapshot(expected_revision)
+        except (ServiceError, StaleRevisionError) as error:
+            raise WorkflowError(str(error)) from error
+
+    def slice_outcome_eligibility(
+        self, state: State, snapshot: InputSnapshot,
+    ) -> SliceOutcomeEligibility:
+        try:
+            return self.__core.slice_outcome_eligibility(state, snapshot)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+
+    def accept_slice_outcome(
+        self,
+        snapshot: InputSnapshot,
+        *,
+        expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        state = self._mutation_state(expected_revision)
+        try:
+            saved = self.__core.accept_slice_outcome(state, snapshot)
+            eligibility = self.__core.slice_outcome_eligibility(saved, snapshot)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        code = "ALREADY_ACCEPTED" if saved.revision == state.revision else "SLICE_OUTCOME_ACCEPTED"
+        result = self._result(
+            code,
+            saved,
+            "current immutable Slice outcome receipt confirmed" if code == "ALREADY_ACCEPTED"
+            else "objective Slice outcome accepted with immutable evidence receipt",
+        )
+        slice_ref = None if saved.active_context is None else saved.active_context.slice_agreement_ref
+        receipt = next(
+            (item for item in saved.slice_outcome_receipts if item.id == eligibility.latest_receipt_id),
+            None,
+        )
+        if receipt is None:
+            raise WorkflowError("Slice outcome receipt could not be recovered as current")
+        return replace(result, slice_outcome_receipt=receipt)
 
     def new(
         self,

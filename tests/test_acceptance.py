@@ -26,6 +26,7 @@ class AcceptanceTests(unittest.TestCase):
                 "discovery.py",
                 "domain.py",
                 "guidance.py",
+                "input_fingerprint.py",
                 "lifecycle.py",
                 "persistence.py",
                 "policies.py",

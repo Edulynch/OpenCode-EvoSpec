@@ -101,7 +101,7 @@ jobs:
       - name: E1 OpenCode adapter and continuation tests
         # These contract tests exercise the native tool registration and its
         # protected boundaries without requiring an authenticated host session.
-        run: node --test tests/opencode_continuation.test.mjs tests/opencode_e1_task_progress.test.mjs tests/opencode_r3a_criterion_verification.test.mjs
+        run: node --test tests/opencode_continuation.test.mjs tests/opencode_e1_task_progress.test.mjs tests/opencode_r3a_criterion_verification.test.mjs tests/opencode_r3b_slice_auto_acceptance.test.mjs
       - name: Typecheck
         run: uvx --from basedpyright basedpyright
       - name: Validate release identity

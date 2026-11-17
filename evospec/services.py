@@ -6,9 +6,14 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import platform
+import sys
+import stat
+import unicodedata
 from typing import TYPE_CHECKING, Never, final
 
 from .domain import (
@@ -77,7 +82,12 @@ from .domain import (
     StateValidationError,
     E1SchemaUpgradeReceipt,
     R3SchemaUpgradeReceipt,
+    R3BSchemaUpgradeReceipt,
     CriterionTestReceipt,
+    CoverageInput,
+    CriterionCoverageApproval,
+    CriterionCoverageDeclaration,
+    SliceOutcomeReceipt,
     TaskProgress,
     TerminalArchive,
     VerificationEvidence,
@@ -87,6 +97,10 @@ from .domain import (
     WorkRelation,
     WorkRelationKind,
     inspect,
+    coverage_declarations_json,
+    coverage_semantic_digest,
+    coverage_set_digest,
+    slice_outcome_semantic_id,
     is_git_branch_ref,
     is_git_identity,
     is_git_sha,
@@ -111,7 +125,22 @@ from .lifecycle import (
     can_converge,
     has_acceptable_review,
 )
-from .persistence import AtomicFailure, FileOperations, _StateStore
+from .persistence import AtomicFailure, FileOperations, R3_SCHEMA, R3B_SCHEMA, _StateStore
+from .input_fingerprint import (
+    COVERAGE_CONTRACT_VERSION,
+    INPUT_FINGERPRINT_VERSION,
+    INPUT_POLICY_DIGEST,
+    INPUT_POLICY_ID,
+    InputFingerprintError,
+    InputSnapshot,
+    R3B_APPROVAL_POLICY_TEXT,
+    TEST_ADMISSION_POLICY_DIGEST,
+    TEST_ADMISSION_POLICY_ID,
+    TEST_ENVIRONMENT_PROFILE_ID,
+    TEST_ENVIRONMENT_PROFILE_DIGEST,
+    sanitized_test_environment,
+    test_environment_profile_digest,
+)
 
 if TYPE_CHECKING:
     from .ports import StatePersistence
@@ -144,6 +173,102 @@ class SliceCriteriaSpec:
     exclusions: tuple[str, ...]
     decisions: tuple[str, ...]
     criteria: tuple[SliceCriterion, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SliceOutcomeEligibility:
+    status: str
+    latest_receipt_id: str | None
+    blockers: tuple[str, ...]
+
+
+_PYTHON_TEST_RUNNER = (
+    "import sys,unittest; root,module=sys.argv[1:3]; "
+    "sys.path.insert(0,root); unittest.main(module=module,argv=[sys.argv[0]])"
+)
+_PYTHON_TEST_TARGET = re.compile(r"tests(?:\.[A-Za-z_][A-Za-z0-9_]*)+\Z")
+_NODE_TEST_TARGET = re.compile(r"tests/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\.test\.mjs\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _supported_test_descriptor(kind: str, target: str) -> bool:
+    return (
+        kind == "python-unittest" and _PYTHON_TEST_TARGET.fullmatch(target) is not None
+        or kind == "node-test" and _NODE_TEST_TARGET.fullmatch(target) is not None
+    )
+
+
+def _runtime_digest(path: str) -> str:
+    try:
+        executable = Path(path)
+        if not executable.is_absolute() or str(executable.resolve(strict=True)) != path:
+            raise ServiceError("R3-B runtime executable is not a canonical absolute path")
+        before = executable.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or bool(getattr(before, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+            or before.st_nlink != 1
+            or before.st_size < 0
+            or before.st_size > 1_073_741_824
+            or (os.name != "nt" and not before.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+        ):
+            raise ServiceError("R3-B runtime executable is not a bounded regular file")
+        digest = sha256()
+        with executable.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or bool(getattr(opened, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+                or opened.st_nlink != 1
+            ):
+                raise ServiceError("R3-B runtime executable became unsafe during verification")
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+            after = os.fstat(handle.fileno())
+        current = executable.lstat()
+    except (OSError, RuntimeError) as error:
+        raise ServiceError("R3-B runtime executable cannot be verified") from error
+    if any(
+        left.st_ino != right.st_ino or left.st_dev != right.st_dev
+        or left.st_size != right.st_size or left.st_mtime_ns != right.st_mtime_ns
+        or left.st_ctime_ns != right.st_ctime_ns
+        or getattr(left, "st_file_attributes", 0) != getattr(right, "st_file_attributes", 0)
+        for left, right in ((before, opened), (opened, after), (after, current))
+    ):
+        raise ServiceError("R3-B runtime executable changed during verification")
+    return digest.hexdigest()
+
+
+def _runtime_version(path: str, root: Path) -> str:
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            cwd=root,
+            env=sanitized_test_environment(root, path),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            check=False,
+        )
+    except (InputFingerprintError, OSError, subprocess.SubprocessError, UnicodeError) as error:
+        raise ServiceError("R3-B runtime version cannot be verified") from error
+    version = (result.stdout + result.stderr).strip()
+    if result.returncode != 0 or not version or len(version) > 256:
+        raise ServiceError("R3-B runtime version cannot be verified")
+    return version
+
+
+def _drift_identity_digest(state: State, change_id: ChangeId | None) -> str:
+    relevant = tuple(sorted(
+        (
+            str(item.id), str(item.expected_publication), item.observed, item.unresolved,
+        )
+        for item in state.drifts if item.change_id is None or item.change_id == change_id
+    ))
+    return sha256(json.dumps(
+        relevant, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
 
 
 def _slice_criteria_json(spec: SliceCriteriaSpec) -> str:
@@ -256,6 +381,159 @@ def _accepted_e1_scope(state: State, root: Path) -> tuple[WorkingContext, Agreem
             or context.current_work != slice_record.initial_task or context.focus != slice_record.title):
         raise ServiceError("E1 Task progress cannot expand or replace the human-approved scope")
     return context, feature, slice_record
+
+
+def _normalize_coverage_declarations(
+    state: State,
+    root: Path,
+    snapshot: InputSnapshot,
+    declarations: tuple[CriterionCoverageDeclaration, ...],
+) -> tuple[CriterionCoverageDeclaration, ...]:
+    if type(declarations) is not tuple or any(
+        type(item) is not CriterionCoverageDeclaration
+        or type(item.criterion_id) is not str
+        or type(item.test_kind) is not str
+        or type(item.test_target) is not str
+        or type(item.known_inputs) is not tuple
+        or any(
+            type(known) is not CoverageInput
+            or type(known.kind) is not str
+            or type(known.path) is not str
+            for known in item.known_inputs
+        )
+        for item in declarations
+    ):
+        raise ServiceError("coverage declarations must be an explicit immutable tuple")
+    context, _, accepted = _accepted_e1_scope(state, root)
+    del context
+    head = next(
+        (item for item in state.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
+        None,
+    )
+    criteria = None if head is None else next(
+        (item for item in state.slice_criteria_revisions if item.id == head.revision_id),
+        None,
+    )
+    if criteria is None or head is None:
+        raise ServiceError("coverage approval requires the current accepted criteria head")
+    if (
+        type(snapshot) is not InputSnapshot
+        or snapshot.repository_id != accepted.repository_id
+        or snapshot.policy_id != INPUT_POLICY_ID
+        or snapshot.policy_digest != INPUT_POLICY_DIGEST
+    ):
+        raise ServiceError("coverage approval snapshot differs from the current root policy")
+    expected = {item.id: item for item in criteria.criteria}
+    if (
+        len(declarations) != len(expected)
+        or len({item.criterion_id for item in declarations}) != len(declarations)
+    ):
+        raise ServiceError("coverage approval must explicitly declare every current criterion once")
+    files = set(snapshot.file_paths)
+    directories = set(snapshot.directory_paths)
+    normalized: list[CriterionCoverageDeclaration] = []
+    for item in declarations:
+        criterion = expected.get(item.criterion_id)
+        if (
+            criterion is None
+            or criterion.expected_evidence != f"{item.test_kind}:{item.test_target}"
+            or not _supported_test_descriptor(item.test_kind, item.test_target)
+            or len(item.known_inputs) > 1024
+        ):
+            raise ServiceError("coverage declaration differs from the accepted test descriptor")
+        seen: set[tuple[str, str]] = set()
+        inputs: list[CoverageInput] = []
+        for known in item.known_inputs:
+            if (
+                type(known) is not CoverageInput
+                or type(known.kind) is not str
+                or type(known.path) is not str
+            ):
+                raise ServiceError("known inputs must declare only exact root files or directories")
+            parts = known.path.split("/")
+            if (
+                known.kind not in ("root-file", "root-directory")
+                or not known.path or len(known.path) > 1024
+                or "\\" in known.path or ":" in known.path
+                or known.path.startswith("/")
+                or any(part in ("", ".", "..") for part in parts)
+                or parts[0].casefold() in (".git", ".evospec")
+                or unicodedata.normalize("NFC", known.path) != known.path
+                or (known.kind, known.path) in seen
+            ):
+                raise ServiceError("known-input declaration contains an unsupported root path")
+            present = known.path in (files if known.kind == "root-file" else directories)
+            if not present:
+                raise ServiceError("known-input declaration path is absent or has the wrong type")
+            seen.add((known.kind, known.path))
+            inputs.append(known)
+        normalized.append(CriterionCoverageDeclaration(
+            item.criterion_id,
+            item.test_kind,
+            item.test_target,
+            tuple(sorted(inputs, key=lambda value: (value.kind, value.path))),
+        ))
+    result = tuple(sorted(normalized, key=lambda value: value.criterion_id))
+    if len(coverage_declarations_json(result)) > 32768:
+        raise ServiceError("known-input coverage proposal exceeds the fixed display limit")
+    return result
+
+
+def _coverage_contract_digest(
+    declarations: tuple[CriterionCoverageDeclaration, ...],
+) -> str:
+    return sha256(coverage_declarations_json(declarations).encode("utf-8")).hexdigest()
+
+
+def _coverage_approvals(
+    state: State,
+    root: Path,
+    snapshot: InputSnapshot,
+    declarations: tuple[CriterionCoverageDeclaration, ...],
+    statement: str,
+    source_reference: str,
+    source_revision: int,
+    recorded_revision: int,
+) -> tuple[CriterionCoverageApproval, ...]:
+    _, _, accepted = _accepted_e1_scope(state, root)
+    head = next(
+        (item for item in state.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
+        None,
+    )
+    if head is None:
+        raise ServiceError("coverage approval requires a current criteria head")
+    approvals: list[CriterionCoverageApproval] = []
+    for declaration in declarations:
+        approval = CriterionCoverageApproval(
+            "",
+            "",
+            accepted.repository_id,
+            accepted.id,
+            head.revision_id,
+            declaration.criterion_id,
+            declaration.test_kind,
+            declaration.test_target,
+            declaration.known_inputs,
+            snapshot.fingerprint,
+            INPUT_POLICY_ID,
+            INPUT_POLICY_DIGEST,
+            TEST_ADMISSION_POLICY_ID,
+            TEST_ADMISSION_POLICY_DIGEST,
+            TEST_ENVIRONMENT_PROFILE_ID,
+            TEST_ENVIRONMENT_PROFILE_DIGEST,
+            statement,
+            source_reference,
+            "INTERACTIVE_TERMINAL",
+            source_revision,
+            recorded_revision,
+        )
+        digest = coverage_semantic_digest(approval)
+        approvals.append(replace(
+            approval,
+            id=f"coverage-{digest[:20]}",
+            contract_digest=digest,
+        ))
+    return tuple(approvals)
 
 
 def _validated(candidate: State, message: str) -> State:
@@ -1988,6 +2266,312 @@ class CoreService:
         except AtomicFailure as error:
             self.__raise_e1_publication_error(current.revision, error)
 
+    def r3b_upgrade_statement(
+        self,
+        state: State,
+        declarations: tuple[CriterionCoverageDeclaration, ...],
+    ) -> str:
+        """Display exact explicit root-input declarations before schema-17 consent."""
+        current = _authoritative_state(self.__persistence, state)
+        if self.__persistence.r3b_schema_ready():
+            raise ServiceError("R3-B schema 17 is already enabled")
+        if (
+            not self.__persistence.r3b_upgrade_eligible()
+            or current.initialization is None
+            or current.r3_schema_upgrade is None
+        ):
+            raise ServiceError("R3-B upgrade requires explicitly converted schema-16 authority")
+        snapshot_state, snapshot = self.__persistence.input_snapshot(current.revision)
+        if snapshot_state != current:
+            raise ServiceError("R3-B source authority changed while preparing its approval")
+        normalized = _normalize_coverage_declarations(
+            current, self.__repository_root, snapshot, declarations,
+        )
+        _, _, accepted = _accepted_e1_scope(current, self.__repository_root)
+        head = next(
+            (item for item in current.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
+            None,
+        )
+        if head is None:
+            raise ServiceError("R3-B requires a current human-accepted criteria head")
+        contract_json = coverage_declarations_json(normalized)
+        contract_digest = sha256(contract_json.encode("utf-8")).hexdigest()
+        return (
+            f"Acepto habilitar aceptación objetiva R3-B desde revision {current.revision}; "
+            f"repository: {current.initialization.repository_id}; Slice: {accepted.id}; "
+            f"criterios: {head.revision_id}; policy: {R3B_APPROVAL_POLICY_TEXT}; "
+            f"root-input-fingerprint: {snapshot.fingerprint}; "
+            f"coverage-contract-sha256: {contract_digest}; "
+            f"coverage-contract-json: {contract_json}; "
+            f"sha256: {self.__persistence.state_source_sha256()}"
+        )
+
+    def confirmed_r3b_upgrade(self, source_revision: int) -> State | None:
+        current = self.__persistence.recover()
+        receipt = current.r3b_schema_upgrade
+        if (
+            type(source_revision) is int
+            and receipt is not None
+            and receipt.source_revision == source_revision
+            and self.__persistence.r3b_schema_ready()
+        ):
+            return current
+        return None
+
+    def upgrade_r3b_schema(
+        self,
+        state: State,
+        decision: UserAcceptance,
+        declarations: tuple[CriterionCoverageDeclaration, ...],
+    ) -> State:
+        current = _authoritative_state(self.__persistence, state)
+        statement = self.r3b_upgrade_statement(current, declarations)
+        source_digest = statement.rsplit("sha256: ", 1)[1]
+        if self.__persistence.state_source_sha256() != source_digest:
+            raise ServiceError("R3-B source authority changed after approval was displayed")
+        expected_ref = f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"
+        if (
+            type(decision) is not UserAcceptance
+            or decision.source != "INTERACTIVE_TERMINAL"
+            or decision.statement != statement
+            or decision.source_reference != expected_ref
+        ):
+            raise ServiceError("R3-B migration requires its exact interactive terminal decision")
+
+        snapshot_state, snapshot = self.__persistence.input_snapshot(current.revision)
+        if snapshot_state != current or f"root-input-fingerprint: {snapshot.fingerprint};" not in statement:
+            raise ServiceError("R3-B root inputs changed after migration approval")
+        normalized = _normalize_coverage_declarations(
+            current, self.__repository_root, snapshot, declarations,
+        )
+        contract_digest = _coverage_contract_digest(normalized)
+        _, _, accepted = _accepted_e1_scope(current, self.__repository_root)
+        head = next(
+            (item for item in current.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
+            None,
+        )
+        if head is None or current.initialization is None:
+            raise ServiceError("R3-B migration requires the current accepted criteria head")
+
+        def convert(locked: State) -> State:
+            locked_scope = _accepted_e1_scope(locked, self.__repository_root)
+            locked_head = next(
+                (item for item in locked.slice_criteria_heads if item.slice_agreement_ref == locked_scope[2].id),
+                None,
+            )
+            if locked != current or locked.initialization is None or locked_head != head:
+                raise ServiceError("R3-B authority changed after human approval")
+            receipt = R3BSchemaUpgradeReceipt(
+                locked.revision,
+                locked.revision + 1,
+                source_digest,
+                statement,
+                expected_ref,
+                locked.initialization.repository_id,
+                accepted.id,
+                head.revision_id,
+                snapshot.fingerprint,
+                contract_digest,
+            )
+            approvals = _coverage_approvals(
+                locked, self.__repository_root, snapshot, normalized,
+                statement, expected_ref, locked.revision, locked.revision + 1,
+            )
+            return _prepare_state_publication(
+                replace(
+                    locked,
+                    r3b_schema_upgrade=receipt,
+                    criterion_coverage_approvals=locked.criterion_coverage_approvals + approvals,
+                ),
+                locked.revision,
+            )
+
+        try:
+            return self.__persistence.transact_r3b(
+                current.revision, convert, upgrade=True, source_digest=source_digest,
+                expected_input_fingerprint=snapshot.fingerprint,
+            )
+        except AtomicFailure as error:
+            self.__raise_e1_publication_error(current.revision, error)
+
+    def r3b_coverage_renewal_statement(
+        self,
+        state: State,
+        declarations: tuple[CriterionCoverageDeclaration, ...],
+    ) -> str:
+        """Display an exact current-root proposal for TTY-only coverage renewal."""
+        current = _authoritative_state(self.__persistence, state)
+        if current.r3b_schema_upgrade is None or not self.__persistence.r3b_schema_ready():
+            raise ServiceError("coverage renewal requires schema-17 authority")
+        snapshot_state, snapshot = self.__persistence.input_snapshot(current.revision)
+        if snapshot_state != current:
+            raise ServiceError("coverage renewal authority changed while preparing approval")
+        normalized = _normalize_coverage_declarations(
+            current, self.__repository_root, snapshot, declarations,
+        )
+        _, _, accepted = _accepted_e1_scope(current, self.__repository_root)
+        head = next(
+            (item for item in current.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
+            None,
+        )
+        if head is None or current.initialization is None:
+            raise ServiceError("coverage renewal requires the current accepted criteria head")
+        source_digest = self.__persistence.state_source_sha256()
+        contract_json = coverage_declarations_json(normalized)
+        contract_digest = sha256(contract_json.encode("utf-8")).hexdigest()
+        return (
+            f"Acepto renovar cobertura R3-B desde revision {current.revision}; "
+            f"repository: {current.initialization.repository_id}; Slice: {accepted.id}; "
+            f"criterios: {head.revision_id}; policy: {R3B_APPROVAL_POLICY_TEXT}; "
+            f"root-input-fingerprint: {snapshot.fingerprint}; "
+            f"coverage-contract-sha256: {contract_digest}; "
+            f"coverage-contract-json: {contract_json}; state-sha256: {source_digest}"
+        )
+
+    def renew_r3b_coverage(
+        self,
+        state: State,
+        decision: UserAcceptance,
+        declarations: tuple[CriterionCoverageDeclaration, ...],
+    ) -> State:
+        current = _authoritative_state(self.__persistence, state)
+        statement = self.r3b_coverage_renewal_statement(current, declarations)
+        source_digest = statement.rsplit("state-sha256: ", 1)[1]
+        if self.__persistence.state_source_sha256() != source_digest:
+            raise ServiceError("coverage source authority changed after approval was displayed")
+        expected_ref = f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"
+        if (
+            type(decision) is not UserAcceptance
+            or decision.source != "INTERACTIVE_TERMINAL"
+            or decision.statement != statement
+            or decision.source_reference != expected_ref
+            or not statement.endswith(f"state-sha256: {source_digest}")
+        ):
+            raise ServiceError("coverage renewal requires its exact interactive terminal decision")
+        snapshot_state, snapshot = self.__persistence.input_snapshot(current.revision)
+        if snapshot_state != current or f"root-input-fingerprint: {snapshot.fingerprint};" not in statement:
+            raise ServiceError("coverage root inputs changed after terminal approval")
+        normalized = _normalize_coverage_declarations(
+            current, self.__repository_root, snapshot, declarations,
+        )
+
+        def renew(locked: State) -> State:
+            if locked != current or locked.r3b_schema_upgrade is None:
+                raise ServiceError("coverage renewal authority changed after human approval")
+            new_approvals = _coverage_approvals(
+                locked, self.__repository_root, snapshot, normalized,
+                statement, expected_ref, locked.revision, locked.revision + 1,
+            )
+            existing = {item.id: item for item in locked.criterion_coverage_approvals}
+            additions = tuple(
+                item for item in new_approvals
+                if item.id not in existing
+            )
+            if any(
+                existing[item.id].contract_digest != item.contract_digest
+                for item in new_approvals if item.id in existing
+            ):
+                raise ServiceError("coverage approval identity conflicts with immutable history")
+            if not additions:
+                return locked
+            return _prepare_state_publication(
+                replace(
+                    locked,
+                    criterion_coverage_approvals=locked.criterion_coverage_approvals + additions,
+                ),
+                locked.revision,
+            )
+
+        try:
+            return self.__persistence.transact_r3b(
+                current.revision,
+                renew,
+                expected_input_fingerprint=snapshot.fingerprint,
+                source_digest=source_digest,
+                allow_noop=True,
+            )
+        except AtomicFailure as error:
+            self.__raise_e1_publication_error(current.revision, error)
+
+    def current_r3b_coverage_approvals(
+        self,
+        state: State,
+        snapshot: InputSnapshot,
+    ) -> tuple[CriterionCoverageApproval, ...]:
+        current = _authoritative_state(self.__persistence, state)
+        return self._current_r3b_coverage_approvals(current, snapshot)
+
+    def _current_r3b_coverage_approvals(
+        self,
+        current: State,
+        snapshot: InputSnapshot,
+    ) -> tuple[CriterionCoverageApproval, ...]:
+        if current.r3b_schema_upgrade is None or not self.__persistence.r3b_schema_ready():
+            return ()
+        try:
+            _, _, accepted = _accepted_e1_scope(current, self.__repository_root)
+        except ServiceError:
+            return ()
+        head = next(
+            (item for item in current.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
+            None,
+        )
+        criteria = None if head is None else next(
+            (item for item in current.slice_criteria_revisions if item.id == head.revision_id),
+            None,
+        )
+        if criteria is None or head is None or snapshot.repository_id != accepted.repository_id:
+            return ()
+        file_paths = set(snapshot.file_paths)
+        directory_paths = set(snapshot.directory_paths)
+        result: list[CriterionCoverageApproval] = []
+        for criterion in criteria.criteria:
+            kind, separator, target = criterion.expected_evidence.partition(":")
+            if not separator:
+                continue
+            approval = next(
+                (
+                    item for item in reversed(current.criterion_coverage_approvals)
+                    if item.repository_id == accepted.repository_id
+                    and item.slice_agreement_ref == accepted.id
+                    and item.criteria_revision_id == head.revision_id
+                    and item.criterion_id == criterion.id
+                    and item.test_kind == kind
+                    and item.test_target == target
+                    and item.root_fingerprint == snapshot.fingerprint
+                    and item.input_policy_id == INPUT_POLICY_ID
+                    and item.input_policy_digest == INPUT_POLICY_DIGEST
+                    and item.admission_policy_id == TEST_ADMISSION_POLICY_ID
+                    and item.admission_policy_digest == TEST_ADMISSION_POLICY_DIGEST
+                    and item.environment_profile_id == TEST_ENVIRONMENT_PROFILE_ID
+                    and item.environment_profile_policy_digest == TEST_ENVIRONMENT_PROFILE_DIGEST
+                    and (
+                        not snapshot.file_paths and not snapshot.directory_paths
+                        or all(
+                            known.path in (
+                                file_paths if known.kind == "root-file" else directory_paths
+                            )
+                            for known in item.known_inputs
+                        )
+                    )
+                ),
+                None,
+            )
+            if approval is not None:
+                result.append(approval)
+        return tuple(result)
+
+    def input_snapshot(
+        self, expected_revision: int | None = None,
+    ) -> tuple[State, InputSnapshot]:
+        try:
+            return self.__persistence.input_snapshot(expected_revision)
+        except AtomicFailure as error:
+            if "revision is stale" in str(error):
+                actual = self.__persistence.recover().revision
+                raise StaleRevisionError(-1 if expected_revision is None else expected_revision, actual) from error
+            raise ServiceError(str(error)) from error
+
     def record_criterion_test(
         self, state: State, repository_id: str, slice_agreement_ref: str,
         criteria_revision_id: str, criterion_id: str, test_kind: str,
@@ -2035,7 +2619,407 @@ class CoreService:
             ), locked.revision)
 
         try:
-            return self.__persistence.transact_r3(current.revision, record)
+            if current.r3b_schema_upgrade is None:
+                return self.__persistence.transact_r3(current.revision, record)
+            _, snapshot = self.__persistence.input_snapshot(current.revision)
+            return self.__persistence.transact_r3b(
+                current.revision,
+                record,
+                expected_input_fingerprint=snapshot.fingerprint,
+            )
+        except AtomicFailure as error:
+            self.__raise_e1_publication_error(current.revision, error)
+
+    def record_criterion_test_r3b(
+        self,
+        state: State,
+        repository_id: str,
+        slice_agreement_ref: str,
+        criteria_revision_id: str,
+        criterion_id: str,
+        test_kind: str,
+        test_target: str,
+        exit_code: int,
+        output_sha256: str,
+        input_fingerprint_before: str,
+        input_fingerprint_after: str,
+        input_policy_id: str,
+        input_policy_digest: str,
+        admission_policy_id: str,
+        admission_policy_digest: str,
+        runtime_executable: str,
+        runtime_executable_sha256: str,
+        runtime_version: str,
+        runtime_argv: tuple[str, ...],
+        environment_profile_id: str,
+        environment_profile_digest: str,
+        coverage_approval_id: str,
+        coverage_contract_digest: str,
+    ) -> State:
+        """Record one fresh test only after Core rechecks its post-test workspace."""
+        current = _authoritative_state(self.__persistence, state)
+        for label, value in (
+            ("repository", repository_id), ("Slice", slice_agreement_ref),
+            ("criteria revision", criteria_revision_id), ("criterion", criterion_id),
+            ("test kind", test_kind), ("test target", test_target),
+            ("input fingerprint", input_fingerprint_before), ("input fingerprint", input_fingerprint_after),
+            ("input policy", input_policy_id), ("input policy digest", input_policy_digest),
+            ("admission policy", admission_policy_id), ("admission policy digest", admission_policy_digest),
+            ("runtime executable", runtime_executable), ("runtime digest", runtime_executable_sha256),
+            ("runtime version", runtime_version), ("environment profile", environment_profile_id),
+            ("environment digest", environment_profile_digest),
+            ("coverage approval", coverage_approval_id),
+            ("coverage contract digest", coverage_contract_digest),
+        ):
+            if type(value) is not str or not value or len(value) > 2048:
+                raise ServiceError(f"R3-B {label} must be bounded nonblank text")
+        if (
+            type(exit_code) is not int or not 0 <= exit_code <= 255
+            or not _SHA256.fullmatch(output_sha256)
+            or not _SHA256.fullmatch(input_fingerprint_before)
+            or input_fingerprint_before != input_fingerprint_after
+            or input_policy_id != INPUT_POLICY_ID
+            or input_policy_digest != INPUT_POLICY_DIGEST
+            or admission_policy_id != TEST_ADMISSION_POLICY_ID
+            or admission_policy_digest != TEST_ADMISSION_POLICY_DIGEST
+            or environment_profile_id != TEST_ENVIRONMENT_PROFILE_ID
+            or not _SHA256.fullmatch(environment_profile_digest)
+            or not re.fullmatch(r"coverage-[0-9a-f]{20}", coverage_approval_id)
+            or not _SHA256.fullmatch(coverage_contract_digest)
+            or type(runtime_argv) is not tuple or any(type(item) is not str or not item for item in runtime_argv)
+            or not _supported_test_descriptor(test_kind, test_target)
+        ):
+            raise ServiceError("R3-B test provenance is unsupported or incomplete")
+        external_inputs: tuple[str, ...] = ()
+        if not Path(runtime_executable).is_absolute() or not _SHA256.fullmatch(runtime_executable_sha256):
+            raise ServiceError("R3-B runtime identity is invalid")
+        try:
+            expected_environment = sanitized_test_environment(
+                self.__repository_root, runtime_executable,
+            )
+            expected_environment_digest = test_environment_profile_digest(expected_environment)
+        except InputFingerprintError as error:
+            raise ServiceError("R3-B sanitized environment profile is unsupported") from error
+        if environment_profile_digest != expected_environment_digest:
+            raise ServiceError("R3-B sanitized environment profile digest is invalid")
+        _, observed_snapshot = self.__persistence.input_snapshot(current.revision)
+        if observed_snapshot.fingerprint != input_fingerprint_before:
+            raise ServiceError("R3-B workspace fingerprint changed before test evidence recording")
+        matching_approval = next(
+            (
+                item for item in self.current_r3b_coverage_approvals(current, observed_snapshot)
+                if item.id == coverage_approval_id
+                and item.contract_digest == coverage_contract_digest
+                and item.root_fingerprint == input_fingerprint_before
+                and item.criterion_id == criterion_id
+                and item.test_kind == test_kind
+                and item.test_target == test_target
+            ),
+            None,
+        )
+        if matching_approval is None:
+            raise ServiceError("R3-B test has no current human-approved known-input contract")
+        if test_kind == "python-unittest":
+            expected_runtime = str(Path(sys.executable).resolve())
+            expected_argv = (
+                "-I", "-B", "-c", _PYTHON_TEST_RUNNER,
+                str(self.__repository_root), test_target,
+            )
+            if (
+                runtime_executable != expected_runtime
+                or runtime_version != f"Python {platform.python_version()}"
+                or runtime_argv != expected_argv
+                or _runtime_digest(expected_runtime) != runtime_executable_sha256
+            ):
+                raise ServiceError("R3-B Python runtime or exact test argv is unsupported")
+        else:
+            version = re.fullmatch(r"v([0-9]+)\.[0-9]+\.[0-9]+(?:[-+].*)?", runtime_version)
+            if (
+                version is None or int(version.group(1)) < 18
+                or Path(runtime_executable).name.casefold() not in ("node", "node.exe")
+                or runtime_argv != ("--test", test_target)
+                or _runtime_digest(runtime_executable) != runtime_executable_sha256
+                or _runtime_version(runtime_executable, self.__repository_root) != runtime_version
+            ):
+                raise ServiceError("R3-B Node runtime or exact test argv is unsupported")
+
+        def record(locked: State) -> State:
+            if locked != current or locked.r3b_schema_upgrade is None:
+                raise ServiceError("R3-B requires exact converted schema-17 authority")
+            _, _, accepted = _accepted_e1_scope(locked, self.__repository_root)
+            head = next(
+                (item for item in locked.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
+                None,
+            )
+            revision = None if head is None else next(
+                (item for item in locked.slice_criteria_revisions if item.id == head.revision_id),
+                None,
+            )
+            criterion = None if revision is None else next(
+                (item for item in revision.criteria if item.id == criterion_id), None,
+            )
+            if (
+                repository_id != accepted.repository_id
+                or slice_agreement_ref != accepted.id
+                or head is None or head.revision_id != criteria_revision_id
+                or criterion is None
+                or criterion.expected_evidence != f"{test_kind}:{test_target}"
+            ):
+                raise ServiceError("R3-B test does not match the current accepted Slice criterion")
+            digest = sha256(json.dumps([
+                accepted.id, criteria_revision_id, criterion_id, test_kind, test_target,
+                exit_code, output_sha256, locked.revision, input_fingerprint_before,
+                input_policy_id, input_policy_digest, admission_policy_id,
+                admission_policy_digest, list(external_inputs), runtime_executable,
+                runtime_executable_sha256, runtime_version, list(runtime_argv),
+                environment_profile_id, environment_profile_digest,
+                coverage_approval_id, coverage_contract_digest,
+            ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:20]
+            receipt = CriterionTestReceipt(
+                f"criterion-test-{digest}", accepted.id, criteria_revision_id,
+                criterion_id, test_kind, test_target, exit_code, output_sha256,
+                locked.revision, locked.revision + 1,
+                input_fingerprint_before, input_fingerprint_after, input_policy_id,
+                input_policy_digest, admission_policy_id, admission_policy_digest,
+                external_inputs, runtime_executable, runtime_executable_sha256,
+                runtime_version, runtime_argv, environment_profile_id,
+                environment_profile_digest,
+                coverage_approval_id, coverage_contract_digest,
+            )
+            return _prepare_state_publication(replace(
+                locked, criterion_test_receipts=locked.criterion_test_receipts + (receipt,),
+            ), locked.revision)
+
+        try:
+            return self.__persistence.transact_r3b(
+                current.revision,
+                record,
+                expected_input_fingerprint=input_fingerprint_after,
+            )
+        except AtomicFailure as error:
+            self.__raise_e1_publication_error(current.revision, error)
+
+    def _slice_outcome_candidate(
+        self, state: State, snapshot: InputSnapshot,
+    ) -> tuple[SliceOutcomeReceipt | None, tuple[str, ...]]:
+        blockers: list[str] = []
+        if state.r3b_schema_upgrade is None or not self.__persistence.r3b_schema_ready():
+            return None, ("SCHEMA_17_REQUIRED",)
+        if (
+            type(snapshot) is not InputSnapshot
+            or snapshot.version != INPUT_FINGERPRINT_VERSION
+            or snapshot.policy_id != INPUT_POLICY_ID
+            or snapshot.policy_digest != INPUT_POLICY_DIGEST
+            or state.initialization is None
+            or snapshot.repository_id != state.initialization.repository_id
+        ):
+            return None, ("WORKSPACE_SNAPSHOT_INVALID",)
+        try:
+            context, _, accepted = _accepted_e1_scope(state, self.__repository_root)
+        except ServiceError:
+            return None, ("ACCEPTED_SLICE_UNAVAILABLE",)
+        head = next(
+            (item for item in state.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
+            None,
+        )
+        criteria = None if head is None else next(
+            (item for item in state.slice_criteria_revisions if item.id == head.revision_id),
+            None,
+        )
+        if criteria is None or head is None:
+            return None, ("CURRENT_CRITERIA_HEAD_UNAVAILABLE",)
+        if (
+            context.unresolved_material_decision
+            or context.safety_facts.unresolved_decision_details
+            or context.safety_facts.material_clarifications
+        ):
+            blockers.append("MATERIAL_DECISION_PENDING")
+        relevant_drifts = tuple(
+            item for item in state.drifts if item.change_id == context.change_id
+        )
+        if any(item.unresolved for item in relevant_drifts):
+            blockers.append("RELEVANT_DRIFT_UNRESOLVED")
+
+        latest: dict[str, CriterionTestReceipt] = {}
+        for receipt in state.criterion_test_receipts:
+            if (
+                receipt.slice_agreement_ref == accepted.id
+                and receipt.criteria_revision_id == head.revision_id
+            ):
+                latest[receipt.criterion_id] = receipt
+
+        evidence_ids: list[str] = []
+        approved = {
+            item.criterion_id: item
+            for item in self._current_r3b_coverage_approvals(state, snapshot)
+        }
+        for criterion in criteria.criteria:
+            descriptor_kind, separator, descriptor_target = criterion.expected_evidence.partition(":")
+            if not separator or not _supported_test_descriptor(descriptor_kind, descriptor_target):
+                blockers.append(f"UNSUPPORTED_CRITERION:{criterion.id}")
+                continue
+            approval = approved.get(criterion.id)
+            if approval is None:
+                blockers.append(f"COVERAGE_APPROVAL_REQUIRED:{criterion.id}")
+                continue
+            receipt = latest.get(criterion.id)
+            if receipt is None:
+                blockers.append(f"CRITERION_UNVERIFIED:{criterion.id}")
+                continue
+            if receipt.exit_code != 0:
+                blockers.append(f"CRITERION_TEST_FAILED:{criterion.id}")
+                continue
+            if (
+                receipt.input_fingerprint_before != snapshot.fingerprint
+                or receipt.input_fingerprint_after != snapshot.fingerprint
+                or receipt.input_policy_id != INPUT_POLICY_ID
+                or receipt.input_policy_digest != INPUT_POLICY_DIGEST
+                or receipt.admission_policy_id != TEST_ADMISSION_POLICY_ID
+                or receipt.admission_policy_digest != TEST_ADMISSION_POLICY_DIGEST
+                or receipt.environment_profile_id != TEST_ENVIRONMENT_PROFILE_ID
+                or receipt.external_inputs
+                or receipt.coverage_approval_id != approval.id
+                or receipt.coverage_contract_digest != approval.contract_digest
+                or approval.root_fingerprint != snapshot.fingerprint
+                or receipt.environment_profile_digest is None
+                or not _SHA256.fullmatch(receipt.environment_profile_digest)
+            ):
+                blockers.append(f"CRITERION_PROVENANCE_STALE:{criterion.id}")
+                continue
+            expected_argv = (
+                (
+                    "-I", "-B", "-c", _PYTHON_TEST_RUNNER,
+                    str(self.__repository_root), descriptor_target,
+                )
+                if descriptor_kind == "python-unittest"
+                else ("--test", descriptor_target)
+            )
+            runtime_valid = (
+                receipt.runtime_executable is not None
+                and receipt.runtime_executable_sha256 is not None
+                and receipt.runtime_version is not None
+                and receipt.runtime_argv == expected_argv
+            )
+            if runtime_valid and descriptor_kind == "python-unittest":
+                runtime_valid = (
+                    receipt.runtime_executable == str(Path(sys.executable).resolve())
+                    and receipt.runtime_version == f"Python {platform.python_version()}"
+                )
+            elif runtime_valid:
+                version = re.fullmatch(r"v([0-9]+)\.[0-9]+\.[0-9]+(?:[-+].*)?", receipt.runtime_version or "")
+                runtime_valid = (
+                    version is not None and int(version.group(1)) >= 18
+                    and Path(receipt.runtime_executable or "").name.casefold() in ("node", "node.exe")
+                )
+            try:
+                runtime_valid = bool(
+                    runtime_valid
+                    and _runtime_digest(receipt.runtime_executable or "")
+                    == receipt.runtime_executable_sha256
+                )
+                if runtime_valid and descriptor_kind == "node-test":
+                    runtime_valid = (
+                        _runtime_version(receipt.runtime_executable or "", self.__repository_root)
+                        == receipt.runtime_version
+                    )
+            except ServiceError:
+                runtime_valid = False
+            try:
+                if runtime_valid:
+                    expected_environment = sanitized_test_environment(
+                        self.__repository_root, receipt.runtime_executable or "",
+                    )
+                    runtime_valid = (
+                        test_environment_profile_digest(expected_environment)
+                        == receipt.environment_profile_digest
+                    )
+            except InputFingerprintError:
+                runtime_valid = False
+            if not runtime_valid:
+                blockers.append(f"CRITERION_RUNTIME_UNVERIFIABLE:{criterion.id}")
+                continue
+            evidence_ids.append(receipt.id)
+
+        if blockers:
+            return None, tuple(blockers)
+        basis = "ALL_CRITERIA_FRESH_SUPPORTED_TESTS"
+        source = "CORE_OBJECTIVE_ACCEPTANCE"
+        drift_digest = _drift_identity_digest(state, context.change_id)
+        coverage_digest = coverage_set_digest(tuple(approved.values()))
+        receipt = SliceOutcomeReceipt(
+            "",
+            accepted.repository_id,
+            accepted.id,
+            head.revision_id,
+            tuple(evidence_ids),
+            snapshot.fingerprint,
+            INPUT_POLICY_ID,
+            INPUT_POLICY_DIGEST,
+            TEST_ADMISSION_POLICY_ID,
+            TEST_ADMISSION_POLICY_DIGEST,
+            drift_digest,
+            basis,
+            source,
+            state.revision,
+            state.revision + 1,
+            coverage_digest,
+        )
+        receipt = replace(receipt, id=slice_outcome_semantic_id(receipt))
+        return receipt, ()
+
+    def slice_outcome_eligibility(
+        self, state: State, snapshot: InputSnapshot,
+    ) -> SliceOutcomeEligibility:
+        current = _authoritative_state(self.__persistence, state)
+        candidate, blockers = self._slice_outcome_candidate(current, snapshot)
+        context = current.active_context
+        slice_ref = None if context is None else context.slice_agreement_ref
+        history = tuple(
+            item for item in current.slice_outcome_receipts
+            if item.slice_agreement_ref == slice_ref
+        )
+        matching = None if candidate is None else next(
+            (item for item in history if item.id == candidate.id),
+            None,
+        )
+        latest_id = matching.id if matching is not None else (None if not history else history[-1].id)
+        if matching is not None:
+            status = "CURRENT"
+        elif blockers:
+            status = "STALE" if history else "BLOCKED"
+        elif history:
+            status = "STALE"
+        else:
+            status = "READY"
+        return SliceOutcomeEligibility(status, latest_id, blockers)
+
+    def accept_slice_outcome(self, state: State, snapshot: InputSnapshot) -> State:
+        """Append one objective Slice outcome without changing lifecycle or Product Truth."""
+        current = _authoritative_state(self.__persistence, state)
+
+        def accept(locked: State) -> State:
+            if locked != current or locked.r3b_schema_upgrade is None:
+                raise ServiceError("R3-B acceptance requires exact schema-17 authority")
+            receipt, blockers = self._slice_outcome_candidate(locked, snapshot)
+            if receipt is None:
+                raise ServiceError("Slice outcome is blocked: " + ", ".join(blockers))
+            if any(item.id == receipt.id for item in locked.slice_outcome_receipts):
+                return locked
+            return _prepare_state_publication(
+                replace(
+                    locked,
+                    slice_outcome_receipts=locked.slice_outcome_receipts + (receipt,),
+                ),
+                locked.revision,
+            )
+
+        try:
+            return self.__persistence.transact_r3b(
+                current.revision,
+                accept,
+                expected_input_fingerprint=snapshot.fingerprint,
+                allow_noop=True,
+            )
         except AtomicFailure as error:
             self.__raise_e1_publication_error(current.revision, error)
 

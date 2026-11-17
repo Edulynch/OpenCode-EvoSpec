@@ -238,7 +238,7 @@ class FirstSliceTests(unittest.TestCase):
         self.assertEqual(cli_main(args, sink), 2)
         self.assertIn("interactive user terminal", sink.getvalue())
         with patch("sys.stdin", _TTY()), patch("sys.stdout", _TTY()), patch("builtins.input", return_value="NO"):
-            self.assertEqual(cli_main(args, io.StringIO()), 2)
+            self.assertEqual(cli_main(args, _TTY()), 2)
         self.assertEqual(CoreService.open(self.root).recover().revision, self.initial.revision)
 
     def test_b09_interactive_cli_requires_exact_consent_phrase(self) -> None:
@@ -247,7 +247,7 @@ class FirstSliceTests(unittest.TestCase):
                 "--expected-revision", str(self.initial.revision)]
         token = sha256(STATEMENT.encode("utf-8")).hexdigest()[:12]
         with patch("sys.stdin", _TTY()), patch("sys.stdout", _TTY()), patch("builtins.input", return_value=f"ACEPTO {token}"):
-            self.assertEqual(cli_main(args, io.StringIO()), 0)
+            self.assertEqual(cli_main(args, _TTY()), 0)
         self.assertEqual(self._context()["accepted_slice"]["source"], "INTERACTIVE_TERMINAL")
 
     def test_b10_second_scope_and_stale_revision_are_blocked(self) -> None:

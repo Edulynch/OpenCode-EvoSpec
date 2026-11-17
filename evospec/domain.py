@@ -8,6 +8,7 @@ from hashlib import sha256
 import json
 from pathlib import PurePosixPath
 import re
+import unicodedata
 from collections.abc import Hashable, Iterable
 from typing import NewType
 
@@ -20,6 +21,20 @@ from .lifecycle import (
     TERMINAL_STATES,
     can_converge,
     validate_context_state,
+)
+from .input_fingerprint import (
+    COVERAGE_CONTRACT_VERSION,
+    INPUT_POLICY_DIGEST,
+    INPUT_POLICY_ID,
+    LEGACY_INPUT_POLICY_DIGEST,
+    LEGACY_INPUT_POLICY_ID,
+    LEGACY_R3B_APPROVAL_POLICY_TEXT,
+    LEGACY_TEST_ADMISSION_POLICY_DIGEST,
+    R3B_APPROVAL_POLICY_TEXT,
+    TEST_ADMISSION_POLICY_DIGEST,
+    TEST_ADMISSION_POLICY_ID,
+    TEST_ENVIRONMENT_PROFILE_ID,
+    TEST_ENVIRONMENT_PROFILE_DIGEST,
 )
 
 FeatureId = NewType("FeatureId", str)
@@ -246,6 +261,120 @@ class SliceCriteriaHead:
 
 
 @dataclass(frozen=True, slots=True)
+class CoverageInput:
+    """One explicit root file or directory-presence dependency declaration."""
+
+    kind: str
+    path: str
+
+
+@dataclass(frozen=True, slots=True)
+class CriterionCoverageDeclaration:
+    """User-proposed known inputs for one exact accepted test descriptor."""
+
+    criterion_id: str
+    test_kind: str
+    test_target: str
+    known_inputs: tuple[CoverageInput, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CriterionCoverageApproval:
+    """Immutable TTY-approved known-input contract for one exact criterion."""
+
+    id: str
+    contract_digest: str
+    repository_id: str
+    slice_agreement_ref: str
+    criteria_revision_id: str
+    criterion_id: str
+    test_kind: str
+    test_target: str
+    known_inputs: tuple[CoverageInput, ...]
+    root_fingerprint: str
+    input_policy_id: str
+    input_policy_digest: str
+    admission_policy_id: str
+    admission_policy_digest: str
+    environment_profile_id: str
+    environment_profile_policy_digest: str
+    statement: str
+    source_reference: str
+    source: str
+    source_revision: int
+    recorded_revision: int
+
+
+def coverage_declarations_json(
+    declarations: tuple[CriterionCoverageDeclaration, ...],
+) -> str:
+    """Return the one canonical, human-displayable coverage proposal."""
+    return json.dumps(
+        {
+            "version": COVERAGE_CONTRACT_VERSION,
+            "criteria": [
+                {
+                    "criterion_id": item.criterion_id,
+                    "test_kind": item.test_kind,
+                    "test_target": item.test_target,
+                    "known_inputs": [
+                        {"kind": known.kind, "path": known.path}
+                        for known in sorted(item.known_inputs, key=lambda value: (value.kind, value.path))
+                    ],
+                }
+                for item in sorted(declarations, key=lambda value: value.criterion_id)
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def coverage_semantic_digest(approval: CriterionCoverageApproval) -> str:
+    values = [
+        approval.repository_id,
+        approval.slice_agreement_ref,
+        approval.criteria_revision_id,
+        approval.criterion_id,
+        approval.test_kind,
+        approval.test_target,
+        [
+            [item.kind, item.path]
+            for item in sorted(approval.known_inputs, key=lambda value: (value.kind, value.path))
+        ],
+        approval.root_fingerprint,
+        approval.input_policy_id,
+        approval.input_policy_digest,
+        approval.admission_policy_id,
+        approval.admission_policy_digest,
+        approval.environment_profile_id,
+        approval.environment_profile_policy_digest,
+    ]
+    return sha256(json.dumps(
+        values, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def coverage_set_digest(approvals: tuple[CriterionCoverageApproval, ...]) -> str:
+    values = [
+        [
+            item.criterion_id,
+            item.test_kind,
+            item.test_target,
+            [
+                [known.kind, known.path]
+                for known in sorted(item.known_inputs, key=lambda known: (known.kind, known.path))
+            ],
+        ]
+        for item in sorted(approvals, key=lambda value: value.criterion_id)
+    ]
+    return sha256(json.dumps(
+        values, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class R3SchemaUpgradeReceipt:
     """A terminal-approved conversion of an exact schema-15 authority snapshot."""
 
@@ -255,6 +384,22 @@ class R3SchemaUpgradeReceipt:
     statement: str
     source_reference: str
     repository_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class R3BSchemaUpgradeReceipt:
+    """A terminal-approved conversion of exact schema-16 Slice authority."""
+
+    source_revision: int
+    converted_revision: int
+    source_sha256: str
+    statement: str
+    source_reference: str
+    repository_id: str
+    slice_agreement_ref: str
+    criteria_revision_id: str
+    input_fingerprint: str | None = None
+    coverage_contract_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +416,64 @@ class CriterionTestReceipt:
     output_sha256: str
     source_revision: int
     recorded_revision: int
+    input_fingerprint_before: str | None = None
+    input_fingerprint_after: str | None = None
+    input_policy_id: str | None = None
+    input_policy_digest: str | None = None
+    admission_policy_id: str | None = None
+    admission_policy_digest: str | None = None
+    external_inputs: tuple[str, ...] = ()
+    runtime_executable: str | None = None
+    runtime_executable_sha256: str | None = None
+    runtime_version: str | None = None
+    runtime_argv: tuple[str, ...] = ()
+    environment_profile_id: str | None = None
+    environment_profile_digest: str | None = None
+    coverage_approval_id: str | None = None
+    coverage_contract_digest: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SliceOutcomeReceipt:
+    """Immutable automatic outcome for one accepted Slice criteria head."""
+
+    id: str
+    repository_id: str
+    slice_agreement_ref: str
+    criteria_revision_id: str
+    evidence_receipt_ids: tuple[str, ...]
+    input_fingerprint: str
+    input_policy_id: str
+    input_policy_digest: str
+    admission_policy_id: str
+    admission_policy_digest: str
+    relevant_drift_digest: str
+    basis: str
+    source: str
+    source_revision: int
+    recorded_revision: int
+    coverage_contract_digest: str | None = None
+
+
+def slice_outcome_semantic_id(receipt: SliceOutcomeReceipt) -> str:
+    """Content-address semantic outcome, excluding evidence IDs and revision noise."""
+    values = [
+        receipt.repository_id,
+        receipt.slice_agreement_ref,
+        receipt.criteria_revision_id,
+        receipt.input_fingerprint,
+        receipt.input_policy_id,
+        receipt.input_policy_digest,
+        receipt.admission_policy_id,
+        receipt.admission_policy_digest,
+        receipt.relevant_drift_digest,
+        receipt.coverage_contract_digest,
+        receipt.basis,
+        receipt.source,
+    ]
+    return "slice-outcome-" + sha256(json.dumps(
+        values, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()[:20]
 
 
 @dataclass(frozen=True, slots=True)
@@ -997,6 +1200,9 @@ class State:
     slice_criteria_heads: tuple[SliceCriteriaHead, ...] = ()
     r3_schema_upgrade: R3SchemaUpgradeReceipt | None = None
     criterion_test_receipts: tuple[CriterionTestReceipt, ...] = ()
+    r3b_schema_upgrade: R3BSchemaUpgradeReceipt | None = None
+    slice_outcome_receipts: tuple[SliceOutcomeReceipt, ...] = ()
+    criterion_coverage_approvals: tuple[CriterionCoverageApproval, ...] = ()
 
 
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -2661,6 +2867,214 @@ def validate_state(state: State) -> None:
             or receipt.repository_id != state.initialization.repository_id
         ):
             raise StateValidationError("R3 schema upgrade does not match its exact human approval")
+    r3b_receipt = state.r3b_schema_upgrade
+    if r3b_receipt is not None:
+        if type(r3b_receipt) is not R3BSchemaUpgradeReceipt:
+            raise StateValidationError("R3-B schema receipt shape is invalid")
+        slice_agreement = agreement_index.get(r3b_receipt.slice_agreement_ref)
+        criteria_revision = revision_index.get(r3b_receipt.criteria_revision_id)
+        legacy_statement = (
+            f"Acepto habilitar aceptación objetiva R3-B desde revision "
+            f"{r3b_receipt.source_revision}; repository: {r3b_receipt.repository_id}; "
+            f"Slice: {r3b_receipt.slice_agreement_ref}; criterios: "
+            f"{r3b_receipt.criteria_revision_id}; policy: {LEGACY_R3B_APPROVAL_POLICY_TEXT}; "
+            f"sha256: {r3b_receipt.source_sha256}"
+        )
+        new_statement_prefix = (
+            f"Acepto habilitar aceptación objetiva R3-B desde revision "
+            f"{r3b_receipt.source_revision}; repository: {r3b_receipt.repository_id}; "
+            f"Slice: {r3b_receipt.slice_agreement_ref}; criterios: "
+            f"{r3b_receipt.criteria_revision_id}; policy: {R3B_APPROVAL_POLICY_TEXT}; "
+            f"root-input-fingerprint: {r3b_receipt.input_fingerprint}; "
+            f"coverage-contract-sha256: {r3b_receipt.coverage_contract_digest}; "
+            "coverage-contract-json: "
+        )
+        statement_valid = (
+            r3b_receipt.statement == legacy_statement
+            if r3b_receipt.input_fingerprint is None
+            else (
+                r3b_receipt.statement.startswith(new_statement_prefix)
+                and r3b_receipt.statement.endswith(f"; sha256: {r3b_receipt.source_sha256}")
+            )
+        )
+        if (
+            state.initialization is None
+            or receipt is None
+            or r3b_receipt.source_revision < receipt.converted_revision
+            or slice_agreement is None
+            or slice_agreement.kind != "SLICE"
+            or slice_agreement.repository_id != r3b_receipt.repository_id
+            or criteria_revision is None
+            or criteria_revision.slice_agreement_ref != r3b_receipt.slice_agreement_ref
+            or r3b_receipt.repository_id != state.initialization.repository_id
+            or r3b_receipt.source_revision < 0
+            or r3b_receipt.converted_revision != r3b_receipt.source_revision + 1
+            or r3b_receipt.converted_revision > state.revision
+            or not is_sha256_digest(r3b_receipt.source_sha256)
+            or (
+                r3b_receipt.input_fingerprint is not None
+                and not is_sha256_digest(r3b_receipt.input_fingerprint)
+            )
+            or (
+                r3b_receipt.coverage_contract_digest is not None
+                and not is_sha256_digest(r3b_receipt.coverage_contract_digest)
+            )
+            or (r3b_receipt.input_fingerprint is None)
+            != (r3b_receipt.coverage_contract_digest is None)
+            or not statement_valid
+            or r3b_receipt.source_reference
+            != f"tty:{sha256(r3b_receipt.statement.encode('utf-8')).hexdigest()[:12]}"
+        ):
+            raise StateValidationError("R3-B schema upgrade does not match its exact human approval")
+    if type(state.criterion_coverage_approvals) is not tuple:
+        raise StateValidationError("criterion coverage approvals must be immutable")
+    if any(type(item) is not CriterionCoverageApproval for item in state.criterion_coverage_approvals):
+        raise StateValidationError("criterion coverage approval shape is invalid")
+    _unique((item.id for item in state.criterion_coverage_approvals), "criterion coverage approval")
+    initialization = state.initialization
+    coverage_by_id = {item.id: item for item in state.criterion_coverage_approvals}
+    for approval in state.criterion_coverage_approvals:
+        agreement = agreement_index.get(approval.slice_agreement_ref)
+        criteria = revision_index.get(approval.criteria_revision_id)
+        criterion = None if criteria is None else next(
+            (item for item in criteria.criteria if item.id == approval.criterion_id), None,
+        )
+        if (
+            r3b_receipt is None
+            or initialization is None
+            or agreement is None
+            or agreement.kind != "SLICE"
+            or agreement.repository_id != approval.repository_id
+            or criteria is None
+            or criteria.slice_agreement_ref != approval.slice_agreement_ref
+            or criterion is None
+            or criterion.expected_evidence != f"{approval.test_kind}:{approval.test_target}"
+            or approval.repository_id != initialization.repository_id
+            or approval.source != "INTERACTIVE_TERMINAL"
+            or not approval.statement
+            or approval.source_reference != f"tty:{sha256(approval.statement.encode('utf-8')).hexdigest()[:12]}"
+            or approval.input_policy_id != INPUT_POLICY_ID
+            or approval.input_policy_digest != INPUT_POLICY_DIGEST
+            or approval.admission_policy_id != TEST_ADMISSION_POLICY_ID
+            or approval.admission_policy_digest != TEST_ADMISSION_POLICY_DIGEST
+            or approval.environment_profile_id != TEST_ENVIRONMENT_PROFILE_ID
+            or approval.environment_profile_policy_digest != TEST_ENVIRONMENT_PROFILE_DIGEST
+            or not is_sha256_digest(approval.root_fingerprint)
+            or not is_sha256_digest(approval.contract_digest)
+            or approval.contract_digest != coverage_semantic_digest(approval)
+            or approval.id != f"coverage-{approval.contract_digest[:20]}"
+            or type(approval.known_inputs) is not tuple
+            or len(approval.known_inputs) > 1024
+            or len({(item.kind, item.path) for item in approval.known_inputs}) != len(approval.known_inputs)
+            or any(
+                type(item) is not CoverageInput
+                or item.kind not in ("root-file", "root-directory")
+                or not item.path
+                or len(item.path) > 1024
+                or "\\" in item.path
+                or ":" in item.path
+                or item.path.startswith("/")
+                or any(part in ("", ".", "..") for part in item.path.split("/"))
+                or item.path.split("/", 1)[0].casefold() in (".git", ".evospec")
+                or unicodedata.normalize("NFC", item.path) != item.path
+                for item in approval.known_inputs
+            )
+            or approval.recorded_revision < r3b_receipt.converted_revision
+            or approval.recorded_revision != approval.source_revision + 1
+            or approval.recorded_revision > state.revision
+            or f"repository: {approval.repository_id};" not in approval.statement
+            or f"Slice: {approval.slice_agreement_ref};" not in approval.statement
+            or f"criterios: {approval.criteria_revision_id};" not in approval.statement
+            or f"root-input-fingerprint: {approval.root_fingerprint};" not in approval.statement
+            or f"policy: {R3B_APPROVAL_POLICY_TEXT};" not in approval.statement
+            or (
+                approval.statement != r3b_receipt.statement
+                and f"Acepto renovar cobertura R3-B desde revision {approval.source_revision};"
+                not in approval.statement
+            )
+        ):
+            raise StateValidationError("criterion coverage approval is not attributable or supported")
+    if r3b_receipt is not None and r3b_receipt.coverage_contract_digest is not None:
+        initial_approvals = tuple(
+            item for item in state.criterion_coverage_approvals
+            if item.source_revision == r3b_receipt.source_revision
+            and item.recorded_revision == r3b_receipt.converted_revision
+            and item.statement == r3b_receipt.statement
+            and item.source_reference == r3b_receipt.source_reference
+            and item.root_fingerprint == r3b_receipt.input_fingerprint
+            and item.slice_agreement_ref == r3b_receipt.slice_agreement_ref
+            and item.criteria_revision_id == r3b_receipt.criteria_revision_id
+        )
+        initial_revision = revision_index[r3b_receipt.criteria_revision_id]
+        if (
+            len(initial_approvals) != len(initial_revision.criteria)
+            or {item.criterion_id for item in initial_approvals}
+            != {item.id for item in initial_revision.criteria}
+            or not initial_approvals
+            or sha256(coverage_declarations_json(tuple(
+                CriterionCoverageDeclaration(
+                    item.criterion_id, item.test_kind, item.test_target, item.known_inputs,
+                )
+                for item in initial_approvals
+            )).encode("utf-8")).hexdigest() != r3b_receipt.coverage_contract_digest
+        ):
+            raise StateValidationError("R3-B migration lacks its exact approved criterion coverage contracts")
+    approval_groups: dict[tuple[str, str, str, int, int], list[CriterionCoverageApproval]] = {}
+    for approval in state.criterion_coverage_approvals:
+        key = (
+            approval.statement,
+            approval.slice_agreement_ref,
+            approval.criteria_revision_id,
+            approval.source_revision,
+            approval.recorded_revision,
+        )
+        approval_groups.setdefault(key, []).append(approval)
+    for approvals in approval_groups.values():
+        assert r3b_receipt is not None
+        first_approval = approvals[0]
+        covered_criteria = revision_index[first_approval.criteria_revision_id].criteria
+        declarations = tuple(
+            CriterionCoverageDeclaration(
+                item.criterion_id, item.test_kind, item.test_target, item.known_inputs,
+            )
+            for item in approvals
+        )
+        contract_json = coverage_declarations_json(declarations)
+        contract_digest = sha256(contract_json.encode("utf-8")).hexdigest()
+        if first_approval.statement == r3b_receipt.statement:
+            expected_statement = (
+                f"Acepto habilitar aceptación objetiva R3-B desde revision "
+                f"{r3b_receipt.source_revision}; repository: {r3b_receipt.repository_id}; "
+                f"Slice: {r3b_receipt.slice_agreement_ref}; criterios: "
+                f"{r3b_receipt.criteria_revision_id}; policy: {R3B_APPROVAL_POLICY_TEXT}; "
+                f"root-input-fingerprint: {r3b_receipt.input_fingerprint}; "
+                f"coverage-contract-sha256: {contract_digest}; "
+                f"coverage-contract-json: {contract_json}; "
+                f"sha256: {r3b_receipt.source_sha256}"
+            )
+        else:
+            state_digest = re.search(
+                r"state-sha256: ([0-9a-f]{64})$", first_approval.statement,
+            )
+            expected_statement = (
+                None if state_digest is None else
+                f"Acepto renovar cobertura R3-B desde revision {first_approval.source_revision}; "
+                f"repository: {first_approval.repository_id}; "
+                f"Slice: {first_approval.slice_agreement_ref}; "
+                f"criterios: {first_approval.criteria_revision_id}; "
+                f"policy: {R3B_APPROVAL_POLICY_TEXT}; "
+                f"root-input-fingerprint: {first_approval.root_fingerprint}; "
+                f"coverage-contract-sha256: {contract_digest}; "
+                f"coverage-contract-json: {contract_json}; "
+                f"state-sha256: {state_digest.group(1)}"
+            )
+        if (
+            len({item.criterion_id for item in approvals}) != len(approvals)
+            or {item.criterion_id for item in approvals}
+            != {item.id for item in covered_criteria}
+            or first_approval.statement != expected_statement
+        ):
+            raise StateValidationError("criterion coverage approval does not match its displayed TTY proposal")
     if type(state.criterion_test_receipts) is not tuple:
         raise StateValidationError("R3 test observations must be immutable")
     if any(type(item) is not CriterionTestReceipt for item in state.criterion_test_receipts):
@@ -2692,13 +3106,206 @@ def validate_state(state: State) -> None:
                 or receipt is None or observation.source_revision < receipt.converted_revision
                 or not re.fullmatch(r"[0-9a-f]{64}", observation.output_sha256)):
             raise StateValidationError("R3 test result has invalid revision or output identity")
-        expected_id = "criterion-test-" + sha256(json.dumps([
+        provenance = (
+            observation.input_fingerprint_before,
+            observation.input_fingerprint_after,
+            observation.input_policy_id,
+            observation.input_policy_digest,
+            observation.admission_policy_id,
+            observation.admission_policy_digest,
+            observation.runtime_executable,
+            observation.runtime_executable_sha256,
+            observation.runtime_version,
+            observation.environment_profile_id,
+            observation.environment_profile_digest,
+        )
+        has_r3b_provenance = (
+            any(value is not None for value in provenance)
+            or bool(observation.external_inputs)
+            or bool(observation.runtime_argv)
+        )
+        has_coverage_binding = (
+            observation.coverage_approval_id is not None
+            or observation.coverage_contract_digest is not None
+        )
+        identity_values: list[object] = [
             observation.slice_agreement_ref, observation.criteria_revision_id,
             observation.criterion_id, observation.test_kind, observation.test_target,
             observation.exit_code, observation.output_sha256, observation.source_revision,
-        ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:20]
+        ]
+        if has_r3b_provenance:
+            identity_values.extend((
+                observation.input_fingerprint_before, observation.input_policy_id,
+                observation.input_policy_digest, observation.admission_policy_id,
+                observation.admission_policy_digest, list(observation.external_inputs),
+                observation.runtime_executable, observation.runtime_executable_sha256,
+                observation.runtime_version, list(observation.runtime_argv),
+                observation.environment_profile_id, observation.environment_profile_digest,
+            ))
+            if has_coverage_binding:
+                identity_values.extend((
+                    observation.coverage_approval_id,
+                    observation.coverage_contract_digest,
+                ))
+        expected_id = "criterion-test-" + sha256(json.dumps(
+            identity_values, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()[:20]
         if observation.id != expected_id:
             raise StateValidationError("R3 test receipt identity does not match its recorded result")
+        if has_r3b_provenance:
+            if (
+                r3b_receipt is None
+                or any(value is None for value in provenance)
+                or observation.input_fingerprint_before != observation.input_fingerprint_after
+                or not is_sha256_digest(observation.input_fingerprint_before or "")
+                or not is_sha256_digest(observation.input_policy_digest or "")
+                or not is_sha256_digest(observation.admission_policy_digest or "")
+                or not is_sha256_digest(observation.runtime_executable_sha256 or "")
+                or not is_sha256_digest(observation.environment_profile_digest or "")
+                or type(observation.external_inputs) is not tuple
+                or observation.external_inputs
+                or type(observation.runtime_argv) is not tuple
+                or not observation.runtime_argv
+                or any(type(value) is not str or not value for value in observation.runtime_argv)
+                or (
+                    observation.input_policy_id,
+                    observation.input_policy_digest,
+                    observation.admission_policy_digest,
+                ) not in (
+                    (INPUT_POLICY_ID, INPUT_POLICY_DIGEST, TEST_ADMISSION_POLICY_DIGEST),
+                    (LEGACY_INPUT_POLICY_ID, LEGACY_INPUT_POLICY_DIGEST, LEGACY_TEST_ADMISSION_POLICY_DIGEST),
+                )
+                or observation.environment_profile_id != TEST_ENVIRONMENT_PROFILE_ID
+                or has_coverage_binding and (
+                    observation.coverage_approval_id is None
+                    or not is_sha256_digest(observation.coverage_contract_digest or "")
+                    or (
+                        (coverage_approval := coverage_by_id.get(observation.coverage_approval_id)) is None
+                        or coverage_approval.contract_digest != observation.coverage_contract_digest
+                        or state.initialization is None
+                        or coverage_approval.repository_id != state.initialization.repository_id
+                        or coverage_approval.slice_agreement_ref != observation.slice_agreement_ref
+                        or coverage_approval.criteria_revision_id != observation.criteria_revision_id
+                        or coverage_approval.criterion_id != observation.criterion_id
+                        or coverage_approval.test_kind != observation.test_kind
+                        or coverage_approval.test_target != observation.test_target
+                        or coverage_approval.root_fingerprint != observation.input_fingerprint_before
+                    )
+                )
+            ):
+                raise StateValidationError("R3-B test provenance is incomplete or unsupported")
+    if type(state.slice_outcome_receipts) is not tuple:
+        raise StateValidationError("Slice outcome receipts must be immutable")
+    if any(type(item) is not SliceOutcomeReceipt for item in state.slice_outcome_receipts):
+        raise StateValidationError("Slice outcome receipt shape is invalid")
+    _unique((item.id for item in state.slice_outcome_receipts), "Slice outcome receipt")
+    if state.slice_outcome_receipts and r3b_receipt is None:
+        raise StateValidationError("automatic Slice outcomes require explicit schema-17 authority")
+    test_receipts = {item.id: item for item in state.criterion_test_receipts}
+    for outcome in state.slice_outcome_receipts:
+        agreement = agreement_index.get(outcome.slice_agreement_ref)
+        criteria = revision_index.get(outcome.criteria_revision_id)
+        current_input_policy = (
+            outcome.input_policy_id == INPUT_POLICY_ID
+            and outcome.input_policy_digest == INPUT_POLICY_DIGEST
+            and outcome.admission_policy_digest == TEST_ADMISSION_POLICY_DIGEST
+        )
+        legacy_input_policy = (
+            outcome.input_policy_id == LEGACY_INPUT_POLICY_ID
+            and outcome.input_policy_digest == LEGACY_INPUT_POLICY_DIGEST
+            and outcome.admission_policy_digest == LEGACY_TEST_ADMISSION_POLICY_DIGEST
+            and outcome.coverage_contract_digest is None
+        )
+        if (
+            agreement is None
+            or agreement.kind != "SLICE"
+            or agreement.repository_id != outcome.repository_id
+            or criteria is None
+            or criteria.slice_agreement_ref != outcome.slice_agreement_ref
+            or not outcome.evidence_receipt_ids
+            or len(outcome.evidence_receipt_ids) != len(set(outcome.evidence_receipt_ids))
+            or len(outcome.evidence_receipt_ids) != len(criteria.criteria)
+            or type(outcome.input_policy_id) is not str
+            or not (current_input_policy or legacy_input_policy)
+            or type(outcome.admission_policy_id) is not str
+            or outcome.admission_policy_id != TEST_ADMISSION_POLICY_ID
+            or (
+                outcome.coverage_contract_digest is not None
+                and not is_sha256_digest(outcome.coverage_contract_digest)
+            )
+            or any(not is_sha256_digest(value) for value in (
+                outcome.input_fingerprint,
+                outcome.input_policy_digest,
+                outcome.admission_policy_digest,
+                outcome.relevant_drift_digest,
+            ))
+            or outcome.basis != "ALL_CRITERIA_FRESH_SUPPORTED_TESTS"
+            or outcome.source != "CORE_OBJECTIVE_ACCEPTANCE"
+            or outcome.source_revision < 0
+            or outcome.recorded_revision != outcome.source_revision + 1
+            or outcome.recorded_revision > state.revision
+        ):
+            raise StateValidationError("Slice outcome receipt is invalid")
+        selected = tuple(test_receipts.get(identity) for identity in outcome.evidence_receipt_ids)
+        if any(
+            receipt is None
+            or receipt.exit_code != 0
+            or receipt.slice_agreement_ref != outcome.slice_agreement_ref
+            or receipt.criteria_revision_id != outcome.criteria_revision_id
+            or receipt.input_fingerprint_before != outcome.input_fingerprint
+            or receipt.input_fingerprint_after != outcome.input_fingerprint
+            or receipt.input_policy_id != outcome.input_policy_id
+            or receipt.input_policy_digest != outcome.input_policy_digest
+            or receipt.admission_policy_id != outcome.admission_policy_id
+            or receipt.admission_policy_digest != outcome.admission_policy_digest
+            or receipt.environment_profile_id != TEST_ENVIRONMENT_PROFILE_ID
+            or receipt.environment_profile_digest is None
+            or not is_sha256_digest(receipt.environment_profile_digest)
+            or receipt.external_inputs
+            or not receipt.runtime_executable
+            or not receipt.runtime_executable_sha256
+            or not receipt.runtime_version
+            or not receipt.runtime_argv
+            or (
+                outcome.coverage_contract_digest is not None
+                and (
+                    receipt.coverage_approval_id is None
+                    or receipt.coverage_contract_digest is None
+                    or (
+                        (approval := coverage_by_id.get(receipt.coverage_approval_id)) is None
+                        or approval.contract_digest != receipt.coverage_contract_digest
+                        or approval.root_fingerprint != outcome.input_fingerprint
+                    )
+                )
+            )
+            for receipt in selected
+        ):
+            raise StateValidationError("Slice outcome must reference matching successful test provenance")
+        if {receipt.criterion_id for receipt in selected if receipt is not None} != {
+            criterion.id for criterion in criteria.criteria
+        }:
+            raise StateValidationError("Slice outcome must cover each current accepted criterion")
+        if outcome.coverage_contract_digest is not None:
+            selected_approvals = tuple(
+                coverage_by_id[receipt.coverage_approval_id]
+                for receipt in selected
+                if receipt is not None and receipt.coverage_approval_id in coverage_by_id
+            )
+            identity_valid = (
+                len(selected_approvals) == len(criteria.criteria)
+                and coverage_set_digest(selected_approvals) == outcome.coverage_contract_digest
+                and outcome.id == slice_outcome_semantic_id(outcome)
+            )
+        else:
+            expected_id = "slice-outcome-" + sha256(json.dumps([
+                outcome.repository_id, outcome.slice_agreement_ref, outcome.criteria_revision_id,
+                list(outcome.evidence_receipt_ids), outcome.input_fingerprint, outcome.input_policy_id,
+                outcome.input_policy_digest, outcome.admission_policy_id, outcome.admission_policy_digest,
+                outcome.relevant_drift_digest, outcome.basis, outcome.source,
+            ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:20]
+            identity_valid = outcome.id == expected_id
+        if not identity_valid:
+            raise StateValidationError("Slice outcome receipt identity does not match its exact basis")
     _unique(
         (agreement.task_id for agreement in state.agreements if agreement.task_id is not None),
         "Slice Task",
