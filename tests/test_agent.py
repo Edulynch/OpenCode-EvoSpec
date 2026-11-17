@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
-from evospec.agent import project_context
+from evospec.agent import _slice_acceptance_inventory, project_context
+from evospec.agent_protocol import context_json
 from evospec.domain import (
+    AgreementRecord,
     AssessmentConfidence,
     AssessmentDepth,
     AssessmentDepthValue,
@@ -15,6 +18,7 @@ from evospec.domain import (
     ChangeId,
     Decision,
     DecisionId,
+    ExpectedRevision,
     FeatureId,
     Feature,
     IntentAssessment,
@@ -29,16 +33,238 @@ from evospec.domain import (
     SemanticLockRevision,
     VerificationEvidence,
     OperationalState,
+    ParkedWork,
+    SliceCriteriaHead,
+    SliceCriteriaRevision,
+    SliceCriterion,
+    SliceOutcomeReceipt,
+    WorkId,
+    WorkItem,
 )
 from evospec.lifecycle import Classification, LifecycleState, Phase, ReviewVerdict
-from evospec.services import CoreService
+from evospec.persistence import JsonValue
+from evospec.services import CoreService, slice_acceptance_statement
 from evospec.workflow import ClarificationAnswer, WorkflowService
 from tests._tempdir import TemporaryDirectory
+from tests.test_e1_r1d1_slice_criteria import CHECKPOINT, FEATURE, SLICE, TASK, _provenance, _spec
 from tests.test_services_state import convergence_assessment
 from tests.test_workflow_assurance import established_change_assessment
 
 
 class AgentContextTests(unittest.TestCase):
+    def test_slice_acceptance_inventory_uses_exact_agreements_heads_and_provenance(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = WorkflowService.open(root)
+            initial = workflow.init()
+            criteria = _spec()
+            statement = slice_acceptance_statement(FEATURE, SLICE, TASK, CHECKPOINT, criteria)
+            _ = workflow.accept_first_slice(
+                FEATURE, SLICE, TASK, CHECKPOINT, _provenance(statement),
+                expected_revision=ExpectedRevision(initial.revision), criteria=criteria,
+            )
+            state = CoreService.open(root).recover()
+            feature, active_slice = state.agreements
+            first_revision = state.slice_criteria_revisions[0]
+            self.assertIsNotNone(state.active_context)
+            active_context = state.active_context
+            if active_context is None:
+                self.fail("accepted Slice fixture must have active context")
+
+            parked_slice = AgreementRecord(
+                "agreement-slice-parked", "SLICE", active_slice.feature_id, active_slice.change_id,
+                "Parked Slice", "accepted parked scope", "INTERACTIVE_TERMINAL", "tty:parked",
+                active_slice.repository_id, "task-parked", "Parked Task", "Parked checkpoint",
+            )
+            queued_feature_id = FeatureId("feature-r4b-other")
+            queued_change_id = ChangeId("change-r4b-other")
+            queued_feature = AgreementRecord(
+                "agreement-feature-r4b-other", "FEATURE", queued_feature_id, queued_change_id,
+                "Other Feature", "accepted other feature", "INTERACTIVE_TERMINAL", "tty:feature",
+                active_slice.repository_id,
+            )
+            queued_slice = AgreementRecord(
+                "agreement-slice-r4b-other", "SLICE", queued_feature_id, queued_change_id,
+                "Other Slice", "accepted other scope", "INTERACTIVE_TERMINAL", "tty:other",
+                active_slice.repository_id, "task-other", "Other Task", "Other checkpoint",
+            )
+            orphan_slice = AgreementRecord(
+                "agreement-slice-orphan", "SLICE", FeatureId("feature-orphan"), ChangeId("change-orphan"),
+                "Orphan Slice", "unassociated scope", "INTERACTIVE_TERMINAL", "tty:orphan",
+                active_slice.repository_id, "task-orphan", "Orphan Task", "Orphan checkpoint",
+            )
+
+            def criteria_for(reference: str, revision_id: str, result: str) -> SliceCriteriaRevision:
+                return replace(
+                    first_revision,
+                    id=revision_id,
+                    slice_agreement_ref=reference,
+                    outcome=result,
+                    criteria=(SliceCriterion(f"AC-{revision_id}", result, "fixture evidence"),),
+                )
+
+            parked_context = replace(
+                active_context, focus="Parked Slice", feature_agreement_ref=feature.id,
+                slice_agreement_ref=parked_slice.id, task_progress=None,
+            )
+            queued_context = replace(
+                active_context, feature_id=queued_feature_id, change_id=queued_change_id,
+                change_ids=(queued_change_id,), focus="Other Slice",
+                feature_agreement_ref=queued_feature.id, slice_agreement_ref=queued_slice.id,
+                task_progress=None,
+            )
+            fixture = replace(
+                state,
+                agreements=(
+                    feature, active_slice, parked_slice, parked_slice,
+                    queued_feature, queued_slice, orphan_slice,
+                ),
+                slice_criteria_revisions=(
+                    first_revision,
+                    criteria_for(parked_slice.id, "criteria-parked", "parked-specific criterion"),
+                    criteria_for(queued_slice.id, "criteria-other", "other-feature-specific criterion"),
+                ),
+                slice_criteria_heads=(
+                    state.slice_criteria_heads[0],
+                    SliceCriteriaHead(parked_slice.id, "criteria-parked"),
+                    SliceCriteriaHead(queued_slice.id, "criteria-other"),
+                ),
+                slice_outcome_receipts=(
+                    SliceOutcomeReceipt(
+                        "receipt-parked", active_slice.repository_id, parked_slice.id,
+                        "criteria-parked", (), "fingerprint", "input-policy", "input-digest",
+                        "admission-policy", "admission-digest", "drift-digest", "basis",
+                        "CORE", 2, 3,
+                    ),
+                    SliceOutcomeReceipt(
+                        "receipt-wrong-criteria", active_slice.repository_id, queued_slice.id,
+                        "criteria-parked", (), "fingerprint", "input-policy", "input-digest",
+                        "admission-policy", "admission-digest", "drift-digest", "basis",
+                        "CORE", 2, 3,
+                    ),
+                ),
+                parked_work=ParkedWork(
+                    parked_context, None, None, None, "waiting", "fixture",
+                ),
+                work_items=(WorkItem(
+                    WorkId(f"work-{queued_change_id}"), OperationalState.READY, queued_context,
+                    None, None, None, "waiting", "fixture",
+                ),),
+            )
+
+            inventory = _slice_acceptance_inventory(fixture)
+            self.assertEqual(inventory.source, "CORE_AGREEMENTS")
+            self.assertEqual(inventory.history_scope, "AGREEMENT_RECORDS_ONLY_NONEXHAUSTIVE")
+            self.assertEqual(inventory.total, 4)
+            self.assertFalse(inventory.complete)
+            self.assertFalse(inventory.truncated)
+            items = {item.slice_agreement_ref: item for item in inventory.items}
+            self.assertEqual(len(items), 4, "duplicate exact Slice refs are deduplicated")
+            self.assertEqual(items[active_slice.id].scope_status, "ACTIVE")
+            self.assertEqual(items[active_slice.id].criteria_revision, first_revision)
+            self.assertEqual(items[parked_slice.id].scope_status, "PARKED")
+            self.assertEqual(items[parked_slice.id].provenance, "PARKED_CONTEXT")
+            parked_revision = items[parked_slice.id].criteria_revision
+            if parked_revision is None:
+                self.fail("parked Slice must retain its canonical criteria revision")
+            self.assertEqual(parked_revision.criteria[0].expected_result, "parked-specific criterion")
+            self.assertTrue(items[parked_slice.id].historical_receipt)
+            self.assertEqual(items[queued_slice.id].scope_status, "QUEUED")
+            self.assertEqual(items[queued_slice.id].feature_id, str(queued_feature_id))
+            self.assertEqual(items[queued_slice.id].operational_state, str(OperationalState.READY))
+            queued_revision = items[queued_slice.id].criteria_revision
+            if queued_revision is None:
+                self.fail("queued Slice must retain its canonical criteria revision")
+            self.assertEqual(queued_revision.criteria[0].expected_result, "other-feature-specific criterion")
+            self.assertFalse(items[queued_slice.id].historical_receipt)
+            self.assertEqual(items[orphan_slice.id].authority_status, "UNAVAILABLE")
+            self.assertEqual(items[orphan_slice.id].scope_status, "UNAVAILABLE")
+            self.assertEqual(items[orphan_slice.id].provenance, "ASSOCIATION_UNAVAILABLE")
+            serialized = context_json(replace(
+                project_context(workflow), slice_acceptance_inventory=inventory,
+            ))["slice_acceptance_inventory"]
+            if not isinstance(serialized, dict):
+                self.fail("serialized inventory must be a JSON object")
+            self.assertEqual(serialized.get("total"), 4)
+            serialized_items_value = serialized.get("items")
+            if not isinstance(serialized_items_value, list):
+                self.fail("serialized inventory items must be a JSON array")
+            serialized_items: list[dict[str, JsonValue]] = []
+            for item in serialized_items_value:
+                if not isinstance(item, dict):
+                    self.fail("serialized inventory item must be a JSON object")
+                serialized_items.append(item)
+            parked_item = next(
+                (item for item in serialized_items if item.get("slice_agreement_ref") == parked_slice.id),
+                None,
+            )
+            if parked_item is None:
+                self.fail("serialized inventory must include the parked Slice")
+            parked_revision_value = parked_item.get("criteria_revision")
+            if not isinstance(parked_revision_value, dict):
+                self.fail("serialized parked Slice must include its criteria revision")
+            parked_criteria_value = parked_revision_value.get("criteria")
+            if not isinstance(parked_criteria_value, list) or not parked_criteria_value:
+                self.fail("serialized parked Slice must include its criteria")
+            parked_criterion_value = parked_criteria_value[0]
+            if not isinstance(parked_criterion_value, dict):
+                self.fail("serialized parked Slice criterion must be a JSON object")
+            self.assertEqual(
+                parked_criterion_value.get("expected_result"),
+                "parked-specific criterion",
+            )
+            self.assertEqual(parked_item.get("scope_status"), "PARKED")
+
+            extra_slices = tuple(
+                AgreementRecord(
+                    f"000-extra-{index:02}", "SLICE", active_slice.feature_id, active_slice.change_id,
+                    f"Extra {index}", "accepted scope", "INTERACTIVE_TERMINAL", "tty:extra",
+                    active_slice.repository_id, f"task-{index}", "Task", "Checkpoint",
+                )
+                for index in range(33)
+            )
+            capped = _slice_acceptance_inventory(replace(
+                state, agreements=(feature, active_slice, *extra_slices),
+            ))
+            self.assertEqual(capped.total, 34)
+            self.assertEqual(len(capped.items), 32)
+            self.assertTrue(capped.truncated)
+            self.assertFalse(capped.complete)
+            self.assertIn(active_slice.id, {item.slice_agreement_ref for item in capped.items})
+
+            invalid_head = _slice_acceptance_inventory(replace(
+                state,
+                slice_criteria_heads=state.slice_criteria_heads + (
+                    SliceCriteriaHead(active_slice.id, "missing-current-head"),
+                ),
+            ))
+            active_item = next(item for item in invalid_head.items if item.slice_agreement_ref == active_slice.id)
+            self.assertEqual(active_item.criteria_status, "UNAVAILABLE")
+            self.assertFalse(invalid_head.complete)
+
+    def test_slice_acceptance_inventory_identifies_normal_parked_queue_work(self) -> None:
+        for reason, expected_state in (
+            ("deferred for later", OperationalState.FROZEN),
+            ("external integration service is unavailable", OperationalState.BLOCKED),
+        ):
+            with self.subTest(reason=reason), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                workflow = WorkflowService.open(root)
+                initial = workflow.init()
+                criteria = _spec()
+                statement = slice_acceptance_statement(FEATURE, SLICE, TASK, CHECKPOINT, criteria)
+                _ = workflow.accept_first_slice(
+                    FEATURE, SLICE, TASK, CHECKPOINT, _provenance(statement),
+                    expected_revision=ExpectedRevision(initial.revision), criteria=criteria,
+                )
+                workflow.park(reason)
+
+                item = _slice_acceptance_inventory(CoreService.open(root).recover()).items[0]
+
+                self.assertEqual(item.scope_status, "PARKED")
+                self.assertEqual(item.provenance, "PARKED_WORK_ITEM")
+                self.assertEqual(item.operational_state, str(expected_state))
+
     def test_context_projects_active_lifecycle_decisions_progress_and_legal_actions(self) -> None:
         # Given: initialized work with durable implementation progress
         with TemporaryDirectory() as temporary:

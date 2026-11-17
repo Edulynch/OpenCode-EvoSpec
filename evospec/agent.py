@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .domain import AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, CriterionCoverageApproval, CriterionTestReceipt, ExpectedRevision, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, SliceCriteriaRevision, SliceOutcomeReceipt, State, WorkItem, WorkingContext
+from .domain import AgreementRecord, AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, CriterionCoverageApproval, CriterionTestReceipt, ExpectedRevision, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, SliceCriteriaHead, SliceCriteriaRevision, SliceCriterion, SliceOutcomeReceipt, State, WorkItem, WorkingContext
 from .guidance import (
     ActionGuidance,
     MaterialDecisionEvidence,
@@ -156,6 +156,36 @@ class WorkQueueSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class SliceAcceptanceItem:
+    """One canonical Slice agreement, kept distinct from evaluation evidence."""
+
+    slice_agreement_ref: str
+    feature_id: str | None
+    feature_agreement_ref: str | None
+    feature_title: str | None
+    slice_title: str | None
+    authority_status: str
+    scope_status: str
+    provenance: str
+    operational_state: str | None
+    criteria_status: str
+    criteria_revision: SliceCriteriaRevision | None
+    historical_receipt: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SliceAcceptanceInventory:
+    """Bounded view of Core's canonical agreement records, not archive history."""
+
+    source: str = "CORE_AGREEMENTS"
+    total: int = 0
+    complete: bool = True
+    truncated: bool = False
+    history_scope: str = "AGREEMENT_RECORDS_ONLY_NONEXHAUSTIVE"
+    items: tuple[SliceAcceptanceItem, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class AgentContext:
     revision: int
     initialization_state: str
@@ -202,6 +232,7 @@ class AgentContext:
     input_snapshot: InputSnapshot | None = None
     slice_outcome: SliceOutcomeSummary | None = None
     criterion_coverage_approvals: tuple[CriterionCoverageApproval, ...] = ()
+    slice_acceptance_inventory: SliceAcceptanceInventory = SliceAcceptanceInventory()
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,10 +362,12 @@ def project_context(
               _pending_capability_selection(inspection.state),
                _outcome(inspection, (), work_queue),
                irreversible_authorizations=_irreversible_authorization_summaries(inspection.state.irreversible_authorizations),
-               r3_schema_ready=inspection.state.r3_schema_upgrade is not None,
-               r3b_schema_ready=inspection.state.r3b_schema_upgrade is not None,
-               input_snapshot=input_snapshot,
-         )
+                r3_schema_ready=inspection.state.r3_schema_upgrade is not None,
+                r3b_schema_ready=inspection.state.r3b_schema_upgrade is not None,
+                input_snapshot=input_snapshot,
+                repository_id=inspection.state.initialization.repository_id,
+                slice_acceptance_inventory=_slice_acceptance_inventory(inspection.state),
+          )
     locks = tuple(lock for lock in inspection.locks if lock.active and lock.feature_id == context.feature_id)
     change = next((item for item in inspection.changes if item.id == context.change_id), None)
     current_assessments = () if change is None else change.lock_assessments
@@ -424,12 +457,279 @@ def project_context(
               _slice_outcome_summary(
                    workflow, inspection.state, context, input_snapshot, snapshot_unavailable,
                ),
-              criterion_coverage_approvals=(
-                  ()
-                  if input_snapshot is None
-                  else workflow.current_r3b_coverage_approvals(inspection.state, input_snapshot)
-              ),
-      )
+               criterion_coverage_approvals=(
+                   ()
+                   if input_snapshot is None
+                   else workflow.current_r3b_coverage_approvals(inspection.state, input_snapshot)
+               ),
+               slice_acceptance_inventory=_slice_acceptance_inventory(inspection.state),
+       )
+
+
+def _slice_acceptance_inventory(state: State) -> SliceAcceptanceInventory:
+    """Project distinct Core Slice agreements without evaluating inactive work."""
+    if not isinstance(state.agreements, tuple):
+        return SliceAcceptanceInventory(complete=False)
+
+    records_by_ref: dict[str, list[AgreementRecord]] = {}
+    malformed_records = False
+    for record in state.agreements:
+        if not isinstance(record, AgreementRecord):
+            malformed_records = True
+            continue
+        if record.kind not in ("FEATURE", "SLICE"):
+            malformed_records = True
+            continue
+        if record.kind == "FEATURE":
+            continue
+        if not isinstance(record.id, str) or not record.id:
+            malformed_records = True
+            continue
+        records_by_ref.setdefault(record.id, []).append(record)
+
+    records = tuple(
+        (reference, values[0], len(values) == 1 or all(value == values[0] for value in values))
+        for reference, values in sorted(records_by_ref.items())
+    )
+    slice_refs = set(records_by_ref)
+    malformed_records = malformed_records or (
+        not isinstance(state.slice_criteria_heads, tuple)
+        or not isinstance(state.slice_criteria_revisions, tuple)
+        or any(
+            not isinstance(head, SliceCriteriaHead)
+            or head.slice_agreement_ref not in slice_refs
+            for head in state.slice_criteria_heads
+        )
+        or any(
+            not isinstance(revision, SliceCriteriaRevision)
+            or revision.slice_agreement_ref not in slice_refs
+            for revision in state.slice_criteria_revisions
+        )
+    )
+    total = len(records)
+    truncated = total > MAX_WORK_ITEMS
+    selected = list(records)
+    active_ref = (
+        state.active_context.slice_agreement_ref
+        if state.active_context is not None else None
+    )
+    if truncated and active_ref is not None:
+        active_record = next((item for item in selected if item[0] == active_ref), None)
+        if active_record is not None and active_record not in selected[:MAX_WORK_ITEMS]:
+            selected = selected[:MAX_WORK_ITEMS - 1] + [active_record]
+    selected = selected[:MAX_WORK_ITEMS]
+
+    items: list[SliceAcceptanceItem] = []
+    structurally_resolved = not malformed_records
+    for _, record, unique in selected:
+        item, resolved = _slice_acceptance_item(state, record, unique)
+        items.append(item)
+        structurally_resolved = structurally_resolved and resolved
+
+    # Completeness covers the full agreement-record scope, not only the display cap.
+    if truncated:
+        for _, record, unique in records:
+            if not unique:
+                structurally_resolved = False
+                continue
+            _, resolved = _slice_acceptance_item(state, record, unique)
+            structurally_resolved = structurally_resolved and resolved
+
+    items.sort(key=lambda item: (item.feature_id or "\uffff", item.slice_agreement_ref))
+    return SliceAcceptanceInventory(
+        total=total,
+        complete=structurally_resolved and not truncated,
+        truncated=truncated,
+        items=tuple(items),
+    )
+
+
+def _slice_acceptance_item(
+    state: State, record: AgreementRecord, unique: bool,
+) -> tuple[SliceAcceptanceItem, bool]:
+    repository_id = (
+        None if state.initialization is None else state.initialization.repository_id
+    )
+    feature_records = tuple(
+        candidate for candidate in state.agreements
+        if isinstance(candidate, AgreementRecord)
+        and candidate.kind == "FEATURE"
+        and candidate.repository_id == repository_id
+        and candidate.feature_id == record.feature_id
+        and candidate.change_id == record.change_id
+    )
+    feature = feature_records[0] if len(feature_records) == 1 else None
+    association_valid = bool(
+        unique
+        and repository_id is not None
+        and record.repository_id == repository_id
+        and isinstance(record.feature_id, str) and record.feature_id
+        and isinstance(record.change_id, str) and record.change_id
+        and feature is not None
+        and isinstance(feature.feature_id, str) and feature.feature_id
+        and isinstance(feature.change_id, str) and feature.change_id
+        and feature.task_id is None and feature.initial_task is None and feature.checkpoint is None
+        and isinstance(record.title, str) and record.title.strip()
+        and isinstance(record.statement, str) and record.statement.strip()
+        and record.source == "INTERACTIVE_TERMINAL"
+        and isinstance(record.source_reference, str) and record.source_reference.strip()
+        and isinstance(record.task_id, str) and record.task_id.strip()
+        and isinstance(record.initial_task, str) and record.initial_task.strip()
+        and isinstance(record.checkpoint, str) and record.checkpoint.strip()
+        and isinstance(feature.title, str) and feature.title.strip()
+        and isinstance(feature.id, str) and feature.id
+        and isinstance(feature.statement, str) and feature.statement.strip()
+        and feature.source == "INTERACTIVE_TERMINAL"
+        and isinstance(feature.source_reference, str) and feature.source_reference.strip()
+    )
+
+    placements: list[tuple[str, str, str | None, WorkingContext]] = []
+
+    def add(
+        context: WorkingContext | None,
+        provenance: str,
+        status: str,
+        queue_state: str | None = None,
+    ) -> None:
+        if context is not None and context.slice_agreement_ref == record.id:
+            placements.append((provenance, status, queue_state, context))
+
+    add(state.active_context, "ACTIVE_CONTEXT", "ACTIVE")
+    add(state.preserved_primary_context, "PRESERVED_PRIMARY", "PRESERVED")
+    if state.parked_work is not None:
+        add(state.parked_work.context, "PARKED_CONTEXT", "PARKED")
+    for work in state.work_items:
+        if work.operational_state in (OperationalState.BLOCKED, OperationalState.FROZEN):
+            add(work.context, "PARKED_WORK_ITEM", "PARKED", str(work.operational_state))
+        else:
+            add(work.context, "WORK_QUEUE", "QUEUED", str(work.operational_state))
+        add(work.preserved_primary_context, "PRESERVED_WORK_ITEM", "PRESERVED")
+    for archive in state.terminal_archives:
+        add(archive.context, "TERMINAL_ARCHIVE", "HISTORICAL")
+
+    provenance = "AGREEMENT_ONLY"
+    scope_status = "INACTIVE"
+    operational_state = None
+    context_valid = True
+    if len(placements) == 1:
+        provenance, scope_status, operational_state, context = placements[0]
+        context_valid = bool(
+            feature is not None
+            and context.feature_id == record.feature_id
+            and context.change_id == record.change_id
+            and context.feature_agreement_ref == feature.id
+        )
+    elif placements:
+        provenance, scope_status, operational_state = "AMBIGUOUS_CONTEXT", "UNAVAILABLE", None
+        context_valid = False
+
+    criteria_status = "NOT_RECORDED"
+    criteria_revision: SliceCriteriaRevision | None = None
+    if not isinstance(state.slice_criteria_heads, tuple) or not isinstance(
+        state.slice_criteria_revisions, tuple
+    ):
+        criteria_status = "UNAVAILABLE"
+    else:
+        raw_heads = tuple(
+            head for head in state.slice_criteria_heads
+            if getattr(head, "slice_agreement_ref", None) == record.id
+        )
+        raw_revisions = tuple(
+            revision for revision in state.slice_criteria_revisions
+            if getattr(revision, "slice_agreement_ref", None) == record.id
+        )
+        heads = tuple(
+            head for head in state.slice_criteria_heads
+            if isinstance(head, SliceCriteriaHead) and head.slice_agreement_ref == record.id
+        )
+        revisions = tuple(
+            revision for revision in state.slice_criteria_revisions
+            if isinstance(revision, SliceCriteriaRevision)
+            and revision.slice_agreement_ref == record.id
+        )
+        if (
+            any(not isinstance(head, SliceCriteriaHead) for head in raw_heads)
+            or any(not isinstance(revision, SliceCriteriaRevision) for revision in raw_revisions)
+            or len(heads) > 1
+            or (not heads and revisions)
+        ):
+            criteria_status = "UNAVAILABLE"
+        elif heads:
+            matches = tuple(
+                revision for revision in state.slice_criteria_revisions
+                if isinstance(revision, SliceCriteriaRevision)
+                and revision.id == heads[0].revision_id
+            )
+            if (
+                len(matches) != 1
+                or not isinstance(matches[0].id, str) or not matches[0].id
+                or matches[0].slice_agreement_ref != record.id
+                or matches[0].repository_id != record.repository_id
+                or not isinstance(matches[0].outcome, str) or not matches[0].outcome.strip()
+                or not isinstance(matches[0].example, str) or not matches[0].example.strip()
+                or matches[0].source not in ("INTERACTIVE_TERMINAL", "INTERACTIVE_TERMINAL_DECISION")
+                or not isinstance(matches[0].source_reference, str) or not matches[0].source_reference.strip()
+                or any(
+                    not isinstance(values, tuple)
+                    or not values
+                    or any(not isinstance(value, str) or not value.strip() for value in values)
+                    for values in (
+                        matches[0].inclusions, matches[0].exclusions, matches[0].decisions,
+                    )
+                )
+                or not isinstance(matches[0].criteria, tuple)
+                or not matches[0].criteria
+                or len({
+                    criterion.id for criterion in matches[0].criteria
+                    if isinstance(criterion, SliceCriterion)
+                }) != len(matches[0].criteria)
+                or any(
+                    not isinstance(criterion, SliceCriterion)
+                    or not isinstance(criterion.id, str) or not criterion.id
+                    or not isinstance(criterion.expected_result, str)
+                    or not criterion.expected_result.strip()
+                    or not isinstance(criterion.expected_evidence, str)
+                    or not criterion.expected_evidence.strip()
+                    for criterion in matches[0].criteria
+                )
+            ):
+                criteria_status = "UNAVAILABLE"
+            else:
+                criteria_status = "RECORDED"
+                criteria_revision = matches[0]
+
+    valid_revision_ids = {
+        revision.id for revision in state.slice_criteria_revisions
+        if isinstance(revision, SliceCriteriaRevision)
+        and revision.slice_agreement_ref == record.id
+        and revision.repository_id == record.repository_id
+        and isinstance(revision.id, str) and revision.id
+    } if isinstance(state.slice_criteria_revisions, tuple) else set()
+    historical_receipt = scope_status != "ACTIVE" and isinstance(
+        state.slice_outcome_receipts, tuple
+    ) and any(
+        isinstance(receipt, SliceOutcomeReceipt)
+        and receipt.slice_agreement_ref == record.id
+        and receipt.repository_id == record.repository_id
+        and receipt.criteria_revision_id in valid_revision_ids
+        for receipt in state.slice_outcome_receipts
+    )
+    authority_valid = association_valid and context_valid and criteria_status != "UNAVAILABLE"
+    item = SliceAcceptanceItem(
+        record.id,
+        str(record.feature_id) if association_valid else None,
+        None if feature is None or not association_valid else feature.id,
+        None if feature is None or not association_valid else feature.title,
+        record.title if isinstance(record.title, str) and record.title.strip() else None,
+        "CANONICAL" if association_valid and context_valid else "UNAVAILABLE",
+        scope_status if association_valid and context_valid else "UNAVAILABLE",
+        provenance if association_valid and context_valid else "ASSOCIATION_UNAVAILABLE",
+        operational_state,
+        criteria_status,
+        criteria_revision,
+        historical_receipt,
+    )
+    return item, authority_valid
 
 
 def _accepted_slice_context(state: State) -> AcceptedSliceContext | None:

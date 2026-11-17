@@ -126,7 +126,7 @@ class _DashboardRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
         if not self._write_sse_frame(
-            f"event: revision\ndata: {json.dumps({'revision': last_seen_revision}, separators=(',', ':'))}\n\n"
+            f"event: revision\ndata: {json.dumps({'repository_id': last_seen_revision[0], 'revision': last_seen_revision[1]}, separators=(',', ':'))}\n\n"
         ):
             return
 
@@ -139,7 +139,7 @@ class _DashboardRequestHandler(BaseHTTPRequestHandler):
                 return
             if revision != last_seen_revision:
                 if not self._write_sse_frame(
-                    f"event: revision\ndata: {json.dumps({'revision': revision}, separators=(',', ':'))}\n\n"
+                    f"event: revision\ndata: {json.dumps({'repository_id': revision[0], 'revision': revision[1]}, separators=(',', ':'))}\n\n"
                 ):
                     return
                 last_seen_revision = revision
@@ -149,8 +149,9 @@ class _DashboardRequestHandler(BaseHTTPRequestHandler):
                 next_heartbeat = time.monotonic() + _HEARTBEAT_INTERVAL_SECONDS
         self.close_connection = True
 
-    def _revision(self, server: DashboardServer) -> int:
-        return project_context(WorkflowService.open(server.root)).revision
+    def _revision(self, server: DashboardServer) -> tuple[str | None, int]:
+        context = project_context(WorkflowService.open(server.root))
+        return context.repository_id, context.revision
 
     def _write_sse_frame(self, frame: str) -> bool:
         try:
