@@ -382,6 +382,14 @@ def context_json(context: AgentContext) -> dict[str, JsonValue]:
                 "receipt_id": context.feature_completion.receipt_id,
                 "blockers": list(context.feature_completion.blockers),
                 "slice_agreement_refs": list(context.feature_completion.slice_agreement_refs),
+                "cycle_id": context.feature_completion.cycle_id,
+                "cycle_state": context.feature_completion.cycle_state,
+                "reopen_receipt_id": context.feature_completion.reopen_receipt_id,
+                "history": [
+                    {"cycle_id": cycle, "reopen_receipt_id": reopen_id,
+                     "completion_receipt_id": closure_id}
+                    for cycle, reopen_id, closure_id in context.feature_completion.history
+                ],
             },
             "input_snapshot": None if context.input_snapshot is None else {
                 "version": context.input_snapshot.version,
@@ -767,6 +775,12 @@ def _dispatch(
             return workflow.accept_slice_outcome(
                 parse_input_snapshot(request),
                 expected_revision=parse_expected_revision(request),
+            )
+        case "accept_historical_slice_outcome":
+            return workflow.accept_slice_outcome(
+                parse_input_snapshot(request),
+                expected_revision=parse_expected_revision(request),
+                slice_agreement_ref=parse_nonblank_string(request, "slice_agreement_ref"),
             )
         case "assess_locks":
             return workflow.assess_locks(

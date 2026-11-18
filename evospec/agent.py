@@ -194,6 +194,10 @@ class FeatureCompletionSummary:
     receipt_id: str | None
     blockers: tuple[str, ...]
     slice_agreement_refs: tuple[str, ...]
+    cycle_id: int = 0
+    cycle_state: str = "OPEN"
+    reopen_receipt_id: str | None = None
+    history: tuple[tuple[int, str | None, str | None], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +385,11 @@ def project_context(
                 r3b_schema_ready=inspection.state.r3b_schema_upgrade is not None,
                 input_snapshot=input_snapshot,
                 repository_id=inspection.state.initialization.repository_id,
+                criterion_coverage_approvals=(
+                    () if input_snapshot is None else _current_cycle_coverage(
+                        workflow, inspection.state, input_snapshot,
+                    )
+                ),
                 slice_acceptance_inventory=_slice_acceptance_inventory(inspection.state),
                 feature_completion=completion,
           )
@@ -476,7 +485,7 @@ def project_context(
                criterion_coverage_approvals=(
                    ()
                    if input_snapshot is None
-                   else workflow.current_r3b_coverage_approvals(inspection.state, input_snapshot)
+                   else _current_cycle_coverage(workflow, inspection.state, input_snapshot)
                ),
                slice_acceptance_inventory=_slice_acceptance_inventory(inspection.state),
                feature_completion=completion,
@@ -505,7 +514,27 @@ def _feature_completion_summary(
         return FeatureCompletionSummary(selected, "BLOCKED", None, ("AUTHORITY_UNAVAILABLE",), ())
     return FeatureCompletionSummary(
         selected, result.status, result.receipt_id, result.blockers, result.slice_agreement_refs,
+        result.cycle_id, result.cycle_state, result.reopen_receipt_id, result.history,
     )
+
+
+def _current_cycle_coverage(
+    workflow: WorkflowService, state: State, snapshot: InputSnapshot,
+) -> tuple[CriterionCoverageApproval, ...]:
+    """Expose only fresh, Core-checked approvals; historical tests remain gated."""
+    records = list(workflow.current_r3b_coverage_approvals(state, snapshot))
+    if state.feature_reopen_receipts:
+        for agreement in state.agreements:
+            if agreement.kind != "SLICE":
+                continue
+            try:
+                records.extend(workflow.current_r3b_coverage_approvals(
+                    state, snapshot, agreement.id,
+                ))
+            except WorkflowError:
+                # A closed or nonterminal Slice has no historical write authority.
+                continue
+    return tuple(dict((item.id, item) for item in records).values())
 
 
 def _slice_acceptance_inventory(state: State) -> SliceAcceptanceInventory:

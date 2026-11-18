@@ -187,6 +187,12 @@ def _parser() -> _ArgumentParser:
     complete.add_argument("--feature-id", required=True, help="Exact accepted primary Feature identity")
     complete.add_argument("--condition", required=True, help="Human-owned Feature completion condition")
     complete.add_argument("--expected-revision", required=True, type=int)
+    reopen = commands.add_parser("reopen-feature")
+    reopen.add_argument("--feature-id", required=True, help="Exact previously completed Feature")
+    reopen.add_argument("--previous-receipt-id", required=True, help="Exact current completion receipt")
+    reopen.add_argument("--reason", required=True, help="Human reason for reopening")
+    reopen.add_argument("--purpose", required=True, help="New purpose for the next cycle")
+    reopen.add_argument("--expected-revision", required=True, type=int)
     revise = commands.add_parser("revise-slice-criteria")
     revise.add_argument("--criteria-file", required=True, help="New complete Slice criteria JSON mini-spec")
     revise.add_argument("--previous-criteria-revision", required=True, help="Current criteria revision, or NOT_RECORDED")
@@ -202,6 +208,7 @@ def _parser() -> _ArgumentParser:
     renew_r3b = commands.add_parser("renew-r3b-coverage")
     renew_r3b.add_argument("--expected-revision", required=True, type=int)
     renew_r3b.add_argument("--coverage-file", required=True, help="Explicit per-criterion root-input contract JSON")
+    renew_r3b.add_argument("--slice-agreement-ref", help="Exact terminal historical Slice in a human-reopened cycle")
     commands.add_parser("doctor")
     commands.add_parser("review")
     ui = commands.add_parser("ui")
@@ -267,7 +274,7 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
     if arguments.command in (
         "accept-slice", "accept-next-slice", "revise-slice-criteria", "upgrade-e1-schema",
         "upgrade-r3-schema", "upgrade-r3-outcome-schema", "renew-r3b-coverage",
-        "complete-feature",
+        "complete-feature", "reopen-feature",
     ):
         workflow = WorkflowService.open(Path(arguments.root))
         if arguments.command == "upgrade-e1-schema":
@@ -316,6 +323,19 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             if already is not None:
                 _render(already, target)
                 return 0
+        if arguments.command == "reopen-feature":
+            try:
+                already = workflow.confirmed_feature_reopening(
+                    arguments.feature_id, arguments.previous_receipt_id,
+                    arguments.reason, arguments.purpose,
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            except (ValueError, RecoveryError, WorkflowError) as error:
+                print(f"ERROR {error}", file=target)
+                return 2
+            if already is not None:
+                _render(already, target)
+                return 0
         # Only a human in a real terminal may accept or change durable authority.
         if not sys.stdin.isatty() or not sys.stdout.isatty() or not target.isatty():
             print("ERROR approval requires an interactive user terminal", file=target)
@@ -342,6 +362,13 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
                     arguments.feature_id, arguments.condition,
                     expected_revision=ExpectedRevision(arguments.expected_revision),
                 )
+            elif arguments.command == "reopen-feature":
+                criteria = None
+                statement = workflow.feature_reopening_agreement(
+                    arguments.feature_id, arguments.previous_receipt_id,
+                    arguments.reason, arguments.purpose,
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
             elif arguments.command == "revise-slice-criteria":
                 criteria = _load_criteria_spec(arguments.criteria_file)
                 statement = slice_criteria_decision_statement(
@@ -365,6 +392,7 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
                 statement = workflow.r3b_coverage_renewal_agreement(
                     coverage,
                     expected_revision=ExpectedRevision(arguments.expected_revision),
+                    slice_agreement_ref=arguments.slice_agreement_ref,
                 )
             else:
                 criteria = None
@@ -381,6 +409,7 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             "accept-slice": "Acuerdo inicial",
             "accept-next-slice": "Nuevo Slice de Feature existente",
             "complete-feature": "Finalización humana de Feature (incluye autorización explícita de schema 17→18)",
+            "reopen-feature": "Reapertura humana auditable de Feature (incluye schema 18→19)",
             "revise-slice-criteria": "Decisión de modificación",
             "upgrade-e1-schema": "Acuerdo de migración",
             "upgrade-r3-schema": "Acuerdo de migración R3-A",
@@ -416,6 +445,13 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
                     UserAcceptance(statement, f"tty:{token}"),
                     expected_revision=ExpectedRevision(arguments.expected_revision),
                 )
+            elif arguments.command == "reopen-feature":
+                result = workflow.reopen_feature(
+                    arguments.feature_id, arguments.previous_receipt_id,
+                    arguments.reason, arguments.purpose,
+                    UserAcceptance(statement, f"tty:{token}"),
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
             elif arguments.command == "revise-slice-criteria":
                 assert criteria is not None
                 result = workflow.revise_slice_criteria(
@@ -441,6 +477,7 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
                     UserAcceptance(statement, f"tty:{token}"),
                     coverage,
                     expected_revision=ExpectedRevision(arguments.expected_revision),
+                    slice_agreement_ref=arguments.slice_agreement_ref,
                 )
             else:
                 result = workflow.upgrade_r3_schema(
@@ -512,6 +549,15 @@ def _render_status(context: AgentContext, output: TextIO) -> None:
     if context.feature_completion is not None:
         closure = context.feature_completion
         print(f"Feature completion: {closure.status} ({closure.feature_id})", file=output)
+        print(f"Feature cycle: {closure.cycle_id} ({closure.cycle_state})", file=output)
+        if closure.reopen_receipt_id is not None:
+            print(f"Feature reopening receipt: {closure.reopen_receipt_id}", file=output)
+        for cycle, reopen_id, completion_id in closure.history:
+            print(
+                f"Feature cycle history: {cycle} | reopening {reopen_id or '-'} "
+                f"| completion {completion_id or '-'}",
+                file=output,
+            )
         if closure.receipt_id is not None:
             print(f"Feature completion receipt: {closure.receipt_id}", file=output)
         if closure.blockers:

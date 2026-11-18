@@ -86,6 +86,25 @@ function context(overrides = {}) {
   }
 }
 
+function reopenedHistoricalContext(cycleState = "OPEN") {
+  // Core's terminal archive must be explicit; an arbitrary Slice ID is not authority.
+  const active = context().accepted_slice
+  return context({
+    accepted_slice: null,
+    slice_outcome: null,
+    feature_completion: { feature_id: "feature-r3b", cycle_id: 1, cycle_state: cycleState },
+    slice_acceptance_inventory: { items: [{
+      slice_agreement_ref: active.slice_agreement_ref,
+      feature_id: "feature-r3b",
+      scope_status: "HISTORICAL",
+      provenance: "TERMINAL_ARCHIVE",
+      authority_status: "CANONICAL",
+      criteria_status: "RECORDED",
+      criteria_revision: active.criteria_revision,
+    }] },
+  })
+}
+
 function stream(value = "") {
   return new ReadableStream({
     start(controller) {
@@ -234,6 +253,16 @@ test("R3-B test binds permission to exact inputs, executes sanitized runtime, an
     assert.equal(sentRequests.at(-1).input_fingerprint_after, snapshot().fingerprint)
     assert.equal(sentRequests.at(-1).coverage_approval_id, approvedCoverage().id)
     assert.equal(sentRequests.at(-1).coverage_contract_digest, approvedCoverage().contract_digest)
+
+    // The same host permission must also protect an archived Slice after a human reopen.
+    current = reopenedHistoricalContext()
+    const historical = await testTool.execute(args, call)
+    assert.equal(JSON.parse(historical.content).recording.result.code, "CRITERION_TEST_RECORDED")
+    assert.equal(JSON.parse(permissions.at(-1).resources[0]).slice_agreement_ref, "slice-r3b")
+    current = reopenedHistoricalContext("CLOSED")
+    const historicalPermissions = permissions.length
+    await assert.rejects(testTool.execute(args, call), /historical evidence requires/)
+    assert.equal(permissions.length, historicalPermissions, "closed cycles cannot request host test permission")
   } finally {
     delete globalThis.Bun
     await rm(root, { recursive: true, force: true })
@@ -448,6 +477,14 @@ test("Slice outcome tool binds the exact current scope and returns Core's immuta
       signal: new AbortController().signal,
     })
     assert.equal(JSON.parse(genericResult.content).error.code, "DEDICATED_TOOL_REQUIRED")
+    const bypass = await generic.execute({
+      request: JSON.stringify({ action: "accept_historical_slice_outcome", expected_revision: 7,
+        slice_agreement_ref: "slice-r3b", input_snapshot: snapshot() }),
+    }, {
+      runtime, sessionID: "ses-r3b", agent: "tester", messageID: "msg-r3b", id: "generic-r3b-history",
+      signal: new AbortController().signal,
+    })
+    assert.equal(JSON.parse(bypass.content).error.code, "DEDICATED_TOOL_REQUIRED")
     assert.equal(permissions.length, 0)
     const result = await tool.execute({ expected_revision: 7 }, {
       runtime, sessionID: "ses-r3b", agent: "tester", messageID: "msg-r3b", id: "accept-r3b",
@@ -480,6 +517,24 @@ test("Slice outcome tool binds the exact current scope and returns Core's immuta
       false,
       "changed inputs prevent the Core acceptance request",
     )
+
+    mutateDuringPermission = false
+    current = reopenedHistoricalContext()
+    const historical = await tool.execute({ expected_revision: 7, slice_agreement_ref: "slice-r3b" }, {
+      runtime, sessionID: "ses-r3b", agent: "tester", messageID: "msg-r3b", id: "historical-r3b",
+      signal: new AbortController().signal,
+    })
+    assert.equal(JSON.parse(historical.content).result.code, "ALREADY_ACCEPTED")
+    assert.equal(requests.at(-1).action, "accept_historical_slice_outcome")
+    assert.equal(requests.at(-1).slice_agreement_ref, "slice-r3b")
+    assert.equal(JSON.parse(permissions.at(-1).resources[0]).slice_agreement_ref, "slice-r3b")
+    current = reopenedHistoricalContext("CLOSED")
+    const permissionCount = permissions.length
+    await assert.rejects(tool.execute({ expected_revision: 7, slice_agreement_ref: "slice-r3b" }, {
+      runtime, sessionID: "ses-r3b", agent: "tester", messageID: "msg-r3b", id: "blocked-r3b",
+      signal: new AbortController().signal,
+    }), /historical evidence requires/)
+    assert.equal(permissions.length, permissionCount)
   } finally {
     delete globalThis.Bun
     await rm(root, { recursive: true, force: true })

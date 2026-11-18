@@ -122,6 +122,10 @@ Confirm OpenCode V2 is running in the integrated project and inspect `evospec do
 
 Run with `--dry-run` to see the conflicting resource paths. The integration will not overwrite a user edit, an unmanifested file, or an old V1 installation. Preserve any needed content, resolve the collision explicitly, then retry.
 
+### R6-B historical evidence in OpenCode
+
+After a human explicitly reopens a Feature with the standalone `reopen-feature` CLI, `evospec_context` displays the current cycle and immutable history. The existing permission-gated `evospec_criterion_test_r3b` tool can validate a precisely named archived accepted Slice once a human has renewed its root-input coverage through `renew-r3b-coverage --slice-agreement-ref`. `evospec_accept_slice_outcome` accepts that optional historical reference and Core rechecks the archive, revision and fresh evidence. Neither tool activates a historical Task; the plugin never reopens the Feature or runs tests automatically.
+
 ### Nothing changes
 
 `CURRENT` means the V2 resource bytes and ownership manifest already match. With `--remove`, no changes means no manifest-owned V2 integration is installed.

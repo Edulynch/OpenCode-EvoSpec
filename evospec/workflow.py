@@ -63,6 +63,8 @@ from .domain import (
     ReviewResult,
     SliceOutcomeReceipt,
     FeatureCompletionReceipt,
+    FeatureReopenReceipt,
+    feature_cycle_status,
     SharedIntent,
     SharedIntentId,
     SemanticLock,
@@ -132,6 +134,7 @@ class WorkflowResult:
     convergence_depth: str | None = None
     slice_outcome_receipt: SliceOutcomeReceipt | None = None
     feature_completion_receipt: FeatureCompletionReceipt | None = None
+    feature_reopen_receipt: FeatureReopenReceipt | None = None
 
 
 InitResult = WorkflowResult
@@ -476,10 +479,13 @@ class WorkflowService:
         declarations: tuple[CriterionCoverageDeclaration, ...],
         *,
         expected_revision: ExpectedRevision,
+        slice_agreement_ref: str | None = None,
     ) -> str:
         state = self._mutation_state(expected_revision)
         try:
-            return self.__core.r3b_coverage_renewal_statement(state, declarations)
+            return self.__core.r3b_coverage_renewal_statement(
+                state, declarations, slice_agreement_ref,
+            )
         except ServiceError as error:
             raise WorkflowError(str(error)) from error
 
@@ -489,10 +495,13 @@ class WorkflowService:
         declarations: tuple[CriterionCoverageDeclaration, ...],
         *,
         expected_revision: ExpectedRevision,
+        slice_agreement_ref: str | None = None,
     ) -> WorkflowResult:
         state = self._mutation_state(expected_revision)
         try:
-            saved = self.__core.renew_r3b_coverage(state, decision, declarations)
+            saved = self.__core.renew_r3b_coverage(
+                state, decision, declarations, slice_agreement_ref,
+            )
         except ServiceError as error:
             raise WorkflowError(str(error)) from error
         code = "COVERAGE_ALREADY_CURRENT" if saved.revision == state.revision else "R3B_COVERAGE_RENEWED"
@@ -506,9 +515,12 @@ class WorkflowService:
 
     def current_r3b_coverage_approvals(
         self, state: State, snapshot: InputSnapshot,
+        slice_agreement_ref: str | None = None,
     ) -> tuple[CriterionCoverageApproval, ...]:
         try:
-            return self.__core.current_r3b_coverage_approvals(state, snapshot)
+            return self.__core.current_r3b_coverage_approvals(
+                state, snapshot, slice_agreement_ref,
+            )
         except ServiceError as error:
             raise WorkflowError(str(error)) from error
 
@@ -522,9 +534,12 @@ class WorkflowService:
 
     def slice_outcome_eligibility(
         self, state: State, snapshot: InputSnapshot,
+        slice_agreement_ref: str | None = None,
     ) -> SliceOutcomeEligibility:
         try:
-            return self.__core.slice_outcome_eligibility(state, snapshot)
+            return self.__core.slice_outcome_eligibility(
+                state, snapshot, slice_agreement_ref,
+            )
         except ServiceError as error:
             raise WorkflowError(str(error)) from error
 
@@ -533,11 +548,14 @@ class WorkflowService:
         snapshot: InputSnapshot,
         *,
         expected_revision: ExpectedRevision,
+        slice_agreement_ref: str | None = None,
     ) -> WorkflowResult:
         state = self._mutation_state(expected_revision)
         try:
-            saved = self.__core.accept_slice_outcome(state, snapshot)
-            eligibility = self.__core.slice_outcome_eligibility(saved, snapshot)
+            saved = self.__core.accept_slice_outcome(state, snapshot, slice_agreement_ref)
+            eligibility = self.__core.slice_outcome_eligibility(
+                saved, snapshot, slice_agreement_ref,
+            )
         except ServiceError as error:
             raise WorkflowError(str(error)) from error
         code = "ALREADY_ACCEPTED" if saved.revision == state.revision else "SLICE_OUTCOME_ACCEPTED"
@@ -570,10 +588,9 @@ class WorkflowService:
     ) -> WorkflowResult | None:
         """Recover an earlier closure before asking for a second terminal approval."""
         state = self.__core.recover()
-        receipt = next((
-            item for item in state.feature_completion_receipts
-            if str(item.feature_id) == feature_id and item.condition == condition.strip()
-        ), None)
+        _, _, receipt = feature_cycle_status(state, FeatureId(feature_id))
+        if receipt is not None and receipt.condition != condition.strip():
+            raise WorkflowError("Feature is already complete with a different human condition")
         if receipt is None:
             return None
         if expected_revision not in (receipt.source_revision, state.revision):
@@ -610,10 +627,7 @@ class WorkflowService:
             )
         except ServiceError as error:
             raise WorkflowError(str(error)) from error
-        receipt = next((
-            item for item in saved.feature_completion_receipts
-            if str(item.feature_id) == feature_id
-        ), None)
+        _, _, receipt = feature_cycle_status(saved, FeatureId(feature_id))
         if receipt is None:
             raise WorkflowError("committed Feature closure receipt is unavailable")
         code = "ALREADY_COMPLETED" if saved.revision == state.revision else "FEATURE_COMPLETED"
@@ -622,6 +636,62 @@ class WorkflowService:
             "immutable Feature completion recovered" if code == "ALREADY_COMPLETED"
             else "human-confirmed Feature completion recorded without publication",
         ), feature_id=feature_id, feature_completion_receipt=receipt)
+
+    def confirmed_feature_reopening(
+        self, feature_id: str, previous_receipt_id: str, reason: str, purpose: str,
+        *, expected_revision: ExpectedRevision,
+    ) -> WorkflowResult | None:
+        """Recognize an exact committed reopen before prompting a second time."""
+        state = self.__core.recover()
+        _, latest, closure = feature_cycle_status(state, FeatureId(feature_id))
+        if latest is None or closure is not None:
+            return None
+        if (latest.previous_completion_receipt_id != previous_receipt_id
+                or latest.reason != reason or latest.purpose != purpose):
+            return None
+        if expected_revision not in (latest.source_revision, state.revision):
+            raise WorkflowError("expected Feature reopening revision is stale")
+        return replace(self._result(
+            "ALREADY_REOPENED", state, "immutable Feature reopening recovered",
+        ), feature_id=feature_id, feature_reopen_receipt=latest)
+
+    def feature_reopening_agreement(
+        self, feature_id: str, previous_receipt_id: str, reason: str, purpose: str,
+        *, expected_revision: ExpectedRevision,
+    ) -> str:
+        """Show the exact next-cycle decision for interactive TTY approval."""
+        state = self._mutation_state(expected_revision)
+        try:
+            scanned, snapshot = self.__core.input_snapshot(state.revision)
+            if scanned != state:
+                raise WorkflowError("Feature reopening authority changed during preflight")
+            return self.__core.feature_reopening_statement(
+                state, feature_id, previous_receipt_id, reason, purpose, snapshot,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+
+    def reopen_feature(
+        self, feature_id: str, previous_receipt_id: str, reason: str, purpose: str,
+        acceptance: UserAcceptance, *, expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        """Record a human-authorized new cycle without assigning work to any agent."""
+        state = self._mutation_state(expected_revision)
+        try:
+            scanned, snapshot = self.__core.input_snapshot(state.revision)
+            if scanned != state:
+                raise WorkflowError("Feature reopening authority changed during preflight")
+            saved = self.__core.reopen_feature(
+                state, feature_id, previous_receipt_id, reason, purpose, acceptance, snapshot,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        _, receipt, _ = feature_cycle_status(saved, FeatureId(feature_id))
+        if receipt is None:
+            raise WorkflowError("committed Feature reopening receipt is unavailable")
+        return replace(self._result(
+            "FEATURE_REOPENED", saved, "human-confirmed new cycle without Slice activation",
+        ), feature_id=feature_id, feature_reopen_receipt=receipt)
 
     def new(
         self,
