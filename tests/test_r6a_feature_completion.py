@@ -6,13 +6,17 @@ import io
 import json
 import shutil
 import unittest
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
 from evospec.agent_protocol import execute
 from evospec.cli import main as cli_main
-from evospec.domain import ExpectedRevision, ReviewResult, VerificationEvidence
+from evospec.domain import (
+    ExpectedRevision, ReviewResult, StateValidationError, VerificationEvidence,
+    feature_completion_semantic_id, validate_state,
+)
 from evospec.lifecycle import LifecycleState, Phase, ReviewVerdict
 from evospec.persistence import FileOperations, RecoveryError
 from evospec.services import CoreService, DurabilityUncertainError, ServiceError, StaleRevisionError, UserAcceptance
@@ -300,6 +304,50 @@ class R6AFeatureCompletionTests(unittest.TestCase):
                 expected_revision=ExpectedRevision(closed.revision),
             )
         self.assertEqual(self.core.recover(), closed)
+
+    def test_09_receipt_statement_must_match_the_exact_human_completion_basis(self) -> None:
+        self._ready_one_slice()
+        self._close()
+        state = self.core.recover()
+        receipt = state.feature_completion_receipts[0]
+
+        # A matching digest proves only that text was hashed, not that the
+        # human declaration actually describes the immutable Feature evidence.
+        attempts = (
+            ("unrelated statement", "I approved an unrelated Feature", receipt.condition),
+            ("changed condition", receipt.statement, "A different completion condition"),
+        )
+        for label, statement, condition in attempts:
+            with self.subTest(label=label):
+                altered = replace(
+                    receipt,
+                    statement=statement,
+                    condition=condition,
+                    source_reference=f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}",
+                )
+                altered = replace(altered, id=feature_completion_semantic_id(altered))
+                with self.assertRaises(StateValidationError):
+                    validate_state(replace(state, feature_completion_receipts=(altered,)))
+        self.assertEqual(self.core.recover(), state)
+
+        # Recovery must fail closed on the same inconsistency when it appears
+        # in the persisted schema-18 authority, even with recomputed hashes.
+        unrelated = "I approved an unrelated Feature"
+        altered = replace(
+            receipt, statement=unrelated,
+            source_reference=f"tty:{sha256(unrelated.encode('utf-8')).hexdigest()[:12]}",
+        )
+        altered = replace(altered, id=feature_completion_semantic_id(altered))
+        path = self.root / ".evospec/state.json"
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["feature_completion_receipts"][0].update({
+            "id": altered.id,
+            "statement": altered.statement,
+            "source_reference": altered.source_reference,
+        })
+        path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(RecoveryError):
+            CoreService.open(self.root).recover()
 
 
 if __name__ == "__main__":

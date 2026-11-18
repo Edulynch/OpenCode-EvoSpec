@@ -90,6 +90,7 @@ from .domain import (
     SliceOutcomeReceipt,
     FeatureCompletionReceipt,
     feature_completion_semantic_id,
+    feature_completion_statement_text,
     TaskProgress,
     TerminalArchive,
     VerificationEvidence,
@@ -3295,24 +3296,16 @@ class CoreService:
         if blockers:
             raise ServiceError("Feature completion is blocked: " + ", ".join(blockers))
         feature = next(item for item in current.features if str(item.id) == feature_id)
-        lines = [
-            "EvoSpec: explicit Feature completion, not Slice acceptance or publication",
-            f"Feature: {feature.title} ({feature_id})",
-            f"Human-approved completion condition: {condition.strip()}",
-            f"Repository: {snapshot.repository_id}",
-            f"Expected revision: {current.revision}",
-            f"Root input fingerprint: {snapshot.fingerprint}",
-            "Feature agreement references: " + ", ".join(item.id for item in features),
-            "Verified terminal Slices and current outcome receipts:",
-        ]
-        lines.extend(f"- {record.id}: {receipt.id}" for record, receipt in zip(slices, outcomes))
-        lines.append(
-            "Schema 18 retained; no automatic legacy migration"
-            if current.feature_completion_receipts
-            else "Schema conversion: 17 to 18 on first closure; no automatic legacy migration"
+        # Use the same canonical wording as the durable-state validator; a
+        # terminal decision must never mean something different after restart.
+        return feature_completion_statement_text(
+            feature=feature, condition=condition.strip(),
+            repository_id=snapshot.repository_id, source_revision=current.revision,
+            input_fingerprint=snapshot.fingerprint,
+            feature_agreement_refs=tuple(item.id for item in features),
+            slice_outcomes=tuple((record.id, receipt.id) for record, receipt in zip(slices, outcomes)),
+            previous_closure_exists=bool(current.feature_completion_receipts),
         )
-        lines.append("This does not authorize model execution, merge, tags, release, or reopening")
-        return "\n".join(lines)
 
     def complete_feature(
         self, state: State, feature_id: str, condition: str,

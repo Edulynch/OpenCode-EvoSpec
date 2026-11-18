@@ -488,6 +488,34 @@ def feature_completion_semantic_id(receipt: FeatureCompletionReceipt) -> str:
     ).encode("utf-8")).hexdigest()[:20]
 
 
+def feature_completion_statement_text(
+    *, feature: Feature, condition: str, repository_id: str,
+    source_revision: int, input_fingerprint: str,
+    feature_agreement_refs: tuple[str, ...],
+    slice_outcomes: tuple[tuple[str, str], ...],
+    previous_closure_exists: bool,
+) -> str:
+    """Render the exact human decision also required when recovering its receipt."""
+    lines = [
+        "EvoSpec: explicit Feature completion, not Slice acceptance or publication",
+        f"Feature: {feature.title} ({feature.id})",
+        f"Human-approved completion condition: {condition}",
+        f"Repository: {repository_id}",
+        f"Expected revision: {source_revision}",
+        f"Root input fingerprint: {input_fingerprint}",
+        "Feature agreement references: " + ", ".join(feature_agreement_refs),
+        "Verified terminal Slices and current outcome receipts:",
+    ]
+    lines.extend(f"- {slice_ref}: {outcome_ref}" for slice_ref, outcome_ref in slice_outcomes)
+    lines.append(
+        "Schema 18 retained; no automatic legacy migration"
+        if previous_closure_exists
+        else "Schema conversion: 17 to 18 on first closure; no automatic legacy migration"
+    )
+    lines.append("This does not authorize model execution, merge, tags, release, or reopening")
+    return "\n".join(lines)
+
+
 def slice_outcome_semantic_id(receipt: SliceOutcomeReceipt) -> str:
     """Content-address semantic outcome, excluding evidence IDs and revision noise."""
     values = [
@@ -3384,9 +3412,11 @@ def validate_state(state: State) -> None:
                 for item, reference in zip(selected, expected_slices)
             )
             or not isinstance(closure.condition, str)
-            or not closure.condition.strip() or len(closure.condition) > 2048
+            or not closure.condition.strip() or closure.condition != closure.condition.strip()
+            or len(closure.condition) > 2048
             or not is_sha256_digest(closure.input_fingerprint)
             or closure.source != "INTERACTIVE_TERMINAL"
+            or type(closure.statement) is not str
             or closure.source_reference != "tty:" + sha256(closure.statement.encode("utf-8")).hexdigest()[:12]
             or not closure.statement.strip()
             or closure.source_revision < 0
@@ -3395,6 +3425,21 @@ def validate_state(state: State) -> None:
             or closure.id != feature_completion_semantic_id(closure)
         ):
             raise StateValidationError("Feature completion receipt authority or evidence is invalid")
+        # Hash consistency alone is insufficient: the recorded human words must
+        # still describe this exact Feature, condition, snapshot, and Slice set.
+        expected_statement = feature_completion_statement_text(
+            feature=records.features[closure.feature_id], condition=closure.condition,
+            repository_id=closure.repository_id, source_revision=closure.source_revision,
+            input_fingerprint=closure.input_fingerprint,
+            feature_agreement_refs=closure.feature_agreement_refs,
+            slice_outcomes=tuple(zip(closure.slice_agreement_refs, closure.slice_outcome_receipt_ids)),
+            previous_closure_exists=any(
+                other is not closure and other.recorded_revision <= closure.source_revision
+                for other in state.feature_completion_receipts
+            ),
+        )
+        if closure.statement != expected_statement:
+            raise StateValidationError("Feature completion statement differs from its human-approved basis")
     _unique(
         (agreement.task_id for agreement in state.agreements if agreement.task_id is not None),
         "Slice Task",
