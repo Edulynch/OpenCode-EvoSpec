@@ -376,6 +376,13 @@ def context_json(context: AgentContext) -> dict[str, JsonValue]:
             "e1_schema_ready": context.e1_schema_ready,
             "accepted_slice": _accepted_slice_json(context.accepted_slice),
             "slice_acceptance_inventory": _slice_acceptance_inventory_json(context),
+            "feature_completion": None if context.feature_completion is None else {
+                "feature_id": context.feature_completion.feature_id,
+                "status": context.feature_completion.status,
+                "receipt_id": context.feature_completion.receipt_id,
+                "blockers": list(context.feature_completion.blockers),
+                "slice_agreement_refs": list(context.feature_completion.slice_agreement_refs),
+            },
             "input_snapshot": None if context.input_snapshot is None else {
                 "version": context.input_snapshot.version,
                 "policy_id": context.input_snapshot.policy_id,

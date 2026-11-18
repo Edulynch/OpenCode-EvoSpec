@@ -62,6 +62,7 @@ from .domain import (
     State,
     ReviewResult,
     SliceOutcomeReceipt,
+    FeatureCompletionReceipt,
     SharedIntent,
     SharedIntentId,
     SemanticLock,
@@ -97,6 +98,7 @@ from .services import (
     ServiceError,
     SliceCriteriaSpec,
     SliceOutcomeEligibility,
+    FeatureCompletionEligibility,
     StaleRevisionError,
     UserAcceptance,
     next_slice_acceptance_statement,
@@ -129,6 +131,7 @@ class WorkflowResult:
     verification_depth: str | None = None
     convergence_depth: str | None = None
     slice_outcome_receipt: SliceOutcomeReceipt | None = None
+    feature_completion_receipt: FeatureCompletionReceipt | None = None
 
 
 InitResult = WorkflowResult
@@ -236,6 +239,8 @@ class WorkflowService:
         ), None)
         if feature is None:
             raise WorkflowError("existing primary Feature-ID was not found")
+        if any(item.feature_id == feature.id for item in state.feature_completion_receipts):
+            raise WorkflowError("REOPEN_DECISION_REQUIRED: completed Feature cannot accept new Slices")
         if any(
             item.kind == "SLICE" and item.feature_id == feature.id
             and item.title.casefold() == slice_title.casefold() for item in state.agreements
@@ -550,6 +555,73 @@ class WorkflowService:
         if receipt is None:
             raise WorkflowError("Slice outcome receipt could not be recovered as current")
         return replace(result, slice_outcome_receipt=receipt)
+
+    def feature_completion_eligibility(
+        self, state: State, feature_id: str, snapshot: InputSnapshot | None,
+    ) -> FeatureCompletionEligibility:
+        """Read completion readiness without acquiring any new human authority."""
+        try:
+            return self.__core.feature_completion_eligibility(state, feature_id, snapshot)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+
+    def confirmed_feature_completion(
+        self, feature_id: str, condition: str, *, expected_revision: ExpectedRevision,
+    ) -> WorkflowResult | None:
+        """Recover an earlier closure before asking for a second terminal approval."""
+        state = self.__core.recover()
+        receipt = next((
+            item for item in state.feature_completion_receipts
+            if str(item.feature_id) == feature_id and item.condition == condition.strip()
+        ), None)
+        if receipt is None:
+            return None
+        if expected_revision not in (receipt.source_revision, state.revision):
+            raise WorkflowError("expected Feature completion revision is stale")
+        return replace(self._result(
+            "ALREADY_COMPLETED", state, "human-approved immutable Feature closure recovered",
+        ), feature_id=feature_id, feature_completion_receipt=receipt)
+
+    def feature_completion_agreement(
+        self, feature_id: str, condition: str, *, expected_revision: ExpectedRevision,
+    ) -> str:
+        """Render the exact immutable inventory and schema conversion for TTY review."""
+        state = self._mutation_state(expected_revision)
+        try:
+            scanned, snapshot = self.__core.input_snapshot(state.revision)
+            if scanned != state:
+                raise WorkflowError("Feature completion authority changed during preflight")
+            return self.__core.feature_completion_statement(state, feature_id, condition, snapshot)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+
+    def complete_feature(
+        self, feature_id: str, condition: str, acceptance: UserAcceptance,
+        *, expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        """Close only the exact Feature shown to the human at the same revision."""
+        state = self._mutation_state(expected_revision)
+        try:
+            scanned, snapshot = self.__core.input_snapshot(state.revision)
+            if scanned != state:
+                raise WorkflowError("Feature completion authority changed during preflight")
+            saved = self.__core.complete_feature(
+                state, feature_id, condition, acceptance, snapshot,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        receipt = next((
+            item for item in saved.feature_completion_receipts
+            if str(item.feature_id) == feature_id
+        ), None)
+        if receipt is None:
+            raise WorkflowError("committed Feature closure receipt is unavailable")
+        code = "ALREADY_COMPLETED" if saved.revision == state.revision else "FEATURE_COMPLETED"
+        return replace(self._result(
+            code, saved,
+            "immutable Feature completion recovered" if code == "ALREADY_COMPLETED"
+            else "human-confirmed Feature completion recorded without publication",
+        ), feature_id=feature_id, feature_completion_receipt=receipt)
 
     def new(
         self,

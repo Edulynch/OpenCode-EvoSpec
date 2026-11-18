@@ -455,6 +455,67 @@ class SliceOutcomeReceipt:
     coverage_contract_digest: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class FeatureCompletionReceipt:
+    """Human-confirmed closure of one exact Feature and its verified Slice set."""
+
+    id: str
+    repository_id: str
+    feature_id: FeatureId
+    feature_agreement_refs: tuple[str, ...]
+    condition: str
+    slice_agreement_refs: tuple[str, ...]
+    slice_outcome_receipt_ids: tuple[str, ...]
+    input_fingerprint: str
+    statement: str
+    source: str
+    source_reference: str
+    source_revision: int
+    recorded_revision: int
+
+
+def feature_completion_semantic_id(receipt: FeatureCompletionReceipt) -> str:
+    """Tie a Feature closure to its human decision and immutable Slice evidence."""
+    values = [
+        receipt.repository_id, receipt.feature_id,
+        list(receipt.feature_agreement_refs), receipt.condition,
+        list(receipt.slice_agreement_refs), list(receipt.slice_outcome_receipt_ids),
+        receipt.input_fingerprint, receipt.statement, receipt.source,
+        receipt.source_reference,
+    ]
+    return "feature-completion-" + sha256(json.dumps(
+        values, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()[:20]
+
+
+def feature_completion_statement_text(
+    *, feature: Feature, condition: str, repository_id: str,
+    source_revision: int, input_fingerprint: str,
+    feature_agreement_refs: tuple[str, ...],
+    slice_outcomes: tuple[tuple[str, str], ...],
+    previous_closure_exists: bool,
+) -> str:
+    """Render the exact human decision also required when recovering its receipt."""
+    lines = [
+        "EvoSpec: explicit Feature completion, not Slice acceptance or publication",
+        f"Feature: {feature.title} ({feature.id})",
+        f"Human-approved completion condition: {condition}",
+        f"Repository: {repository_id}",
+        f"Expected revision: {source_revision}",
+        f"Root input fingerprint: {input_fingerprint}",
+        "Feature agreement references: " + ", ".join(feature_agreement_refs),
+        "Verified terminal Slices and current outcome receipts:",
+    ]
+    lines.extend(f"- {slice_ref}: {outcome_ref}" for slice_ref, outcome_ref in slice_outcomes)
+    lines.append(
+        "Schema 18 retained; no automatic legacy migration"
+        if previous_closure_exists
+        else "Schema conversion: 17 to 18 on first closure; no automatic legacy migration"
+    )
+    lines.append("This does not authorize model execution, merge, tags, release, or reopening")
+    return "\n".join(lines)
+
+
 def slice_outcome_semantic_id(receipt: SliceOutcomeReceipt) -> str:
     """Content-address semantic outcome, excluding evidence IDs and revision noise."""
     values = [
@@ -1203,6 +1264,7 @@ class State:
     r3b_schema_upgrade: R3BSchemaUpgradeReceipt | None = None
     slice_outcome_receipts: tuple[SliceOutcomeReceipt, ...] = ()
     criterion_coverage_approvals: tuple[CriterionCoverageApproval, ...] = ()
+    feature_completion_receipts: tuple[FeatureCompletionReceipt, ...] = ()
 
 
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -3317,6 +3379,67 @@ def validate_state(state: State) -> None:
             identity_valid = outcome.id == expected_id
         if not identity_valid:
             raise StateValidationError("Slice outcome receipt identity does not match its exact basis")
+    # A Feature closure is a separate human decision, never an inferred Slice outcome.
+    if type(state.feature_completion_receipts) is not tuple or any(
+        type(item) is not FeatureCompletionReceipt for item in state.feature_completion_receipts
+    ):
+        raise StateValidationError("Feature completion receipts must be immutable records")
+    _unique((item.id for item in state.feature_completion_receipts), "Feature completion receipt")
+    _unique((item.feature_id for item in state.feature_completion_receipts), "completed Feature")
+    outcomes_by_id = {item.id: item for item in state.slice_outcome_receipts}
+    for closure in state.feature_completion_receipts:
+        expected_features = tuple(sorted(
+            item.id for item in state.agreements
+            if item.kind == "FEATURE" and item.feature_id == closure.feature_id
+        ))
+        expected_slices = tuple(sorted(
+            item.id for item in state.agreements
+            if item.kind == "SLICE" and item.feature_id == closure.feature_id
+        ))
+        selected = tuple(outcomes_by_id.get(identity) for identity in closure.slice_outcome_receipt_ids)
+        if (
+            state.initialization is None
+            or closure.repository_id != state.initialization.repository_id
+            or closure.feature_id not in records.features
+            or not expected_features or not expected_slices
+            or closure.feature_agreement_refs != expected_features
+            or closure.slice_agreement_refs != expected_slices
+            or len(closure.slice_outcome_receipt_ids) != len(expected_slices)
+            or any(item is None for item in selected)
+            or any(
+                item is None or item.slice_agreement_ref != reference
+                or item.input_fingerprint != closure.input_fingerprint
+                for item, reference in zip(selected, expected_slices)
+            )
+            or not isinstance(closure.condition, str)
+            or not closure.condition.strip() or closure.condition != closure.condition.strip()
+            or len(closure.condition) > 2048
+            or not is_sha256_digest(closure.input_fingerprint)
+            or closure.source != "INTERACTIVE_TERMINAL"
+            or type(closure.statement) is not str
+            or closure.source_reference != "tty:" + sha256(closure.statement.encode("utf-8")).hexdigest()[:12]
+            or not closure.statement.strip()
+            or closure.source_revision < 0
+            or closure.recorded_revision != closure.source_revision + 1
+            or closure.recorded_revision > state.revision
+            or closure.id != feature_completion_semantic_id(closure)
+        ):
+            raise StateValidationError("Feature completion receipt authority or evidence is invalid")
+        # Hash consistency alone is insufficient: the recorded human words must
+        # still describe this exact Feature, condition, snapshot, and Slice set.
+        expected_statement = feature_completion_statement_text(
+            feature=records.features[closure.feature_id], condition=closure.condition,
+            repository_id=closure.repository_id, source_revision=closure.source_revision,
+            input_fingerprint=closure.input_fingerprint,
+            feature_agreement_refs=closure.feature_agreement_refs,
+            slice_outcomes=tuple(zip(closure.slice_agreement_refs, closure.slice_outcome_receipt_ids)),
+            previous_closure_exists=any(
+                other is not closure and other.recorded_revision <= closure.source_revision
+                for other in state.feature_completion_receipts
+            ),
+        )
+        if closure.statement != expected_statement:
+            raise StateValidationError("Feature completion statement differs from its human-approved basis")
     _unique(
         (agreement.task_id for agreement in state.agreements if agreement.task_id is not None),
         "Slice Task",
