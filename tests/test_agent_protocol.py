@@ -153,6 +153,14 @@ class AgentProtocolTests(unittest.TestCase):
             self.assertTrue(all(response["result"]["code"] == "INIT_REQUIRED" for response in responses))
             self.assertTrue(all(response["context"]["initialization_state"] == "UNINITIALIZED" for response in responses))
             self.assertTrue(all(response["context"]["legal_actions"] == ["init", "context"] for response in responses))
+            self.assertEqual(responses[0]["context"]["slice_acceptance_inventory"], {
+                "source": "CORE_AGREEMENTS",
+                "total": 0,
+                "complete": True,
+                "truncated": False,
+                "history_scope": "AGREEMENT_RECORDS_ONLY_NONEXHAUSTIVE",
+                "items": [],
+            })
             init_guidance = responses[0]["context"]["guidance"][1]
             self.assertEqual(
                 init_guidance,

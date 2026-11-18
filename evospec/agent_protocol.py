@@ -7,7 +7,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from .agent import AcceptedSliceContext, AgentContext, WorkItemSummary, project_context
+from .agent import AcceptedSliceContext, AgentContext, SliceAcceptanceItem, WorkItemSummary, project_context
 from .agent_protocol_schema import (
     ProtocolError,
     decode_request,
@@ -40,7 +40,7 @@ from .agent_protocol_schema import (
     parse_work_relation_kind,
     validate_action_request,
 )
-from .domain import AssessmentOperation, AutonomyEnvelope, AutonomyEnvelopeDelta, CriterionCoverageApproval, SliceOutcomeReceipt
+from .domain import AssessmentOperation, AutonomyEnvelope, AutonomyEnvelopeDelta, CriterionCoverageApproval, SliceCriteriaRevision, SliceOutcomeReceipt
 from .input_fingerprint import (
     COVERAGE_CONTRACT_VERSION,
     INPUT_FINGERPRINT_VERSION,
@@ -210,23 +210,58 @@ def _accepted_slice_json(accepted: AcceptedSliceContext | None) -> dict[str, Jso
         "source": accepted.source,
         "source_reference": accepted.source_reference,
         "criteria_status": accepted.criteria_status,
-        "criteria_revision": None if accepted.criteria_revision is None else {
-            "id": accepted.criteria_revision.id,
-            "previous_revision_id": accepted.criteria_revision.previous_revision_id,
-            "outcome": accepted.criteria_revision.outcome,
-            "example": accepted.criteria_revision.example,
-            "inclusions": list(accepted.criteria_revision.inclusions),
-            "exclusions": list(accepted.criteria_revision.exclusions),
-            "decisions": list(accepted.criteria_revision.decisions),
-            "criteria": [
-                {"id": item.id, "expected_result": item.expected_result,
-                 "expected_evidence": item.expected_evidence}
-                for item in accepted.criteria_revision.criteria
-            ],
-            "source": accepted.criteria_revision.source,
-            "source_reference": accepted.criteria_revision.source_reference,
-            "reason": accepted.criteria_revision.reason,
-        },
+        "criteria_revision": _criteria_revision_json(accepted.criteria_revision),
+    }
+
+
+def _criteria_revision_json(revision: SliceCriteriaRevision | None) -> dict[str, JsonValue] | None:
+    if revision is None:
+        return None
+    return {
+        "id": revision.id,
+        "previous_revision_id": revision.previous_revision_id,
+        "outcome": revision.outcome,
+        "example": revision.example,
+        "inclusions": list(revision.inclusions),
+        "exclusions": list(revision.exclusions),
+        "decisions": list(revision.decisions),
+        "criteria": [
+            {"id": item.id, "expected_result": item.expected_result,
+             "expected_evidence": item.expected_evidence}
+            for item in revision.criteria
+        ],
+        "source": revision.source,
+        "source_reference": revision.source_reference,
+        "reason": revision.reason,
+    }
+
+
+def _slice_acceptance_item_json(item: SliceAcceptanceItem) -> dict[str, JsonValue]:
+    return {
+        "slice_agreement_ref": item.slice_agreement_ref,
+        "feature_id": item.feature_id,
+        "feature_agreement_ref": item.feature_agreement_ref,
+        "feature_title": item.feature_title,
+        "slice_title": item.slice_title,
+        "authority_status": item.authority_status,
+        "scope_status": item.scope_status,
+        "provenance": item.provenance,
+        "operational_state": item.operational_state,
+        "criteria_status": item.criteria_status,
+        "criteria_revision": _criteria_revision_json(item.criteria_revision),
+        "historical_receipt": item.historical_receipt,
+    }
+
+
+def _slice_acceptance_inventory_json(context: AgentContext) -> dict[str, JsonValue]:
+    inventory = context.slice_acceptance_inventory
+    return {
+        "source": inventory.source,
+        "total": inventory.total,
+        "complete": inventory.complete,
+        "truncated": inventory.truncated,
+        "history_scope": inventory.history_scope,
+        "items": [_slice_acceptance_item_json(item) for item in inventory.items],
     }
 
 
@@ -351,6 +386,7 @@ def context_json(context: AgentContext) -> dict[str, JsonValue]:
             },
             "e1_schema_ready": context.e1_schema_ready,
             "accepted_slice": _accepted_slice_json(context.accepted_slice),
+            "slice_acceptance_inventory": _slice_acceptance_inventory_json(context),
             "input_snapshot": None if context.input_snapshot is None else {
                 "version": context.input_snapshot.version,
                 "policy_id": context.input_snapshot.policy_id,

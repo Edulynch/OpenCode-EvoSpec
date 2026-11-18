@@ -21,11 +21,19 @@
   let latestFeatureRender;
   let activeSliceMessage;
   let activeCriterionStatuses = [];
+  let acceptanceStatuses = [];
   let displayedRevision;
+  let displayedRepositoryId;
   let signaledRevision = null;
+  let signaledRepositoryId;
   const objectValue = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const arrayValue = (value) => Array.isArray(value) ? value : [];
   const textValue = (value, fallback = "Not available") => value === null || value === undefined || value === "" ? fallback : String(value);
+  const repositoryIdentity = (context) => {
+    if (!Object.prototype.hasOwnProperty.call(context, "repository_id")) return undefined;
+    const value = context.repository_id;
+    return typeof value === "string" || value === null ? value : undefined;
+  };
   const clear = (element) => element.replaceChildren();
   const create = (tagName, className, value) => {
     const element = document.createElement(tagName);
@@ -141,7 +149,7 @@
     return ["Acceptance status unavailable", "waiting", "The canonical acceptance status is not available."];
   }
 
-  function renderAcceptanceIndex(context) {
+  function renderLegacyAcceptanceIndex(context) {
     clear(elements.activeSliceContent);
     activeSliceMessage = undefined;
     activeCriterionStatuses = [];
@@ -182,12 +190,15 @@
     elements.activeSliceContent.append(identity);
 
     const criteriaRevision = accepted.criteria_revision;
+    const revision = objectValue(criteriaRevision);
+    if (typeof revision.outcome === "string" && revision.outcome.trim()) {
+      elements.activeSliceContent.append(create("p", "acceptance-scope-outcome", `Agreed outcome: ${revision.outcome.trim()}`));
+    }
     if (criteriaRevision === null || criteriaRevision === undefined) {
       setStatus("Criteria not recorded", "waiting");
       activeSliceMessage = appendEmpty(elements.activeSliceContent, "Acceptance criteria are not recorded yet.");
       return;
     }
-    const revision = objectValue(criteriaRevision);
     if (!Array.isArray(revision.criteria)) {
       unavailable("Acceptance criteria are not available for this context.");
       return;
@@ -228,11 +239,275 @@
     elements.activeSliceContent.append(list);
   }
 
+  function acceptanceInventory(context) {
+    if (!Object.prototype.hasOwnProperty.call(context, "slice_acceptance_inventory")) {
+      renderLegacyAcceptanceIndex(context);
+      return;
+    }
+    clear(elements.activeSliceContent);
+    activeSliceMessage = undefined;
+    activeCriterionStatuses = [];
+    acceptanceStatuses = [elements.activeSliceStatus];
+    const setStatus = (label, tone) => {
+      elements.activeSliceStatus.textContent = label;
+      elements.activeSliceStatus.dataset.status = tone;
+    };
+    const unavailable = (message) => {
+      setStatus("Status unavailable", "waiting");
+      activeSliceMessage = appendEmpty(elements.activeSliceContent, message);
+    };
+    if (context.dashboard_error) {
+      unavailable("The accepted Slice inventory could not be loaded.");
+      return;
+    }
+    const inventory = objectValue(context.slice_acceptance_inventory);
+    if (
+      inventory.source !== "CORE_AGREEMENTS"
+      || !Number.isSafeInteger(inventory.total) || inventory.total < 0
+      || typeof inventory.complete !== "boolean"
+      || typeof inventory.truncated !== "boolean"
+      || inventory.history_scope !== "AGREEMENT_RECORDS_ONLY_NONEXHAUSTIVE"
+      || !Array.isArray(inventory.items)
+      || inventory.items.length > inventory.total
+      || inventory.truncated !== (inventory.total > inventory.items.length)
+      || (inventory.truncated && inventory.complete)
+    ) {
+      unavailable("The accepted Slice inventory is not available in a recognized Core projection.");
+      return;
+    }
+    const items = inventory.items.map(objectValue);
+    if (
+      items.length
+      && (typeof context.repository_id !== "string" || !context.repository_id.trim())
+    ) {
+      unavailable("Repository identity is unavailable for grouping accepted Feature/Slice scopes.");
+      return;
+    }
+    const activeItems = items.filter((item) => item.scope_status === "ACTIVE");
+    const acceptedExists = Object.prototype.hasOwnProperty.call(context, "accepted_slice");
+    if (!acceptedExists || activeItems.length > 1) {
+      unavailable("Active Slice authority is missing or ambiguous.");
+      return;
+    }
+    let activeItem = activeItems[0];
+    const accepted = context.accepted_slice;
+    if (accepted === null) {
+      if (activeItem) {
+        unavailable("The active Slice does not match the canonical agreement inventory.");
+        return;
+      }
+      setStatus("No active Slice", "waiting");
+      activeSliceMessage = appendEmpty(elements.activeSliceContent, "No active accepted Slice.");
+    } else {
+      const current = objectValue(accepted);
+      if (
+        !activeItem
+        || current.slice_agreement_ref !== activeItem.slice_agreement_ref
+        || current.feature_agreement_ref !== activeItem.feature_agreement_ref
+        || activeItem.authority_status !== "CANONICAL"
+      ) {
+        unavailable("Active Slice details do not match one canonical Feature/Slice agreement.");
+        return;
+      }
+      if (activeItem.criteria_status === "RECORDED") {
+        const projected = objectValue(activeItem.criteria_revision);
+        const acceptedRevision = objectValue(current.criteria_revision);
+        if (
+          !Array.isArray(projected.criteria) || !projected.criteria.length
+          || typeof projected.id !== "string" || projected.id !== acceptedRevision.id
+          || !Array.isArray(acceptedRevision.criteria)
+          || JSON.stringify(projected) !== JSON.stringify(acceptedRevision)
+        ) {
+          unavailable("The active Slice criteria head is unavailable or inconsistent.");
+          return;
+        }
+      } else if (
+        activeItem.criteria_status !== "NOT_RECORDED"
+        || current.criteria_revision !== null
+      ) {
+        unavailable("The active Slice criteria head is unavailable or inconsistent.");
+        return;
+      }
+      const criteria = objectValue(activeItem.criteria_revision);
+      const criteriaRows = arrayValue(criteria.criteria).map(objectValue);
+      if (activeItem.criteria_status === "RECORDED" && criteriaRows.some((criterion) =>
+        typeof criterion.expected_result !== "string" || !criterion.expected_result.trim()
+      )) {
+        unavailable("The active Slice criteria are malformed.");
+        return;
+      }
+      if (activeItem.criteria_status === "NOT_RECORDED") {
+        setStatus("Criteria not recorded", "waiting");
+        activeSliceMessage = appendEmpty(elements.activeSliceContent, "Acceptance criteria are not recorded yet.");
+      } else {
+        const [label, tone, message] = activeOutcomePresentation(context, activeItem);
+        setStatus(label, tone);
+        activeSliceMessage = create("p", "active-slice-note", message);
+        elements.activeSliceContent.append(activeSliceMessage);
+      }
+    }
+
+    const note = create(
+      "p",
+      "acceptance-coverage-note",
+      `Showing ${items.length} of ${inventory.total} Slice agreements in Core agreement records. Archived/history coverage is not exhaustive.`
+    );
+    elements.activeSliceContent.append(note);
+    if (inventory.truncated) {
+      elements.activeSliceContent.append(create("p", "empty-state", "The displayed list is truncated; additional accepted Slice agreements are not shown."));
+    } else if (!inventory.complete) {
+      elements.activeSliceContent.append(create("p", "empty-state", "Some canonical agreement or criteria records are unresolved; acceptance is not inferred."));
+    }
+    const groups = new Map();
+    const unassociated = [];
+    items.forEach((item) => {
+      const scope = String(item.scope_status || "").toUpperCase();
+      const knownScope = ["ACTIVE", "PARKED", "QUEUED", "PRESERVED", "HISTORICAL", "INACTIVE"].includes(scope);
+      if (
+        item.authority_status !== "CANONICAL" || !knownScope
+        || typeof item.feature_id !== "string" || !item.feature_id
+        || typeof item.feature_title !== "string" || !item.feature_title.trim()
+        || typeof item.feature_agreement_ref !== "string" || !item.feature_agreement_ref
+        || typeof item.slice_title !== "string" || !item.slice_title.trim()
+      ) {
+        unassociated.push(item);
+        return;
+      }
+      const key = `${String(context.repository_id || "")}\u0000${item.feature_id}`;
+      if (!groups.has(key)) groups.set(key, { featureId: item.feature_id, title: item.feature_title, items: [] });
+      groups.get(key).items.push(item);
+    });
+
+    [...groups.values()]
+      .sort((left, right) => left.featureId.localeCompare(right.featureId))
+      .forEach((group) => {
+        const article = create("article", "acceptance-feature-group");
+        article.dataset.featureId = group.featureId;
+        article.append(create("p", "eyebrow", "Feature"), create("h3", "acceptance-feature-title", group.title));
+        group.items
+          .sort((left, right) => left.slice_agreement_ref.localeCompare(right.slice_agreement_ref))
+          .forEach((item) => appendAcceptanceSlice(article, item, item === activeItem, context));
+        elements.activeSliceContent.append(article);
+      });
+    if (unassociated.length) {
+      const article = create("article", "acceptance-unassociated");
+      article.append(create("h3", "", "Unassociated Slice records"));
+      unassociated.forEach((item) => {
+        const row = create("p", "empty-state", textValue(item.slice_title, "Slice agreement details unavailable."));
+        article.append(row);
+      });
+      elements.activeSliceContent.append(article);
+    }
+  }
+
+  function activeOutcomePresentation(context, item) {
+    const outcome = objectValue(context.slice_outcome);
+    if (String(outcome.status || "").toUpperCase() !== "CURRENT") {
+      return outcomePresentation(outcome);
+    }
+    const receipt = objectValue(outcome.receipt);
+    if (
+      typeof outcome.latest_receipt_id === "string" && outcome.latest_receipt_id !== ""
+      && receipt.id === outcome.latest_receipt_id
+      && receipt.repository_id === context.repository_id
+      && receipt.slice_agreement_ref === item.slice_agreement_ref
+      && receipt.criteria_revision_id === objectValue(item.criteria_revision).id
+    ) {
+      return ["Slice accepted", "accepted", "Current canonical acceptance is recorded."];
+    }
+    return ["Acceptance status unavailable", "waiting", "The canonical acceptance receipt is unavailable or belongs to another Slice or criteria revision."];
+  }
+
+  function appendAcceptanceSlice(container, item, isActive, context) {
+    const slice = create("section", "acceptance-slice");
+    slice.append(create("h4", "acceptance-slice-title", item.slice_title));
+    const revision = objectValue(item.criteria_revision);
+    const scopeLabels = {
+      ACTIVE: "Active",
+      PARKED: "Parked",
+      QUEUED: `Queued${item.operational_state ? ` (${item.operational_state})` : ""}`,
+      PRESERVED: "Preserved primary work (inactive)",
+      HISTORICAL: "Historical context (not current)",
+      INACTIVE: "Inactive (agreement only)",
+    };
+    slice.append(create("p", "eyebrow", "Agreed scope"));
+    const scopeLabel = create("span", "status-label", scopeLabels[item.scope_status]);
+    scopeLabel.dataset.status = item.scope_status === "ACTIVE" ? "in-review" : "waiting";
+    acceptanceStatuses.push(scopeLabel);
+    const provenanceDetails = [`Scope provenance: ${textValue(item.provenance, "unavailable")}`];
+    if (item.operational_state) provenanceDetails.push(`Operational state: ${item.operational_state}`);
+    slice.append(scopeLabel, create("p", "acceptance-provenance", provenanceDetails.join("; ")));
+    if (typeof revision.outcome === "string" && revision.outcome.trim()) {
+      slice.append(create("p", "acceptance-scope-outcome", `Agreed outcome: ${revision.outcome.trim()}`));
+    }
+    const acceptance = isActive && item.criteria_status === "RECORDED"
+      ? activeOutcomePresentation(context, item)
+      : isActive
+        ? ["Acceptance status unavailable", "waiting", "Current outcome acceptance requires a recorded criteria revision."]
+        : [
+          item.scope_status === "PARKED"
+            ? "Parked — current acceptance not evaluated"
+            : "Current acceptance not evaluated",
+          "waiting",
+          "This inactive Slice has no current acceptance evaluation.",
+        ];
+    slice.append(create("p", "eyebrow", "Outcome acceptance"));
+    const acceptanceStatus = create("span", "status-label", acceptance[0]);
+    acceptanceStatus.dataset.status = acceptance[1];
+    acceptanceStatuses.push(acceptanceStatus);
+    slice.append(acceptanceStatus);
+    if (!isActive && item.historical_receipt === true) {
+      slice.append(create("p", "acceptance-history-note", "A historical outcome receipt is recorded for this Slice and its criteria; it is not current acceptance."));
+    }
+    if (item.criteria_status === "NOT_RECORDED") {
+      slice.append(create("p", "empty-state", "Acceptance criteria are not recorded for this Slice."));
+    } else if (item.criteria_status !== "RECORDED") {
+      slice.append(create("p", "empty-state", "Acceptance criteria are unavailable; no current criteria are inferred."));
+    } else {
+      const revision = objectValue(item.criteria_revision);
+      const criteria = arrayValue(revision.criteria).map(objectValue);
+      if (!criteria.length || criteria.some((criterion) =>
+        typeof criterion.expected_result !== "string" || !criterion.expected_result.trim()
+      )) {
+        slice.append(create("p", "empty-state", "Acceptance criteria are unavailable; this record is malformed."));
+      } else {
+        slice.append(create("h5", "active-slice-criteria-heading", "Criterion verification"));
+        const verificationRecords = isActive ? arrayValue(context.criterion_verification).map(objectValue) : [];
+        const list = create("ul", "active-slice-criteria");
+        list.setAttribute("aria-label", `${item.slice_title} criterion verification`);
+        criteria.forEach((criterion) => {
+          const matches = isActive
+            ? verificationRecords.filter((record) =>
+              record.criterion_id === criterion.id && record.criteria_revision_id === revision.id
+            )
+            : [];
+          const [label, tone] = isActive
+            ? criterionPresentation(matches.length === 1 ? matches[0] : null)
+            : ["Not evaluated", "waiting"];
+          const row = create("li", "active-slice-criterion");
+          const status = create("span", "status-label", label);
+          status.dataset.status = tone;
+          acceptanceStatuses.push(status);
+          if (isActive) activeCriterionStatuses.push(status);
+          row.append(create("span", "active-slice-criterion-result", criterion.expected_result.trim()), status);
+          list.append(row);
+        });
+        slice.append(list);
+      }
+    }
+    container.append(slice);
+  }
+
+  function renderAcceptanceIndex(context) {
+    acceptanceStatuses = [];
+    acceptanceInventory(context);
+  }
+
   function markAcceptanceUpdating() {
     elements.activeSliceStatus.textContent = "Updating";
     elements.activeSliceStatus.dataset.status = "waiting";
     if (activeSliceMessage) activeSliceMessage.textContent = "A newer project revision is being checked.";
-    activeCriterionStatuses.forEach((status) => {
+    (acceptanceStatuses.length ? acceptanceStatuses : activeCriterionStatuses).forEach((status) => {
       status.textContent = "Updating";
       status.dataset.status = "waiting";
     });
@@ -365,6 +640,17 @@
     appendTechnicalRecord(elements.technicalContent, "technical-work-items", "Work items", works.map((work) => [
       textValue(work.id, "Unknown work"), `${humanStatus(work)}${work.reason || work.blocker ? `: ${textValue(work.reason || work.blocker)}` : ""}`
     ]));
+    const slices = arrayValue(objectValue(context.slice_acceptance_inventory).items).map(objectValue);
+    if (slices.length) appendTechnicalRecord(
+      elements.technicalContent, "technical-slice-agreements", "Slice agreement revisions",
+      slices.map((item) => {
+        const revision = objectValue(item.criteria_revision);
+        return [
+          textValue(item.slice_title, "Slice"),
+          `Feature agreement ${textValue(item.feature_agreement_ref)}; Slice agreement ${textValue(item.slice_agreement_ref)}; criteria revision ${textValue(revision.id, "not recorded")}; provenance ${textValue(item.provenance)}; agreed outcome ${textValue(revision.outcome)}`,
+        ];
+      })
+    );
     const assurance = [];
     if (arrayValue(queue.relations).length) assurance.push(["Relations", `${arrayValue(queue.relations).length} recorded`]);
     if (arrayValue(context.active_locks).length) assurance.push(["Active locks", `${arrayValue(context.active_locks).length} active`]);
@@ -380,7 +666,15 @@
   function render(contextPayload) {
     const context = objectValue(contextPayload);
     displayedRevision = Number.isSafeInteger(context.revision) ? context.revision : null;
-    if (signaledRevision !== null && displayedRevision !== null && displayedRevision >= signaledRevision) signaledRevision = null;
+    displayedRepositoryId = repositoryIdentity(context);
+    if (
+      signaledRevision !== null
+      && (signaledRepositoryId === undefined || displayedRepositoryId === signaledRepositoryId)
+      && displayedRevision !== null && displayedRevision >= signaledRevision
+    ) {
+      signaledRevision = null;
+      signaledRepositoryId = undefined;
+    }
     const queue = objectValue(context.work_queue);
     const progress = objectValue(context.progress);
     const capabilities = arrayValue(context.accepted_capabilities).map(objectValue);
@@ -450,8 +744,15 @@
         const response = await fetch("/api/context", { headers: { Accept: "application/json" } });
         if (!response.ok) throw new Error(`Context request failed with status ${response.status}.`);
         const context = await response.json();
-        const revision = objectValue(context).revision;
-        if (signaledRevision !== null && Number.isSafeInteger(revision) && revision < signaledRevision) {
+        const current = objectValue(context);
+        const revision = current.revision;
+        const repositoryId = repositoryIdentity(current);
+        const signaledRootMismatch = signaledRepositoryId !== undefined && repositoryId !== signaledRepositoryId;
+        const olderThanSignal = signaledRevision !== null && !signaledRootMismatch
+          && Number.isSafeInteger(revision) && revision < signaledRevision;
+        const olderThanDisplayed = displayedRepositoryId !== undefined && repositoryId === displayedRepositoryId
+          && displayedRevision !== null && Number.isSafeInteger(revision) && revision < displayedRevision;
+        if (signaledRootMismatch || olderThanSignal || olderThanDisplayed) {
           contextRequestQueued = true;
         }
         if (!contextRequestQueued && !pageHidden) render(context);
@@ -478,9 +779,20 @@
     });
     eventSource.addEventListener("revision", (event) => {
       try {
-        const revision = objectValue(JSON.parse(event.data)).revision;
-        if (Number.isSafeInteger(revision) && (displayedRevision === undefined || revision > displayedRevision)) {
-          signaledRevision = Math.max(signaledRevision === null ? revision : signaledRevision, revision);
+        const data = objectValue(JSON.parse(event.data));
+        const revision = data.revision;
+        const repositoryId = repositoryIdentity(data);
+        const rootChanged = repositoryId !== undefined && repositoryId !== displayedRepositoryId;
+        const revisionChanged = Number.isSafeInteger(revision)
+          && (displayedRevision === undefined || displayedRevision === null || revision > displayedRevision);
+        if (Number.isSafeInteger(revision) && (rootChanged || revisionChanged)) {
+          if (rootChanged) {
+            signaledRepositoryId = repositoryId;
+            signaledRevision = revision;
+          } else {
+            if (repositoryId !== undefined) signaledRepositoryId = repositoryId;
+            signaledRevision = Math.max(signaledRevision === null ? revision : signaledRevision, revision);
+          }
           if (displayedRevision !== undefined && displayedRevision !== null) markAcceptanceUpdating();
         }
       } catch {

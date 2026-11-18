@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 
 from evospec.dashboard import DEFAULT_HOST, DashboardServer, create_server
 from evospec.domain import ExpectedRevision
-from evospec.services import slice_acceptance_statement
+from evospec.services import CoreService, slice_acceptance_statement
 from evospec.workflow import WorkflowService
 from tests._tempdir import TemporaryDirectory
 from tests.test_e1_r1d1_slice_criteria import CHECKPOINT, FEATURE, SLICE, TASK, _provenance, _spec
@@ -182,6 +182,13 @@ class DashboardTests(unittest.TestCase):
                 and item["status"] == "UNVERIFIED"
                 for item in context["criterion_verification"]
             ))
+            inventory = context["slice_acceptance_inventory"]
+            self.assertEqual(inventory["source"], "CORE_AGREEMENTS")
+            self.assertEqual(inventory["total"], 1)
+            self.assertTrue(inventory["complete"])
+            self.assertEqual(inventory["history_scope"], "AGREEMENT_RECORDS_ONLY_NONEXHAUSTIVE")
+            self.assertEqual(inventory["items"][0]["slice_agreement_ref"], accepted["slice_agreement_ref"])
+            self.assertEqual(inventory["items"][0]["criteria_revision"]["id"], accepted["criteria_revision"]["id"])
             environment = os.environ.copy()
             environment["EVOSPEC_DASHBOARD_ACCEPTANCE_CONTEXT"] = json.dumps(context, separators=(",", ":"))
             completed = subprocess.run(
@@ -217,6 +224,10 @@ class DashboardTests(unittest.TestCase):
             workflow = WorkflowService.open(root)
             _ = workflow.init()
             initial_revision = workflow.status().revision
+            initialization = CoreService.open(root).recover().initialization
+            if initialization is None:
+                self.fail("initialized dashboard fixture must retain repository identity")
+            repository_id = initialization.repository_id
             before_stream = self._files(root)
             server, thread, _ = self._start_server(root)
             stream = _EventStream(DEFAULT_HOST, server.server_port)
@@ -226,7 +237,7 @@ class DashboardTests(unittest.TestCase):
                 self.assertEqual(headers.get("content-type", "").split(";", 1)[0], "text/event-stream")
 
                 initial = stream.wait_for(lambda frame: frame.event == "revision")
-                self.assertEqual(json.loads(initial.data), {"revision": initial_revision})
+                self.assertEqual(json.loads(initial.data), {"repository_id": repository_id, "revision": initial_revision})
                 unchanged = stream.next_frame()
                 self.assertIsNone(unchanged.event)
                 self.assertTrue(unchanged.comments)
@@ -236,7 +247,7 @@ class DashboardTests(unittest.TestCase):
                 changed_revision = workflow.status().revision
                 self.assertGreater(changed_revision, initial_revision)
                 changed = stream.wait_for(lambda frame: frame.event == "revision")
-                self.assertEqual(json.loads(changed.data), {"revision": changed_revision})
+                self.assertEqual(json.loads(changed.data), {"repository_id": repository_id, "revision": changed_revision})
 
                 after_change = self._files(root)
                 unchanged = stream.next_frame()
@@ -253,13 +264,17 @@ class DashboardTests(unittest.TestCase):
             workflow = WorkflowService.open(root)
             _ = workflow.init()
             initial_revision = workflow.status().revision
+            initialization = CoreService.open(root).recover().initialization
+            if initialization is None:
+                self.fail("initialized dashboard fixture must retain repository identity")
+            repository_id = initialization.repository_id
             server, thread, _ = self._start_server(root)
             stream = _EventStream(DEFAULT_HOST, server.server_port)
             reconnected = _EventStream(DEFAULT_HOST, server.server_port)
             try:
                 self.assertEqual(stream.open()[0], 200)
                 initial = stream.wait_for(lambda frame: frame.event == "revision")
-                self.assertEqual(json.loads(initial.data), {"revision": initial_revision})
+                self.assertEqual(json.loads(initial.data), {"repository_id": repository_id, "revision": initial_revision})
 
                 transition_started = time.monotonic()
                 _ = workflow.new("Add rapid dashboard workflow coverage")
@@ -271,15 +286,15 @@ class DashboardTests(unittest.TestCase):
 
                 latest = stream.wait_for(
                     lambda frame: frame.event == "revision"
-                    and json.loads(frame.data) == {"revision": final_revision}
+                    and json.loads(frame.data) == {"repository_id": repository_id, "revision": final_revision}
                 )
-                self.assertEqual(json.loads(latest.data), {"revision": final_revision})
+                self.assertEqual(json.loads(latest.data), {"repository_id": repository_id, "revision": final_revision})
 
                 after_changes = self._files(root)
                 stream.close()
                 self.assertEqual(reconnected.open()[0], 200)
                 reconnected_initial = reconnected.wait_for(lambda frame: frame.event == "revision")
-                self.assertEqual(json.loads(reconnected_initial.data), {"revision": final_revision})
+                self.assertEqual(json.loads(reconnected_initial.data), {"repository_id": repository_id, "revision": final_revision})
                 self.assertEqual(self._files(root), after_changes)
             finally:
                 stream.close()
@@ -292,6 +307,10 @@ class DashboardTests(unittest.TestCase):
             workflow = WorkflowService.open(root)
             _ = workflow.init()
             initial_revision = workflow.status().revision
+            initialization = CoreService.open(root).recover().initialization
+            if initialization is None:
+                self.fail("initialized dashboard fixture must retain repository identity")
+            repository_id = initialization.repository_id
             server, thread, _ = self._start_server(root)
             first = _EventStream(DEFAULT_HOST, server.server_port)
             second = _EventStream(DEFAULT_HOST, server.server_port)
@@ -300,7 +319,7 @@ class DashboardTests(unittest.TestCase):
                 self.assertEqual(second.open()[0], 200)
                 for stream in (first, second):
                     initial = stream.wait_for(lambda frame: frame.event == "revision")
-                    self.assertEqual(json.loads(initial.data), {"revision": initial_revision})
+                    self.assertEqual(json.loads(initial.data), {"repository_id": repository_id, "revision": initial_revision})
 
                 first.close()
                 _ = workflow.new("Add independent dashboard client")
@@ -309,9 +328,9 @@ class DashboardTests(unittest.TestCase):
                 # comprobamos que converge a la revisión final persistida.
                 changed = second.wait_for(
                     lambda frame: frame.event == "revision"
-                    and json.loads(frame.data) == {"revision": changed_revision}
+                    and json.loads(frame.data) == {"repository_id": repository_id, "revision": changed_revision}
                 )
-                self.assertEqual(json.loads(changed.data), {"revision": changed_revision})
+                self.assertEqual(json.loads(changed.data), {"repository_id": repository_id, "revision": changed_revision})
             finally:
                 first.close()
                 second.close()
@@ -616,7 +635,7 @@ class DashboardTests(unittest.TestCase):
       require(document.querySelector('#load-status').textContent.trim() === "Polling", "a closed event stream must retain the Polling status");
       require(document.documentElement.scrollWidth <= document.documentElement.clientWidth, "dashboard must not overflow horizontally at the configured viewport width");
     });
-    window.__dashboardTest.setContext(window.__dashboardFixtures.linked);
+    window.__dashboardTest.setContext({ ...window.__dashboardFixtures.linked, revision: 105 });
     window.__dashboardTest.reconnect();
     await sleep(20);
     check("SSE reconnect refresh preserves Technical and its raw disclosure", () => {
@@ -631,7 +650,7 @@ class DashboardTests(unittest.TestCase):
       require(technical.hidden && getComputedStyle(technical).display === "none" && technical.getBoundingClientRect().height === 0, "Features selection must fully hide the Technical panel");
       require(document.documentElement.scrollWidth <= document.documentElement.clientWidth, "dashboard must not overflow after returning to Features");
     });
-    window.__dashboardTest.setContext(window.__dashboardFixtures.empty);
+    window.__dashboardTest.setContext({ ...window.__dashboardFixtures.empty, revision: 106 });
     window.__dashboardTest.revision();
     await sleep(20);
     check("empty capabilities and queue retain Features safely at desktop and narrow widths", () => {
@@ -696,7 +715,17 @@ class DashboardTests(unittest.TestCase):
         }
         linked: dict[str, object] = {
             "revision": 101,
+            "repository_id": "repository-dashboard-fixture",
             "initialization_state": "INITIALIZED",
+            "accepted_slice": None,
+            "slice_acceptance_inventory": {
+                "source": "CORE_AGREEMENTS",
+                "total": 0,
+                "complete": True,
+                "truncated": False,
+                "history_scope": "AGREEMENT_RECORDS_ONLY_NONEXHAUSTIVE",
+                "items": [],
+            },
             "accepted_capabilities": capabilities,
             "accepted_capabilities_complete": True,
             "accepted_capabilities_total": 9,

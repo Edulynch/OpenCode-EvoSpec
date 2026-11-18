@@ -75,6 +75,7 @@ function makeContext({
     expected_result,
     expected_evidence: "python-unittest:private-test-target",
   }))
+  const defaultCriteriaRevision = { id: revisionId, outcome: "The agreed task outcome is visible", criteria }
   const acceptedSlice = {
     feature_agreement_ref: "feature-ref-private",
     slice_agreement_ref: "slice-ref-private",
@@ -82,8 +83,9 @@ function makeContext({
     slice_title: sliceTitle,
     task_id: "TASK-private",
     criteria_status: "RECORDED",
-    criteria_revision: criteriaRevision === undefined ? { id: revisionId, criteria } : criteriaRevision,
+    criteria_revision: criteriaRevision === undefined ? defaultCriteriaRevision : criteriaRevision,
   }
+  const projectedCriteriaRevision = criteriaRevision === undefined ? defaultCriteriaRevision : criteriaRevision
   const criterionVerification = verifications === undefined
     ? criteria.map((criterion) => ({
       criterion_id: criterion.id,
@@ -102,13 +104,41 @@ function makeContext({
     ? {
       status: "CURRENT",
       latest_receipt_id: receiptId,
-      receipt: { id: receiptId, input_fingerprint: "private-hash", evidence_receipt_ids: ["private-evidence"] },
+      receipt: {
+        id: receiptId,
+        repository_id: "private-repository-id",
+        slice_agreement_ref: acceptedSlice.slice_agreement_ref,
+        criteria_revision_id: revisionId,
+        input_fingerprint: "private-hash",
+        evidence_receipt_ids: ["private-evidence"],
+      },
     }
     : { status: outcome, latest_receipt_id: null, receipt: null, blockers: ["private-technical-blocker"] }
   const context = {
     revision,
     repository_id: "private-repository-id",
     accepted_slice: acceptedSlice,
+    slice_acceptance_inventory: {
+      source: "CORE_AGREEMENTS",
+      total: 1,
+      complete: true,
+      truncated: false,
+      history_scope: "AGREEMENT_RECORDS_ONLY_NONEXHAUSTIVE",
+      items: [{
+        slice_agreement_ref: acceptedSlice.slice_agreement_ref,
+        feature_id: "feature-1",
+        feature_agreement_ref: acceptedSlice.feature_agreement_ref,
+        feature_title: acceptedSlice.feature_title,
+        slice_title: acceptedSlice.slice_title,
+        authority_status: "CANONICAL",
+        scope_status: "ACTIVE",
+        provenance: "ACTIVE_CONTEXT",
+        operational_state: null,
+        criteria_status: projectedCriteriaRevision === null ? "NOT_RECORDED" : "RECORDED",
+        criteria_revision: projectedCriteriaRevision,
+        historical_receipt: false,
+      }],
+    },
     criterion_verification: criterionVerification,
     slice_outcome: sliceOutcome === undefined ? defaultOutcome : sliceOutcome,
     accepted_capabilities: [{ feature_id: "feature-1", title: featureTitle }],
@@ -225,6 +255,10 @@ function rowResult(row) {
   return descendants(row).find((element) => element.className === "active-slice-criterion-result")?.textContent
 }
 
+function statusBadges(app) {
+  return descendants(app.ids.get("active-slice-content")).filter((element) => element.className === "status-label")
+}
+
 async function waitFor(predicate, message = "dashboard did not settle") {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (predicate()) return
@@ -253,6 +287,7 @@ test("renders Feature, active Slice, and current criteria from the canonical GET
   const content = app.ids.get("active-slice-content").textContent
   assert.ok(content.includes(accepted.feature_title))
   assert.ok(content.includes(accepted.slice_title))
+  assert.ok(content.includes(`Agreed outcome: ${accepted.criteria_revision.outcome}`))
   assert.deepEqual(criterionRows(app).map(rowResult), accepted.criteria_revision.criteria.map((criterion) => criterion.expected_result))
   assert.equal(criterionRows(app).length, accepted.criteria_revision.criteria.length)
   assert.deepEqual(criterionRows(app).map(rowStatus), accepted.criteria_revision.criteria.map(() => "Pending"))
@@ -269,6 +304,8 @@ test("renders Feature, active Slice, and current criteria from the canonical GET
   assert.equal(app.fetchCalls.length, 1)
   assert.equal(app.fetchCalls[0].url, "/api/context")
   assert.equal(app.fetchCalls[0].options.method, undefined)
+  const technicalRevision = descendants(app.ids.get("technical-content")).find((element) => element.id === "technical-slice-agreements")
+  assert.ok(technicalRevision?.textContent.includes(`criteria revision ${accepted.criteria_revision.id}`))
 })
 
 test("READY and completed Tasks never become Slice acceptance", async () => {
@@ -279,7 +316,12 @@ test("READY and completed Tasks never become Slice acceptance", async () => {
   assert.notEqual(app.ids.get("active-slice-status").textContent, "Slice accepted")
   assert.ok(app.ids.get("active-slice-content").textContent.includes("not yet accepted"))
 
-  const noSlice = await loadedDashboard({ ...context, accepted_slice: null, slice_outcome: makeContext({ outcome: "CURRENT" }).slice_outcome })
+  const noSlice = await loadedDashboard({
+    ...context,
+    accepted_slice: null,
+    slice_acceptance_inventory: { ...context.slice_acceptance_inventory, total: 0, items: [] },
+    slice_outcome: makeContext({ outcome: "CURRENT" }).slice_outcome,
+  })
   assert.equal(noSlice.ids.get("active-slice-status").textContent, "No active Slice")
   assert.ok(noSlice.ids.get("active-slice-content").textContent.includes("No active accepted Slice."))
 })
@@ -288,6 +330,12 @@ test("only a CURRENT outcome with its matching canonical receipt says Slice acce
   const accepted = await loadedDashboard(makeContext({ outcome: "CURRENT" }))
   assert.equal(accepted.ids.get("active-slice-status").textContent, "Slice accepted")
   const primary = accepted.ids.get("active-slice-content").textContent
+  const activeCard = descendants(accepted.ids.get("active-slice-content")).find((element) => element.className === "acceptance-slice")
+  assert.ok(activeCard?.textContent.includes("Agreed scope"))
+  assert.ok(activeCard?.textContent.includes("Agreed outcome: The agreed task outcome is visible"))
+  assert.ok(activeCard?.textContent.includes("Outcome acceptance"))
+  assert.ok(activeCard?.textContent.includes("Criterion verification"))
+  assert.ok(activeCard?.textContent.includes("Slice accepted"))
   for (const privateValue of ["private-hash", "private-evidence", "private-receipt", "TASK-private", "AC-1", "private-test-target", "feature-ref-private", "slice-ref-private"]) {
     assert.equal(primary.includes(privateValue), false, `primary index leaked ${privateValue}`)
   }
@@ -296,10 +344,15 @@ test("only a CURRENT outcome with its matching canonical receipt says Slice acce
   mismatch.slice_outcome.receipt.id = "different-receipt"
   const unavailable = await loadedDashboard(mismatch)
   assert.equal(unavailable.ids.get("active-slice-status").textContent, "Acceptance status unavailable")
+  assert.equal(statusBadges(unavailable).some((badge) => badge.dataset.status === "accepted"), false)
 
   const missingReceipt = makeContext({ outcome: "CURRENT" })
   missingReceipt.slice_outcome.receipt = null
   assert.equal((await loadedDashboard(missingReceipt)).ids.get("active-slice-status").textContent, "Acceptance status unavailable")
+
+  const wrongCriteriaReceipt = makeContext({ outcome: "CURRENT" })
+  wrongCriteriaReceipt.slice_outcome.receipt.criteria_revision_id = "another-slice-revision"
+  assert.equal((await loadedDashboard(wrongCriteriaReceipt)).ids.get("active-slice-status").textContent, "Acceptance status unavailable")
 })
 
 test("criterion states remain distinct and legacy VERIFIED freshness is not current", async () => {
@@ -336,7 +389,7 @@ test("missing Slice, criteria, old schema, unknown state, and context errors fai
   assert.ok(absent.ids.get("active-slice-content").textContent.includes("not recorded yet"))
 
   const emptyCriteria = makeContext({ criteriaRevision: { id: "criteria-empty", criteria: [] } })
-  assert.equal((await loadedDashboard(emptyCriteria)).ids.get("active-slice-status").textContent, "Criteria not recorded")
+  assert.equal((await loadedDashboard(emptyCriteria)).ids.get("active-slice-status").textContent, "Status unavailable")
 
   for (const [outcome, label] of [["BLOCKED", "Blocked"], ["STALE", "Revalidate"], ["REVALIDATION_REQUIRED", "Revalidate"]]) {
     const app = await loadedDashboard(makeContext({ outcome }))
@@ -349,6 +402,129 @@ test("missing Slice, criteria, old schema, unknown state, and context errors fai
   assert.equal(error.ids.get("active-slice-status").textContent, "Status unavailable")
   assert.ok(error.ids.get("active-slice-content").textContent.includes("could not be loaded"))
   assert.equal(error.ids.get("active-slice-content").textContent.includes("private/path"), false)
+})
+
+test("groups accepted Slices by canonical Feature identity and never evaluates inactive criteria", async () => {
+  const context = makeContext({ outcome: "READY" })
+  const active = context.slice_acceptance_inventory.items[0]
+  const makeItem = (overrides) => ({
+    ...active,
+    slice_agreement_ref: "slice-extra",
+    feature_title: "Same Feature, renamed scope title",
+    slice_title: "Extra Slice",
+    scope_status: "INACTIVE",
+    provenance: "AGREEMENT_ONLY",
+    criteria_status: "RECORDED",
+    criteria_revision: {
+      id: "criteria-extra",
+      outcome: "extra approved outcome",
+      criteria: [{ id: "AC-extra", expected_result: "extra-only result", expected_evidence: "private extra evidence" }],
+    },
+    historical_receipt: false,
+    ...overrides,
+  })
+  context.slice_acceptance_inventory = {
+    ...context.slice_acceptance_inventory,
+    total: 6,
+    items: [
+      active,
+      makeItem({
+        slice_agreement_ref: "slice-parked",
+        slice_title: "Parked Slice",
+        scope_status: "PARKED",
+        provenance: "PARKED_CONTEXT",
+        criteria_revision: {
+          id: "criteria-parked",
+          outcome: "parked approved outcome",
+          criteria: [{ id: "AC-parked", expected_result: "parked-only result", expected_evidence: "private parked evidence" }],
+        },
+        historical_receipt: true,
+      }),
+      makeItem({
+        slice_agreement_ref: "slice-inactive",
+        slice_title: "Agreement-only Slice",
+        scope_status: "INACTIVE",
+        provenance: "AGREEMENT_ONLY",
+        criteria_status: "NOT_RECORDED",
+        criteria_revision: null,
+      }),
+      makeItem({
+        slice_agreement_ref: "slice-preserved",
+        slice_title: "Preserved Slice",
+        scope_status: "PRESERVED",
+        provenance: "PRESERVED_WORK_ITEM",
+      }),
+      makeItem({
+        slice_agreement_ref: "slice-historical",
+        slice_title: "Historical Slice",
+        scope_status: "HISTORICAL",
+        provenance: "TERMINAL_ARCHIVE",
+      }),
+      makeItem({
+        slice_agreement_ref: "slice-other-feature",
+        feature_id: "feature-2",
+        feature_agreement_ref: "feature-ref-2",
+        feature_title: "Different Feature",
+        slice_title: "Queued Slice",
+        scope_status: "QUEUED",
+        provenance: "WORK_QUEUE",
+        operational_state: "READY",
+        criteria_revision: {
+          id: "criteria-queued",
+          outcome: "queued approved outcome",
+          criteria: [{ id: "AC-queued", expected_result: "queued-only result", expected_evidence: "private queued evidence" }],
+        },
+      }),
+    ],
+  }
+  const app = await loadedDashboard(context)
+  const groups = descendants(app.ids.get("active-slice-content")).filter((element) => element.className === "acceptance-feature-group")
+  assert.equal(groups.length, 2)
+  assert.deepEqual(groups.map((group) => group.dataset.featureId), ["feature-1", "feature-2"])
+  assert.equal(descendants(groups[0]).filter((element) => element.className === "acceptance-slice").length, 5)
+  assert.equal(descendants(groups[1]).filter((element) => element.className === "acceptance-slice").length, 1)
+  assert.equal(app.ids.get("active-slice-status").textContent, "Ready for acceptance")
+  const card = (title) => descendants(app.ids.get("active-slice-content")).find((element) =>
+    element.className === "acceptance-slice" && element.textContent.includes(title)
+  )
+  const parked = card("Parked Slice")
+  assert.ok(parked?.textContent.includes("Agreed outcome: parked approved outcome"))
+  assert.ok(parked?.textContent.includes("Parked — current acceptance not evaluated"))
+  assert.ok(parked?.textContent.includes("historical outcome receipt"))
+  assert.ok(parked?.textContent.includes("parked-only result"))
+  assert.equal(parked?.textContent.includes("private parked evidence"), false)
+  const inactive = card("Agreement-only Slice")
+  assert.ok(inactive?.textContent.includes("Current acceptance not evaluated"))
+  assert.ok(inactive?.textContent.includes("Acceptance criteria are not recorded"))
+  assert.ok(card("Preserved Slice")?.textContent.includes("Current acceptance not evaluated"))
+  assert.ok(card("Historical Slice")?.textContent.includes("Current acceptance not evaluated"))
+  const queued = card("Queued Slice")
+  assert.ok(queued?.textContent.includes("Agreed outcome: queued approved outcome"))
+  assert.ok(queued?.textContent.includes("Current acceptance not evaluated"))
+  assert.ok(queued?.textContent.includes("queued-only result"))
+  assert.ok(app.ids.get("active-slice-content").textContent.includes("Archived/history coverage is not exhaustive"))
+})
+
+test("inventory truncation, malformed associations, and unknown states fail closed visibly", async () => {
+  const truncated = makeContext()
+  truncated.slice_acceptance_inventory.total = 40
+  truncated.slice_acceptance_inventory.complete = false
+  truncated.slice_acceptance_inventory.truncated = true
+  const truncatedApp = await loadedDashboard(truncated)
+  assert.ok(truncatedApp.ids.get("active-slice-content").textContent.includes("truncated"))
+  assert.ok(truncatedApp.ids.get("active-slice-status").textContent === "Pending" || truncatedApp.ids.get("active-slice-status").textContent === "Ready for acceptance")
+
+  const malformed = makeContext()
+  malformed.slice_acceptance_inventory.items[0].authority_status = "UNAVAILABLE"
+  assert.equal((await loadedDashboard(malformed)).ids.get("active-slice-status").textContent, "Status unavailable")
+
+  const unknown = makeContext()
+  unknown.slice_acceptance_inventory.items[0].scope_status = "FUTURE_SCOPE"
+  assert.equal((await loadedDashboard(unknown)).ids.get("active-slice-status").textContent, "Status unavailable")
+
+  const invalidShape = makeContext()
+  invalidShape.slice_acceptance_inventory.history_scope = "UNKNOWN"
+  assert.equal((await loadedDashboard(invalidShape)).ids.get("active-slice-status").textContent, "Status unavailable")
 })
 
 test("SSE revision during an in-flight GET hides stale acceptance until a coherent refetch", async () => {
@@ -387,6 +563,101 @@ test("SSE revision during an in-flight GET hides stale acceptance until a cohere
   assert.equal(content.includes("Prior feature"), false)
   assert.equal(content.includes("Intermediate feature"), false)
   assert.deepEqual(app.fetchCalls.map((call) => call.url), ["/api/context", "/api/context", "/api/context"])
+})
+
+test("repository identity changes discard stale responses and stale errors before rendering", async () => {
+  let resolveStaleError
+  let resolveLatest
+  const staleError = new Promise((resolve) => { resolveStaleError = resolve })
+  const latest = new Promise((resolve) => { resolveLatest = resolve })
+  const initial = makeContext({ revision: 19, featureTitle: "Prior root", outcome: "CURRENT" })
+  const current = makeContext({ revision: 2, featureTitle: "New root", sliceTitle: "New-root Slice", outcome: "READY" })
+  current.repository_id = "repository-new"
+  const app = makeDashboard((_url, _options, requestNumber) => {
+    if (requestNumber === 1) return Promise.resolve(makeResponse(initial))
+    if (requestNumber === 2) return staleError
+    if (requestNumber === 3) return latest
+    throw new Error("unexpected extra context request")
+  })
+  await waitFor(() => app.ids.get("active-slice-status").textContent === "Slice accepted")
+  const source = app.sources[0]
+  source.emit("open")
+  await waitFor(() => app.fetchCalls.length === 2)
+  source.emit("revision", { data: JSON.stringify({ repository_id: "repository-new", revision: 2 }) })
+  assert.equal(app.ids.get("active-slice-status").textContent, "Updating")
+  resolveStaleError(makeResponse({}, false))
+  await waitFor(() => app.fetchCalls.length === 3)
+  assert.equal(app.ids.get("active-slice-status").textContent, "Updating")
+  assert.equal(app.ids.get("active-slice-content").textContent.includes("could not be loaded"), false)
+  resolveLatest(makeResponse(current))
+  await waitFor(() => app.ids.get("active-slice-status").textContent === "Ready for acceptance")
+  const content = app.ids.get("active-slice-content").textContent
+  assert.ok(content.includes("New root"))
+  assert.equal(content.includes("Prior root"), false)
+})
+
+test("explicit null repository identity invalidates lower-revision acceptance until the null-root context arrives", async () => {
+  let resolveObsoleteSuccess
+  let rejectObsoleteError
+  let resolveNullContext
+  const obsoleteSuccess = new Promise((resolve) => { resolveObsoleteSuccess = resolve })
+  const obsoleteError = new Promise((_resolve, reject) => { rejectObsoleteError = reject })
+  const nullContext = new Promise((resolve) => { resolveNullContext = resolve })
+  const initial = makeContext({
+    revision: 19,
+    featureTitle: "Prior root",
+    outcome: "CURRENT",
+    verifications: [
+      { status: "VERIFIED", fresh_for_current_workspace: true },
+      { status: "VERIFIED", fresh_for_current_workspace: true },
+    ],
+  })
+  const obsolete = makeContext({ revision: 19, featureTitle: "Obsolete response", outcome: "CURRENT" })
+  const next = makeContext({
+    revision: 3,
+    outcome: null,
+    contextOverrides: {
+      repository_id: null,
+      accepted_slice: null,
+      slice_acceptance_inventory: {
+        ...makeContext().slice_acceptance_inventory,
+        total: 0,
+        items: [],
+      },
+    },
+  })
+  const app = makeDashboard((_url, _options, requestNumber) => {
+    if (requestNumber === 1) return Promise.resolve(makeResponse(initial))
+    if (requestNumber === 2) return obsoleteSuccess
+    if (requestNumber === 3) return obsoleteError
+    if (requestNumber === 4) return nullContext
+    throw new Error("unexpected extra context request")
+  })
+  await waitFor(() => app.ids.get("active-slice-status").textContent === "Slice accepted")
+  assert.ok(statusBadges(app).some((badge) => badge.textContent === "Verified (current)"))
+  const source = app.sources[0]
+  source.emit("open")
+  await waitFor(() => app.fetchCalls.length === 2)
+  source.emit("revision", { data: JSON.stringify({ repository_id: null, revision: 2 }) })
+  assert.equal(app.ids.get("active-slice-status").textContent, "Updating")
+  assert.ok(statusBadges(app).every((badge) => badge.textContent === "Updating"))
+  assert.equal(statusBadges(app).some((badge) => badge.textContent === "Slice accepted" || badge.textContent === "Verified (current)"), false)
+
+  resolveObsoleteSuccess(makeResponse(obsolete))
+  await waitFor(() => app.fetchCalls.length === 3)
+  assert.equal(app.ids.get("active-slice-status").textContent, "Updating")
+  assert.equal(app.ids.get("active-slice-content").textContent.includes("Obsolete response"), false)
+  source.emit("revision", { data: JSON.stringify({ repository_id: null, revision: 3 }) })
+  rejectObsoleteError(new Error("obsolete old-root fetch error"))
+  await waitFor(() => app.fetchCalls.length === 4)
+  assert.equal(app.ids.get("active-slice-status").textContent, "Updating")
+  assert.equal(app.ids.get("active-slice-content").textContent.includes("could not be loaded"), false)
+  assert.equal(statusBadges(app).some((badge) => badge.textContent === "Slice accepted" || badge.textContent === "Verified (current)"), false)
+
+  resolveNullContext(makeResponse(next))
+  await waitFor(() => app.ids.get("active-slice-status").textContent === "No active Slice")
+  assert.equal(app.ids.get("active-slice-content").textContent.includes("Prior root"), false)
+  assert.equal(statusBadges(app).some((badge) => badge.textContent === "Slice accepted" || badge.textContent === "Verified (current)"), false)
 })
 
 test("refresh and dashboard navigation make read-only context requests", async () => {
