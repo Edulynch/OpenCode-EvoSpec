@@ -2853,6 +2853,43 @@ class _StateStore:
                 )
             self.__publish_state_locked(state, strict_directory=True)
 
+    def publish_next_slice(
+        self, state: State, change: Change,
+        agreements: tuple[AgreementRecord, AgreementRecord],
+        criteria: SliceCriteriaRevision,
+    ) -> None:
+        """Publish a new accepted Slice and all of its immutable records under one CAS."""
+        with _state_publish_lock(self.__root):
+            current = self.__check_state_revision(state)
+            if self.__writer_schema_locked(current) != R3B_SCHEMA:
+                raise AtomicFailure("next Slice requires schema-17 authority")
+            if (
+                len(agreements) != 2 or agreements[0].kind != "FEATURE"
+                or agreements[1].kind != "SLICE"
+                or state.agreements != current.agreements + agreements
+                or state.changes != current.changes + (change,)
+                or state.slice_criteria_revisions != current.slice_criteria_revisions + (criteria,)
+                or len(state.slice_criteria_heads) != len(current.slice_criteria_heads) + 1
+                or state.slice_criteria_heads[:-1] != current.slice_criteria_heads
+                or state.slice_criteria_heads[-1].revision_id != criteria.id
+                or state.slice_criteria_heads[-1].slice_agreement_ref != agreements[1].id
+            ):
+                raise AtomicFailure("next Slice must append one exact accepted aggregate")
+            for agreement in agreements:
+                self.__publish_immutable(
+                    f"records/agreements/{agreement.id}.json",
+                    encode_json(_agreement_to_json(agreement)), strict_directory=True,
+                )
+            self.__publish_immutable(
+                f"records/changes/{change.id}.json",
+                encode_json(_change_to_json(change)), strict_directory=True,
+            )
+            self.__publish_immutable(
+                f"records/slice-criteria/{criteria.id}.json",
+                encode_json(_slice_criteria_to_json(criteria)), strict_directory=True,
+            )
+            self.__publish_state_locked(state, strict_directory=True, allow_next_slice=True)
+
     def publish_slice_criteria_revision(self, state: State, revision: SliceCriteriaRevision) -> None:
         """Publish an amendment under the same State CAS as its new head pointer."""
         with _state_publish_lock(self.__root):
@@ -3064,7 +3101,7 @@ class _StateStore:
     def __publish_state_locked(
         self, state: State, *, strict_directory: bool = False, allow_e1_upgrade: bool = False,
         allow_criteria_upgrade: bool = False, allow_r3_upgrade: bool = False,
-        allow_r3b_upgrade: bool = False,
+        allow_r3b_upgrade: bool = False, allow_next_slice: bool = False,
     ) -> None:
         current = self.__check_state_revision(state)
         output_schema = self.__writer_schema_locked(
@@ -3072,7 +3109,10 @@ class _StateStore:
             allow_criteria_upgrade=allow_criteria_upgrade, allow_r3_upgrade=allow_r3_upgrade,
             allow_r3b_upgrade=allow_r3b_upgrade,
         )
-        if current.agreements and state.agreements != current.agreements:
+        if current.agreements and state.agreements != current.agreements and not (
+            allow_next_slice and state.agreements[:len(current.agreements)] == current.agreements
+            and len(state.agreements) == len(current.agreements) + 2
+        ):
             raise AtomicFailure("the original accepted E1 agreements cannot be replaced")
         if (current.e1_schema_upgrade != state.e1_schema_upgrade
                 and not (allow_e1_upgrade and current.e1_schema_upgrade is None

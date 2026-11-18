@@ -2455,8 +2455,10 @@ def validate_state(state: State) -> None:
                 or type(receipt.source_sha256) is not str
                 or re.fullmatch(r"[0-9a-f]{64}", receipt.source_sha256) is None):
             raise StateValidationError("E1 schema upgrade source identity is invalid")
+        # The historical E1 receipt authorizes its original pair, not a permanent
+        # limit on how many later Slice agreements the repository may accept.
         if (initialization is None or receipt.repository_id != initialization.repository_id
-                or len(state.agreements) != 2):
+                or len(state.agreements) < 2):
             raise StateValidationError("E1 schema upgrade receipt does not bind accepted authority")
         feature = next((item for item in state.agreements if item.id == receipt.feature_agreement_ref), None)
         slice_record = next((item for item in state.agreements if item.id == receipt.slice_agreement_ref), None)
@@ -2802,20 +2804,29 @@ def validate_state(state: State) -> None:
             if initial:
                 owning_feature = next(
                     (item for item in state.agreements
-                     if item.kind == "FEATURE" and item.feature_id == agreement.feature_id),
+                     if item.kind == "FEATURE" and item.feature_id == agreement.feature_id
+                     and item.change_id == agreement.change_id),
                     None,
+                )
+                first_statement = (
+                    f"Acepto Feature: {owning_feature.title if owning_feature is not None else ''}; "
+                    f"Slice: {agreement.title}; Task: {agreement.initial_task}; "
+                    f"checkpoint: {agreement.checkpoint}; criterios: {canonical_spec}"
+                )
+                next_statement = (
+                    f"Acepto siguiente Slice de Feature-ID: {agreement.feature_id}; "
+                    f"Feature: {owning_feature.title if owning_feature is not None else ''}; "
+                    f"Slice: {agreement.title}; Task: {agreement.initial_task}; "
+                    f"checkpoint: {agreement.checkpoint}; criterios: {canonical_spec}"
                 )
                 if (
                     owning_feature is None
-                    or
-                    revision.decision_statement is not None
+                    or revision.decision_statement is not None
                     or revision.source_reference != agreement.source_reference
                     or revision.id != f"slice-criteria-{agreement.id.removeprefix('agreement-slice-')}-1"
-                    or agreement.statement != (
-                        f"Acepto Feature: {owning_feature.title if owning_feature is not None else ''}; "
-                        f"Slice: {agreement.title}; Task: {agreement.initial_task}; "
-                        f"checkpoint: {agreement.checkpoint}; criterios: {canonical_spec}"
-                    )
+                    or agreement.statement not in (first_statement, next_statement)
+                    or owning_feature.statement != agreement.statement
+                    or owning_feature.source_reference != agreement.source_reference
                 ):
                     raise StateValidationError("initial criteria must match the exact accepted agreement")
         else:
