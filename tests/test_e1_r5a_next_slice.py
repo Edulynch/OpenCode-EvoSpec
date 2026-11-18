@@ -69,7 +69,10 @@ class FailNextStateDirectory(FileOperations):
 
 
 class NextSliceAcceptanceTests(unittest.TestCase):
-    def setUp(self) -> None:
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        # Each test owns a distinct fixture from construction through cleanup.
+        # This also makes the fixture attributes explicit to static analysis.
         temporary = tempfile.TemporaryDirectory(prefix="evospec-r5a-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
@@ -155,9 +158,11 @@ class NextSliceAcceptanceTests(unittest.TestCase):
         self.assertEqual(len(after.agreements), 4)
         self.assertEqual(len(after.changes), 2)
         self.assertEqual(len(after.slice_criteria_revisions), 2)
-        self.assertEqual(after.active_context.feature_id, before.features[0].id)
-        self.assertEqual(after.active_context.current_work, TASK)
-        self.assertEqual(after.active_context.slice_agreement_ref, after.agreements[3].id)
+        active = after.active_context
+        assert active is not None, "the accepted Slice must activate its Task"
+        self.assertEqual(active.feature_id, before.features[0].id)
+        self.assertEqual(active.current_work, TASK)
+        self.assertEqual(active.slice_agreement_ref, after.agreements[3].id)
         self.assertEqual(after.agreements[3].statement, self.agreement())
         context = json.loads(execute(self.root, '{"action":"context"}'))["context"]
         inventory = context["slice_acceptance_inventory"]
@@ -284,7 +289,9 @@ class NextSliceAcceptanceTests(unittest.TestCase):
         self.assertNotIn("error", result)
         self.assertEqual(result["result"]["code"], "TASK_PROGRESS_RECORDED")
         self.assertEqual(self.state().agreements[0:2], self.first_authority.agreements)
-        self.assertEqual(self.state().work_items[0].context.slice_agreement_ref, self.first_authority.agreements[1].id)
+        original_context = self.state().work_items[0].context
+        assert original_context is not None, "the parked Task retains its original Slice context"
+        self.assertEqual(original_context.slice_agreement_ref, self.first_authority.agreements[1].id)
         self.assertEqual(result["context"]["task_progress"]["report_kind"], "REPORTED_UNVERIFIED")
 
     def test_r5a_09_second_title_collision_is_not_a_new_slice(self):
