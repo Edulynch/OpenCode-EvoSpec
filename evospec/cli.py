@@ -15,6 +15,7 @@ from typing import TextIO
 import unicodedata
 
 from .agent import AgentContext, project_context
+from .continuation_summary import ContinuationSummary, project_continuation
 from .dashboard import DEFAULT_PORT, serve
 from .opencode_integration import IntegrationRegistry, OpenCodeIntegrationInspection, OpenCodeIntegrationProvider
 from .persistence import IntegrationRegistryError, RecoveryError
@@ -508,9 +509,117 @@ def _render_status(context: AgentContext, output: TextIO) -> None:
             )
     elif context.completed_terminal:
         print("History: DONE", file=output)
+    summary = project_continuation(context)
     guidance = _next_guidance(context)
-    next_action = guidance.action.value if guidance.allowed else "-" if guidance.next_action is None else guidance.next_action.value
-    print(f"Next: {next_action} ({guidance.intervention.value}) - {guidance.message}", file=output)
+    if summary.next_action_allowed and summary.next_action == guidance.action.value and guidance.allowed:
+        print(f"Next: {summary.next_action} ({guidance.intervention.value}) - {guidance.message}", file=output)
+    _render_continuation(summary, output)
+
+
+def _render_continuation(summary: ContinuationSummary, output: TextIO) -> None:
+    print(f"Continuation: {summary.status}", file=output)
+    if summary.feature_id is not None:
+        feature = summary.feature_id
+        if summary.feature_title is not None:
+            feature = f"{summary.feature_title} ({feature})"
+        print(f"Feature context: {feature}", file=output)
+    if summary.lifecycle is not None and summary.active_slice is None:
+        print(
+            f"Active lifecycle without accepted Slice: {summary.lifecycle[0]} / {summary.lifecycle[1]}",
+            file=output,
+        )
+    if summary.active_slice is not None and summary.accepted_slice is not None:
+        accepted = summary.accepted_slice
+        print(
+            f"Active Slice: {accepted.slice_title} ({accepted.slice_agreement_ref}) "
+            f"| {summary.active_slice.provenance}",
+            file=output,
+        )
+        print(
+            f"Registered Task: {accepted.task_id} | {accepted.initial_task} "
+            f"| initial checkpoint: {accepted.checkpoint}",
+            file=output,
+        )
+        print(f"Criteria authority: {summary.active_slice.criteria_status}", file=output)
+        verifications = summary.criterion_verification
+        if isinstance(verifications, list):
+            statuses = ", ".join(
+                f"{item['criterion_id']}={item['status']}"
+                for item in verifications if isinstance(item, dict)
+            )
+            if statuses:
+                print(f"Criterion verification: {statuses}", file=output)
+        if summary.task_progress is not None:
+            print(
+                f"Task report: {summary.task_progress.report_kind} "
+                f"| {summary.task_progress.checkpoint} "
+                f"| revision {summary.task_progress.recorded_revision}",
+                file=output,
+            )
+        if summary.slice_outcome_status is not None:
+            print(
+                f"Slice outcome: {summary.slice_outcome_status} "
+                "(does not establish Feature completion)",
+                file=output,
+            )
+    elif summary.status == "EMPTY_SLOT":
+        print("Active Slice: none (no Slice is CURRENT)", file=output)
+    elif summary.status == "SOURCE_UNAVAILABLE":
+        print(f"Continuation source: unavailable ({summary.next_message})", file=output)
+
+    if summary.other_slices:
+        if summary.feature_id is None:
+            label = "Representable Slices (no current Feature selected)"
+        else:
+            label = "Other Slices (not active)"
+        print(f"{label}:", file=output)
+        for item in summary.other_slices:
+            print(
+                f"- {item.slice_title or item.slice_agreement_ref} "
+                f"[{item.scope_status}; {item.provenance}; criteria {item.criteria_status}]"
+                f"{'' if item.criteria_revision is None else f'; revision {item.criteria_revision.id}'}",
+                file=output,
+            )
+    print(
+        f"Slice inventory: {summary.inventory_visible}/{summary.inventory_total} visible; "
+        f"complete={summary.inventory_complete}; truncated={summary.inventory_truncated}; "
+        f"history={summary.inventory_history_scope}",
+        file=output,
+    )
+    print(
+        f"Work queue: {summary.queue_visible}/{summary.queue_total} visible; "
+        f"complete={summary.queue_complete}; next={summary.queue_next_code}; "
+        f"candidates={summary.queue_candidates_total} "
+        f"(complete={summary.queue_candidates_complete}); "
+        f"relations={summary.queue_relations_total} "
+        f"(complete={summary.queue_relations_complete})",
+        file=output,
+    )
+    if summary.terminal_history:
+        print(
+            "Terminal history exists; it is historical and does not by itself prove current Feature completion.",
+            file=output,
+        )
+    print(f"Continuation next: {summary.next_code}", file=output)
+    if summary.next_action is not None and summary.next_options_kind is not None:
+        state = (
+            "allowed" if summary.next_action_allowed is True
+            else "blocked" if summary.next_action_allowed is False
+            else "requires explicit input"
+        )
+        print(f"Continuation action ({state}): {summary.next_action}", file=output)
+    print(f"Continuation guidance: {summary.next_message}", file=output)
+    if summary.decision is not None:
+        print(f"Decision: {summary.decision.decision}", file=output)
+    if summary.next_options:
+        label = {
+            "MATERIAL_DECISION": "Decision options",
+            "QUEUE_CANDIDATES": "Queue candidates (none selected)",
+            "CORE_IDENTIFIED_CANDIDATE": "Core-identified candidate (not active)",
+        }.get(summary.next_options_kind or "", "Options")
+        print(f"{label}: {', '.join(summary.next_options)}", file=output)
+    for value in summary.required_input:
+        print(f"Required: {value}", file=output)
 
 
 def _render_doctor(root: Path, workflow: WorkflowService, output: TextIO) -> int:

@@ -21,6 +21,7 @@ class AcceptanceTests(unittest.TestCase):
                 "agent_protocol.py",
                 "agent_protocol_schema.py",
                 "cli.py",
+                "continuation_summary.py",
                 "opencode_integration.py",
                 "dashboard.py",
                 "discovery.py",
