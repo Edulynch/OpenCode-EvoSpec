@@ -211,3 +211,11 @@ When `product_truth_changed` is `true`, add nonblank `product_truth_content` to 
 The OpenCode V2 local plugin invokes this protocol through provider-neutral and typed tools. Native commands such as `/evospec.context`, `/evospec.init`, `/evospec.start`, `/evospec.status`, `/evospec.clarify`, `/evospec.review`, and `/evospec.converge` are OpenCode commands, not standalone CLI commands. They instruct an OpenCode agent to use context-first protocol actions and preserve revision discipline.
 
 OpenCode is an integration client, not a Core dependency. The protocol remains usable by other agents and callers that can exchange the documented JSON messages.
+
+## R6-B Feature cycles and historical Slice evidence (schema 19)
+
+The read-only `feature_completion` projection now includes `cycle_id`, `cycle_state` (`OPEN` or `CLOSED`), `reopen_receipt_id` and a chronological `history` of reopen/completion receipts. The CLI `status` and agent context use the same Core eligibility projection; neither may migrate state or select work.
+
+**No agent writer reopens a Feature.** The human must use `evospec reopen-feature` in a real terminal with an exact prior closure receipt, reason, purpose and revision, then confirm `ACEPTO <token>`. The atomic schema 18→19 conversion appends an immutable `FeatureReopenReceipt` while preserving schema-18 closures. It does not create or activate a Slice; `accept-next-slice` has its own human gate.
+
+When the new cycle is open, an **accepted terminal historical Slice** may receive fresh coverage via the TTY command `renew-r3b-coverage --slice-agreement-ref`. The existing OpenCode `evospec_criterion_test_r3b` tool can then execute its exact approved descriptor **only with real host permission** and Core's archived-scope/fingerprint validation. The separate `evospec_accept_slice_outcome` tool takes optional `slice_agreement_ref` for this case. Its provider-neutral action is `accept_historical_slice_outcome` with required fields `action`, `expected_revision`, `slice_agreement_ref` and `input_snapshot`; legacy `accept_slice_outcome` remains unchanged. The agent cannot synthesize a reopening or a human coverage decision. Stale evidence blocks closure, and all historical criteria remain applicable by default.

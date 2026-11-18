@@ -246,7 +246,13 @@ class DashboardTests(unittest.TestCase):
                 _ = workflow.new("Add dashboard event stream")
                 changed_revision = workflow.status().revision
                 self.assertGreater(changed_revision, initial_revision)
-                changed = stream.wait_for(lambda frame: frame.event == "revision")
+                # Un intake puede persistir varias revisiones autorizadas antes de terminar.
+                # El stream puede observar alguna intermedia; esperamos la revisión final
+                # sin confundir un evento válido y anterior con un fallo de sincronización.
+                changed = stream.wait_for(
+                    lambda frame: frame.event == "revision"
+                    and json.loads(frame.data) == {"repository_id": repository_id, "revision": changed_revision}
+                )
                 self.assertEqual(json.loads(changed.data), {"repository_id": repository_id, "revision": changed_revision})
 
                 after_change = self._files(root)

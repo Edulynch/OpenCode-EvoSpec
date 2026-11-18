@@ -313,12 +313,34 @@ function coverageSetIdentity(approvals) {
   return JSON.stringify(approvals.map(coverageApprovalIdentity))
 }
 
+function acceptedR3BScope(snapshot, sliceAgreementRef) {
+  // The terminal archive and open Feature cycle are Core-issued read-only
+  // authority. A caller-supplied Slice ID by itself can never enable a test.
+  if (snapshot.accepted_slice?.slice_agreement_ref === sliceAgreementRef) {
+    return snapshot.accepted_slice
+  }
+  const cycle = snapshot.feature_completion
+  const matches = snapshot.slice_acceptance_inventory?.items?.filter((item) =>
+    item?.slice_agreement_ref === sliceAgreementRef &&
+    item?.feature_id === cycle?.feature_id &&
+    item?.scope_status === "HISTORICAL" &&
+    item?.provenance === "TERMINAL_ARCHIVE" &&
+    item?.authority_status === "CANONICAL" &&
+    item?.criteria_status === "RECORDED" &&
+    item?.criteria_revision?.id)
+  if (cycle?.cycle_state !== "OPEN" || !Number.isSafeInteger(cycle.cycle_id) ||
+      cycle.cycle_id < 1 || !Array.isArray(matches) || matches.length !== 1) {
+    throw new Error("R3-B historical evidence requires a human-reopened, terminal accepted Slice")
+  }
+  return matches[0]
+}
+
 function acceptedR3BCriterion(snapshot, args) {
   if (snapshot.revision !== args.expected_revision || snapshot.repository_id !== args.repository_id ||
       snapshot.r3b_schema_ready !== true) {
     throw new Error("R3-B test request is stale or schema 17 is not enabled")
   }
-  const scope = snapshot.accepted_slice
+  const scope = acceptedR3BScope(snapshot, args.slice_agreement_ref)
   const criterion = scope?.criteria_revision?.criteria?.find((item) => item.id === args.criterion_id)
   if (scope?.slice_agreement_ref !== args.slice_agreement_ref ||
       scope.criteria_revision?.id !== args.criteria_revision_id ||
@@ -593,12 +615,14 @@ async function executeAcceptSliceOutcome(runtime, args, context) {
   let before = await inspectR3B(runtime, root, context, args.expected_revision)
   const policy = canonicalR3BPolicy(before)
   const inputSnapshot = canonicalR3BSnapshot(before, before.repository_id)
-  const accepted = before.accepted_slice
+  const accepted = args.slice_agreement_ref
+    ? acceptedR3BScope(before, args.slice_agreement_ref)
+    : before.accepted_slice
   const criteriaRevision = accepted?.criteria_revision?.id
   if (!accepted?.slice_agreement_ref || !criteriaRevision) {
     throw new Error("Core has no current accepted Slice criteria head")
   }
-  if (!["READY", "CURRENT"].includes(before.slice_outcome?.status)) {
+  if (!args.slice_agreement_ref && !["READY", "CURRENT"].includes(before.slice_outcome?.status)) {
     throw new Error(`Slice outcome is not eligible: ${before.slice_outcome?.status || "UNKNOWN"}`)
   }
   const coverage = currentR3BCoverageSet(before, accepted)
@@ -631,20 +655,24 @@ async function executeAcceptSliceOutcome(runtime, args, context) {
   before = await inspectR3B(runtime, root, context, args.expected_revision)
   const afterSnapshot = canonicalR3BSnapshot(before, before.repository_id)
   const afterPolicy = canonicalR3BPolicy(before)
-  if (before.accepted_slice?.slice_agreement_ref !== accepted.slice_agreement_ref ||
-      before.accepted_slice?.criteria_revision?.id !== criteriaRevision ||
+  const afterAccepted = args.slice_agreement_ref
+    ? acceptedR3BScope(before, args.slice_agreement_ref)
+    : before.accepted_slice
+  if (afterAccepted?.slice_agreement_ref !== accepted.slice_agreement_ref ||
+      afterAccepted?.criteria_revision?.id !== criteriaRevision ||
       afterSnapshot.fingerprint !== inputSnapshot.fingerprint ||
       JSON.stringify(afterPolicy) !== JSON.stringify(policy)) {
     throw new Error("Slice outcome scope, policy, or inputs changed while permission was pending")
   }
-  const afterCoverage = currentR3BCoverageSet(before, before.accepted_slice)
+  const afterCoverage = currentR3BCoverageSet(before, afterAccepted)
   if (coverageSetIdentity(afterCoverage) !== coverageSetIdentity(coverage)) {
     throw new Error("Slice outcome known-input contracts changed while permission was pending")
   }
   return executeRequest(runtime, {
-    action: "accept_slice_outcome",
+    action: args.slice_agreement_ref ? "accept_historical_slice_outcome" : "accept_slice_outcome",
     expected_revision: args.expected_revision,
     input_snapshot: inputSnapshot,
+    ...(args.slice_agreement_ref ? { slice_agreement_ref: args.slice_agreement_ref } : {}),
   }, context, { retryStale: false, authorizedRoot: root })
 }
 
@@ -1048,7 +1076,7 @@ const tools = [
     (args, context) => {
       // Keep the E1 capability visible to the host as its own permission-controlled tool.
       if (["accepted_task_progress", "criterion_test_result", "criterion_test_result_r3b",
-        "accept_slice_outcome"].includes(staleRequest(args.request)?.action)) {
+        "accept_slice_outcome", "accept_historical_slice_outcome"].includes(staleRequest(args.request)?.action)) {
         return JSON.stringify({ error: {
           code: "DEDICATED_TOOL_REQUIRED",
           detail: "Use the dedicated host-authorized tool for accepted Task, criterion test evidence, or Slice outcome acceptance",
@@ -1168,8 +1196,9 @@ const tools = [
   ),
   protocolTool(
     "evospec_accept_slice_outcome",
-    "Accept the current schema-17 Slice outcome only when Core proves fresh passing evidence for every accepted criterion; require exact-scope host permission and return its immutable receipt.",
-    object({ expected_revision: nonnegativeInteger }),
+    "Accept an active Slice outcome or explicitly named historical terminal Slice in a human-reopened Feature cycle, only with fresh passing evidence and exact-scope host permission.",
+    object({ expected_revision: nonnegativeInteger,
+      slice_agreement_ref: { type: "string", minLength: 1, maxLength: 2048 } }, ["expected_revision"]),
     (args, context) => executeAcceptSliceOutcome(context.runtime, args, context),
   ),
   protocolTool(

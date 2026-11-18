@@ -65,6 +65,9 @@ ACTION_KEYS = {
         "coverage_approval_id", "coverage_contract_digest",
     )),
     "accept_slice_outcome": frozenset(("action", "expected_revision", "input_snapshot")),
+    "accept_historical_slice_outcome": frozenset((
+        "action", "expected_revision", "input_snapshot", "slice_agreement_ref",
+    )),
     "assess_locks": frozenset(("action", "expected_revision", "assessments")),
     "review": frozenset(("action", "expected_revision", "review")),
     "verify": frozenset(("action", "expected_revision", "verification")),

@@ -472,20 +472,117 @@ class FeatureCompletionReceipt:
     source_reference: str
     source_revision: int
     recorded_revision: int
+    cycle_id: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureReopenReceipt:
+    """Human authorization to continue the same Feature in a new, auditable cycle."""
+
+    id: str
+    repository_id: str
+    feature_id: FeatureId
+    cycle_id: int
+    previous_completion_receipt_id: str
+    reason: str
+    purpose: str
+    input_fingerprint: str
+    statement: str
+    source: str
+    source_reference: str
+    source_revision: int
+    recorded_revision: int
+
+
+def feature_reopen_semantic_id(receipt: FeatureReopenReceipt) -> str:
+    """Identify one human decision without depending on publication timing."""
+    values = [
+        receipt.repository_id, receipt.feature_id, receipt.cycle_id,
+        receipt.previous_completion_receipt_id, receipt.reason, receipt.purpose,
+        receipt.input_fingerprint, receipt.statement, receipt.source,
+        receipt.source_reference,
+    ]
+    return "feature-reopen-" + sha256(json.dumps(
+        values, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()[:20]
+
+
+def feature_reopen_statement_text(
+    *, feature: Feature, cycle_id: int, previous_completion_receipt_id: str,
+    reason: str, purpose: str, repository_id: str, source_revision: int,
+    input_fingerprint: str,
+) -> str:
+    """Keep the exact words approved by a human independently recoverable."""
+    return "\n".join((
+        "EvoSpec: explicit Feature reopening, not Slice acceptance or publication",
+        f"Feature: {feature.title} ({feature.id})",
+        f"New cycle: {cycle_id}",
+        f"Previous completion receipt: {previous_completion_receipt_id}",
+        f"Human reason: {reason}",
+        f"New purpose: {purpose}",
+        f"Repository: {repository_id}",
+        f"Expected revision: {source_revision}",
+        f"Root input fingerprint: {input_fingerprint}",
+        "Schema conversion: 18 to 19 on reopening, or schema 19 retained",
+        "No Slice is created, accepted, activated, or resumed by this decision",
+        "This does not authorize model execution, merge, tags, or release",
+    ))
+
+
+def feature_cycle_completion_statement_text(
+    *, feature: Feature, cycle_id: int, previous_reopen_receipt_id: str,
+    condition: str, repository_id: str, source_revision: int,
+    input_fingerprint: str, feature_agreement_refs: tuple[str, ...],
+    slice_outcomes: tuple[tuple[str, str], ...],
+) -> str:
+    """A later closure must explicitly name its cycle and fresh evidence."""
+    lines = [
+        "EvoSpec: explicit Feature cycle completion, not Slice acceptance or publication",
+        f"Feature: {feature.title} ({feature.id})",
+        f"Cycle: {cycle_id}",
+        f"Reopening authority: {previous_reopen_receipt_id}",
+        f"Human-approved completion condition: {condition}",
+        f"Repository: {repository_id}",
+        f"Expected revision: {source_revision}",
+        f"Root input fingerprint: {input_fingerprint}",
+        "Feature agreement references: " + ", ".join(feature_agreement_refs),
+        "Verified terminal Slices and current outcome receipts:",
+    ]
+    lines.extend(f"- {slice_ref}: {outcome_ref}" for slice_ref, outcome_ref in slice_outcomes)
+    lines.extend((
+        "Schema 19 retained; earlier cycle receipts remain immutable",
+        "This does not authorize model execution, merge, tags, release, or reopening",
+    ))
+    return "\n".join(lines)
 
 
 def feature_completion_semantic_id(receipt: FeatureCompletionReceipt) -> str:
     """Tie a Feature closure to its human decision and immutable Slice evidence."""
-    values = [
+    values: list[object] = [
         receipt.repository_id, receipt.feature_id,
         list(receipt.feature_agreement_refs), receipt.condition,
         list(receipt.slice_agreement_refs), list(receipt.slice_outcome_receipt_ids),
         receipt.input_fingerprint, receipt.statement, receipt.source,
         receipt.source_reference,
     ]
+    # Schema-18 closures retain their original semantic identity byte for byte.
+    if receipt.cycle_id:
+        values.append(receipt.cycle_id)
     return "feature-completion-" + sha256(json.dumps(
         values, ensure_ascii=False, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()[:20]
+
+
+def feature_cycle_status(
+    state: State, feature_id: FeatureId,
+) -> tuple[int, FeatureReopenReceipt | None, FeatureCompletionReceipt | None]:
+    """Derive current cycle authority; historical closures never close a newer cycle."""
+    reopenings = tuple(item for item in state.feature_reopen_receipts if item.feature_id == feature_id)
+    latest_reopen = max(reopenings, key=lambda item: item.cycle_id) if reopenings else None
+    cycle_id = 0 if latest_reopen is None else latest_reopen.cycle_id
+    closure = next((item for item in state.feature_completion_receipts
+                    if item.feature_id == feature_id and item.cycle_id == cycle_id), None)
+    return cycle_id, latest_reopen, closure
 
 
 def feature_completion_statement_text(
@@ -494,6 +591,7 @@ def feature_completion_statement_text(
     feature_agreement_refs: tuple[str, ...],
     slice_outcomes: tuple[tuple[str, str], ...],
     previous_closure_exists: bool,
+    schema19_retained: bool = False,
 ) -> str:
     """Render the exact human decision also required when recovering its receipt."""
     lines = [
@@ -508,9 +606,11 @@ def feature_completion_statement_text(
     ]
     lines.extend(f"- {slice_ref}: {outcome_ref}" for slice_ref, outcome_ref in slice_outcomes)
     lines.append(
+        "Schema 19 retained; no automatic legacy migration"
+        if schema19_retained else
         "Schema 18 retained; no automatic legacy migration"
-        if previous_closure_exists
-        else "Schema conversion: 17 to 18 on first closure; no automatic legacy migration"
+        if previous_closure_exists else
+        "Schema conversion: 17 to 18 on first closure; no automatic legacy migration"
     )
     lines.append("This does not authorize model execution, merge, tags, release, or reopening")
     return "\n".join(lines)
@@ -1265,6 +1365,7 @@ class State:
     slice_outcome_receipts: tuple[SliceOutcomeReceipt, ...] = ()
     criterion_coverage_approvals: tuple[CriterionCoverageApproval, ...] = ()
     feature_completion_receipts: tuple[FeatureCompletionReceipt, ...] = ()
+    feature_reopen_receipts: tuple[FeatureReopenReceipt, ...] = ()
 
 
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -3385,23 +3486,70 @@ def validate_state(state: State) -> None:
     ):
         raise StateValidationError("Feature completion receipts must be immutable records")
     _unique((item.id for item in state.feature_completion_receipts), "Feature completion receipt")
-    _unique((item.feature_id for item in state.feature_completion_receipts), "completed Feature")
+    _unique(((item.feature_id, item.cycle_id) for item in state.feature_completion_receipts), "completed Feature cycle")
+    if type(state.feature_reopen_receipts) is not tuple or any(
+        type(item) is not FeatureReopenReceipt for item in state.feature_reopen_receipts
+    ):
+        raise StateValidationError("Feature reopening receipts must be immutable records")
+    _unique((item.id for item in state.feature_reopen_receipts), "Feature reopening receipt")
+    _unique(((item.feature_id, item.cycle_id) for item in state.feature_reopen_receipts), "reopened Feature cycle")
+    closures_by_cycle = {(item.feature_id, item.cycle_id): item for item in state.feature_completion_receipts}
+    reopens_by_cycle = {(item.feature_id, item.cycle_id): item for item in state.feature_reopen_receipts}
+    for reopening in state.feature_reopen_receipts:
+        if type(reopening.cycle_id) is not int or type(reopening.statement) is not str:
+            raise StateValidationError("Feature reopening receipt has invalid primitive fields")
+        previous = closures_by_cycle.get((reopening.feature_id, reopening.cycle_id - 1))
+        feature = records.features.get(reopening.feature_id)
+        if (
+            state.initialization is None or feature is None or feature.side_of is not None
+            or reopening.repository_id != state.initialization.repository_id
+            or type(reopening.cycle_id) is not int or reopening.cycle_id < 1
+            or previous is None or reopening.previous_completion_receipt_id != previous.id
+            or previous.recorded_revision > reopening.source_revision
+            or any(type(value) is not str or not value.strip() or value != value.strip()
+                   or len(value) > 2048 for value in (reopening.reason, reopening.purpose))
+            or not is_sha256_digest(reopening.input_fingerprint)
+            or reopening.source != "INTERACTIVE_TERMINAL"
+            or reopening.source_reference != "tty:" + sha256(reopening.statement.encode("utf-8")).hexdigest()[:12]
+            or reopening.source_revision < 0
+            or reopening.recorded_revision != reopening.source_revision + 1
+            or reopening.recorded_revision > state.revision
+            or reopening.id != feature_reopen_semantic_id(reopening)
+            or reopening.statement != feature_reopen_statement_text(
+                feature=feature, cycle_id=reopening.cycle_id,
+                previous_completion_receipt_id=previous.id, reason=reopening.reason,
+                purpose=reopening.purpose, repository_id=reopening.repository_id,
+                source_revision=reopening.source_revision,
+                input_fingerprint=reopening.input_fingerprint,
+            )
+        ):
+            raise StateValidationError("Feature reopening receipt authority is invalid")
     outcomes_by_id = {item.id: item for item in state.slice_outcome_receipts}
     for closure in state.feature_completion_receipts:
+        # Old Slice agreements are a prefix of the append-only agreement ledger.
+        # New-cycle Slices may extend that ledger without rewriting past closures.
+        feature_records = tuple(item for item in state.agreements
+                                if item.kind == "FEATURE" and item.feature_id == closure.feature_id)
+        slice_records = tuple(item for item in state.agreements
+                              if item.kind == "SLICE" and item.feature_id == closure.feature_id)
         expected_features = tuple(sorted(
-            item.id for item in state.agreements
-            if item.kind == "FEATURE" and item.feature_id == closure.feature_id
+            item.id for item in feature_records[:len(closure.feature_agreement_refs)]
         ))
         expected_slices = tuple(sorted(
-            item.id for item in state.agreements
-            if item.kind == "SLICE" and item.feature_id == closure.feature_id
+            item.id for item in slice_records[:len(closure.slice_agreement_refs)]
         ))
+        reopening = reopens_by_cycle.get((closure.feature_id, closure.cycle_id))
+        previous = closures_by_cycle.get((closure.feature_id, closure.cycle_id - 1))
         selected = tuple(outcomes_by_id.get(identity) for identity in closure.slice_outcome_receipt_ids)
         if (
             state.initialization is None
             or closure.repository_id != state.initialization.repository_id
             or closure.feature_id not in records.features
             or not expected_features or not expected_slices
+            or (closure.cycle_id == 0 and reopening is not None)
+            or (closure.cycle_id > 0 and (reopening is None or previous is None
+                or reopening.recorded_revision > closure.source_revision))
+            or type(closure.cycle_id) is not int or closure.cycle_id < 0
             or closure.feature_agreement_refs != expected_features
             or closure.slice_agreement_refs != expected_slices
             or len(closure.slice_outcome_receipt_ids) != len(expected_slices)
@@ -3437,6 +3585,16 @@ def validate_state(state: State) -> None:
                 other is not closure and other.recorded_revision <= closure.source_revision
                 for other in state.feature_completion_receipts
             ),
+            schema19_retained=any(item.recorded_revision <= closure.source_revision
+                                  for item in state.feature_reopen_receipts),
+        ) if closure.cycle_id == 0 else feature_cycle_completion_statement_text(
+            feature=records.features[closure.feature_id], cycle_id=closure.cycle_id,
+            previous_reopen_receipt_id=reopening.id if reopening is not None else "",
+            condition=closure.condition, repository_id=closure.repository_id,
+            source_revision=closure.source_revision,
+            input_fingerprint=closure.input_fingerprint,
+            feature_agreement_refs=closure.feature_agreement_refs,
+            slice_outcomes=tuple(zip(closure.slice_agreement_refs, closure.slice_outcome_receipt_ids)),
         )
         if closure.statement != expected_statement:
             raise StateValidationError("Feature completion statement differs from its human-approved basis")

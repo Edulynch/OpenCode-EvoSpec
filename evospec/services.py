@@ -89,6 +89,11 @@ from .domain import (
     CriterionCoverageDeclaration,
     SliceOutcomeReceipt,
     FeatureCompletionReceipt,
+    FeatureReopenReceipt,
+    feature_cycle_status,
+    feature_reopen_semantic_id,
+    feature_reopen_statement_text,
+    feature_cycle_completion_statement_text,
     feature_completion_semantic_id,
     feature_completion_statement_text,
     TaskProgress,
@@ -193,6 +198,10 @@ class FeatureCompletionEligibility:
     receipt_id: str | None
     blockers: tuple[str, ...]
     slice_agreement_refs: tuple[str, ...] = ()
+    cycle_id: int = 0
+    cycle_state: str = "OPEN"
+    reopen_receipt_id: str | None = None
+    history: tuple[tuple[int, str | None, str | None], ...] = ()
 
 
 _PYTHON_TEST_RUNNER = (
@@ -415,11 +424,51 @@ def _accepted_e1_scope(state: State, root: Path) -> tuple[WorkingContext, Agreem
     return context, feature, slice_record
 
 
+def _evidence_scope(
+    state: State, root: Path, slice_agreement_ref: str | None,
+) -> tuple[WorkingContext, AgreementRecord]:
+    """Resolve active evidence, or a terminal Slice in an explicitly open cycle.
+
+    A supplied reference alone confers no authority: the immutable archive,
+    original agreement, exact root and current Feature cycle must agree.
+    """
+    if slice_agreement_ref is None:
+        context, _, accepted = _accepted_e1_scope(state, root)
+        return context, accepted
+    if type(slice_agreement_ref) is not str or not slice_agreement_ref:
+        raise ServiceError("historical evidence requires an exact Slice agreement reference")
+    try:
+        active_context, _, active = _accepted_e1_scope(state, root)
+        if active.id == slice_agreement_ref:
+            return active_context, active
+    except ServiceError:
+        pass
+    accepted = next((item for item in state.agreements
+                     if item.kind == "SLICE" and item.id == slice_agreement_ref), None)
+    if accepted is None or state.initialization is None:
+        raise ServiceError("historical evidence Slice agreement is unavailable")
+    expected_root = sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+    if accepted.repository_id != expected_root or state.initialization.repository_id != expected_root:
+        raise ServiceError("historical evidence belongs to a different repository root")
+    cycle_id, _, closure = feature_cycle_status(state, accepted.feature_id)
+    if cycle_id < 1 or closure is not None:
+        raise ServiceError("historical evidence requires a human-reopened active Feature cycle")
+    archives = tuple(item for item in state.terminal_archives
+                     if item.context.slice_agreement_ref == accepted.id)
+    if (len(archives) != 1 or archives[0].context.status is not LifecycleState.ACCEPTED
+            or archives[0].context.feature_id != accepted.feature_id
+            or archives[0].context.change_id != accepted.change_id
+            or archives[0].context.side_of is not None):
+        raise ServiceError("historical evidence requires a unique accepted terminal Slice")
+    return archives[0].context, accepted
+
+
 def _normalize_coverage_declarations(
     state: State,
     root: Path,
     snapshot: InputSnapshot,
     declarations: tuple[CriterionCoverageDeclaration, ...],
+    slice_agreement_ref: str | None = None,
 ) -> tuple[CriterionCoverageDeclaration, ...]:
     if type(declarations) is not tuple or any(
         type(item) is not CriterionCoverageDeclaration
@@ -436,7 +485,7 @@ def _normalize_coverage_declarations(
         for item in declarations
     ):
         raise ServiceError("coverage declarations must be an explicit immutable tuple")
-    context, _, accepted = _accepted_e1_scope(state, root)
+    context, accepted = _evidence_scope(state, root, slice_agreement_ref)
     del context
     head = next(
         (item for item in state.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
@@ -526,8 +575,9 @@ def _coverage_approvals(
     source_reference: str,
     source_revision: int,
     recorded_revision: int,
+    slice_agreement_ref: str | None = None,
 ) -> tuple[CriterionCoverageApproval, ...]:
-    _, _, accepted = _accepted_e1_scope(state, root)
+    _, accepted = _evidence_scope(state, root, slice_agreement_ref)
     head = next(
         (item for item in state.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
         None,
@@ -649,7 +699,7 @@ def _record_change(current: State, change: Change) -> State:
     feature = next((item for item in current.features if item.id == change.feature_id), None)
     if feature is None or feature.side_of is not None:
         raise ServiceError("primary change requires an authoritative primary feature")
-    if any(item.feature_id == feature.id for item in current.feature_completion_receipts):
+    if feature_cycle_status(current, feature.id)[2] is not None:
         raise ServiceError("REOPEN_DECISION_REQUIRED: completed Feature cannot gain new work")
     if current.active_context is not None or current.preserved_primary_context is not None:
         raise ServiceError("primary change requires no active work")
@@ -2104,7 +2154,7 @@ class CoreService:
         feature = next((item for item in current.features if str(item.id) == feature_id and item.side_of is None), None)
         if feature is None:
             raise ServiceError("existing primary Feature-ID was not found")
-        if any(item.feature_id == feature.id for item in current.feature_completion_receipts):
+        if feature_cycle_status(current, feature.id)[2] is not None:
             raise ServiceError("REOPEN_DECISION_REQUIRED: Feature completion is immutable")
         original = next((
             item for item in current.agreements if item.kind == "FEATURE" and item.feature_id == feature.id
@@ -2529,6 +2579,7 @@ class CoreService:
         self,
         state: State,
         declarations: tuple[CriterionCoverageDeclaration, ...],
+        slice_agreement_ref: str | None = None,
     ) -> str:
         """Display an exact current-root proposal for TTY-only coverage renewal."""
         current = _authoritative_state(self.__persistence, state)
@@ -2538,9 +2589,9 @@ class CoreService:
         if snapshot_state != current:
             raise ServiceError("coverage renewal authority changed while preparing approval")
         normalized = _normalize_coverage_declarations(
-            current, self.__repository_root, snapshot, declarations,
+            current, self.__repository_root, snapshot, declarations, slice_agreement_ref,
         )
-        _, _, accepted = _accepted_e1_scope(current, self.__repository_root)
+        _, accepted = _evidence_scope(current, self.__repository_root, slice_agreement_ref)
         head = next(
             (item for item in current.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
             None,
@@ -2564,9 +2615,10 @@ class CoreService:
         state: State,
         decision: UserAcceptance,
         declarations: tuple[CriterionCoverageDeclaration, ...],
+        slice_agreement_ref: str | None = None,
     ) -> State:
         current = _authoritative_state(self.__persistence, state)
-        statement = self.r3b_coverage_renewal_statement(current, declarations)
+        statement = self.r3b_coverage_renewal_statement(current, declarations, slice_agreement_ref)
         source_digest = statement.rsplit("state-sha256: ", 1)[1]
         if self.__persistence.state_source_sha256() != source_digest:
             raise ServiceError("coverage source authority changed after approval was displayed")
@@ -2583,7 +2635,7 @@ class CoreService:
         if snapshot_state != current or f"root-input-fingerprint: {snapshot.fingerprint};" not in statement:
             raise ServiceError("coverage root inputs changed after terminal approval")
         normalized = _normalize_coverage_declarations(
-            current, self.__repository_root, snapshot, declarations,
+            current, self.__repository_root, snapshot, declarations, slice_agreement_ref,
         )
 
         def renew(locked: State) -> State:
@@ -2592,6 +2644,7 @@ class CoreService:
             new_approvals = _coverage_approvals(
                 locked, self.__repository_root, snapshot, normalized,
                 statement, expected_ref, locked.revision, locked.revision + 1,
+                slice_agreement_ref,
             )
             existing = {item.id: item for item in locked.criterion_coverage_approvals}
             additions = tuple(
@@ -2628,9 +2681,13 @@ class CoreService:
         self,
         state: State,
         snapshot: InputSnapshot,
+        slice_agreement_ref: str | None = None,
     ) -> tuple[CriterionCoverageApproval, ...]:
         current = _authoritative_state(self.__persistence, state)
-        return self._current_r3b_coverage_approvals(current, snapshot)
+        if slice_agreement_ref is None:
+            return self._current_r3b_coverage_approvals(current, snapshot)
+        _, accepted = _evidence_scope(current, self.__repository_root, slice_agreement_ref)
+        return self._current_r3b_coverage_approvals(current, snapshot, accepted)
 
     def _current_r3b_coverage_approvals(
         self,
@@ -2842,7 +2899,9 @@ class CoreService:
             raise ServiceError("R3-B workspace fingerprint changed before test evidence recording")
         matching_approval = next(
             (
-                item for item in self.current_r3b_coverage_approvals(current, observed_snapshot)
+                item for item in self.current_r3b_coverage_approvals(
+                    current, observed_snapshot, slice_agreement_ref,
+                )
                 if item.id == coverage_approval_id
                 and item.contract_digest == coverage_contract_digest
                 and item.root_fingerprint == input_fingerprint_before
@@ -2881,7 +2940,7 @@ class CoreService:
         def record(locked: State) -> State:
             if locked != current or locked.r3b_schema_upgrade is None:
                 raise ServiceError("R3-B requires exact converted schema-17 authority")
-            _, _, accepted = _accepted_e1_scope(locked, self.__repository_root)
+            _, accepted = _evidence_scope(locked, self.__repository_root, slice_agreement_ref)
             head = next(
                 (item for item in locked.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
                 None,
@@ -3108,11 +3167,16 @@ class CoreService:
 
     def slice_outcome_eligibility(
         self, state: State, snapshot: InputSnapshot,
+        slice_agreement_ref: str | None = None,
     ) -> SliceOutcomeEligibility:
         current = _authoritative_state(self.__persistence, state)
-        candidate, blockers = self._slice_outcome_candidate(current, snapshot)
+        scope = None if slice_agreement_ref is None else _evidence_scope(
+            current, self.__repository_root, slice_agreement_ref,
+        )
+        candidate, blockers = self._slice_outcome_candidate(current, snapshot, scope)
         context = current.active_context
-        slice_ref = None if context is None else context.slice_agreement_ref
+        slice_ref = (slice_agreement_ref if slice_agreement_ref is not None
+                     else None if context is None else context.slice_agreement_ref)
         history = tuple(
             item for item in current.slice_outcome_receipts
             if item.slice_agreement_ref == slice_ref
@@ -3132,14 +3196,20 @@ class CoreService:
             status = "READY"
         return SliceOutcomeEligibility(status, latest_id, blockers)
 
-    def accept_slice_outcome(self, state: State, snapshot: InputSnapshot) -> State:
+    def accept_slice_outcome(
+        self, state: State, snapshot: InputSnapshot,
+        slice_agreement_ref: str | None = None,
+    ) -> State:
         """Append one objective Slice outcome without changing lifecycle or Product Truth."""
         current = _authoritative_state(self.__persistence, state)
 
         def accept(locked: State) -> State:
             if locked != current or locked.r3b_schema_upgrade is None:
                 raise ServiceError("R3-B acceptance requires exact schema-17 authority")
-            receipt, blockers = self._slice_outcome_candidate(locked, snapshot)
+            scope = None if slice_agreement_ref is None else _evidence_scope(
+                locked, self.__repository_root, slice_agreement_ref,
+            )
+            receipt, blockers = self._slice_outcome_candidate(locked, snapshot, scope)
             if receipt is None:
                 raise ServiceError("Slice outcome is blocked: " + ", ".join(blockers))
             if any(item.id == receipt.id for item in locked.slice_outcome_receipts):
@@ -3265,17 +3335,27 @@ class CoreService:
     ) -> FeatureCompletionEligibility:
         """Inspect a Feature without creating a receipt, running tests, or selecting work."""
         current = _authoritative_state(self.__persistence, state)
-        previous = next((
-            item for item in current.feature_completion_receipts if str(item.feature_id) == feature_id
-        ), None)
+        cycle_id, reopening, previous = feature_cycle_status(current, FeatureId(feature_id))
+        history = tuple((index, next((item.id for item in current.feature_reopen_receipts
+                                      if str(item.feature_id) == feature_id and item.cycle_id == index), None),
+                         next((item.id for item in current.feature_completion_receipts
+                               if str(item.feature_id) == feature_id and item.cycle_id == index), None))
+                        for index in range(cycle_id + 1))
         if previous is not None:
-            return FeatureCompletionEligibility("COMPLETE", previous.id, (), previous.slice_agreement_refs)
+            return FeatureCompletionEligibility(
+                "COMPLETE", previous.id, (), previous.slice_agreement_refs,
+                cycle_id, "CLOSED", None if reopening is None else reopening.id, history,
+            )
         if snapshot is None:
-            return FeatureCompletionEligibility("BLOCKED", None, ("INPUT_SNAPSHOT_UNAVAILABLE",))
+            return FeatureCompletionEligibility(
+                "BLOCKED", None, ("INPUT_SNAPSHOT_UNAVAILABLE",), (),
+                cycle_id, "OPEN", None if reopening is None else reopening.id, history,
+            )
         _, slices, _, blockers = self._feature_completion_basis(current, feature_id, snapshot)
         return FeatureCompletionEligibility(
             "BLOCKED" if blockers else "READY_FOR_HUMAN_DECISION", None,
             blockers, tuple(item.id for item in slices),
+            cycle_id, "OPEN", None if reopening is None else reopening.id, history,
         )
 
     def feature_completion_statement(
@@ -3285,9 +3365,7 @@ class CoreService:
         current = _authoritative_state(self.__persistence, state)
         if type(condition) is not str or not condition.strip() or len(condition) > 2048:
             raise ServiceError("Feature completion condition must be explicit bounded text")
-        previous = next((
-            item for item in current.feature_completion_receipts if str(item.feature_id) == feature_id
-        ), None)
+        cycle_id, reopening, previous = feature_cycle_status(current, FeatureId(feature_id))
         if previous is not None:
             if previous.condition != condition:
                 raise ServiceError("Feature is already complete with a different human condition")
@@ -3298,6 +3376,17 @@ class CoreService:
         feature = next(item for item in current.features if str(item.id) == feature_id)
         # Use the same canonical wording as the durable-state validator; a
         # terminal decision must never mean something different after restart.
+        if cycle_id:
+            assert reopening is not None
+            return feature_cycle_completion_statement_text(
+                feature=feature, condition=condition.strip(),
+                repository_id=snapshot.repository_id, source_revision=current.revision,
+                input_fingerprint=snapshot.fingerprint,
+                feature_agreement_refs=tuple(item.id for item in features),
+                slice_outcomes=tuple((record.id, receipt.id) for record, receipt in zip(slices, outcomes)),
+                cycle_id=cycle_id,
+                previous_reopen_receipt_id=reopening.id,
+            )
         return feature_completion_statement_text(
             feature=feature, condition=condition.strip(),
             repository_id=snapshot.repository_id, source_revision=current.revision,
@@ -3305,6 +3394,7 @@ class CoreService:
             feature_agreement_refs=tuple(item.id for item in features),
             slice_outcomes=tuple((record.id, receipt.id) for record, receipt in zip(slices, outcomes)),
             previous_closure_exists=bool(current.feature_completion_receipts),
+            schema19_retained=bool(current.feature_reopen_receipts),
         )
 
     def complete_feature(
@@ -3321,7 +3411,8 @@ class CoreService:
             or acceptance.statement != statement or acceptance.source_reference != reference
         ):
             raise ServiceError("Feature completion requires the exact human terminal decision")
-        if any(str(item.feature_id) == feature_id for item in current.feature_completion_receipts):
+        cycle_id, _, previous = feature_cycle_status(current, FeatureId(feature_id))
+        if previous is not None:
             return current
 
         def close(locked: State) -> State:
@@ -3338,6 +3429,7 @@ class CoreService:
                 tuple(item.id for item in slices), tuple(item.id for item in outcomes),
                 snapshot.fingerprint, statement, acceptance.source,
                 acceptance.source_reference, locked.revision, locked.revision + 1,
+                cycle_id,
             )
             receipt = replace(receipt, id=feature_completion_semantic_id(receipt))
             return _prepare_state_publication(replace(
@@ -3347,6 +3439,88 @@ class CoreService:
         try:
             return self.__persistence.transact_feature_completion(
                 current.revision, close, expected_input_fingerprint=snapshot.fingerprint,
+            )
+        except AtomicFailure as error:
+            self.__raise_e1_publication_error(current.revision, error)
+
+    def feature_reopening_statement(
+        self, state: State, feature_id: str, previous_receipt_id: str,
+        reason: str, purpose: str, snapshot: InputSnapshot,
+    ) -> str:
+        """Describe the next cycle without selecting or activating any work."""
+        current = _authoritative_state(self.__persistence, state)
+        if any(type(value) is not str or not value.strip() or value != value.strip()
+               or len(value) > 2048 for value in (feature_id, previous_receipt_id, reason, purpose)):
+            raise ServiceError("reopening identity, reason and purpose must be exact bounded text")
+        feature = next((item for item in current.features
+                        if str(item.id) == feature_id and item.side_of is None), None)
+        if feature is None or current.initialization is None:
+            raise ServiceError("reopening requires an existing accepted primary Feature")
+        cycle_id, _, prior = feature_cycle_status(current, feature.id)
+        if prior is None or prior.id != previous_receipt_id:
+            raise ServiceError("reopening requires the exact current completion receipt")
+        if (snapshot.repository_id != current.initialization.repository_id
+                or current.initialization.repository_id != sha256(str(self.__repository_root).encode()).hexdigest()[:16]
+                or snapshot.version != INPUT_FINGERPRINT_VERSION
+                or snapshot.policy_id != INPUT_POLICY_ID
+                or snapshot.policy_digest != INPUT_POLICY_DIGEST):
+            raise ServiceError("reopening root authority differs from the expected repository")
+        if any(context is not None and context.feature_id == feature.id
+               for context in (current.active_context, current.preserved_primary_context,
+                               None if current.parked_work is None else current.parked_work.context,
+                               None if current.parked_work is None
+                               else current.parked_work.preserved_primary_context)):
+            raise ServiceError("reopening requires all Feature contexts to be terminal")
+        if any(item.operational_state is not OperationalState.DONE
+               and ((item.context is not None and item.context.feature_id == feature.id)
+                    or (item.preserved_primary_context is not None
+                        and item.preserved_primary_context.feature_id == feature.id))
+               for item in current.work_items):
+            raise ServiceError("reopening requires all Feature work items to be terminal")
+        if (current.pending_intake is not None
+                and current.pending_intake.deferred_from_feature_id == feature.id
+                or current.deferred_side_request is not None
+                and current.deferred_side_request.primary_feature_id == feature.id):
+            raise ServiceError("reopening cannot consume pending intake or parked work")
+        return feature_reopen_statement_text(
+            feature=feature, cycle_id=cycle_id + 1, previous_completion_receipt_id=prior.id,
+            reason=reason, purpose=purpose, repository_id=snapshot.repository_id,
+            source_revision=current.revision, input_fingerprint=snapshot.fingerprint,
+        )
+
+    def reopen_feature(
+        self, state: State, feature_id: str, previous_receipt_id: str,
+        reason: str, purpose: str, acceptance: UserAcceptance, snapshot: InputSnapshot,
+    ) -> State:
+        """Persist only an append-only cycle decision under the human-approved root."""
+        current = _authoritative_state(self.__persistence, state)
+        statement = self.feature_reopening_statement(
+            current, feature_id, previous_receipt_id, reason, purpose, snapshot,
+        )
+        reference = "tty:" + sha256(statement.encode("utf-8")).hexdigest()[:12]
+        if (type(acceptance) is not UserAcceptance
+                or acceptance.source != "INTERACTIVE_TERMINAL"
+                or acceptance.statement != statement or acceptance.source_reference != reference):
+            raise ServiceError("Feature reopening requires its exact human terminal decision")
+        cycle_id, _, _ = feature_cycle_status(current, FeatureId(feature_id))
+
+        def reopen(locked: State) -> State:
+            if locked != current:
+                raise ServiceError("Feature reopening authority changed after confirmation")
+            receipt = FeatureReopenReceipt(
+                "", snapshot.repository_id, FeatureId(feature_id), cycle_id + 1,
+                previous_receipt_id, reason, purpose, snapshot.fingerprint,
+                statement, acceptance.source, acceptance.source_reference,
+                locked.revision, locked.revision + 1,
+            )
+            receipt = replace(receipt, id=feature_reopen_semantic_id(receipt))
+            return _prepare_state_publication(replace(
+                locked, feature_reopen_receipts=locked.feature_reopen_receipts + (receipt,),
+            ), locked.revision)
+
+        try:
+            return self.__persistence.transact_feature_reopening(
+                current.revision, reopen, expected_input_fingerprint=snapshot.fingerprint,
             )
         except AtomicFailure as error:
             self.__raise_e1_publication_error(current.revision, error)

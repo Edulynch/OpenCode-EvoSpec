@@ -71,7 +71,7 @@ The package installation above is the normal source-based path and also provides
 
 ## Lifecycle Commands
 
-The lifecycle surface contains `init`, `new`, `change`, `clarify`, `continue`, `status`, and `review`, plus narrowly scoped E1 `accept-slice`, `accept-next-slice`, `revise-slice-criteria`, and R6-A `complete-feature` terminal-confirmed commands. The separate `ui` dashboard and `doctor` diagnostic are read-only local commands.
+The lifecycle surface contains `init`, `new`, `change`, `clarify`, `continue`, `status`, and `review`, plus narrowly scoped E1 `accept-slice`, `accept-next-slice`, `revise-slice-criteria`, R6-A `complete-feature`, and R6-B `reopen-feature` terminal-confirmed commands. The separate `ui` dashboard and `doctor` diagnostic are read-only local commands.
 
 ### `accept-slice` (E1 first Slice, explicit human consent)
 
@@ -150,7 +150,30 @@ evospec complete-feature --feature-id 'feature-EXACT-ID' --condition 'All agreed
 
 The values above are **examples**. The CLI prints the exact Feature identity, the condition you supply, all matching Feature agreements, every included Slice and outcome receipt, the root fingerprint, State revision, and first schema conversion (**17→18**). Enter the displayed `ACEPTO <token>` only after reviewing the whole statement. If the original Feature agreement does not express its own completion condition, this is a **new explicit human material decision**, stored together with its immutable completion receipt. Schema 17 stays readable; the conversion to 18 happens only after this terminal decision and a fresh in-lock root scan. No project is migrated by a read-only status query.
 
-Successful completion commits **one new State revision** and an immutable Feature receipt without changing the previous agreements, Slice outcome receipts, archives or Product Truth. An identical retry returns `ALREADY_COMPLETED` without a new write. A subsequent Slice request against that Feature fails with `REOPEN_DECISION_REQUIRED`; reopening is intentionally outside R6-A and needs a future separate agreement. `evospec status` and the OpenCode `evospec_context` tool expose the same read-only completion status, blockers and receipt identity. No model run, merge, tag, release or GitHub issue closure follows from this command.
+Successful completion commits **one new State revision** and an immutable Feature receipt without changing the previous agreements, Slice outcome receipts, archives or Product Truth. An identical retry returns `ALREADY_COMPLETED` without a new write. A subsequent Slice request against that Feature fails with `REOPEN_DECISION_REQUIRED` until the separate R6-B human reopening gate is approved. `evospec status` and the OpenCode `evospec_context` tool expose the same read-only completion status, blockers and receipt identity. No model run, merge, tag, release or GitHub issue closure follows from this command.
+
+### `reopen-feature` (R6-B, explicit new Feature cycle)
+
+Only a **completed Feature** may be reopened, preserving its existing Feature-ID. Inspect `evospec status` for the current cycle, prior Feature completion receipt and State revision. In a real PowerShell terminal:
+
+```powershell
+cd 'D:\WORKSPACE\Personal\Tools\YourConsumerProject'
+git branch --show-current
+evospec status
+evospec reopen-feature --feature-id 'feature-EXACT-ID' --previous-receipt-id 'feature-completion-EXACT-ID' --reason 'New requirement approved by the user' --purpose 'Continue with the next auditable Slice' --expected-revision 13
+```
+
+All identities and revisions above are **examples**, not defaults. The CLI displays the exact Feature, prior completion, reason, purpose, root fingerprint and prospective new cycle. Only the human may enter `ACEPTO <token>` to authorize one atomic schema 18→19 conversion and append one immutable `FeatureReopenReceipt`. Exact identical retries return `ALREADY_REOPENED` without advancing the revision. Incorrect roots, receipts, revisions, decisions or nonterminal contexts fail closed.
+
+Reopening **does not create, accept, activate or resume a Slice**. The next Slice requires a separate `accept-next-slice` TTY agreement. Earlier completions remain valid history; a later `complete-feature` binds the new cycle and requires fresh evidence for **every applicable Slice**.
+
+After a root change, old Slice coverage and tests become stale. An archived accepted Slice can obtain fresh human-approved coverage while its Feature cycle is open:
+
+```powershell
+evospec renew-r3b-coverage --slice-agreement-ref 'agreement-slice-EXACT-ID' --coverage-file '.\r3b-coverage.json' --expected-revision 14
+```
+
+The host may then execute the separately permitted `evospec_criterion_test_r3b` for that historical Slice and `evospec_accept_slice_outcome` with `slice_agreement_ref` to publish its current outcome. Core verifies the terminal archive, original agreement and fingerprint without activating the Task. No tests or models run automatically, and no old criterion is silently excluded. CLI and agent status display the same read-only cycle chronology; reads never migrate schema.
 
 For a material amendment, first read `evospec status` or the read-only `evospec_context` result to obtain the **current** criteria revision. Write the replacement complete JSON mini-spec and use:
 
