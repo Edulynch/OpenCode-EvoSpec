@@ -88,6 +88,8 @@ from .domain import (
     CriterionCoverageApproval,
     CriterionCoverageDeclaration,
     SliceOutcomeReceipt,
+    FeatureCompletionReceipt,
+    feature_completion_semantic_id,
     TaskProgress,
     TerminalArchive,
     VerificationEvidence,
@@ -180,6 +182,16 @@ class SliceOutcomeEligibility:
     status: str
     latest_receipt_id: str | None
     blockers: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureCompletionEligibility:
+    """Read-only readiness, separated from any authority to close a Feature."""
+
+    status: str
+    receipt_id: str | None
+    blockers: tuple[str, ...]
+    slice_agreement_refs: tuple[str, ...] = ()
 
 
 _PYTHON_TEST_RUNNER = (
@@ -636,6 +648,8 @@ def _record_change(current: State, change: Change) -> State:
     feature = next((item for item in current.features if item.id == change.feature_id), None)
     if feature is None or feature.side_of is not None:
         raise ServiceError("primary change requires an authoritative primary feature")
+    if any(item.feature_id == feature.id for item in current.feature_completion_receipts):
+        raise ServiceError("REOPEN_DECISION_REQUIRED: completed Feature cannot gain new work")
     if current.active_context is not None or current.preserved_primary_context is not None:
         raise ServiceError("primary change requires no active work")
     context = _initial_context(change)
@@ -2089,6 +2103,8 @@ class CoreService:
         feature = next((item for item in current.features if str(item.id) == feature_id and item.side_of is None), None)
         if feature is None:
             raise ServiceError("existing primary Feature-ID was not found")
+        if any(item.feature_id == feature.id for item in current.feature_completion_receipts):
+            raise ServiceError("REOPEN_DECISION_REQUIRED: Feature completion is immutable")
         original = next((
             item for item in current.agreements if item.kind == "FEATURE" and item.feature_id == feature.id
         ), None)
@@ -2619,13 +2635,17 @@ class CoreService:
         self,
         current: State,
         snapshot: InputSnapshot,
+        accepted_override: AgreementRecord | None = None,
     ) -> tuple[CriterionCoverageApproval, ...]:
         if current.r3b_schema_upgrade is None or not self.__persistence.r3b_schema_ready():
             return ()
-        try:
-            _, _, accepted = _accepted_e1_scope(current, self.__repository_root)
-        except ServiceError:
-            return ()
+        if accepted_override is None:
+            try:
+                _, _, accepted = _accepted_e1_scope(current, self.__repository_root)
+            except ServiceError:
+                return ()
+        else:
+            accepted = accepted_override
         head = next(
             (item for item in current.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
             None,
@@ -2915,6 +2935,7 @@ class CoreService:
 
     def _slice_outcome_candidate(
         self, state: State, snapshot: InputSnapshot,
+        scope_override: tuple[WorkingContext, AgreementRecord] | None = None,
     ) -> tuple[SliceOutcomeReceipt | None, tuple[str, ...]]:
         blockers: list[str] = []
         if state.r3b_schema_upgrade is None or not self.__persistence.r3b_schema_ready():
@@ -2928,10 +2949,13 @@ class CoreService:
             or snapshot.repository_id != state.initialization.repository_id
         ):
             return None, ("WORKSPACE_SNAPSHOT_INVALID",)
-        try:
-            context, _, accepted = _accepted_e1_scope(state, self.__repository_root)
-        except ServiceError:
-            return None, ("ACCEPTED_SLICE_UNAVAILABLE",)
+        if scope_override is None:
+            try:
+                context, _, accepted = _accepted_e1_scope(state, self.__repository_root)
+            except ServiceError:
+                return None, ("ACCEPTED_SLICE_UNAVAILABLE",)
+        else:
+            context, accepted = scope_override
         head = next(
             (item for item in state.slice_criteria_heads if item.slice_agreement_ref == accepted.id),
             None,
@@ -2965,7 +2989,7 @@ class CoreService:
         evidence_ids: list[str] = []
         approved = {
             item.criterion_id: item
-            for item in self._current_r3b_coverage_approvals(state, snapshot)
+            for item in self._current_r3b_coverage_approvals(state, snapshot, accepted)
         }
         for criterion in criteria.criteria:
             descriptor_kind, separator, descriptor_target = criterion.expected_evidence.partition(":")
@@ -3133,6 +3157,203 @@ class CoreService:
                 accept,
                 expected_input_fingerprint=snapshot.fingerprint,
                 allow_noop=True,
+            )
+        except AtomicFailure as error:
+            self.__raise_e1_publication_error(current.revision, error)
+
+    def _feature_completion_basis(
+        self, current: State, feature_id: str, snapshot: InputSnapshot,
+    ) -> tuple[tuple[AgreementRecord, ...], tuple[AgreementRecord, ...], tuple[SliceOutcomeReceipt, ...], tuple[str, ...]]:
+        """Revalidate every recorded Slice independently, without activating historical work."""
+        blockers: list[str] = []
+        root_id = sha256(str(self.__repository_root).encode("utf-8")).hexdigest()[:16]
+        feature = next((item for item in current.features if str(item.id) == feature_id), None)
+        if feature is None or feature.side_of is not None:
+            return (), (), (), ("PRIMARY_FEATURE_NOT_FOUND",)
+        if (
+            current.initialization is None or current.initialization.repository_id != root_id
+            or type(snapshot) is not InputSnapshot or snapshot.repository_id != root_id
+            or snapshot.version != INPUT_FINGERPRINT_VERSION
+            or snapshot.policy_id != INPUT_POLICY_ID or snapshot.policy_digest != INPUT_POLICY_DIGEST
+        ):
+            return (), (), (), ("ROOT_AUTHORITY_UNAVAILABLE",)
+        if current.r3b_schema_upgrade is None or not self.__persistence.r3b_schema_ready():
+            blockers.append("SCHEMA_17_REQUIRED")
+        feature_records = tuple(sorted(
+            (item for item in current.agreements if item.kind == "FEATURE" and str(item.feature_id) == feature_id),
+            key=lambda item: item.id,
+        ))
+        slices = tuple(sorted(
+            (item for item in current.agreements if item.kind == "SLICE" and str(item.feature_id) == feature_id),
+            key=lambda item: item.id,
+        ))
+        if not feature_records or not slices:
+            blockers.append("FEATURE_SLICE_INVENTORY_UNAVAILABLE")
+        if any(
+            not any(record.change_id == item.change_id for record in feature_records)
+            for item in slices
+        ):
+            blockers.append("FEATURE_AGREEMENT_ASSOCIATION_INVALID")
+
+        # A queue item is separate lifecycle authority; an accepted Slice receipt
+        # must never silently terminate work that remains owned by the user.
+        contexts = (
+            current.active_context, current.preserved_primary_context,
+            None if current.parked_work is None else current.parked_work.context,
+            None if current.parked_work is None else current.parked_work.preserved_primary_context,
+        )
+        if any(context is not None and str(context.feature_id) == feature_id for context in contexts):
+            blockers.append("FEATURE_WORK_NOT_TERMINAL")
+        if any(
+            item.operational_state is not OperationalState.DONE
+            and (item.context is not None and str(item.context.feature_id) == feature_id
+                 or item.preserved_primary_context is not None
+                 and str(item.preserved_primary_context.feature_id) == feature_id)
+            for item in current.work_items
+        ):
+            blockers.append("FEATURE_QUEUE_NOT_TERMINAL")
+        if (current.pending_intake is not None and str(current.pending_intake.deferred_from_feature_id) == feature_id
+            or current.deferred_side_request is not None and str(current.deferred_side_request.primary_feature_id) == feature_id):
+            blockers.append("FEATURE_PENDING_INTAKE")
+        if any(item.unresolved for item in current.drifts if any(
+            item.change_id == record.change_id for record in slices
+        )):
+            blockers.append("FEATURE_DRIFT_UNRESOLVED")
+
+        outcomes: list[SliceOutcomeReceipt] = []
+        for record in slices:
+            archives = tuple(
+                archive for archive in current.terminal_archives
+                if archive.context.slice_agreement_ref == record.id
+            )
+            if len(archives) != 1 or archives[0].context.status is not LifecycleState.ACCEPTED:
+                blockers.append(f"SLICE_NOT_ACCEPTED_TERMINAL:{record.id}")
+                continue
+            context = archives[0].context
+            if (
+                context.feature_id != record.feature_id or context.change_id != record.change_id
+                or context.feature_agreement_ref not in {item.id for item in feature_records}
+                or not any(
+                    item.id == context.feature_agreement_ref and item.change_id == record.change_id
+                    for item in feature_records
+                )
+                or record.repository_id != root_id
+                or context.focus != record.title or context.current_work != record.initial_task
+                or archives[0].parent_feature_id is not None
+            ):
+                blockers.append(f"SLICE_TERMINAL_AUTHORITY_INVALID:{record.id}")
+                continue
+            candidate, slice_blockers = self._slice_outcome_candidate(
+                current, snapshot, (context, record),
+            )
+            if candidate is None:
+                blockers.extend(f"{record.id}:{reason}" for reason in slice_blockers)
+                continue
+            matched = next((
+                item for item in current.slice_outcome_receipts
+                if item.id == candidate.id and item.slice_agreement_ref == record.id
+            ), None)
+            if matched is None:
+                blockers.append(f"SLICE_OUTCOME_NOT_CURRENT:{record.id}")
+                continue
+            outcomes.append(matched)
+        return feature_records, slices, tuple(outcomes), tuple(dict.fromkeys(blockers))
+
+    def feature_completion_eligibility(
+        self, state: State, feature_id: str, snapshot: InputSnapshot | None,
+    ) -> FeatureCompletionEligibility:
+        """Inspect a Feature without creating a receipt, running tests, or selecting work."""
+        current = _authoritative_state(self.__persistence, state)
+        previous = next((
+            item for item in current.feature_completion_receipts if str(item.feature_id) == feature_id
+        ), None)
+        if previous is not None:
+            return FeatureCompletionEligibility("COMPLETE", previous.id, (), previous.slice_agreement_refs)
+        if snapshot is None:
+            return FeatureCompletionEligibility("BLOCKED", None, ("INPUT_SNAPSHOT_UNAVAILABLE",))
+        _, slices, _, blockers = self._feature_completion_basis(current, feature_id, snapshot)
+        return FeatureCompletionEligibility(
+            "BLOCKED" if blockers else "READY_FOR_HUMAN_DECISION", None,
+            blockers, tuple(item.id for item in slices),
+        )
+
+    def feature_completion_statement(
+        self, state: State, feature_id: str, condition: str, snapshot: InputSnapshot,
+    ) -> str:
+        """Display the precise closure and first schema-18 conversion before TTY approval."""
+        current = _authoritative_state(self.__persistence, state)
+        if type(condition) is not str or not condition.strip() or len(condition) > 2048:
+            raise ServiceError("Feature completion condition must be explicit bounded text")
+        previous = next((
+            item for item in current.feature_completion_receipts if str(item.feature_id) == feature_id
+        ), None)
+        if previous is not None:
+            if previous.condition != condition:
+                raise ServiceError("Feature is already complete with a different human condition")
+            return previous.statement
+        features, slices, outcomes, blockers = self._feature_completion_basis(current, feature_id, snapshot)
+        if blockers:
+            raise ServiceError("Feature completion is blocked: " + ", ".join(blockers))
+        feature = next(item for item in current.features if str(item.id) == feature_id)
+        lines = [
+            "EvoSpec: explicit Feature completion, not Slice acceptance or publication",
+            f"Feature: {feature.title} ({feature_id})",
+            f"Human-approved completion condition: {condition.strip()}",
+            f"Repository: {snapshot.repository_id}",
+            f"Expected revision: {current.revision}",
+            f"Root input fingerprint: {snapshot.fingerprint}",
+            "Feature agreement references: " + ", ".join(item.id for item in features),
+            "Verified terminal Slices and current outcome receipts:",
+        ]
+        lines.extend(f"- {record.id}: {receipt.id}" for record, receipt in zip(slices, outcomes))
+        lines.append(
+            "Schema 18 retained; no automatic legacy migration"
+            if current.feature_completion_receipts
+            else "Schema conversion: 17 to 18 on first closure; no automatic legacy migration"
+        )
+        lines.append("This does not authorize model execution, merge, tags, release, or reopening")
+        return "\n".join(lines)
+
+    def complete_feature(
+        self, state: State, feature_id: str, condition: str,
+        acceptance: UserAcceptance, snapshot: InputSnapshot,
+    ) -> State:
+        """Close one Feature after all historical outcomes and human intent are fresh."""
+        current = _authoritative_state(self.__persistence, state)
+        statement = self.feature_completion_statement(current, feature_id, condition, snapshot)
+        reference = f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"
+        if (
+            type(acceptance) is not UserAcceptance
+            or acceptance.source != "INTERACTIVE_TERMINAL"
+            or acceptance.statement != statement or acceptance.source_reference != reference
+        ):
+            raise ServiceError("Feature completion requires the exact human terminal decision")
+        if any(str(item.feature_id) == feature_id for item in current.feature_completion_receipts):
+            return current
+
+        def close(locked: State) -> State:
+            if locked != current:
+                raise ServiceError("Feature authority changed after confirmation")
+            feature_records, slices, outcomes, blockers = self._feature_completion_basis(
+                locked, feature_id, snapshot,
+            )
+            if blockers:
+                raise ServiceError("Feature completion is blocked: " + ", ".join(blockers))
+            receipt = FeatureCompletionReceipt(
+                "", snapshot.repository_id, FeatureId(feature_id),
+                tuple(item.id for item in feature_records), condition.strip(),
+                tuple(item.id for item in slices), tuple(item.id for item in outcomes),
+                snapshot.fingerprint, statement, acceptance.source,
+                acceptance.source_reference, locked.revision, locked.revision + 1,
+            )
+            receipt = replace(receipt, id=feature_completion_semantic_id(receipt))
+            return _prepare_state_publication(replace(
+                locked, feature_completion_receipts=locked.feature_completion_receipts + (receipt,),
+            ), locked.revision)
+
+        try:
+            return self.__persistence.transact_feature_completion(
+                current.revision, close, expected_input_fingerprint=snapshot.fingerprint,
             )
         except AtomicFailure as error:
             self.__raise_e1_publication_error(current.revision, error)

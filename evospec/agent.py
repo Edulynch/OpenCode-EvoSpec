@@ -186,6 +186,17 @@ class SliceAcceptanceInventory:
 
 
 @dataclass(frozen=True, slots=True)
+class FeatureCompletionSummary:
+    """Core-owned closure/readiness displayed without granting execution rights."""
+
+    feature_id: str
+    status: str
+    receipt_id: str | None
+    blockers: tuple[str, ...]
+    slice_agreement_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class AgentContext:
     revision: int
     initialization_state: str
@@ -233,6 +244,7 @@ class AgentContext:
     slice_outcome: SliceOutcomeSummary | None = None
     criterion_coverage_approvals: tuple[CriterionCoverageApproval, ...] = ()
     slice_acceptance_inventory: SliceAcceptanceInventory = SliceAcceptanceInventory()
+    feature_completion: FeatureCompletionSummary | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +281,9 @@ def project_context(
             pass
     snapshot_unavailable = (
         inspection.state.r3b_schema_upgrade is not None and input_snapshot is None
+    )
+    completion = _feature_completion_summary(
+        workflow, inspection.state, inspection.active_context, input_snapshot,
     )
     # A separate schema read could advertise a newer writer gate with an older revision.
     e1_schema_ready = inspection.e1_schema_ready
@@ -367,6 +382,7 @@ def project_context(
                 input_snapshot=input_snapshot,
                 repository_id=inspection.state.initialization.repository_id,
                 slice_acceptance_inventory=_slice_acceptance_inventory(inspection.state),
+                feature_completion=completion,
           )
     locks = tuple(lock for lock in inspection.locks if lock.active and lock.feature_id == context.feature_id)
     change = next((item for item in inspection.changes if item.id == context.change_id), None)
@@ -463,7 +479,33 @@ def project_context(
                    else workflow.current_r3b_coverage_approvals(inspection.state, input_snapshot)
                ),
                slice_acceptance_inventory=_slice_acceptance_inventory(inspection.state),
+               feature_completion=completion,
        )
+
+
+def _feature_completion_summary(
+    workflow: WorkflowService, state: State,
+    context: WorkingContext | None, snapshot: InputSnapshot | None,
+) -> FeatureCompletionSummary | None:
+    """Project one unambiguous Feature; never pick work or issue a closure."""
+    if state.initialization is None:
+        return None
+    primaries = tuple(sorted(
+        (str(item.id) for item in state.features if item.side_of is None),
+    ))
+    selected = (
+        str(context.feature_id) if context is not None and str(context.feature_id) in primaries
+        else primaries[0] if len(primaries) == 1 else None
+    )
+    if selected is None:
+        return None
+    try:
+        result = workflow.feature_completion_eligibility(state, selected, snapshot)
+    except WorkflowError:
+        return FeatureCompletionSummary(selected, "BLOCKED", None, ("AUTHORITY_UNAVAILABLE",), ())
+    return FeatureCompletionSummary(
+        selected, result.status, result.receipt_id, result.blockers, result.slice_agreement_refs,
+    )
 
 
 def _slice_acceptance_inventory(state: State) -> SliceAcceptanceInventory:

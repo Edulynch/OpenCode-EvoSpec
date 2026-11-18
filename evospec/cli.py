@@ -183,6 +183,10 @@ def _parser() -> _ArgumentParser:
     next_slice.add_argument("--checkpoint", required=True, help="Initial verification checkpoint")
     next_slice.add_argument("--criteria-file", required=True, help="Complete JSON mini-spec for human acceptance")
     next_slice.add_argument("--expected-revision", required=True, type=int)
+    complete = commands.add_parser("complete-feature")
+    complete.add_argument("--feature-id", required=True, help="Exact accepted primary Feature identity")
+    complete.add_argument("--condition", required=True, help="Human-owned Feature completion condition")
+    complete.add_argument("--expected-revision", required=True, type=int)
     revise = commands.add_parser("revise-slice-criteria")
     revise.add_argument("--criteria-file", required=True, help="New complete Slice criteria JSON mini-spec")
     revise.add_argument("--previous-criteria-revision", required=True, help="Current criteria revision, or NOT_RECORDED")
@@ -263,6 +267,7 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
     if arguments.command in (
         "accept-slice", "accept-next-slice", "revise-slice-criteria", "upgrade-e1-schema",
         "upgrade-r3-schema", "upgrade-r3-outcome-schema", "renew-r3b-coverage",
+        "complete-feature",
     ):
         workflow = WorkflowService.open(Path(arguments.root))
         if arguments.command == "upgrade-e1-schema":
@@ -299,6 +304,18 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             if already is not None:
                 _render(already, target)
                 return 0
+        if arguments.command == "complete-feature":
+            try:
+                already = workflow.confirmed_feature_completion(
+                    arguments.feature_id, arguments.condition,
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            except (ValueError, RecoveryError, WorkflowError) as error:
+                print(f"ERROR {error}", file=target)
+                return 2
+            if already is not None:
+                _render(already, target)
+                return 0
         # Only a human in a real terminal may accept or change durable authority.
         if not sys.stdin.isatty() or not sys.stdout.isatty() or not target.isatty():
             print("ERROR approval requires an interactive user terminal", file=target)
@@ -318,6 +335,12 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
                 statement = workflow.next_slice_agreement(
                     arguments.feature_id, arguments.slice, arguments.task, arguments.checkpoint,
                     criteria, expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            elif arguments.command == "complete-feature":
+                criteria = None
+                statement = workflow.feature_completion_agreement(
+                    arguments.feature_id, arguments.condition,
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
                 )
             elif arguments.command == "revise-slice-criteria":
                 criteria = _load_criteria_spec(arguments.criteria_file)
@@ -357,6 +380,7 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
         description = {
             "accept-slice": "Acuerdo inicial",
             "accept-next-slice": "Nuevo Slice de Feature existente",
+            "complete-feature": "Finalización humana de Feature (incluye autorización explícita de schema 17→18)",
             "revise-slice-criteria": "Decisión de modificación",
             "upgrade-e1-schema": "Acuerdo de migración",
             "upgrade-r3-schema": "Acuerdo de migración R3-A",
@@ -385,6 +409,12 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
                     arguments.feature_id, arguments.slice, arguments.task,
                     arguments.checkpoint, UserAcceptance(statement, f"tty:{token}"),
                     expected_revision=ExpectedRevision(arguments.expected_revision), criteria=criteria,
+                )
+            elif arguments.command == "complete-feature":
+                result = workflow.complete_feature(
+                    arguments.feature_id, arguments.condition,
+                    UserAcceptance(statement, f"tty:{token}"),
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
                 )
             elif arguments.command == "revise-slice-criteria":
                 assert criteria is not None
@@ -479,6 +509,13 @@ def _render_status(context: AgentContext, output: TextIO) -> None:
     health = "RECOVERY_REQUIRED" if context.stale else context.initialization_state
     print(f"Health: {health}", file=output)
     print(f"Revision: {context.revision}", file=output)
+    if context.feature_completion is not None:
+        closure = context.feature_completion
+        print(f"Feature completion: {closure.status} ({closure.feature_id})", file=output)
+        if closure.receipt_id is not None:
+            print(f"Feature completion receipt: {closure.receipt_id}", file=output)
+        if closure.blockers:
+            print("Feature completion blockers: " + ", ".join(closure.blockers), file=output)
     if context.lifecycle is not None:
         print(f"Flow: {context.lifecycle[0]} / {context.lifecycle[1]}", file=output)
         work = " | ".join(

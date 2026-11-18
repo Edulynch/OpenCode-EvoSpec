@@ -85,6 +85,7 @@ from .domain import (
     CoverageInput,
     CriterionCoverageApproval,
     SliceOutcomeReceipt,
+    FeatureCompletionReceipt,
     TaskProgress,
     TerminalArchive,
     PendingIntake,
@@ -116,6 +117,7 @@ JsonValue: TypeAlias = (
 SCHEMA: Final = 15
 R3_SCHEMA: Final = 16
 R3B_SCHEMA: Final = 17
+FEATURE_COMPLETION_SCHEMA: Final = 18
 LEGACY_WRITE_SCHEMA: Final = 13
 E1_TASK_PROGRESS_SCHEMA: Final = 14
 INTEGRATION_REGISTRY_SCHEMA: Final = 1
@@ -168,6 +170,7 @@ STATE_FIELDS: Final = frozenset(
 STATE_FIELDS_V16: Final = STATE_FIELDS
 STATE_FIELDS_V17_LEGACY: Final = STATE_FIELDS | frozenset(("r3b_schema_upgrade", "slice_outcome_receipts"))
 STATE_FIELDS_V17: Final = STATE_FIELDS_V17_LEGACY | frozenset(("criterion_coverage_approvals",))
+STATE_FIELDS_V18: Final = STATE_FIELDS_V17 | frozenset(("feature_completion_receipts",))
 CONTEXT_FIELDS: Final = frozenset(
     (
         "feature_id",
@@ -1855,6 +1858,51 @@ def _slice_outcome_from_json(value: JsonValue) -> SliceOutcomeReceipt:
     )
 
 
+_FEATURE_COMPLETION_FIELDS: Final = frozenset((
+    "id", "repository_id", "feature_id", "feature_agreement_refs", "condition",
+    "slice_agreement_refs", "slice_outcome_receipt_ids", "input_fingerprint",
+    "statement", "source", "source_reference", "source_revision", "recorded_revision",
+))
+
+
+def _feature_completion_to_json(receipt: FeatureCompletionReceipt) -> JsonValue:
+    """Persist only the exact human-confirmed Feature closure basis."""
+    return {
+        "id": receipt.id,
+        "repository_id": receipt.repository_id,
+        "feature_id": receipt.feature_id,
+        "feature_agreement_refs": list(receipt.feature_agreement_refs),
+        "condition": receipt.condition,
+        "slice_agreement_refs": list(receipt.slice_agreement_refs),
+        "slice_outcome_receipt_ids": list(receipt.slice_outcome_receipt_ids),
+        "input_fingerprint": receipt.input_fingerprint,
+        "statement": receipt.statement,
+        "source": receipt.source,
+        "source_reference": receipt.source_reference,
+        "source_revision": receipt.source_revision,
+        "recorded_revision": receipt.recorded_revision,
+    }
+
+
+def _feature_completion_from_json(value: JsonValue) -> FeatureCompletionReceipt:
+    raw = _object(value, _FEATURE_COMPLETION_FIELDS, "Feature completion receipt")
+    return FeatureCompletionReceipt(
+        _string(raw["id"], "Feature completion id"),
+        _string(raw["repository_id"], "Feature completion repository"),
+        FeatureId(_string(raw["feature_id"], "Feature completion Feature")),
+        _strings(raw["feature_agreement_refs"], "Feature completion agreements"),
+        _string(raw["condition"], "Feature completion condition"),
+        _strings(raw["slice_agreement_refs"], "Feature completion Slices"),
+        _strings(raw["slice_outcome_receipt_ids"], "Feature completion outcomes"),
+        _string(raw["input_fingerprint"], "Feature completion fingerprint"),
+        _string(raw["statement"], "Feature completion statement"),
+        _string(raw["source"], "Feature completion source"),
+        _string(raw["source_reference"], "Feature completion source reference"),
+        _integer(raw["source_revision"], "Feature completion source revision"),
+        _integer(raw["recorded_revision"], "Feature completion recorded revision"),
+    )
+
+
 def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
     """Read the persisted schema and its state from the same authority snapshot."""
     state_path = _artifact_path(root, "state.json")
@@ -1877,9 +1925,11 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                     decoded.pop(field)
         if schema in (9, 10):
             raw = _object(decoded, STATE_FIELDS_V10, "state")
-        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA):
+        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA):
             decoded_fields = set(decoded)
-            if schema == R3B_SCHEMA and decoded_fields == set(STATE_FIELDS_V17):
+            if schema == FEATURE_COMPLETION_SCHEMA and decoded_fields == set(STATE_FIELDS_V18):
+                raw = _object(decoded, STATE_FIELDS_V18, "state")
+            elif schema == R3B_SCHEMA and decoded_fields == set(STATE_FIELDS_V17):
                 raw = _object(decoded, STATE_FIELDS_V17, "state")
             elif schema == R3B_SCHEMA and decoded_fields == set(STATE_FIELDS_V17_LEGACY):
                 raw = {**_object(decoded, STATE_FIELDS_V17_LEGACY, "state"), "criterion_coverage_approvals": []}
@@ -1956,7 +2006,7 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 legacy_fields,
                 "state",
             )
-        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA):
+        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA):
             raise DecodeError("unknown state schema")
         (
             initialization, deferred, intake, selection, recovery, selection_history,
@@ -2051,8 +2101,12 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 _coverage_approval_from_json(item)
                 for item in _array(raw.get("criterion_coverage_approvals", []), "criterion coverage approvals")
             ) if schema >= R3B_SCHEMA else (),
+            feature_completion_receipts=tuple(
+                _feature_completion_from_json(item)
+                for item in _array(raw["feature_completion_receipts"], "Feature completion receipts")
+            ) if schema >= FEATURE_COMPLETION_SCHEMA else (),
         )
-        if schema == R3B_SCHEMA and state.r3b_schema_upgrade is None:
+        if schema >= R3B_SCHEMA and state.r3b_schema_upgrade is None:
             raise DecodeError("schema 17 requires an explicit R3-B conversion receipt")
         validate_state(state)
         _validate_capability_selection_authority(state, schema)
@@ -2526,11 +2580,11 @@ def _pending_intake_from_json(value: JsonValue) -> PendingIntake | None:
 
 def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
     """Preserve each accepted layout until a scoped authority decision changes it."""
-    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA):
+    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA):
         raise ValueError("unsupported state writer schema")
     if schema < SCHEMA and (state.slice_criteria_revisions or state.slice_criteria_heads):
         raise ValueError("Slice criteria cannot be silently downgraded")
-    if schema == R3B_SCHEMA and state.r3b_schema_upgrade is None:
+    if schema >= R3B_SCHEMA and state.r3b_schema_upgrade is None:
         raise ValueError("schema 17 requires its separate human-approved conversion receipt")
     value: dict[str, JsonValue] = {
             "schema": schema,
@@ -2608,6 +2662,12 @@ def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
         ]
     elif state.r3b_schema_upgrade is not None or state.slice_outcome_receipts or state.criterion_coverage_approvals:
         raise ValueError("R3-B approval or Slice outcome evidence cannot be downgraded")
+    if schema >= FEATURE_COMPLETION_SCHEMA:
+        value["feature_completion_receipts"] = [
+            _feature_completion_to_json(item) for item in state.feature_completion_receipts
+        ]
+    elif state.feature_completion_receipts:
+        raise ValueError("Feature completion authority cannot be silently downgraded")
     return encode_json(value)
 
 
@@ -2780,22 +2840,22 @@ class _StateStore:
             expected_id = sha256(str(self.__root).encode("utf-8")).hexdigest()[:16]
             if state.initialization is None or state.initialization.repository_id != expected_id:
                 raise RecoveryError("accepted Slice state belongs to a different repository root")
-        return state, (schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA) if state.agreements else None)
+        return state, (schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA) if state.agreements else None)
 
     def e1_schema_ready(self) -> bool:
         """Legacy state remains readable but cannot silently enter the E1 writer path."""
         raw = _read_json(_artifact_path(self.__root, "state.json"))
-        return isinstance(raw, dict) and raw.get("schema") in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA)
+        return isinstance(raw, dict) and raw.get("schema") in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA)
 
     def r3_schema_ready(self) -> bool:
         """Schema 15 stays readable; it never becomes an R3 writer without consent."""
         raw = _read_json(_artifact_path(self.__root, "state.json"))
-        return isinstance(raw, dict) and raw.get("schema") in (R3_SCHEMA, R3B_SCHEMA)
+        return isinstance(raw, dict) and raw.get("schema") in (R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA)
 
     def r3b_schema_ready(self) -> bool:
         """Schema 16 stays readable; schema 17 requires its own explicit decision."""
         raw = _read_json(_artifact_path(self.__root, "state.json"))
-        return isinstance(raw, dict) and raw.get("schema") == R3B_SCHEMA
+        return isinstance(raw, dict) and raw.get("schema") in (R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA)
 
     def r3b_upgrade_eligible(self) -> bool:
         raw = _read_json(_artifact_path(self.__root, "state.json"))
@@ -2834,7 +2894,7 @@ class _StateStore:
         with _state_publish_lock(self.__root):
             # Validate the CAS before creating records that may become inert orphans.
             current = self.__check_state_revision(state)
-            if self.__writer_schema_locked(current) not in (SCHEMA, R3_SCHEMA, R3B_SCHEMA):
+            if self.__writer_schema_locked(current) not in (SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA):
                 raise AtomicFailure("first E1 Slice requires the current state schema")
             for agreement in agreements:
                 self.__publish_immutable(
@@ -2861,7 +2921,7 @@ class _StateStore:
         """Publish a new accepted Slice and all of its immutable records under one CAS."""
         with _state_publish_lock(self.__root):
             current = self.__check_state_revision(state)
-            if self.__writer_schema_locked(current) != R3B_SCHEMA:
+            if self.__writer_schema_locked(current) not in (R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA):
                 raise AtomicFailure("next Slice requires schema-17 authority")
             if (
                 len(agreements) != 2 or agreements[0].kind != "FEATURE"
@@ -2973,7 +3033,7 @@ class _StateStore:
             if upgrade and (source_digest is None or self.state_source_sha256() != source_digest):
                 raise AtomicFailure("E1 conversion source identity changed after human approval")
             source_schema = self.__writer_schema_locked(current, allow_e1_upgrade=upgrade)
-            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA):
+            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA):
                 raise AtomicFailure("E1_TASK_PROGRESS_REQUIRES_SCHEMA_14")
             candidate = transform(current)
             if candidate.revision != current.revision + 1:
@@ -3019,7 +3079,7 @@ class _StateStore:
             if source_digest is not None and self.state_source_sha256() != source_digest:
                 raise AtomicFailure("R3-B conversion source identity changed after human approval")
             output_schema = self.__writer_schema_locked(current, allow_r3b_upgrade=upgrade)
-            if output_schema != R3B_SCHEMA:
+            if output_schema not in (R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA):
                 raise AtomicFailure("R3B_SCHEMA_UPGRADE_REQUIRED")
             if not upgrade and expected_input_fingerprint is None:
                 raise AtomicFailure("R3-B operation requires its observed workspace fingerprint")
@@ -3041,6 +3101,34 @@ class _StateStore:
                 raise AtomicFailure("R3-B operation must publish exactly one revision")
             self.__publish_state_locked(
                 candidate, strict_directory=True, allow_r3b_upgrade=upgrade,
+            )
+            return candidate
+
+    def transact_feature_completion(
+        self, expected_revision: int, transform: Callable[[State], State],
+        *, expected_input_fingerprint: str,
+    ) -> State:
+        """Commit human-approved Feature closure and schema 17→18 as one atomic step."""
+        with _state_publish_lock(self.__root):
+            current = self.recover()
+            if current.revision != expected_revision:
+                raise AtomicFailure("Feature completion expected revision is stale")
+            output_schema = self.__writer_schema_locked(current, allow_feature_completion=True)
+            if output_schema != FEATURE_COMPLETION_SCHEMA or current.initialization is None:
+                raise AtomicFailure("FEATURE_COMPLETION_REQUIRES_SCHEMA_17")
+            try:
+                snapshot = repository_input_snapshot(self.__root, current.initialization.repository_id)
+            except InputFingerprintError as error:
+                raise AtomicFailure(f"Feature completion input scan failed: {error}") from error
+            if snapshot.fingerprint != expected_input_fingerprint:
+                raise AtomicFailure("Feature completion root inputs changed before publication")
+            candidate = transform(current)
+            if candidate == current:
+                return current
+            if candidate.revision != current.revision + 1:
+                raise AtomicFailure("Feature completion must publish exactly one revision")
+            self.__publish_state_locked(
+                candidate, strict_directory=True, allow_feature_completion=True,
             )
             return candidate
 
@@ -3067,6 +3155,7 @@ class _StateStore:
     def __writer_schema_locked(
         self, current: State, *, allow_e1_upgrade: bool = False, allow_criteria_upgrade: bool = False,
         allow_r3_upgrade: bool = False, allow_r3b_upgrade: bool = False,
+        allow_feature_completion: bool = False,
     ) -> int:
         """Choose the output version from persisted authority, never caller input."""
         state_path = _artifact_path(self.__root, "state.json")
@@ -3090,24 +3179,30 @@ class _StateStore:
             if source_schema != R3_SCHEMA or current.r3b_schema_upgrade is not None:
                 raise AtomicFailure("only unconverted schema-16 authority may enter R3-B")
             return R3B_SCHEMA
+        if allow_feature_completion:
+            if source_schema not in (R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA) or current.r3b_schema_upgrade is None:
+                raise AtomicFailure("Feature completion requires explicitly upgraded R3-B authority")
+            return FEATURE_COMPLETION_SCHEMA
         if source_schema == LEGACY_WRITE_SCHEMA and current.agreements:
             raise AtomicFailure("E1_SCHEMA_UPGRADE_REQUIRED: ordinary writers are read-only")
         if allow_criteria_upgrade:
-            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA):
+            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA):
                 raise AtomicFailure("Slice criteria amendment requires E1 schema 14 or 15")
             return max(SCHEMA, source_schema)
-        return source_schema if source_schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA) else LEGACY_WRITE_SCHEMA
+        return source_schema if source_schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA) else LEGACY_WRITE_SCHEMA
 
     def __publish_state_locked(
         self, state: State, *, strict_directory: bool = False, allow_e1_upgrade: bool = False,
         allow_criteria_upgrade: bool = False, allow_r3_upgrade: bool = False,
         allow_r3b_upgrade: bool = False, allow_next_slice: bool = False,
+        allow_feature_completion: bool = False,
     ) -> None:
         current = self.__check_state_revision(state)
         output_schema = self.__writer_schema_locked(
             current, allow_e1_upgrade=allow_e1_upgrade,
             allow_criteria_upgrade=allow_criteria_upgrade, allow_r3_upgrade=allow_r3_upgrade,
             allow_r3b_upgrade=allow_r3b_upgrade,
+            allow_feature_completion=allow_feature_completion,
         )
         if current.agreements and state.agreements != current.agreements and not (
             allow_next_slice and state.agreements[:len(current.agreements)] == current.agreements
@@ -3132,6 +3227,13 @@ class _StateStore:
             raise AtomicFailure("Slice outcome receipts are append-only")
         if state.criterion_coverage_approvals[:len(current.criterion_coverage_approvals)] != current.criterion_coverage_approvals:
             raise AtomicFailure("criterion coverage approvals are append-only")
+        if (
+            state.feature_completion_receipts[:len(current.feature_completion_receipts)]
+            != current.feature_completion_receipts
+            or (state.feature_completion_receipts != current.feature_completion_receipts and not allow_feature_completion)
+            or (allow_feature_completion and len(state.feature_completion_receipts) != len(current.feature_completion_receipts) + 1)
+        ):
+            raise AtomicFailure("Feature completion requires exactly one append-only receipt")
         ready = tuple(
             item for item in current.irreversible_authorizations
             if item.status is IrreversibleAuthorizationStatus.READY

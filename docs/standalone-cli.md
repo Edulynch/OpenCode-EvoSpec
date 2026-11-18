@@ -71,7 +71,7 @@ The package installation above is the normal source-based path and also provides
 
 ## Lifecycle Commands
 
-The lifecycle surface contains `init`, `new`, `change`, `clarify`, `continue`, `status`, and `review`, plus narrowly scoped E1 `accept-slice`, `accept-next-slice`, and `revise-slice-criteria` terminal-confirmed commands. The separate `ui` dashboard and `doctor` diagnostic are read-only local commands.
+The lifecycle surface contains `init`, `new`, `change`, `clarify`, `continue`, `status`, and `review`, plus narrowly scoped E1 `accept-slice`, `accept-next-slice`, `revise-slice-criteria`, and R6-A `complete-feature` terminal-confirmed commands. The separate `ui` dashboard and `doctor` diagnostic are read-only local commands.
 
 ### `accept-slice` (E1 first Slice, explicit human consent)
 
@@ -133,6 +133,24 @@ evospec accept-next-slice --feature-id 'feature-EXACT-ID' --slice 'Create local 
 ```
 
 All identities, the revision and the criteria path above are examples, not defaults. The CLI displays the existing Feature and **new Slice agreement**, then requires a fresh `ACEPTO <token>`. Core records the new Change, paired agreements, first Task/checkpoint and criteria head in one authoritative CAS revision, preserving earlier records and parked work. The R4-B index shows both Slices, but agreement **does not mean the new outcome was verified or accepted**. New R3-B criterion coverage needs its own separately approved authority; it is never inherited from the first Slice. No agent protocol endpoint synthesizes human confirmation.
+
+### `complete-feature` (R6-A, independent Feature closure)
+
+The explicit Feature completion gate requires **every canonical Slice agreement** under the chosen Feature to have its own **ACCEPTED terminal lifecycle archive**, a currently valid criteria head, complete fresh R3-B evidence, and an existing matching objective Slice outcome receipt. Pending/parked/active work, unresolved decisions and relevant drift block closure. A historical receipt alone is not proof of freshness. The Core evaluator reads inactive Slices directly without activating work, running tests, or renewing coverage. If earlier evidence became stale because the repository changed, requalify it through a separately authorized process before retrying.
+
+After checking the Feature-ID, current revision and local status, use a **real interactive terminal**:
+
+```powershell
+cd 'D:\WORKSPACE\Personal\Tools\YourConsumerProject'
+git status --short
+git branch --show-current
+evospec status
+evospec complete-feature --feature-id 'feature-EXACT-ID' --condition 'All agreed Feature results are verified and delivered' --expected-revision 12
+```
+
+The values above are **examples**. The CLI prints the exact Feature identity, the condition you supply, all matching Feature agreements, every included Slice and outcome receipt, the root fingerprint, State revision, and first schema conversion (**17→18**). Enter the displayed `ACEPTO <token>` only after reviewing the whole statement. If the original Feature agreement does not express its own completion condition, this is a **new explicit human material decision**, stored together with its immutable completion receipt. Schema 17 stays readable; the conversion to 18 happens only after this terminal decision and a fresh in-lock root scan. No project is migrated by a read-only status query.
+
+Successful completion commits **one new State revision** and an immutable Feature receipt without changing the previous agreements, Slice outcome receipts, archives or Product Truth. An identical retry returns `ALREADY_COMPLETED` without a new write. A subsequent Slice request against that Feature fails with `REOPEN_DECISION_REQUIRED`; reopening is intentionally outside R6-A and needs a future separate agreement. `evospec status` and the OpenCode `evospec_context` tool expose the same read-only completion status, blockers and receipt identity. No model run, merge, tag, release or GitHub issue closure follows from this command.
 
 For a material amendment, first read `evospec status` or the read-only `evospec_context` result to obtain the **current** criteria revision. Write the replacement complete JSON mini-spec and use:
 
