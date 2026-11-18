@@ -99,6 +99,7 @@ from .services import (
     SliceOutcomeEligibility,
     StaleRevisionError,
     UserAcceptance,
+    next_slice_acceptance_statement,
 )
 from .input_fingerprint import InputSnapshot
 
@@ -198,6 +199,54 @@ class WorkflowService:
         except ServiceError as error:
             raise WorkflowError(str(error)) from error
         return self._result("SLICE_ACCEPTED", saved, "accepted Feature, Slice and first Task persisted")
+
+    def accept_next_slice(
+        self, feature_id: str, slice_title: str, initial_task: str, checkpoint: str,
+        acceptance: UserAcceptance, *, expected_revision: ExpectedRevision,
+        criteria: SliceCriteriaSpec,
+    ) -> WorkflowResult:
+        """Accept another Slice only after its own human-confirmed mini-spec."""
+        state = self._mutation_state(expected_revision)
+        try:
+            saved = self.__core.accept_next_slice(
+                state, feature_id, slice_title, initial_task, checkpoint, acceptance, criteria,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        return self._result("NEXT_SLICE_ACCEPTED", saved, "new Slice accepted under the existing Feature")
+
+    def next_slice_agreement(
+        self, feature_id: str, slice_title: str, initial_task: str,
+        checkpoint: str, criteria: SliceCriteriaSpec, *,
+        expected_revision: ExpectedRevision,
+    ) -> str:
+        """Read canonical Feature naming before displaying a new human agreement."""
+        state = self._mutation_state(expected_revision)
+        if state.r3b_schema_upgrade is None:
+            raise WorkflowError("next Slice requires prior explicit schema-17 approval")
+        if (
+            state.active_context is not None or state.preserved_primary_context is not None
+            or state.parked_work is not None or state.pending_intake is not None
+            or state.deferred_side_request is not None
+        ):
+            raise WorkflowError("next Slice requires an empty active slot; manage existing work explicitly")
+        feature = next((
+            item for item in state.features
+            if str(item.id) == feature_id and item.side_of is None
+        ), None)
+        if feature is None:
+            raise WorkflowError("existing primary Feature-ID was not found")
+        if any(
+            item.kind == "SLICE" and item.feature_id == feature.id
+            and item.title.casefold() == slice_title.casefold() for item in state.agreements
+        ):
+            raise WorkflowError("a Slice with this title is already accepted in the Feature")
+        try:
+            return next_slice_acceptance_statement(
+                feature_id, feature.title, slice_title, initial_task, checkpoint, criteria,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
 
     def revise_slice_criteria(
         self, criteria: SliceCriteriaSpec, previous_revision_id: str,

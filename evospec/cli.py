@@ -175,6 +175,13 @@ def _parser() -> _ArgumentParser:
     accept.add_argument("--checkpoint", required=True, help="Initial pending verification checkpoint")
     accept.add_argument("--criteria-file", help="JSON mini-spec included in the same human acceptance")
     accept.add_argument("--expected-revision", required=True, type=int)
+    next_slice = commands.add_parser("accept-next-slice")
+    next_slice.add_argument("--feature-id", required=True, help="Exact identity of an already accepted Feature")
+    next_slice.add_argument("--slice", required=True, help="Human-approved next Slice title")
+    next_slice.add_argument("--task", required=True, help="Initial Task for the next Slice")
+    next_slice.add_argument("--checkpoint", required=True, help="Initial verification checkpoint")
+    next_slice.add_argument("--criteria-file", required=True, help="Complete JSON mini-spec for human acceptance")
+    next_slice.add_argument("--expected-revision", required=True, type=int)
     revise = commands.add_parser("revise-slice-criteria")
     revise.add_argument("--criteria-file", required=True, help="New complete Slice criteria JSON mini-spec")
     revise.add_argument("--previous-criteria-revision", required=True, help="Current criteria revision, or NOT_RECORDED")
@@ -253,7 +260,7 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             return 2
         return 0
     if arguments.command in (
-        "accept-slice", "revise-slice-criteria", "upgrade-e1-schema",
+        "accept-slice", "accept-next-slice", "revise-slice-criteria", "upgrade-e1-schema",
         "upgrade-r3-schema", "upgrade-r3-outcome-schema", "renew-r3b-coverage",
     ):
         workflow = WorkflowService.open(Path(arguments.root))
@@ -305,6 +312,12 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
                 statement = slice_acceptance_statement(
                     arguments.feature, arguments.slice, arguments.task, arguments.checkpoint, criteria,
                 )
+            elif arguments.command == "accept-next-slice":
+                criteria = _load_criteria_spec(arguments.criteria_file)
+                statement = workflow.next_slice_agreement(
+                    arguments.feature_id, arguments.slice, arguments.task, arguments.checkpoint,
+                    criteria, expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
             elif arguments.command == "revise-slice-criteria":
                 criteria = _load_criteria_spec(arguments.criteria_file)
                 statement = slice_criteria_decision_statement(
@@ -342,6 +355,7 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
         verb = "DECIDO" if arguments.command == "revise-slice-criteria" else "ACEPTO"
         description = {
             "accept-slice": "Acuerdo inicial",
+            "accept-next-slice": "Nuevo Slice de Feature existente",
             "revise-slice-criteria": "Decisión de modificación",
             "upgrade-e1-schema": "Acuerdo de migración",
             "upgrade-r3-schema": "Acuerdo de migración R3-A",
@@ -361,6 +375,13 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             if arguments.command == "accept-slice":
                 result = workflow.accept_first_slice(
                     arguments.feature, arguments.slice, arguments.task,
+                    arguments.checkpoint, UserAcceptance(statement, f"tty:{token}"),
+                    expected_revision=ExpectedRevision(arguments.expected_revision), criteria=criteria,
+                )
+            elif arguments.command == "accept-next-slice":
+                assert criteria is not None
+                result = workflow.accept_next_slice(
+                    arguments.feature_id, arguments.slice, arguments.task,
                     arguments.checkpoint, UserAcceptance(statement, f"tty:{token}"),
                     expected_revision=ExpectedRevision(arguments.expected_revision), criteria=criteria,
                 )

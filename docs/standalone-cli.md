@@ -71,7 +71,7 @@ The package installation above is the normal source-based path and also provides
 
 ## Lifecycle Commands
 
-The lifecycle surface contains `init`, `new`, `change`, `clarify`, `continue`, `status`, and `review`, plus narrowly scoped E1 `accept-slice` and `revise-slice-criteria` terminal-confirmed commands. The separate `ui` dashboard and `doctor` diagnostic are read-only local commands.
+The lifecycle surface contains `init`, `new`, `change`, `clarify`, `continue`, `status`, and `review`, plus narrowly scoped E1 `accept-slice`, `accept-next-slice`, and `revise-slice-criteria` terminal-confirmed commands. The separate `ui` dashboard and `doctor` diagnostic are read-only local commands.
 
 ### `accept-slice` (E1 first Slice, explicit human consent)
 
@@ -117,6 +117,22 @@ evospec accept-slice --feature 'Task manager' --slice 'Local task list' --task '
 ```
 
 The CLI displays the entire canonical agreement and prompts for one `ACEPTO <token>` confirmation. Core publishes the Feature, Slice, initial Task, pending checkpoint, and immutable criteria revision under one State CAS. The model/agent cannot silently accept on the user's behalf.
+
+### `accept-next-slice` (R5-A, existing Feature, sequential)
+
+After the first Slice, EvoSpec can accept one more Slice **under the same Feature identity**, provided the active work slot is empty. Complete or explicitly park the previous work using its lifecycle operation first; the command does **not** auto-park, finish, or accept the previous outcome. This writer requires a previously human-approved schema-17 authority; earlier schemas do not migrate automatically.
+
+Read the current State revision with `evospec status` and the original Feature-ID from the read-only `evospec_context` / acceptance inventory (status also displays the Feature-ID while work is active). Prepare a complete criteria file in the JSON format above. In a real interactive PowerShell terminal:
+
+```powershell
+cd 'D:\WORKSPACE\Personal\Tools\YourConsumerProject'
+git status --short
+git branch --show-current
+evospec status
+evospec accept-next-slice --feature-id 'feature-EXACT-ID' --slice 'Create local task' --task 'Implement local creation' --checkpoint 'New task survives restart' --criteria-file '.\slice-criteria.json' --expected-revision 5
+```
+
+All identities, the revision and the criteria path above are examples, not defaults. The CLI displays the existing Feature and **new Slice agreement**, then requires a fresh `ACEPTO <token>`. Core records the new Change, paired agreements, first Task/checkpoint and criteria head in one authoritative CAS revision, preserving earlier records and parked work. The R4-B index shows both Slices, but agreement **does not mean the new outcome was verified or accepted**. New R3-B criterion coverage needs its own separately approved authority; it is never inherited from the first Slice. No agent protocol endpoint synthesizes human confirmation.
 
 For a material amendment, first read `evospec status` or the read-only `evospec_context` result to obtain the **current** criteria revision. Write the replacement complete JSON mini-spec and use:
 

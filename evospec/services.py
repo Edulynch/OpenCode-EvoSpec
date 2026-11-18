@@ -331,6 +331,22 @@ def slice_acceptance_statement(
     return statement
 
 
+def next_slice_acceptance_statement(
+    feature_id: str, feature_title: str, slice_title: str, initial_task: str,
+    checkpoint: str, criteria: SliceCriteriaSpec,
+) -> str:
+    """Present the existing Feature identity and the entire new Slice for consent."""
+    validate_slice_criteria_spec(criteria)
+    values = (feature_id, feature_title, slice_title, initial_task, checkpoint)
+    if any(type(value) is not str or not value or value != value.strip() or len(value) > 2048 for value in values):
+        raise ServiceError("next Slice acceptance requires canonical bounded Feature and Slice fields")
+    return (
+        f"Acepto siguiente Slice de Feature-ID: {feature_id}; Feature: {feature_title}; "
+        f"Slice: {slice_title}; Task: {initial_task}; checkpoint: {checkpoint}; "
+        f"criterios: {_slice_criteria_json(criteria)}"
+    )
+
+
 def slice_criteria_decision_statement(
     previous_revision_id: str, reason: str, criteria: SliceCriteriaSpec,
 ) -> str:
@@ -368,8 +384,11 @@ def _accepted_e1_scope(state: State, root: Path) -> tuple[WorkingContext, Agreem
         raise ServiceError("E1 repository authority does not match the exact local root")
     if (context is None or context.side_of is not None or context.change_id is None
             or state.preserved_primary_context is not None or state.preserved_primary_work_id is not None
-            or state.work_items or state.parked_work is not None or state.pending_intake is not None
-            or state.deferred_side_request is not None or len(state.agreements) != 2):
+            or state.parked_work is not None or state.pending_intake is not None
+            or state.deferred_side_request is not None or len(state.agreements) < 2
+            or any(item.context is not None and (
+                item.context.feature_agreement_ref is None or item.context.slice_agreement_ref is None
+            ) for item in state.work_items)):
         raise ServiceError("E1 Task progress requires one active primary accepted Slice")
     feature = next((item for item in state.agreements if item.id == context.feature_agreement_ref), None)
     slice_record = next((item for item in state.agreements if item.id == context.slice_agreement_ref), None)
@@ -2052,6 +2071,101 @@ class CoreService:
             self.__persistence.publish_first_slice(saved, change, saved.agreements)
         except AtomicFailure as error:
             raise ServiceError("first Slice aggregate publication was rejected") from error
+        return saved
+
+    def accept_next_slice(
+        self, state: State, feature_id: str, slice_title: str, initial_task: str,
+        checkpoint: str, acceptance: UserAcceptance, criteria: SliceCriteriaSpec,
+    ) -> State:
+        """Accept another Slice under the original Feature in a single Core revision."""
+        current = _authoritative_state(self.__persistence, state)
+        root_identity = sha256(str(self.__repository_root).encode("utf-8")).hexdigest()[:16]
+        if current.initialization is None or current.initialization.repository_id != root_identity:
+            raise ServiceError("next Slice requires initialized authority for this exact root")
+        if not self.__persistence.r3b_schema_ready() or current.r3b_schema_upgrade is None:
+            raise ServiceError("next Slice requires current schema-17 authority; no implicit migration")
+        if type(feature_id) is not str or not feature_id or feature_id != feature_id.strip():
+            raise ServiceError("existing Feature-ID must be explicit and canonical")
+        feature = next((item for item in current.features if str(item.id) == feature_id and item.side_of is None), None)
+        if feature is None:
+            raise ServiceError("existing primary Feature-ID was not found")
+        original = next((
+            item for item in current.agreements if item.kind == "FEATURE" and item.feature_id == feature.id
+        ), None)
+        if original is None:
+            raise ServiceError("existing Feature lacks an accepted origin agreement")
+        statement = next_slice_acceptance_statement(
+            feature_id, feature.title, slice_title, initial_task, checkpoint, criteria,
+        )
+        expected_reference = f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"
+        if (
+            type(acceptance) is not UserAcceptance
+            or acceptance.source != "INTERACTIVE_TERMINAL"
+            or acceptance.statement != statement
+            or acceptance.source_reference != expected_reference
+        ):
+            raise ServiceError("next Slice requires its own exact human terminal acceptance")
+        digest = sha256(json.dumps([
+            root_identity, original.id, feature_id, slice_title, initial_task, checkpoint,
+            acceptance.statement, acceptance.source_reference,
+        ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+        change_id = ChangeId(f"change-{digest}")
+        task_id = f"task-{digest}"
+        feature_ref, slice_ref = f"agreement-feature-{digest}", f"agreement-slice-{digest}"
+        existing_pair = tuple(item for item in current.agreements if item.id in (feature_ref, slice_ref))
+        if existing_pair:
+            if (
+                len(existing_pair) == 2
+                and {item.id for item in existing_pair} == {feature_ref, slice_ref}
+                and any(item.id == change_id and item.feature_id == feature.id for item in current.changes)
+            ):
+                # An identical accepted proposal is already durable. No new revision.
+                return current
+            raise ServiceError("next Slice identity conflicts with existing agreements")
+        if any(item.kind == "SLICE" and item.feature_id == feature.id
+               and item.title.casefold() == slice_title.casefold() for item in current.agreements):
+            raise ServiceError("a Slice with this title is already accepted in the Feature")
+        if (
+            current.active_context is not None or current.preserved_primary_context is not None
+            or current.parked_work is not None or current.pending_intake is not None
+            or current.deferred_side_request is not None
+        ):
+            raise ServiceError("next Slice requires an empty active slot; manage existing work explicitly")
+        change = Change(change_id, feature.id, slice_title, Classification.FEATURE)
+        # The new Feature companion binds this Change to its accepted origin;
+        # its statement describes the new Slice, not a replacement of the old Feature.
+        feature_agreement = AgreementRecord(
+            feature_ref, "FEATURE", feature.id, change_id, feature.title,
+            statement, acceptance.source, acceptance.source_reference, root_identity,
+        )
+        slice_agreement = AgreementRecord(
+            slice_ref, "SLICE", feature.id, change_id, slice_title,
+            statement, acceptance.source, acceptance.source_reference, root_identity,
+            task_id, initial_task, checkpoint,
+        )
+        criteria_revision = SliceCriteriaRevision(
+            f"slice-criteria-{digest}-1", slice_ref, root_identity,
+            criteria.outcome, criteria.example, criteria.inclusions, criteria.exclusions,
+            criteria.decisions, criteria.criteria, acceptance.source, acceptance.source_reference,
+        )
+        candidate = _record_change(current, change)
+        assert candidate.active_context is not None
+        candidate = replace(
+            candidate,
+            active_context=replace(
+                candidate.active_context, focus=slice_title, current_work=initial_task,
+                checkpoints=(Checkpoint(checkpoint, False),),
+                feature_agreement_ref=feature_ref, slice_agreement_ref=slice_ref,
+            ),
+            agreements=current.agreements + (feature_agreement, slice_agreement),
+            slice_criteria_revisions=current.slice_criteria_revisions + (criteria_revision,),
+            slice_criteria_heads=current.slice_criteria_heads + (SliceCriteriaHead(slice_ref, criteria_revision.id),),
+        )
+        saved = _prepare_state_publication(_validated(candidate, "next Slice was rejected"), current.revision)
+        try:
+            self.__persistence.publish_next_slice(saved, change, (feature_agreement, slice_agreement), criteria_revision)
+        except AtomicFailure as error:
+            self.__raise_e1_publication_error(current.revision, error)
         return saved
 
     def revise_slice_criteria(
