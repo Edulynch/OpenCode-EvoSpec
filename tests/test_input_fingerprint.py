@@ -8,6 +8,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 from evospec import input_fingerprint
@@ -178,6 +180,55 @@ class InputFingerprintTests(unittest.TestCase):
                 self.snapshot()
         with self.assertRaises(InputFingerprintError):
             repository_input_snapshot(self.root, "wrong-root")
+
+    def test_09b_windows_path_and_handle_metadata_keep_identity_checks(self) -> None:
+        def file_stat(**changes: int) -> os.stat_result:
+            # Simula los dos orígenes de metadatos sin depender del Windows del CI.
+            fields = {
+                "st_dev": 1,
+                "st_ino": 42,
+                "st_mode": stat.S_IFREG | stat.S_IREAD,
+                "st_size": 10,
+                "st_mtime_ns": 200,
+                "st_ctime_ns": 100,
+                "st_birthtime_ns": 100,
+                "st_nlink": 1,
+                "st_file_attributes": 0,
+            }
+            fields.update(changes)
+            return cast(os.stat_result, cast(object, SimpleNamespace(**fields)))
+
+        from_path = file_stat()
+        from_handle = file_stat(st_ctime_ns=150)
+
+        with patch.object(input_fingerprint, "_WINDOWS_STAT_CTIME_DIFFERENCE", True):
+            # La creación coincide; solo el ctime del descriptor refleja cambios.
+            self.assertTrue(input_fingerprint._same_file(from_path, from_handle, path_to_descriptor=True))
+            self.assertFalse(input_fingerprint._same_file(from_path, from_handle))
+
+            for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns",
+                          "st_birthtime_ns", "st_nlink", "st_file_attributes"):
+                with self.subTest(changed_field=field):
+                    modified = file_stat(**{field: getattr(from_handle, field) + 1, "st_ctime_ns": 150})
+                    self.assertFalse(input_fingerprint._same_file(from_path, modified, path_to_descriptor=True))
+
+            # Sin birthtime no se relaja la comparación: se falla de forma segura.
+            without_birthtime = cast(os.stat_result, cast(object, SimpleNamespace(**{
+                field: value for field, value in vars(from_handle).items() if field != "st_birthtime_ns"
+            })))
+            self.assertFalse(input_fingerprint._same_file(from_path, without_birthtime, path_to_descriptor=True))
+
+        with patch.object(input_fingerprint, "_WINDOWS_STAT_CTIME_DIFFERENCE", False):
+            self.assertFalse(input_fingerprint._same_file(from_path, from_handle, path_to_descriptor=True))
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only path/descriptor regression")
+    def test_09c_windows_snapshot_accepts_rewritten_regular_file(self) -> None:
+        target = self.root / "input.txt"
+        target.write_text("first", encoding="utf-8")
+        target.write_text("second", encoding="utf-8")
+        before = self.snapshot()
+        target.write_text("third", encoding="utf-8")
+        self.assertNotEqual(before.fingerprint, self.snapshot().fingerprint)
 
     def test_10_environment_profile_excludes_ambient_home_credentials_and_config(self) -> None:
         runtime = str(Path(sys.executable).resolve())

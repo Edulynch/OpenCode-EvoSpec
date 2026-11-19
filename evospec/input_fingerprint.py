@@ -200,14 +200,32 @@ class _FileEntry:
     content_sha256: str
 
 
-def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+_WINDOWS_STAT_CTIME_DIFFERENCE = os.name == "nt"
+
+
+def _same_file(left: os.stat_result, right: os.stat_result, *, path_to_descriptor: bool = False) -> bool:
+    # En Windows, lstat() puede exponer la creación en ctime y fstat() el último
+    # cambio de metadatos. Comparar birthtime evita rechazar el mismo archivo.
+    if path_to_descriptor and _WINDOWS_STAT_CTIME_DIFFERENCE:
+        left_birthtime = getattr(left, "st_birthtime_ns", None)
+        right_birthtime = getattr(right, "st_birthtime_ns", None)
+        same_creation_time = (
+            left_birthtime == right_birthtime
+            if left_birthtime is not None and right_birthtime is not None
+            else left.st_ctime_ns == right.st_ctime_ns
+        )
+    else:
+        # Dos fstat() siguen exigiendo el mismo ctime para detectar cambios
+        # mientras el descriptor está abierto.
+        same_creation_time = left.st_ctime_ns == right.st_ctime_ns
+
     return (
         left.st_dev == right.st_dev
         and left.st_ino == right.st_ino
         and left.st_mode == right.st_mode
         and left.st_size == right.st_size
         and left.st_mtime_ns == right.st_mtime_ns
-        and left.st_ctime_ns == right.st_ctime_ns
+        and same_creation_time
         and left.st_nlink == right.st_nlink
         and getattr(left, "st_file_attributes", 0) == getattr(right, "st_file_attributes", 0)
     )
@@ -231,7 +249,7 @@ def _read_file(path: Path, before: os.stat_result) -> str:
             not stat.S_ISREG(opened.st_mode)
             or _is_reparse_point(opened)
             or opened.st_nlink != 1
-            or not _same_file(before, opened)
+            or not _same_file(before, opened, path_to_descriptor=True)
         ):
             raise InputFingerprintError("repository file changed or is unsafe during fingerprinting")
         digest = hashlib.sha256()
@@ -250,7 +268,7 @@ def _read_file(path: Path, before: os.stat_result) -> str:
             _is_reparse_point(after)
             or _is_reparse_point(current)
             or not _same_file(opened, after)
-            or not _same_file(after, current)
+            or not _same_file(after, current, path_to_descriptor=True)
             or read_bytes != after.st_size
         ):
             raise InputFingerprintError("repository file changed during fingerprinting")
