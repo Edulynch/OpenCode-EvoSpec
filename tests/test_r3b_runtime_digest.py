@@ -14,6 +14,9 @@ from evospec.services import ServiceError, _runtime_digest
 
 
 class R3BRuntimeDigestTests(unittest.TestCase):
+    # Every test receives its own disposable executable path in setUp.
+    executable: Path = Path()
+
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix="evospec-r3b-runtime-")
         self.addCleanup(temporary.cleanup)
