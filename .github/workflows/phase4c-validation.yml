@@ -98,6 +98,11 @@ jobs:
         run: uv python install ${{ matrix.python }}
       - name: Source tests
         run: uv run --python ${{ matrix.python }} python -m unittest discover -v
+      - name: Windows Python 3.13 runtime metadata regression
+        if: runner.os == 'Windows'
+        # The reported false executable drift occurred in Python 3.13 on Windows.
+        # Keep this probe separate from the project's baseline Python 3.11 venv.
+        run: uv run --no-project --python 3.13 python -m unittest -v tests.test_r3b_runtime_digest
       - name: E1 OpenCode adapter and continuation tests
         # These contract tests exercise the native tool registration and its
         # protected boundaries without requiring an authenticated host session.

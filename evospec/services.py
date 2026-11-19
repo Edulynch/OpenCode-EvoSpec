@@ -211,12 +211,41 @@ _PYTHON_TEST_RUNNER = (
 _PYTHON_TEST_TARGET = re.compile(r"tests(?:\.[A-Za-z_][A-Za-z0-9_]*)+\Z")
 _NODE_TEST_TARGET = re.compile(r"tests/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\.test\.mjs\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_WINDOWS_STAT_CTIME_DIFFERENCE = os.name == "nt"
 
 
 def _supported_test_descriptor(kind: str, target: str) -> bool:
     return (
         kind == "python-unittest" and _PYTHON_TEST_TARGET.fullmatch(target) is not None
         or kind == "node-test" and _NODE_TEST_TARGET.fullmatch(target) is not None
+    )
+
+
+def _same_runtime_stat(
+    left: os.stat_result, right: os.stat_result, *, path_to_descriptor: bool = False,
+) -> bool:
+    # Windows Python 3.13 may report creation time through path ctime and
+    # metadata-change time through handle ctime. Birthtime binds those views
+    # to the same file without relaxing checks made on two open handles.
+    if path_to_descriptor and _WINDOWS_STAT_CTIME_DIFFERENCE:
+        left_birth = getattr(left, "st_birthtime_ns", None)
+        right_birth = getattr(right, "st_birthtime_ns", None)
+        same_time = (
+            left_birth == right_birth
+            if left_birth is not None and right_birth is not None
+            else left.st_ctime_ns == right.st_ctime_ns
+        )
+    else:
+        same_time = left.st_ctime_ns == right.st_ctime_ns
+    return (
+        left.st_ino == right.st_ino
+        and left.st_dev == right.st_dev
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and same_time
+        and getattr(left, "st_file_attributes", 0) == getattr(right, "st_file_attributes", 0)
+        and left.st_mode == right.st_mode
+        and left.st_nlink == right.st_nlink
     )
 
 
@@ -236,6 +265,7 @@ def _runtime_digest(path: str) -> str:
         ):
             raise ServiceError("R3-B runtime executable is not a bounded regular file")
         digest = sha256()
+        read_bytes = 0
         with executable.open("rb") as handle:
             opened = os.fstat(handle.fileno())
             if (
@@ -246,16 +276,16 @@ def _runtime_digest(path: str) -> str:
                 raise ServiceError("R3-B runtime executable became unsafe during verification")
             while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)
+                read_bytes += len(chunk)
             after = os.fstat(handle.fileno())
         current = executable.lstat()
     except (OSError, RuntimeError) as error:
         raise ServiceError("R3-B runtime executable cannot be verified") from error
-    if any(
-        left.st_ino != right.st_ino or left.st_dev != right.st_dev
-        or left.st_size != right.st_size or left.st_mtime_ns != right.st_mtime_ns
-        or left.st_ctime_ns != right.st_ctime_ns
-        or getattr(left, "st_file_attributes", 0) != getattr(right, "st_file_attributes", 0)
-        for left, right in ((before, opened), (opened, after), (after, current))
+    if (
+        not _same_runtime_stat(before, opened, path_to_descriptor=True)
+        or not _same_runtime_stat(opened, after)
+        or not _same_runtime_stat(after, current, path_to_descriptor=True)
+        or read_bytes != after.st_size
     ):
         raise ServiceError("R3-B runtime executable changed during verification")
     return digest.hexdigest()

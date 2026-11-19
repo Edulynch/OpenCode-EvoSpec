@@ -12,6 +12,11 @@ import {
 const AGENT_COMMAND = __EVOSPEC_AGENT_COMMAND__
 const CLI_COMMAND = __EVOSPEC_CLI_COMMAND__
 const canonicalSnapshots = new Map()
+const explicitR3BPermissionHooks = new WeakSet()
+const R3B_HUMAN_PERMISSION_ACTIONS = new Set([
+  "evospec_criterion_test_r3b",
+  "evospec_accept_slice_outcome",
+])
 
 const string = { type: "string" }
 const nullableString = { type: ["string", "null"] }
@@ -444,6 +449,11 @@ async function inspectR3B(runtime, root, context, expectedRevision) {
 }
 
 async function executeCriterionTestR3B(runtime, args, context) {
+  // A plain permission.assert can silently allow custom actions under V2's
+  // default rules. Require an installed ask hook before any test can run.
+  if (!explicitR3BPermissionHooks.has(runtime)) {
+    throw new Error("R3-B explicit human permission guard is unavailable")
+  }
   if (typeof runtime?.permission?.assert !== "function" || typeof runtime?.session?.get !== "function") {
     throw new Error("R3-B host permission/session API is unavailable")
   }
@@ -503,7 +513,13 @@ async function executeCriterionTestR3B(runtime, args, context) {
       environment_profile_id: policy.environment_profile_id,
       environment_profile_policy_digest: policy.environment_profile_policy_digest,
       environment_profile_digest: profile.environmentProfileDigest,
-    })],
+    }), root],
+    metadata: {
+      repository_root: root,
+      criterion_id: args.criterion_id,
+      test_target: args.test_target,
+      decision: "Inspect the canonical repository root and approve this test only once",
+    },
   })
   if (Object.entries(requester).some(([key, value]) => context?.[key] !== value) ||
       resolve(await realpath(await sessionRoot(runtime, context))) !== resolve(root)) {
@@ -597,6 +613,9 @@ async function executeCriterionTestR3B(runtime, args, context) {
 }
 
 async function executeAcceptSliceOutcome(runtime, args, context) {
+  if (!explicitR3BPermissionHooks.has(runtime)) {
+    throw new Error("R3-B explicit human permission guard is unavailable")
+  }
   if (typeof runtime?.permission?.assert !== "function" || typeof runtime?.session?.get !== "function") {
     throw new Error("Slice outcome acceptance requires the host permission/session API")
   }
@@ -646,7 +665,12 @@ async function executeAcceptSliceOutcome(runtime, args, context) {
        coverage_approvals: coverage,
        environment_profile_id: policy.environment_profile_id,
       environment_profile_policy_digest: policy.environment_profile_policy_digest,
-    })],
+    }), root],
+    metadata: {
+      repository_root: root,
+      slice_agreement_ref: accepted.slice_agreement_ref,
+      decision: "Inspect the canonical repository root and approve Slice outcome only once",
+    },
   })
   if (Object.entries(requester).some(([key, value]) => context?.[key] !== value) ||
       resolve(await realpath(await sessionRoot(runtime, context))) !== resolve(root)) {
@@ -1381,6 +1405,16 @@ const tools = [
 export default {
   id: "evospec",
   async setup(runtime) {
+    if (typeof runtime?.permission?.hook === "function") {
+      await runtime.permission.hook("evaluate", (event) => {
+        if (!R3B_HUMAN_PERMISSION_ACTIONS.has(event.action) || event.effect === "deny") return
+        // Ask again even when a permissive default or saved approval would
+        // otherwise let the host execute without showing a human decision.
+        event.effect = "ask"
+        event.message = "EvoSpec R3-B requires explicit approval. Inspect repository_root before proceeding."
+      })
+      explicitR3BPermissionHooks.add(runtime)
+    }
     const runtimeTools = tools.map((definition) => ({
       ...definition,
       execute: (args, context) => definition.execute(
