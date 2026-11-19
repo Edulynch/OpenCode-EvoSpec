@@ -119,6 +119,7 @@ test("R3-B test binds permission to exact inputs, executes sanitized runtime, an
   const commands = []
   const permissions = []
   const sentRequests = []
+  let permissionGuard
   let decision = async () => {}
   let sessionPath = root
   let current = context()
@@ -191,9 +192,29 @@ test("R3-B test binds permission to exact inputs, executes sanitized runtime, an
       tool: { transform: async (register) => register({ add: (item) => definitions.push(item) }),
         list: async () => definitions.map((item) => ({ id: item.name })) },
       session: { get: async () => ({ location: { directory: sessionPath } }), hook: async () => {} },
-      permission: { assert: async (request) => { permissions.push(request); await decision(request) } },
+      permission: {
+        hook: async (name, handler) => {
+          assert.equal(name, "evaluate")
+          permissionGuard = handler
+        },
+        assert: async (request) => {
+          // V2's default allow must become a real ask for the native human gate.
+          assert.ok(permissionGuard, "the host permission guard must be installed")
+          const event = { action: request.action, resources: request.resources, effect: "allow" }
+          await permissionGuard(event)
+          assert.equal(event.effect, "ask")
+          permissions.push(request)
+          await decision(request)
+        },
+      },
     }
     await plugin.setup(runtime)
+    const unrelated = { action: "read", resources: ["*"], effect: "allow" }
+    await permissionGuard(unrelated)
+    assert.equal(unrelated.effect, "allow", "R3-B rules must not rewrite unrelated permissions")
+    const forbidden = { action: "evospec_criterion_test_r3b", resources: ["*"], effect: "deny" }
+    await permissionGuard(forbidden)
+    assert.equal(forbidden.effect, "deny", "a configured deny remains final")
     const testTool = definitions.find((item) => item.name === "evospec_criterion_test_r3b")
     const generic = definitions.find((item) => item.name === "evospec")
     assert.ok(testTool)
@@ -237,6 +258,8 @@ test("R3-B test binds permission to exact inputs, executes sanitized runtime, an
     const resource = JSON.parse(permissions.at(-1).resources[0])
     assert.equal(resource.operation, "run_criterion_test_r3b")
     assert.equal(resource.repository_root, canonicalRoot)
+    assert.equal(permissions.at(-1).resources[1], canonicalRoot)
+    assert.equal(permissions.at(-1).metadata.repository_root, canonicalRoot)
     assert.equal(resource.input_fingerprint, snapshot().fingerprint)
     assert.equal(resource.coverage_approval.id, approvedCoverage().id)
     assert.equal(resource.coverage_approval.contract_digest, approvedCoverage().contract_digest)
@@ -265,6 +288,37 @@ test("R3-B test binds permission to exact inputs, executes sanitized runtime, an
     assert.equal(permissions.length, historicalPermissions, "closed cycles cannot request host test permission")
   } finally {
     delete globalThis.Bun
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("R3-B refuses to run when the host cannot install an explicit permission guard", async () => {
+  const root = await mkdtemp(join(tmpdir(), "evospec-r3b-no-ask-"))
+  try {
+    const content = (await readFile(source, "utf8"))
+      .replace("__EVOSPEC_AGENT_COMMAND__", JSON.stringify(["python", "-m", "evospec.agent_protocol"]))
+      .replace("__EVOSPEC_CLI_COMMAND__", JSON.stringify(["python", "-m", "evospec.cli"]))
+    await writeFile(join(root, "index.mjs"), content)
+    await copyFile(continuation, join(root, "continuation.mjs"))
+    const definitions = []
+    const runtime = {
+      tool: { transform: async (register) => register({ add: (item) => definitions.push(item) }),
+        list: async () => definitions.map((item) => ({ id: item.name })) },
+      session: { get: async () => ({ location: { directory: root } }), hook: async () => {} },
+      // A host may expose assert but lack the hook that forces a visible ask.
+      permission: { assert: async () => { throw new Error("must never ask without an enforceable guard") } },
+    }
+    const plugin = (await import(pathToFileURL(join(root, "index.mjs")).href)).default
+    await plugin.setup(runtime)
+    const testTool = definitions.find((item) => item.name === "evospec_criterion_test_r3b")
+    const outcomeTool = definitions.find((item) => item.name === "evospec_accept_slice_outcome")
+    const call = {
+      runtime, sessionID: "ses-r3b", agent: "tester", messageID: "msg-r3b", id: "no-ask",
+      signal: new AbortController().signal,
+    }
+    await assert.rejects(testTool.execute({}, call), /explicit human permission guard is unavailable/)
+    await assert.rejects(outcomeTool.execute({}, call), /explicit human permission guard is unavailable/)
+  } finally {
     await rm(root, { recursive: true, force: true })
   }
 })
@@ -306,7 +360,7 @@ test("R3-B test rejects scope or fingerprint changes while host permission is pe
       tool: { transform: async (register) => register({ add: (item) => definitions.push(item) }),
         list: async () => definitions.map((item) => ({ id: item.name })) },
       session: { get: async () => ({ location: { directory: sessionPath } }), hook: async () => {} },
-      permission: { assert: async (request) => {
+      permission: { hook: async () => {}, assert: async (request) => {
         permissions.push(request)
         if (mutateDuringPermission) current = context({ input_snapshot: snapshot("b".repeat(64)) })
       } },
@@ -384,7 +438,7 @@ test("R3-B test submits no evidence when requester or session root changes durin
           tool: { transform: async (register) => register({ add: (item) => definitions.push(item) }),
             list: async () => definitions.map((item) => ({ id: item.name })) },
           session: { get: async () => ({ location: { directory: sessionPath } }), hook: async () => {} },
-          permission: { assert: async () => {} },
+          permission: { hook: async () => {}, assert: async () => {} },
         }
         await plugin.setup(runtime)
         const tool = definitions.find((item) => item.name === "evospec_criterion_test_r3b")
@@ -419,6 +473,7 @@ test("R3-B test submits no evidence when requester or session root changes durin
 test("Slice outcome tool binds the exact current scope and returns Core's immutable receipt", async () => {
   const root = await mkdtemp(join(tmpdir(), "evospec-r3b-accept-"))
   const permissions = []
+  let permissionGuard
   const requests = []
   let current = context()
   let mutateDuringPermission = false
@@ -461,10 +516,19 @@ test("Slice outcome tool binds the exact current scope and returns Core's immuta
       tool: { transform: async (register) => register({ add: (item) => definitions.push(item) }),
         list: async () => definitions.map((item) => ({ id: item.name })) },
       session: { get: async () => ({ location: { directory: root } }), hook: async () => {} },
-      permission: { assert: async (request) => {
-        permissions.push(request)
-        if (mutateDuringPermission) current = context({ input_snapshot: snapshot("b".repeat(64)) })
-      } },
+      permission: {
+        hook: async (name, handler) => {
+          assert.equal(name, "evaluate")
+          permissionGuard = handler
+        },
+        assert: async (request) => {
+          const event = { action: request.action, resources: request.resources, effect: "allow" }
+          await permissionGuard(event)
+          assert.equal(event.effect, "ask", "outcome acceptance also requires an explicit prompt")
+          permissions.push(request)
+          if (mutateDuringPermission) current = context({ input_snapshot: snapshot("b".repeat(64)) })
+        },
+      },
     }
     await plugin.setup(runtime)
     const tool = definitions.find((item) => item.name === "evospec_accept_slice_outcome")
@@ -494,6 +558,8 @@ test("Slice outcome tool binds the exact current scope and returns Core's immuta
     assert.equal(response.result.code, "ALREADY_ACCEPTED")
     assert.equal(response.result.slice_outcome_receipt.id, "slice-outcome-canonical")
     const resource = JSON.parse(permissions[0].resources[0])
+    assert.equal(permissions[0].resources[1], await realpath(root))
+    assert.equal(permissions[0].metadata.repository_root, await realpath(root))
     assert.equal(resource.operation, "accept_slice_outcome")
     assert.equal(resource.repository_id, "repo-r3b")
     assert.equal(resource.slice_agreement_ref, "slice-r3b")
