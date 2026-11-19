@@ -244,8 +244,6 @@ def _same_runtime_stat(
         and left.st_mtime_ns == right.st_mtime_ns
         and same_time
         and getattr(left, "st_file_attributes", 0) == getattr(right, "st_file_attributes", 0)
-        and left.st_mode == right.st_mode
-        and left.st_nlink == right.st_nlink
     )
 
 

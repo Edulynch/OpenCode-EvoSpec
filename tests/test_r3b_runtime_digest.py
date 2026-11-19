@@ -20,7 +20,7 @@ class R3BRuntimeDigestTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix="evospec-r3b-runtime-")
         self.addCleanup(temporary.cleanup)
-        self.executable = Path(temporary.name) / "test-runtime.exe"
+        self.executable = (Path(temporary.name) / "test-runtime.exe").resolve()
         self.executable.write_bytes(b"trusted local executable bytes")
         # Unix requires an executable bit; the identity check does not run the file.
         self.executable.chmod(0o700)
