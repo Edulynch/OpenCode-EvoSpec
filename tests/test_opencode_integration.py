@@ -297,7 +297,11 @@ assert(JSON.stringify(proposal.delta.allowed_paths) === '["index.html"]', "only 
 assert(JSON.stringify(proposal.delta.reversible_actions) ===
   '["progress","assess_locks","review","verify","edit"]', "preserves existing actions and adds only edit")
 assert(proposal.delta.operation_budget === 3, "proposed grant is finite and proportional")
-assert(!("irreversible_permissions" in proposal.delta), "no Git or irreversible escalation")
+assert(proposal.delta.irreversible_permissions === null, "irreversible grants remain unchanged")
+assert(proposal.delta.stop_conditions === null, "all existing stop conditions remain in place")
+assert(proposal.delta.retry_budget === null, "retry budget remains unchanged")
+assert(proposal.delta.external_wait_allowed === null, "external wait authority remains unchanged")
+assert(Object.keys(proposal.delta).length === 7, "strict protocol receives every optional field")
 let rejected = false
 try { await call({ expected_revision: 7, path: "../outside" }) }
 catch (error) { rejected = String(error).includes("EDIT_PATH_INVALID") }
