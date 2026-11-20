@@ -39,6 +39,24 @@ Start with `context` and treat the returned EvoSpec lifecycle fields as authorit
 
 Choose the next action from the returned `legal_actions`. Do not assume that an action is legal because it was legal in an earlier response. `context` is read-only and does not require `expected_revision`.
 
+### SESSION_REQUEST recovery projection (experimental)
+
+For a Core-validated paired `SESSION_REQUEST` Feature/Slice, `accepted_slice` keeps its existing agreement references, Task fields, `source`, and `source_reference`, and adds only this compact original-request snapshot:
+
+```json
+{
+  "session_request": {
+    "statement": "<verbatim original message>",
+    "sha256": "<full 64-character SHA-256 of the statement>",
+    "repository_id": "<initialized repository identity>"
+  }
+}
+```
+
+The snapshot comes from the persisted original agreement. It is not a TTY decision, proof of human identity, or host permission. A mixed pair or pair with different message references/statements is not projected as canonical. At intake, `criteria_status` is `NOT_RECORDED` and `criteria_revision` is `null`; a separate TTY-approved criteria amendment can add criteria later. No criteria, test evidence, or outcome is inferred from the request.
+
+For an exact active canonical `SESSION_REQUEST` before schema 17, the existing top-level `input_snapshot` also exposes Core's current revision-bound workspace fingerprint. It is read-only and separate from the immutable request snapshot: a relevant file edit can change this fingerprint without changing the authority revision or request hash. This does not record test evidence, approve coverage, create a Slice outcome, authorize an upgrade, or close a Feature. If the scan fails, context remains readable with `input_snapshot: null`; an unclosed Feature stays blocked with `INPUT_SNAPSHOT_UNAVAILABLE`. When a snapshot is available, `feature_completion` still reports Core's actual blockers, including `SCHEMA_17_REQUIRED` before schema 17. Neither path upgrades state. Schema-17 R3-B continues to use `input_snapshot` through its existing path.
+
 ### E1 accepted Task: guarded operational progress (Slice C)
 
 An explicitly approved E1 Slice is a different authority boundary from legacy `progress`. The immutable `accepted_slice` object continues to show the human-approved Feature, Slice, first Task and **initial** checkpoint. The optional `task_progress` object reports the **current operational** checkpoint with `report_kind: "REPORTED_UNVERIFIED"`; it never marks that checkpoint verified or changes the original agreement. For compatibility, `progress.resume_point` is derived from `task_progress.checkpoint` on E1 reads, but it is not written as a second source of truth.
