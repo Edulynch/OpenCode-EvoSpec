@@ -103,7 +103,10 @@ class SessionRequestFirstSliceTests(unittest.TestCase):
                 evidence.source_reference.rsplit(":", 1)[-1],
                 sha256(text.encode("utf-8")).hexdigest()[:16],
             )
-            self.assertEqual(state.active_context.focus, text.strip())
+            active = state.active_context
+            self.assertIsNotNone(active)
+            assert active is not None
+            self.assertEqual(active.focus, text.strip())
             self.assertFalse(state.slice_criteria_heads)
             unchanged = workflow.accept_first_slice_session(
                 evidence, expected_revision=ExpectedRevision(state.revision),
