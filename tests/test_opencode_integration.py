@@ -129,7 +129,8 @@ const definitions = []
 const commands = []
 let canonical = { context: {
   revision: 1, repository_id: "repo-1",
-  initialization_state: "INITIALIZED", e1_schema_ready: true,
+  // Core returns null before the first persisted Slice agreement.
+  initialization_state: "INITIALIZED", e1_schema_ready: null,
   lifecycle: null, feature_id: null, change_id: null,
   feature_completion: null, completed_terminal: false,
   pending_intake: false, side_work_active: false, stale: false,
@@ -172,6 +173,7 @@ const proposal = JSON.parse((await call("evospec_first_slice_handoff", {
 })).content)
 assert(proposal.code === "INTERACTIVE_FIRST_SLICE_APPROVAL_REQUIRED", "proposal demands TTY approval")
 assert(proposal.state === "READ_ONLY_PROPOSAL", "proposal never records acceptance")
+assert(proposal.writer_schema_verified === false, "handoff never claims the writer-schema preflight passed")
 assert(proposal.repository_root === process.cwd(), "handoff remains bound to executing session root")
 assert(proposal.revision === 1, "handoff binds the original Core revision")
 assert(proposal.terminal_command.includes("accept-slice"), "only first Slice CLI is offered")
@@ -192,6 +194,14 @@ try { await call("evospec_first_slice_handoff", {
 }) } catch (error) { rejected = String(error).includes("FIRST_SLICE_UNAVAILABLE") }
 assert(rejected, "an occupied work slot cannot gain a first-Slice handoff")
 canonical.context.lifecycle = null
+canonical.context.e1_schema_ready = false
+rejected = false
+try { await call("evospec_first_slice_handoff", {
+  expected_revision: 1, feature: "MiniLista",
+  slice: "Add and check tasks", task: "Create index.html", checkpoint: "Browser",
+}) } catch (error) { rejected = String(error).includes("FIRST_SLICE_UNAVAILABLE") }
+assert(rejected, "explicitly unavailable E1 schema must stop the handoff")
+canonical.context.e1_schema_ready = null
 const legacy = JSON.parse((await call("evospec_start", {
   operation: "new", intent: "Explicit legacy work", intake_route: "legacy",
 })).content)
