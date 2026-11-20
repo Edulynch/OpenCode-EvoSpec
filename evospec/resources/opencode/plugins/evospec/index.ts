@@ -962,6 +962,93 @@ async function executeFirstSliceHandoff(runtime, args, context) {
   })
 }
 
+// This is a session-message provenance route, NOT an authenticated human
+// signature. Programmatic session.prompt messages also have type="user".
+async function currentSessionRequest(runtime, context) {
+  if (typeof runtime?.session?.context !== "function"
+      || typeof context.messageID !== "string" || !context.messageID.startsWith("msg_")) {
+    throw new Error("INPUT_PROVENANCE_UNAVAILABLE: OpenCode session context or tool message identity is missing")
+  }
+  const messages = await runtime.session.context({ sessionID: context.sessionID })
+  if (!Array.isArray(messages) || messages.length > 4096) {
+    throw new Error("INPUT_PROVENANCE_UNAVAILABLE: admitted session transcript is unavailable or unbounded")
+  }
+  const at = messages.findIndex((item) =>
+    item?.type === "assistant" && item.id === context.messageID)
+  if (at < 1) {
+    throw new Error("INPUT_PROVENANCE_UNAVAILABLE: the invoking assistant turn is not in the admitted session")
+  }
+  const prior = messages.slice(0, at)
+  const lastUser = prior.findLastIndex((item) => item?.type === "user")
+  if (lastUser < 0) {
+    throw new Error("INPUT_PROVENANCE_UNAVAILABLE: no admitted user request precedes this tool call")
+  }
+  if (prior.slice(lastUser + 1).some((item) => item?.type === "synthetic")) {
+    throw new Error("INPUT_PROVENANCE_UNAVAILABLE: a synthetic event separates the request from this tool")
+  }
+  const item = prior[lastUser]
+  if (typeof item.id !== "string" || !/^msg_[A-Za-z0-9_-]{3,128}$/.test(item.id)
+      || typeof item.text !== "string" || !item.text.trim()
+      || item.text !== item.text.trim() || item.text.length > 512
+      || /[\u0000-\u001f\u007f]/.test(item.text)
+      || (Array.isArray(item.files) && item.files.length > 0)) {
+    throw new Error("SESSION_REQUEST_SCOPE_INVALID: only a bounded, single-line admitted text request is supported")
+  }
+  return { message_id: item.id, request_text: item.text }
+}
+
+async function executeSessionFirstSlice(runtime, args, context) {
+  const root = await sessionRoot(runtime, context)
+  const current = parseContextResponse(
+    await rawExecuteRequest(runtime, { action: "context" }, context, root)
+  )
+  if (current.revision !== args.expected_revision) {
+    throw new Error("STALE_REVISION: reread canonical context before new session intake")
+  }
+  if (!firstSliceHandoffEligible(current) || typeof current.repository_id !== "string") {
+    throw new Error("SESSION_REQUEST_FIRST_SLICE_UNAVAILABLE: an initialized empty E1 slot is required")
+  }
+  const original = await currentSessionRequest(runtime, context)
+  if (typeof runtime?.permission?.assert !== "function"
+      || !["sessionID", "agent", "messageID", "id"].every((key) =>
+        typeof context[key] === "string" && context[key].trim())) {
+    throw new Error("HOST_PERMISSION_UNAVAILABLE: full executing tool identity and permission API required")
+  }
+  // Let OpenCode resolve this precise operation under this session's own
+  // policy (Auto or prompt); Core independently restricts the only new file.
+  await runtime.permission.assert({
+    sessionID: context.sessionID,
+    agent: context.agent,
+    source: { type: "tool", messageID: context.messageID, id: context.id },
+    action: "evospec_session_intake",
+    resources: [root],
+  })
+  // Permission checks may await human input: re-read root, actual message,
+  // and Core revision after the await. Never reuse stale session authority.
+  if (resolve(await sessionRoot(runtime, context)) !== resolve(root)) {
+    throw new Error("SESSION_REQUEST_ROOT_CHANGED: project moved after host admission")
+  }
+  const fresh = await currentSessionRequest(runtime, context)
+  if (fresh.message_id !== original.message_id || fresh.request_text !== original.request_text) {
+    throw new Error("SESSION_REQUEST_CHANGED: the session request changed before recording")
+  }
+  const latest = parseContextResponse(
+    await rawExecuteRequest(runtime, { action: "context" }, context, root)
+  )
+  if (latest.revision !== current.revision || !firstSliceHandoffEligible(latest)
+      || latest.repository_id !== current.repository_id) {
+    throw new Error("STALE_REVISION: Core authority changed during host permission admission")
+  }
+  return rawExecuteRequest(runtime, {
+    action: "accept_first_slice_session",
+    expected_revision: current.revision,
+    repository_id: current.repository_id,
+    session_id: context.sessionID,
+    message_id: original.message_id,
+    request_text: original.request_text,
+  }, context, root)
+}
+
 // A single-file edit request is deliberately a proposal, not a grant.
 // Core alone owns the exact envelope and the subsequent HUMAN decision.
 function canonicalEditFilePath(value) {
@@ -1202,12 +1289,12 @@ async function executeStart(runtime, args, context) {
   if (args.operation === "new" && args.intake_route !== "legacy"
       && firstSliceHandoffEligible(initialized)) {
     return JSON.stringify({
-      code: "FIRST_SLICE_HANDOFF_REQUIRED",
+      code: "SESSION_FIRST_SLICE_AVAILABLE",
       state: "NO_FEATURE_CREATED",
       repository_root: root,
       revision: initialized.revision,
-      next_tool: "evospec_first_slice_handoff",
-      instruction: "Propose the smallest user-observable first Slice, one initial Task and checkpoint; call the read-only handoff tool at this revision. Do not run legacy NEW before TTY approval.",
+      next_tool: "evospec_session_first_slice",
+      instruction: "For a clear, low-risk, new single-file web app, call evospec_session_first_slice with this revision. It reads the original admitted session message itself, asks OpenCode to authorize the operation under its current session policy, and records an exact first Slice without TTY; Core permits only a fresh index.html. If provenance or scope fails, explain the specific blocker without forging user consent or falling back to legacy NEW.",
     })
   }
   const result = await spawnCommand(
@@ -1412,7 +1499,7 @@ const tools = [
     object({ request: string }),
     (args, context) => {
       // Keep the E1 capability visible to the host as its own permission-controlled tool.
-      if (["accepted_task_progress", "criterion_test_result", "criterion_test_result_r3b",
+      if (["accept_first_slice_session", "accepted_task_progress", "criterion_test_result", "criterion_test_result_r3b",
         "accept_slice_outcome", "accept_historical_slice_outcome"].includes(staleRequest(args.request)?.action)) {
         return JSON.stringify({ error: {
           code: "DEDICATED_TOOL_REQUIRED",
@@ -1424,7 +1511,7 @@ const tools = [
   ),
   protocolTool(
     "evospec_start",
-    "Start session intake. A first new Feature in an empty E1 project returns a read-only first-Slice handoff; explicitly requested legacy routing remains available.",
+    "Start session intake. For an empty E1 repo, offer native session-bound first Slice without TTY when the host can supply admitted message provenance. Legacy routing is explicit only.",
     object({
       operation: { type: "string", enum: ["new", "change"] },
       intent: string,
@@ -1443,6 +1530,12 @@ const tools = [
       checkpoint: { type: "string", minLength: 1, maxLength: 2048 },
     }),
     (args, context) => executeFirstSliceHandoff(context.runtime, args, context),
+  ),
+  protocolTool(
+    "evospec_session_first_slice",
+    "For a new, empty repository only: recover the admitted user message from the executing OpenCode session, ask the host to authorize session intake, then persist the exact Feature/Slice/Task with only index.html in Core edit scope. Never claims authenticated human approval; cannot add criteria or close Feature.",
+    object({ expected_revision: nonnegativeInteger }),
+    (args, context) => executeSessionFirstSlice(context.runtime, args, context),
   ),
   protocolTool(
     "evospec_propose_file_edit",
@@ -1816,7 +1909,7 @@ export default {
         type: "text",
         text: "For natural-language questions about where work stands or where to resume (¿dónde seguimos?, ¿en qué quedamos?, where were we?), load the evospec skill and call only evospec_context for the current session project. Report the known Feature, Slice, Task, and next checkpoint plainly; distinguish initial acceptance from later task_progress (REPORTED_UNVERIFIED), and disclose missing or ambiguous context. When there is no active Task, report accepted work_queue items as inactive and never choose or activate one on a status query. Read-only questions never initialize, continue, reaccept, or mutate. " +
           "If evospec_context is unavailable or fails, report that the authoritative context cannot be verified and stop; never replace it with Engram memories, previous session messages, other repositories, or guessed work. " +
-          "For a first new Feature in an empty initialized E1 project, use evospec_first_slice_handoff and require an interactive TTY acceptance; chat consent is not Slice acceptance. Never create legacy active work first. Reread canonical context after approval. After a human-accepted E1 Slice, if a file edit is outside the current autonomy envelope, use evospec_propose_file_edit for the exact file with a small finite budget; it proposes but does not grant authority, and the user must choose Core's exact AUTHORIZE, REJECT or NARROW decision. Never repeat the initial Slice acceptance or infer file permission from chat. For other explicit EvoSpec lifecycle work, load the evospec skill and call evospec_context before repository inspection, tests, or lifecycle mutations. Then use evospec_continuation and follow its deterministic adapter directive: SAFE_AUTOMATIC_OPERATION and in-envelope BOUNDED_DELEGATION continue; EXTERNAL_WAIT waits; HUMAN_MATERIAL_DECISION asks exactly Core's decision; STRUCTURAL_DEFECT fails closed; terminal with outcome null completes. Re-read context after every Core mutation, reevaluate STALE_REVISION before any retry, and never edit .evospec manually.",
+          "For a clear low-risk single-file web application in a freshly initialized empty E1 repository, call evospec_session_first_slice with the current revision instead of a TTY acceptance. It obtains the admitted user message from the current session itself and asks the host for the session-intake tool permission; Core records source SESSION_REQUEST (not authenticated human approval) and grants ONLY a fresh index.html with finite reversible budget. Never invent or widen scope from model-generated prose; follow Core and host denials. No ACEPTO or AUTHORIZE is required for that exact bounded initial file if Core and host both allow it. Do not create legacy active work first. If the current Core envelope still excludes a requested edit, do NOT silently self-grant it; use evospec_propose_file_edit only for other explicitly accepted work. The current session route does not register objective Slice criteria or complete a Feature; report those pending honestly. For other explicit EvoSpec lifecycle work, load the evospec skill and call evospec_context before repository inspection, tests, or lifecycle mutations. Then use evospec_continuation and follow its deterministic adapter directive: SAFE_AUTOMATIC_OPERATION and in-envelope BOUNDED_DELEGATION continue; EXTERNAL_WAIT waits; HUMAN_MATERIAL_DECISION asks exactly Core's decision; STRUCTURAL_DEFECT fails closed; terminal with outcome null completes. Re-read context after every Core mutation, reevaluate STALE_REVISION before any retry, and never edit .evospec manually.",
       })
     })
   },
