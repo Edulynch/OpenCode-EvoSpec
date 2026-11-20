@@ -2605,7 +2605,13 @@ def validate_state(state: State) -> None:
             )
             if (match is None or match.group(3) != sha256(agreement.statement.encode("utf-8")).hexdigest()[:16]):
                 raise StateValidationError("session request agreement has invalid message provenance")
-        elif agreement.source != "INTERACTIVE_TERMINAL":
+        elif agreement.source == "INTERACTIVE_TERMINAL":
+            # Legacy terminal receipts are cryptographically bound to their
+            # own canonical statement, not interchangeable with SESSION_REQUEST.
+            expected_ref = "tty:" + sha256(agreement.statement.encode("utf-8")).hexdigest()[:12]
+            if agreement.source_reference != expected_ref:
+                raise StateValidationError("terminal agreement reference does not match its statement")
+        else:
             raise StateValidationError("agreement provenance must identify an available channel")
         if initialization is None or agreement.repository_id != initialization.repository_id:
             raise StateValidationError("agreement repository identity is not authoritative")
