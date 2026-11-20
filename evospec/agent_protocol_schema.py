@@ -28,6 +28,7 @@ ACTION_KEYS = {
     "propose_autonomy_expansion": frozenset(("action", "expected_revision", "delta")),
     "resolve_autonomy_expansion": frozenset(("action", "expected_revision", "proposal_id", "decision", "narrowed_envelope")),
     "init": frozenset(("action", "expected_revision")),
+    "accept_first_slice_session": frozenset(("action", "expected_revision", "repository_id", "session_id", "message_id", "request_text")),
     "new": frozenset(("action", "expected_revision", "intent", "assessment")),
     "change": frozenset(("action", "expected_revision", "intent", "assessment")),
     "clarify": frozenset(("action", "expected_revision", "answers")),
