@@ -232,7 +232,15 @@ assert(commands.some((cmd) => cmd.includes("new")), "legacy intent still reaches
                 '''import plugin from "./plugin.ts"
 const definitions = [], requests = [], writes = []
 const assert = (test, message) => { if (!test) throw new Error(message) }
-const text = "Quiero una aplicación sencilla para llevar mis tareas y marcar las terminadas."
+// A real admitted prompt may have CRLF, blank lines, indentation, and
+// trailing whitespace. Its exact bytes must reach Core without rewrites.
+const text = [
+  "  Quiero una aplicación sencilla para mis tareas.",
+  "",
+  "- Agregar tareas nuevas.",
+  "- Marcar y desmarcar las terminadas.",
+  "",
+].join(String.fromCharCode(13, 10))
 const user = { type: "user", id: "msg_user0001", text, files: [] }
 const assistant = { type: "assistant", id: "msg_assistant0001" }
 let messages = [user, assistant]
@@ -309,7 +317,16 @@ assert(blocked.error.code === "DEDICATED_TOOL_REQUIRED", "no model-owned source 
 
 // A missing assistant message or programmatic synthetic message fails before
 // host permission or Core mutation.
+// Control bytes still fail closed, without a new session approval.
 let rejected = false
+messages = [{ ...user, text: text + String.fromCharCode(0) }, assistant]
+responseQueue.push(idle)
+const checksBeforeInvalid = assertions
+try { await invoke() } catch (e) { rejected = String(e).includes("SESSION_REQUEST_SCOPE_INVALID") }
+assert(rejected, "NUL must be rejected even though CRLF is permitted")
+assert(assertions === checksBeforeInvalid, "invalid input must fail before host permission")
+messages = [user, assistant]
+rejected = false
 messages = [user, { type: "assistant", id: "msg_other0001" }]
 responseQueue.push(idle)
 try { await invoke() } catch (e) { rejected = String(e).includes("INPUT_PROVENANCE_UNAVAILABLE") }
