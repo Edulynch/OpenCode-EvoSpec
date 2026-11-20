@@ -76,6 +76,14 @@ The integration installs exactly these nine native commands:
 8. `/evospec.context` — show protocol context and legal actions without mutation.
 9. `/evospec.doctor` — run the local read-only diagnostic without auto-remediation.
 
+### Accepted Slice: request one file edit without a blind permission loop (R2A-003)
+
+After the human accepts the first Slice, Core deliberately starts with no file paths and without the reversible `edit` operation. A permitted Slice is not a file-write grant. The OpenCode plugin now exposes `evospec_propose_file_edit(expected_revision, path, remaining_operations?)` for an active, unambiguous **accepted** E1 Slice. It first queries Core's current `autonomy_evaluate` for `edit` on that exact repository-relative path. When permission is missing, it preserves existing permissions and stop conditions and proposes only the additional path, reversible `edit`, and a **finite operation budget** (three remaining Core operations by default; caller may request one to four). It never applies the grant itself. Core issues an explicit pending proposal whose **entire** delta requires a separate `AUTHORIZE`, `REJECT`, or `NARROW` user decision.
+
+Fail closed for stale revisions, missing accepted Slice, unresolved human gates, existing proposals, malformed paths and incomplete canonical context; never retry or expand silently. This is a Core **authorization proposal**, not an OS filesystem sandbox or proof that the host gave write access. The actual OpenCode file permission remains independent. The base lifecycle/Task gate and E1 progress protocol are unchanged.
+
+Core proposal rejection messages now preserve the safe, explicit `ServiceError` reason (for example, `an autonomy grant requires a finite positive operation budget`) through `WorkflowService` instead of emitting only a generic refusal. This improves agent remediation without granting permissions automatically.
+
 ### New Feature: first-Slice handoff (D-004)
 
 When a **new material Feature** arrives in an initialized repository whose current projection shows an empty work slot and no accepted Slice, `evospec_start(operation="new")` now returns `FIRST_SLICE_HANDOFF_REQUIRED` instead of creating a classic active Feature/Change. The agent proposes only one user-observable Slice, an initial Task, and a checkpoint; `evospec_first_slice_handoff` checks the current Core revision and bounded empty-slot projection and returns an exact, read-only terminal command for `accept-slice`. Before the first agreement, `e1_schema_ready` can be `null`; **the proposal does not prove writer-schema readiness or full ledger emptiness**. The interactive Core operation makes those authoritative checks. No Feature, Change or agreement is created by this proposal.
