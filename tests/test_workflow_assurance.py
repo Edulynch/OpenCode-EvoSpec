@@ -492,6 +492,88 @@ class WorkflowAssuranceTests(unittest.TestCase):
             self.assertEqual(review.verdict, ReviewVerdict.BLOCKED)
             self.assertNotIn("TECHNICAL", tuple(item.category for item in recovered.review_evidence))
 
+    def test_review_accepts_completed_work_without_an_active_task(self) -> None:
+        # A finished small delivery has recorded progress, even when nothing
+        # remains in the current-work slot for the review phase.
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = WorkflowService.open(root)
+            workflow.init()
+            workflow.new("MiniLista task list")
+            workflow.record_progress(
+                "implement", "index.html", ("index.html implemented",), None, (), "review"
+            )
+
+            # Review accepts the recorded completion, but it does not claim
+            # that the application was independently verified.
+            workflow.record_review(
+                ReviewResult(ReviewVerdict.PASS, ("static review passed",), True)
+            )
+            reviewed = CoreService.open(root).recover().active_context
+            if reviewed is None or reviewed.review is None:
+                self.fail("expected a persisted review")
+            self.assertEqual(reviewed.review.verdict, ReviewVerdict.PASS)
+            self.assertTrue(reviewed.review.safe_to_proceed)
+            progress = next(
+                evidence for evidence in reviewed.review_evidence
+                if evidence.category == "PROGRESS"
+            )
+            self.assertEqual(progress.value, "completed work reported")
+            self.assertFalse(reviewed.verification.sufficient)
+
+            # A fresh session can verify separately; review did not bypass
+            # the verification phase or fabricate test evidence.
+            resumed = WorkflowService.open(root)
+            resumed.record_verification(
+                VerificationEvidence(("browser smoke run",), True)
+            )
+            verified = CoreService.open(root).recover().active_context
+            if verified is None:
+                self.fail("expected active verification context")
+            self.assertTrue(verified.verification.sufficient)
+
+    def test_deep_review_still_requires_finished_work(self) -> None:
+        # Deeper reviews must not become acceptable on an active-work claim
+        # when the required completed-work record is still missing.
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = WorkflowService.open(root)
+            workflow.init()
+            workflow.new("Foundation storage migration")
+            workflow.record_progress(
+                "implement", "migration", (), "schema change", (), "review"
+            )
+            workflow.record_review(ReviewResult(ReviewVerdict.PASS, (), True))
+            reviewed = CoreService.open(root).recover().active_context
+            if reviewed is None or reviewed.review is None:
+                self.fail("expected a persisted review")
+            self.assertEqual(reviewed.review.verdict, ReviewVerdict.BLOCKED)
+            progress = next(
+                evidence for evidence in reviewed.review_evidence
+                if evidence.category == "PROGRESS"
+            )
+            self.assertEqual(progress.value, "MISSING")
+
+    def test_completed_work_does_not_override_blocking_review_findings(self) -> None:
+        # A recorded completion is not authority to suppress a real review
+        # finding or to promote implementation progress to technical success.
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = WorkflowService.open(root)
+            workflow.init()
+            workflow.new("MiniLista task list")
+            workflow.record_progress(
+                "implement", "index.html", ("index.html implemented",), None, (), "review"
+            )
+            workflow.record_review(
+                ReviewResult(ReviewVerdict.BLOCKED, ("blocking issue",), False)
+            )
+            reviewed = CoreService.open(root).recover().active_context
+            if reviewed is None or reviewed.review is None:
+                self.fail("expected a persisted review")
+            self.assertEqual(reviewed.review.verdict, ReviewVerdict.BLOCKED)
+            self.assertFalse(reviewed.review.safe_to_proceed)
+
     def test_current_drift_reconciliation_survives_reload_and_requires_its_change(self) -> None:
         # Given: an accepted baseline and a later persisted change
         with TemporaryDirectory() as temporary:
