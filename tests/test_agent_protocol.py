@@ -1200,6 +1200,95 @@ class AgentProtocolTests(unittest.TestCase):
             self.assertEqual(stale["error"]["code"], "STALE_REVISION")
             self.assertIsNone(recovered_state.pending_discovery_recovery)
 
+    def test_autonomy_proposal_rejection_explains_missing_finite_budget(self) -> None:
+        # The model must get the Core rule that failed, not a generic refusal.
+        # An incomplete scope request may not mutate the authoritative state.
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            initialized = json.loads(execute(root, request("init", expected_revision=0)))
+            started = json.loads(execute(
+                root,
+                request(
+                    "new",
+                    expected_revision=initialized["result"]["revision"],
+                    intent="MiniLista", assessment=assessment("NEW", "PLANNED", "FEATURE"),
+                ),
+            ))
+            revision = started["result"]["revision"]
+            before = CoreService.open(root).recover()
+            # Strict transport shape errors must stay separate from Core
+            # rejections and must not publish any pending decision.
+            malformed = json.loads(execute(root, request(
+                "propose_autonomy_expansion",
+                expected_revision=revision,
+                delta={"allowed_paths": ["index.html"]},
+            )))
+            self.assertEqual(malformed["error"]["code"], "INVALID_REQUEST")
+            self.assertIn("missing", malformed["error"]["detail"])
+            self.assertEqual(before, CoreService.open(root).recover())
+
+            # No budget was supplied: the proposed envelope still has budget 0.
+            invalid = json.loads(execute(root, request(
+                "propose_autonomy_expansion",
+                expected_revision=revision,
+                delta={
+                    "allowed_paths": ["index.html"],
+                    "reversible_actions": None,
+                    "operation_budget": None,
+                    "external_wait_allowed": None,
+                    "retry_budget": None,
+                    "irreversible_permissions": None,
+                    "stop_conditions": None,
+                },
+            )))
+            self.assertEqual(invalid["error"]["code"], "WORKFLOW_ERROR")
+            self.assertIn(
+                "an autonomy grant requires a finite positive operation budget",
+                invalid["error"]["detail"],
+            )
+            self.assertEqual(before, CoreService.open(root).recover())
+
+            # An exact one-file proposal with a finite budget is persisted
+            # only as a decision, not as a granted editing permission.
+            proposed = json.loads(execute(root, request(
+                "propose_autonomy_expansion",
+                expected_revision=revision,
+                delta={
+                    "allowed_paths": ["index.html"],
+                    "reversible_actions": ["progress", "assess_locks", "review", "verify", "edit"],
+                    "operation_budget": 3,
+                    "external_wait_allowed": None,
+                    "retry_budget": None,
+                    "irreversible_permissions": None,
+                    "stop_conditions": None,
+                },
+            )))
+            self.assertEqual(proposed["result"]["code"], "AUTONOMY_EXPANSION_PROPOSED")
+            pending = proposed["context"]["pending_autonomy_expansion"]
+            self.assertIsNotNone(pending)
+            self.assertEqual(pending["delta"]["allowed_paths"], ["index.html"])
+            self.assertEqual(pending["delta"]["operation_budget"], 3)
+            self.assertEqual(
+                proposed["context"]["autonomy_envelope"]["allowed_paths"], [],
+                "a proposal must not grant file authority before a human decision",
+            )
+            self.assertEqual(
+                json.loads(execute(root, request(
+                    "propose_autonomy_expansion",
+                    expected_revision=revision,
+                    delta={
+                        "allowed_paths": ["index.html"],
+                        "operation_budget": 3,
+                        "reversible_actions": None,
+                        "external_wait_allowed": None,
+                        "retry_budget": None,
+                        "irreversible_permissions": None,
+                        "stop_conditions": None,
+                    },
+                )))["error"]["code"],
+                "STALE_REVISION",
+            )
+
     def test_protocol_projects_autonomy_envelope_metrics_and_evaluation(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -81,6 +81,7 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn("Read-only questions never initialize", plugin)
         self.assertIn("evospec_first_slice_handoff", plugin)
         self.assertIn("evospec_first_slice_handoff", skill)
+        self.assertIn("evospec_propose_file_edit", skill)
         self.assertIn("interactive terminal", skill)
         self.assertIn("¿dónde seguimos?", skill)
         self.assertIn("Call **only** `evospec_context`", skill)
@@ -215,6 +216,128 @@ assert(commands.some((cmd) => cmd.includes("new")), "legacy intent still reaches
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_accepted_slice_file_edit_helper_proposes_exact_bounded_delta(self) -> None:
+        # A fresh E1 accepted Slice may request one file, but the tool must
+        # preserve all Core constraints and never resolve the human decision.
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "plugin.ts").write_text(_resources()[PLUGIN], encoding="utf-8")
+            (root / "continuation.mjs").write_text(_resources()[CONTINUATION], encoding="utf-8")
+            runner = root / "edit-scope.ts"
+            runner.write_text(
+                '''import plugin from "./plugin.ts"
+const definitions = [], requests = [], writes = [], outputs = []
+const root = process.cwd()
+const current = { revision: 7, repository_id: "repo-a",
+  feature_id: "feature-a", change_id: "change-a",
+  initialization_state: "INITIALIZED", lifecycle: ["PROPOSED", "RESEARCH"],
+  side_work_active: false, stale: false,
+  accepted_slice: { feature_agreement_ref: "agreement-feature-a",
+                    slice_agreement_ref: "agreement-slice-a", task_id: "task-a" },
+  legal_actions: ["propose_autonomy_expansion"],
+  pending_autonomy_expansion: null,
+  autonomy_envelope: {
+    goal: "MiniLista", allowed_paths: [], operation_budget: 0,
+    reversible_actions: ["progress", "assess_locks", "review", "verify"],
+    retry_budget: 0, external_wait_allowed: true,
+    irreversible_permissions: [], stop_conditions: ["material decision required"],
+  },
+  autonomy_metrics: { automatic_operations: 0 },
+}
+const assert = (check, reason) => { if (!check) throw new Error(reason) }
+const runtime = {
+  tool: {
+    transform: async (callback) => callback({ add: (tool) => definitions.push(tool) }),
+    list: async () => definitions.map((tool) => ({ id: tool.name })),
+  },
+  session: {
+    get: async () => ({ location: { directory: root } }),
+    hook: async () => {},
+  },
+}
+await plugin.setup(runtime)
+Object.defineProperty(Bun, "spawn", { value(command, opts) {
+  assert(!command.includes("--project"), "the helper must not invoke acceptance CLI")
+  if (opts.stdin) writes.push(opts.stdin.text().then((payload) => requests.push(JSON.parse(payload))))
+  const value = outputs.shift()
+  assert(value !== undefined, "unexpected protocol request")
+  return { stdout: new Blob([JSON.stringify(value)]).stream(),
+           stderr: new Blob([""]).stream(), exited: Promise.resolve(0) }
+} })
+const call = async (args) => {
+  const tool = definitions.find((item) => item.name === "evospec_propose_file_edit")
+  assert(tool, "dedicated helper is registered")
+  return tool.execute(args, { sessionID: "session-a", signal: new AbortController().signal })
+}
+outputs.push({ context: current })
+outputs.push({ context: current, evaluation: {
+  authorization: "HUMAN_MATERIAL_DECISION", reason: "operation is outside reversible authority",
+} })
+outputs.push({ result: { code: "AUTONOMY_EXPANSION_PROPOSED" },
+  context: { ...current, revision: 8, pending_autonomy_expansion: {
+    proposal_id: "autonomy-a", decision_options: ["AUTHORIZE", "REJECT", "NARROW"],
+  } },
+})
+const result = JSON.parse((await call({
+  expected_revision: 7, path: "index.html", remaining_operations: 3,
+})).content)
+await Promise.all(writes)
+assert(result.result.code === "AUTONOMY_EXPANSION_PROPOSED", "Core receives a proposal")
+assert(result.requested_edit_scope.human_decision_required === true, "no authority was silently granted")
+assert(result.requested_edit_scope.total_operation_budget === 3, "finite operation budget required")
+assert(result.context.autonomy_envelope.allowed_paths.length === 0, "original authority is unchanged")
+assert(requests.length === 3, "context, evaluation and proposal are the only requests")
+assert(requests[0].action === "context", "reads canonical context first")
+assert(requests[1].action === "autonomy_evaluate", "rechecks exact edit operation")
+assert(JSON.stringify(requests[1].paths) === '["index.html"]', "preflight is path-specific")
+const proposal = requests[2]
+assert(proposal.action === "propose_autonomy_expansion", "only Core proposal is submitted")
+assert(proposal.expected_revision === 7, "never bind the request to an invented revision")
+assert(JSON.stringify(proposal.delta.allowed_paths) === '["index.html"]', "only requested user path is added")
+assert(JSON.stringify(proposal.delta.reversible_actions) ===
+  '["progress","assess_locks","review","verify","edit"]', "preserves existing actions and adds only edit")
+assert(proposal.delta.operation_budget === 3, "proposed grant is finite and proportional")
+assert(proposal.delta.irreversible_permissions === null, "irreversible grants remain unchanged")
+assert(proposal.delta.stop_conditions === null, "all existing stop conditions remain in place")
+assert(proposal.delta.retry_budget === null, "retry budget remains unchanged")
+assert(proposal.delta.external_wait_allowed === null, "external wait authority remains unchanged")
+assert(Object.keys(proposal.delta).length === 7, "strict protocol receives every optional field")
+let rejected = false
+try { await call({ expected_revision: 7, path: "../outside" }) }
+catch (error) { rejected = String(error).includes("EDIT_PATH_INVALID") }
+assert(rejected, "path escape fails before calling Core")
+outputs.push({ context: current })
+rejected = false
+try { await call({ expected_revision: 6, path: "index.html" }) }
+catch (error) { rejected = String(error).includes("STALE_REVISION") }
+assert(rejected, "stale revision cannot propose scope")
+outputs.push({ context: { ...current, accepted_slice: null } })
+rejected = false
+try { await call({ expected_revision: 7, path: "index.html" }) }
+catch (error) { rejected = String(error).includes("EDIT_SCOPE_UNAVAILABLE") }
+assert(rejected, "unaccepted work cannot use this E1 helper")
+outputs.push({ context: { ...current, pending_autonomy_expansion: { proposal_id: "busy" } } })
+rejected = false
+try { await call({ expected_revision: 7, path: "index.html" }) }
+catch (error) { rejected = String(error).includes("EDIT_SCOPE_UNAVAILABLE") }
+assert(rejected, "an existing pending proposal must be resolved first")
+outputs.push({ context: current })
+outputs.push({ context: current, evaluation: { authorization: "ALLOWED", reason: "in envelope" } })
+const already = JSON.parse((await call({
+  expected_revision: 7, path: "index.html",
+})).content)
+assert(already.code === "EDIT_SCOPE_ALREADY_ALLOWED", "already permitted edits require no new proposal")
+await Promise.all(writes)
+assert(requests.filter((item) => item.action === "propose_autonomy_expansion").length === 1,
+  "no blind proposal is retried or autoapproved")
+''',
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                ("bun", "run", str(runner)), cwd=root, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_v2_plugin_registers_and_serializes_provider_neutral_typed_actions(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -261,9 +384,9 @@ const runtime = {
   },
 }
 await plugin.setup(runtime)
-assert(definitions.length === 29, "raw protocol tool and all typed helpers register")
+assert(definitions.length === 30, "raw protocol tool and all typed helpers register")
 const names = new Set(definitions.map((definition) => definition.name))
-for (const name of ["evospec", "evospec_start", "evospec_first_slice_handoff", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_criterion_test", "evospec_criterion_test_r3b", "evospec_accept_slice_outcome", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
+for (const name of ["evospec", "evospec_start", "evospec_first_slice_handoff", "evospec_propose_file_edit", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_criterion_test", "evospec_criterion_test_r3b", "evospec_accept_slice_outcome", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
 const contextEntry = definitions.find((definition) => definition.name === "evospec_context")
 assert(contextEntry.options?.codemode === false, "canonical read-only context bypasses deferred Code Mode discovery")
 assert(definitions.filter((definition) => definition.options?.codemode === false).length === 1, "only canonical context is directly exposed")

@@ -959,6 +959,121 @@ async function executeFirstSliceHandoff(runtime, args, context) {
   })
 }
 
+// A single-file edit request is deliberately a proposal, not a grant.
+// Core alone owns the exact envelope and the subsequent HUMAN decision.
+function canonicalEditFilePath(value) {
+  if (typeof value !== "string" || !value || value.length > 512
+      || /[\u0000-\u001f\u007f\\]/.test(value) || value.startsWith("/")) {
+    throw new Error("EDIT_PATH_INVALID: provide one canonical repository-relative file")
+  }
+  const parts = value.split("/")
+  if (parts.some((part) => !part || part === "." || part === ".." || part.includes(":"))
+      || [".git", ".evospec", ".opencode"].includes(parts[0])) {
+    throw new Error("EDIT_PATH_INVALID: path escapes the allowed user-file scope")
+  }
+  return value
+}
+
+async function executeProposeFileEdit(runtime, args, context) {
+  const path = canonicalEditFilePath(args.path)
+  const root = await sessionRoot(runtime, context)
+  const current = parseContextResponse(
+    await rawExecuteRequest(runtime, { action: "context" }, context, root)
+  )
+  if (current.revision !== args.expected_revision) {
+    throw new Error("STALE_REVISION: reread accepted Slice and edit scope")
+  }
+  if (!current.accepted_slice || current.lifecycle === null
+      || !current.feature_id || !current.change_id
+      || current.side_work_active || current.stale) {
+    throw new Error("EDIT_SCOPE_UNAVAILABLE: no current, unambiguous accepted primary Slice")
+  }
+  if (!current.legal_actions?.includes("propose_autonomy_expansion")
+      || current.pending_autonomy_expansion) {
+    throw new Error("EDIT_SCOPE_UNAVAILABLE: Core does not currently allow an expansion proposal; inspect its current blocker")
+  }
+  const envelope = current.autonomy_envelope
+  const metrics = current.autonomy_metrics
+  if (!envelope || !Array.isArray(envelope.allowed_paths)
+      || !Array.isArray(envelope.reversible_actions)
+      || !Number.isSafeInteger(envelope.operation_budget)
+      || !metrics || !Number.isSafeInteger(metrics.automatic_operations)
+      || metrics.automatic_operations < 0) {
+    throw new Error("EDIT_SCOPE_UNAVAILABLE: canonical autonomy budget or actions are incomplete")
+  }
+  const remaining = args.remaining_operations ?? 3
+  if (!Number.isSafeInteger(remaining) || remaining < 1 || remaining > 4) {
+    throw new Error("EDIT_BUDGET_INVALID: request 1 to 4 remaining Core operations")
+  }
+  const evaluated = JSON.parse(await rawExecuteRequest(runtime, {
+    action: "autonomy_evaluate",
+    expected_revision: current.revision,
+    operation: "edit", paths: [path], irreversible: false,
+  }, context, root))
+  if (evaluated.error) return JSON.stringify(evaluated)
+  if (evaluated.context?.revision !== current.revision
+      || evaluated.context?.feature_id !== current.feature_id
+      || evaluated.context?.change_id !== current.change_id) {
+    throw new Error("STALE_REVISION: edit authority changed during read-only preflight")
+  }
+  if (evaluated.evaluation?.authorization === "ALLOWED") {
+    return JSON.stringify({
+      code: "EDIT_SCOPE_ALREADY_ALLOWED",
+      path, revision: current.revision,
+      instruction: "Edit is already inside the current Core envelope; host file permissions still apply.",
+    })
+  }
+  if (evaluated.evaluation?.authorization !== "HUMAN_MATERIAL_DECISION") {
+    throw new Error("EDIT_SCOPE_UNAVAILABLE: Core did not offer a material expansion decision")
+  }
+  // Delta collections replace entire fields, so preserve the existing grants
+  // and append only the one requested file and reversible edit action.
+  const paths = envelope.allowed_paths.includes(path)
+    ? envelope.allowed_paths
+    : [...envelope.allowed_paths, path]
+  const actions = envelope.reversible_actions.some((action) => action.toLowerCase() === "edit")
+    ? envelope.reversible_actions
+    : [...envelope.reversible_actions, "edit"]
+  const budget = Math.max(
+    envelope.operation_budget,
+    metrics.automatic_operations + remaining
+  )
+  if (!Number.isSafeInteger(budget) || budget <= 0) {
+    throw new Error("EDIT_BUDGET_INVALID: finite positive operation budget required")
+  }
+  // Strict protocol requires all seven delta fields; null means
+  // unchanged, not an attempted removal of existing authority.
+  const delta = {
+    allowed_paths: paths,
+    reversible_actions: actions,
+    operation_budget: budget,
+    external_wait_allowed: null,
+    retry_budget: null,
+    irreversible_permissions: null,
+    stop_conditions: null,
+  }
+  // A stale revision is never replayed, and the proposal still needs a
+  // separate exact AUTHORIZE / REJECT / NARROW human decision.
+  const response = JSON.parse(await executeRequest(runtime, {
+    action: "propose_autonomy_expansion",
+    expected_revision: current.revision,
+    delta,
+  }, context, { retryStale: false, authorizedRoot: root }))
+  if (response.error) return JSON.stringify(response)
+  return JSON.stringify({
+    ...response,
+    requested_edit_scope: {
+      repository_root: root,
+      path, remaining_operations: remaining,
+      total_operation_budget: budget,
+      existing_paths_preserved: envelope.allowed_paths,
+      exact_delta: delta,
+      human_decision_required: true,
+    },
+    instruction: "Show the exact proposed paths, actions and finite budget. Ask the user to choose only the Core-offered AUTHORIZE, REJECT or NARROW option. The proposal does not permit edits; reread context after the human decision and revalidate the host's file permission.",
+  })
+}
+
 async function executeStart(runtime, args, context) {
   const root = await sessionRoot(runtime, context)
   const initialized = await ensureInitializedForExplicitTask(runtime, root, args.intent, context)
@@ -1206,6 +1321,16 @@ const tools = [
       checkpoint: { type: "string", minLength: 1, maxLength: 2048 },
     }),
     (args, context) => executeFirstSliceHandoff(context.runtime, args, context),
+  ),
+  protocolTool(
+    "evospec_propose_file_edit",
+    "Propose bounded edit authority for one file of the currently accepted Slice, preserving existing Core constraints. Requires a separate exact human Core decision; it never edits files or grants permission.",
+    object({
+      expected_revision: nonnegativeInteger,
+      path: { type: "string", minLength: 1, maxLength: 512 },
+      remaining_operations: { type: "integer", minimum: 1, maximum: 4 },
+    }, ["expected_revision", "path"]),
+    (args, context) => executeProposeFileEdit(context.runtime, args, context),
   ),
   protocolTool(
     "evospec_assessed_start",
@@ -1534,7 +1659,7 @@ export default {
         type: "text",
         text: "For natural-language questions about where work stands or where to resume (¿dónde seguimos?, ¿en qué quedamos?, where were we?), load the evospec skill and call only evospec_context for the current session project. Report the known Feature, Slice, Task, and next checkpoint plainly; distinguish initial acceptance from later task_progress (REPORTED_UNVERIFIED), and disclose missing or ambiguous context. When there is no active Task, report accepted work_queue items as inactive and never choose or activate one on a status query. Read-only questions never initialize, continue, reaccept, or mutate. " +
           "If evospec_context is unavailable or fails, report that the authoritative context cannot be verified and stop; never replace it with Engram memories, previous session messages, other repositories, or guessed work. " +
-          "For a first new Feature in an empty initialized E1 project, use evospec_first_slice_handoff and require an interactive TTY acceptance; chat consent is not Slice acceptance. Never create legacy active work first. Reread canonical context after approval. For other explicit EvoSpec lifecycle work, load the evospec skill and call evospec_context before repository inspection, tests, or lifecycle mutations. Then use evospec_continuation and follow its deterministic adapter directive: SAFE_AUTOMATIC_OPERATION and in-envelope BOUNDED_DELEGATION continue; EXTERNAL_WAIT waits; HUMAN_MATERIAL_DECISION asks exactly Core's decision; STRUCTURAL_DEFECT fails closed; terminal with outcome null completes. Re-read context after every Core mutation, reevaluate STALE_REVISION before any retry, and never edit .evospec manually.",
+          "For a first new Feature in an empty initialized E1 project, use evospec_first_slice_handoff and require an interactive TTY acceptance; chat consent is not Slice acceptance. Never create legacy active work first. Reread canonical context after approval. After a human-accepted E1 Slice, if a file edit is outside the current autonomy envelope, use evospec_propose_file_edit for the exact file with a small finite budget; it proposes but does not grant authority, and the user must choose Core's exact AUTHORIZE, REJECT or NARROW decision. Never repeat the initial Slice acceptance or infer file permission from chat. For other explicit EvoSpec lifecycle work, load the evospec skill and call evospec_context before repository inspection, tests, or lifecycle mutations. Then use evospec_continuation and follow its deterministic adapter directive: SAFE_AUTOMATIC_OPERATION and in-envelope BOUNDED_DELEGATION continue; EXTERNAL_WAIT waits; HUMAN_MATERIAL_DECISION asks exactly Core's decision; STRUCTURAL_DEFECT fails closed; terminal with outcome null completes. Re-read context after every Core mutation, reevaluate STALE_REVISION before any retry, and never edit .evospec manually.",
       })
     })
   },
