@@ -2124,13 +2124,16 @@ class CoreService:
             raise ServiceError("Feature, Slice, Task and checkpoint must be bounded nonblank text")
         if type(acceptance) is SessionRequestEvidence:
             # The first low-risk lane records EXACTLY the request as the Feature
-            # and Slice. The agent cannot expand user scope through a summary.
+            # and Slice. Keep the admitted text byte-for-byte, including
+            # indentation, blank lines and trailing newlines, in its statement
+            # and source digest; display titles may be trimmed separately.
             # Criteria are deliberately absent until their meaning and tests
             # can be proven; report that limitation instead of inventing PASS.
             message = acceptance.statement
             if (
-                type(message) is not str or not message or message != message.strip()
-                or len(message) > 512 or re.search(r"[\x00-\x1f\x7f]", message)
+                type(message) is not str or not message.strip()
+                or len(message) > 2048
+                or re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", message)
                 or not re.fullmatch(r"ses_[A-Za-z0-9_-]{3,128}", acceptance.session_id)
                 or not re.fullmatch(r"msg_[A-Za-z0-9_-]{3,128}", acceptance.message_id)
                 or acceptance.repository_id != root_identity
