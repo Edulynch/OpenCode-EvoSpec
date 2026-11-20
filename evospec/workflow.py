@@ -96,6 +96,7 @@ from .discovery import (
 from .policies import AssurancePolicy, CapabilityRoute, IntakeOperation, IntakePolicy
 from .services import (
     CoreService,
+    SessionRequestEvidence,
     NextActionable,
     ServiceError,
     SliceCriteriaSpec,
@@ -205,6 +206,20 @@ class WorkflowService:
         except ServiceError as error:
             raise WorkflowError(str(error)) from error
         return self._result("SLICE_ACCEPTED", saved, "accepted Feature, Slice and first Task persisted")
+
+    def accept_first_slice_session(
+        self, evidence: SessionRequestEvidence, *, expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        """Record a bounded session request, not an invented interactive approval."""
+        state = self._mutation_state(expected_revision)
+        try:
+            saved = self.__core.accept_first_slice_session(state, evidence)
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        return self._result(
+            "SESSION_SLICE_RECORDED", saved,
+            "session request persisted with provenance and bounded single-file work; criteria not yet accepted",
+        )
 
     def accept_next_slice(
         self, feature_id: str, slice_title: str, initial_task: str, checkpoint: str,

@@ -171,6 +171,31 @@ class UserAcceptance:
     source: str = "INTERACTIVE_TERMINAL"
 
 
+# Session requests describe a user-supplied outcome; they do not prove that
+# the sender is a physically authenticated person or grant host permissions.
+SESSION_REQUEST_TASK = "Implementar únicamente el resultado expresado en la petición"
+SESSION_REQUEST_CHECKPOINT = "Comprobar el resultado observable expresado en la petición"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRequestEvidence:
+    """Transport provenance of an admitted OpenCode message, never a TTY signature."""
+
+    session_id: str
+    message_id: str
+    statement: str
+    repository_id: str
+
+    @property
+    def source(self) -> str:
+        return "SESSION_REQUEST"
+
+    @property
+    def source_reference(self) -> str:
+        digest = sha256(self.statement.encode("utf-8")).hexdigest()[:16]
+        return f"session:{self.session_id}:{self.message_id}:{digest}"
+
+
 @dataclass(frozen=True, slots=True)
 class SliceCriteriaSpec:
     """Human-readable Slice bounds, before Core assigns an immutable identity."""
@@ -2082,10 +2107,10 @@ class CoreService:
         slice_title: str,
         initial_task: str,
         checkpoint: str,
-        acceptance: UserAcceptance,
+        acceptance: UserAcceptance | SessionRequestEvidence,
         criteria: SliceCriteriaSpec | None = None,
     ) -> State:
-        """Persist a human-approved Feature, Slice and Task in one Core commit."""
+        """Persist an E1 agreement without mislabeling session input as a TTY decision."""
         current = _authoritative_state(self.__persistence, state)
         if current.initialization is None:
             raise ServiceError("repository initialization is required before Slice acceptance")
@@ -2097,18 +2122,45 @@ class CoreService:
         values = (feature_title, slice_title, initial_task, checkpoint)
         if any(type(value) is not str or not value.strip() or len(value) > 2048 for value in values):
             raise ServiceError("Feature, Slice, Task and checkpoint must be bounded nonblank text")
-        if (
-            type(acceptance) is not UserAcceptance
-            or acceptance.source != "INTERACTIVE_TERMINAL"
-            or not acceptance.statement.strip()
-        ):
-            raise ServiceError("attributable user acceptance evidence is required")
-        accepted_statement = slice_acceptance_statement(
-            feature_title, slice_title, initial_task, checkpoint, criteria,
-        )
-        expected_reference = f"tty:{sha256(accepted_statement.encode('utf-8')).hexdigest()[:12]}"
+        if type(acceptance) is SessionRequestEvidence:
+            # The first low-risk lane records EXACTLY the request as the Feature
+            # and Slice. Keep the admitted text byte-for-byte, including
+            # indentation, blank lines and trailing newlines, in its statement
+            # and source digest; display titles may be trimmed separately.
+            # Criteria are deliberately absent until their meaning and tests
+            # can be proven; report that limitation instead of inventing PASS.
+            message = acceptance.statement
+            if (
+                type(message) is not str or not message.strip()
+                or len(message) > 2048
+                or re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", message)
+                or not re.fullmatch(r"ses_[A-Za-z0-9_-]{3,128}", acceptance.session_id)
+                or not re.fullmatch(r"msg_[A-Za-z0-9_-]{3,128}", acceptance.message_id)
+                or acceptance.repository_id != root_identity
+                or criteria is not None
+                or feature_title != message or slice_title != message
+                or initial_task != SESSION_REQUEST_TASK
+                or checkpoint != SESSION_REQUEST_CHECKPOINT
+            ):
+                raise ServiceError("SESSION_REQUEST_SCOPE_INVALID: only the exact bounded session request can be recorded")
+            # Restrict the first experiment to a fresh, isolated, single-file
+            # project. Existing files, including a symlinked index, require the
+            # normal, separately authorized path rather than an implicit edit.
+            if any(item.name not in (".git", ".evospec", ".opencode") for item in self.__repository_root.iterdir()):
+                raise ServiceError("SESSION_REQUEST_PROJECT_NOT_EMPTY: no automatic edit scope for existing files")
+            accepted_statement = message
+            expected_reference = acceptance.source_reference
+        elif type(acceptance) is UserAcceptance:
+            if acceptance.source != "INTERACTIVE_TERMINAL" or not acceptance.statement.strip():
+                raise ServiceError("attributable user acceptance evidence is required")
+            accepted_statement = slice_acceptance_statement(
+                feature_title, slice_title, initial_task, checkpoint, criteria,
+            )
+            expected_reference = f"tty:{sha256(accepted_statement.encode('utf-8')).hexdigest()[:12]}"
+        else:
+            raise ServiceError("unsupported first-Slice acceptance evidence")
         if acceptance.statement != accepted_statement or acceptance.source_reference != expected_reference:
-            raise ServiceError("acceptance must match exactly the human-confirmed agreement")
+            raise ServiceError("acceptance source and content do not match the canonical statement")
         # Bind a retry to identical canonical input and the exact initialized root.
         digest = sha256(json.dumps([
             root_identity, *values, acceptance.statement, acceptance.source_reference,
@@ -2154,6 +2206,17 @@ class CoreService:
                 checkpoints=(Checkpoint(checkpoint.strip(), False),),
                 feature_agreement_ref=feature_ref,
                 slice_agreement_ref=slice_ref,
+                autonomy_envelope=(
+                    # This is a bounded Core budget, not OS enforcement. Native
+                    # OpenCode edit tools still apply their actual host policy.
+                    AutonomyEnvelope(
+                        change.intent,
+                        allowed_paths=(RepositoryPath("index.html"),),
+                        operation_budget=8,
+                        reversible_actions=("progress", "assess_locks", "review", "verify", "edit"),
+                    ) if type(acceptance) is SessionRequestEvidence
+                    else candidate.active_context.autonomy_envelope
+                ),
             ),
             agreements=(feature_agreement, slice_agreement),
             slice_criteria_revisions=() if criteria_revision is None else (criteria_revision,),
@@ -2165,6 +2228,15 @@ class CoreService:
         except AtomicFailure as error:
             raise ServiceError("first Slice aggregate publication was rejected") from error
         return saved
+
+    def accept_first_slice_session(self, state: State, evidence: SessionRequestEvidence) -> State:
+        """Record one low-risk user request with limited file scope and no TTY claim."""
+        if type(evidence) is not SessionRequestEvidence:
+            raise ServiceError("session evidence must be typed")
+        return self.accept_first_slice(
+            state, evidence.statement, evidence.statement,
+            SESSION_REQUEST_TASK, SESSION_REQUEST_CHECKPOINT, evidence,
+        )
 
     def accept_next_slice(
         self, state: State, feature_id: str, slice_title: str, initial_task: str,
