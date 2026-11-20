@@ -2267,6 +2267,23 @@ class WorkflowService:
         native = () if not project_evidence else (
             ReviewEvidence(ReviewEvidenceCategory.REQUIREMENTS, ReviewEvidenceKind.REFERENCE, "project-native", True, "bounded native capability evidence", ",".join(project_evidence)),
         )
+        # Finishing a task clears current_work; its recorded completion still
+        # counts as reported progress, not as independently verified delivery.
+        current_progress = (
+            context.current_work
+            if context.current_work is not None and context.current_work.strip()
+            else None
+        )
+        completed_progress = any(item.strip() for item in context.completed_work)
+        progress_missing = (
+            (current_progress is None and not completed_progress)
+            or (context.safety_facts.review_depth == "DEEP" and not completed_progress)
+        )
+        progress_value = (
+            "MISSING"
+            if progress_missing
+            else current_progress or "completed work reported"
+        )
         return (
             ReviewEvidence(ReviewEvidenceCategory.WORKFLOW, ReviewEvidenceKind.FACT, "Core", True, "active review context"),
             ReviewEvidence(ReviewEvidenceCategory.REQUIREMENTS, ReviewEvidenceKind.REFERENCE, "discovery", True, ",".join(context.safety_facts.scope) or "initialized repository research"),
@@ -2278,12 +2295,6 @@ class WorkflowService:
                 ReviewEvidenceKind.STATUS,
                 "Core",
                 True,
-                "MISSING"
-                if context.current_work is None
-                or (
-                    context.safety_facts.review_depth == "DEEP"
-                    and not context.completed_work
-                )
-                else context.current_work,
+                progress_value,
             ),
         ) + native
