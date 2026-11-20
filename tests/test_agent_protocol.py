@@ -1220,7 +1220,15 @@ class AgentProtocolTests(unittest.TestCase):
             invalid = json.loads(execute(root, request(
                 "propose_autonomy_expansion",
                 expected_revision=revision,
-                delta={"allowed_paths": ["index.html"]},
+                delta={
+                    "allowed_paths": ["index.html"],
+                    "reversible_actions": None,
+                    "operation_budget": None,
+                    "external_wait_allowed": None,
+                    "retry_budget": None,
+                    "irreversible_permissions": None,
+                    "stop_conditions": None,
+                },
             )))
             self.assertEqual(invalid["error"]["code"], "WORKFLOW_ERROR")
             self.assertIn(
@@ -1238,6 +1246,10 @@ class AgentProtocolTests(unittest.TestCase):
                     "allowed_paths": ["index.html"],
                     "reversible_actions": ["progress", "assess_locks", "review", "verify", "edit"],
                     "operation_budget": 3,
+                    "external_wait_allowed": None,
+                    "retry_budget": None,
+                    "irreversible_permissions": None,
+                    "stop_conditions": None,
                 },
             )))
             self.assertEqual(proposed["result"]["code"], "AUTONOMY_EXPANSION_PROPOSED")
@@ -1253,7 +1265,15 @@ class AgentProtocolTests(unittest.TestCase):
                 json.loads(execute(root, request(
                     "propose_autonomy_expansion",
                     expected_revision=revision,
-                    delta={"allowed_paths": ["index.html"], "operation_budget": 3},
+                    delta={
+                        "allowed_paths": ["index.html"],
+                        "operation_budget": 3,
+                        "reversible_actions": None,
+                        "external_wait_allowed": None,
+                        "retry_budget": None,
+                        "irreversible_permissions": None,
+                        "stop_conditions": None,
+                    },
                 )))["error"]["code"],
                 "STALE_REVISION",
             )
