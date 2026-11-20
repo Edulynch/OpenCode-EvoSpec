@@ -17,3 +17,30 @@ These rules govern agents developing, reviewing, and testing **this repository**
 - Before claiming OpenCode V2 native compatibility, verify the latest published stable host version and record the exact version and commit tested. Automated bundle/adapter tests are separate evidence.
 - Preserve already accepted Feature/Slice/Task identities, revisions, provenance, checkpoints, and authority files during blocked tests. Never repeat user acceptance or fabricate a new Task solely to bypass model availability.
 - Report executed, skipped, blocked, and unverified gates separately. Do not infer permission to implement, merge, or release from test success.
+
+## Canonical information ownership and directory rules
+
+Apply these repository-development rules together with the closest applicable
+nested `AGENTS.md`. Each nested file describes its directory's responsibility;
+none overrides Core authority or grants permission to write.
+
+| Information | Canonical owner | Do not store it in |
+| --- | --- | --- |
+| Python domain, workflow, protocol and persistence implementation | `evospec/` | `docs/`, `specs/`, generated `.evospec/` files |
+| Packaged OpenCode plugin, commands, skill and UI assets | `evospec/resources/` | Manually edited local `.opencode/` copies |
+| Runtime Feature/Slice/Task authority, decisions, evidence and checkpoints | Core-managed project-local `.evospec/` through supported operations | `AGENTS.md`, chat history, arbitrary Markdown, direct JSON edits |
+| Accepted Product Truth | Core-published immutable Living Specs under project-local `.evospec/living-specs/` | Draft specs, tests, source-code comments |
+| Source repository design history and proposals | `specs/` and `docs/`, with their respective scopes | Runtime authority records |
+| Executable regression checks and isolated fixtures | `tests/` | Production state or user-owned repositories |
+| Release construction and installation logic | `packaging/` and `scripts/` | Project-local runtime state |
+| CI automation and operations | `.github/` and `ops/` | Product specifications |
+
+Before writing, identify whether a change is to the EvoSpec **framework** or
+to a **consumer project's** workflow state. Framework development must not
+rewrite consumer state. The `.evospec/` directory is Git-ignored here and
+must not receive a generated `AGENTS.md`; its content is managed by Core.
+
+Do not duplicate operational rules or feature decisions across multiple files.
+Reference the authoritative owner and update adjacent documentation only when
+the underlying contract really changed. `AGENTS.md` files are instructions
+for agents, not a storage schema, a permission gate, or Product Truth.
