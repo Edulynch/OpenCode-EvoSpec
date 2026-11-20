@@ -45,10 +45,18 @@ This repository currently provides a source-only installation. Git access and Py
    evospec integrate opencode
    ```
 
-3. **Open OpenCode and describe the work naturally.**
+3. **Initialize authority for a new project (only when it is not already initialized).**
+
+   ```sh
+   evospec init
+   ```
+
+4. **Open OpenCode and describe the work naturally.**
    > Add a dark mode to the dashboard. Keep it accessible and consistent with the current product.
 
-4. **Optional: open the human dashboard.**
+   A request in plain language does **not** silently accept a Slice. New Feature/Slice agreements, criteria and test coverage require separate explicit human terminal decisions; see the [Standalone CLI guide](docs/standalone-cli.md).
+
+5. **Optional: open the human dashboard.**
 
    ```text
    evospec ui
@@ -62,7 +70,7 @@ You:      "Add a dark mode to the dashboard. Keep it accessible and consistent."
 OpenCode: "I'll keep the work centered on that outcome as we investigate, build, and check it."
 ```
 
-No ritual to memorize. Start with the outcome; EvoSpec helps the work stay connected to it.
+Start with the outcome; EvoSpec helps the conversation stay grounded. Human approval is still required for material agreements, protected test coverage and other gated decisions.
 
 ## ✨ What EvoSpec Helps With
 - Keeping a product goal clear across long-running AI work.
@@ -83,13 +91,21 @@ Read the [EvoSpec Methodology](docs/methodology.md) for the deeper picture.
 
 ## Project Status
 
-**Source/package version:** `0.5.0` (source snapshot; not a published release in this repository).
+**Source/package version:** `0.5.0`. This public repository is **source-only**: a source version is not a published GitHub Release, native installer/archive or PyPI distribution. The supported installation path uses Python 3.11+ from a source checkout.
 
-**E0 V2 methodology:** Product-owner approved on 2026-11-12 as a method-level contract. **E1 Vertical Slice B is functionally complete and merged** ([PR #3](https://github.com/Edulynch/OpenCode-EvoSpec/pull/3), 2026-11-13): an explicitly accepted Feature/Slice/Task and checkpoint persist locally and are recovered in an independent OpenCode session. Windows native-host qualification used OpenCode 2.3.0; Linux/Windows CI passed. This does **not** close all E1 design gates, certify Windows power-loss durability, prove unforgeable human identity against same-user processes, or authorize a release. E1.2 specifies a portable application with repository/worktree-local state; cross-computer context synchronization is outside E1.
+**Implemented on `master`:**
 
-The **v0.6.0 — Autonomy Pass** is paused historical planning, not an active EvoSpec V2 objective. Its task state remains in [ROADMAP.md](ROADMAP.md).
+- **E0/E1:** owner-approved V2 methodology and durable, human-accepted Feature → Slice → Task/checkpoint, with read-only recovery across sessions ([E1 PR #3](https://github.com/Edulynch/OpenCode-EvoSpec/pull/3), [Task progress PR #6](https://github.com/Edulynch/OpenCode-EvoSpec/pull/6)). E0's proposed unprefixed UX commands are not necessarily installed commands.
+- **R3-A/B:** deterministic criterion receipts and separately permissioned objective Slice outcome acceptance ([PR #14](https://github.com/Edulynch/OpenCode-EvoSpec/pull/14), [PR #16](https://github.com/Edulynch/OpenCode-EvoSpec/pull/16)).
+- **R4-A/B:** read-only acceptance indexes for active and multiple Slices ([PR #19](https://github.com/Edulynch/OpenCode-EvoSpec/pull/19), [PR #21](https://github.com/Edulynch/OpenCode-EvoSpec/pull/21)).
+- **R5-A/B/C:** a separately accepted next Slice, multi-Slice continuation and independent second-Slice test/outcome evidence ([PR #23](https://github.com/Edulynch/OpenCode-EvoSpec/pull/23), [PR #25](https://github.com/Edulynch/OpenCode-EvoSpec/pull/25), [PR #27](https://github.com/Edulynch/OpenCode-EvoSpec/pull/27)).
+- **R6-A/B:** explicit human-confirmed Feature completion (schema 18) and human-authorized reopening cycles (schema 19), without implicitly promoting an accepted Slice into a finished Feature ([PR #29](https://github.com/Edulynch/OpenCode-EvoSpec/pull/29), [PR #31](https://github.com/Edulynch/OpenCode-EvoSpec/pull/31)).
 
-CI validates this source snapshot; no native installer/archive assets, PyPI package, or GitHub Release have been published from this repository.
+**Verified separately from CI:** R3-B criterion and outcome testing through Windows OpenCode v2.3.2 ([T2 #36](https://github.com/Edulynch/OpenCode-EvoSpec/issues/36)); a second Slice with independent coverage, receipts and idempotent acceptance ([T3 #37](https://github.com/Edulynch/OpenCode-EvoSpec/issues/37)); and normal recovery across two independent, read-only OpenCode sessions ([T4 #38](https://github.com/Edulynch/OpenCode-EvoSpec/issues/38)). These specific native tests used an **explicitly owner-approved proportional permission boundary**: verify the root/fingerprint independently and confirm the exact custom-tool prompts and human `Allow once`. OpenCode v2.3.2's TUI does **not** render `repository_root` inside the generic custom-tool permission dialog; see [OpenCode integration](docs/opencode.md).
+
+**Distinct gates:** Task progress `REPORTED_UNVERIFIED` is not a criterion `VERIFIED`; a Slice outcome `CURRENT` is not a terminal Slice or completed Feature. Windows **physical power-loss durability remains NOT TESTED**, cross-computer synchronization is out of scope, and the local evidence/permission model is not cryptographic same-user attestation or an OS sandbox. General native R6 end-to-end qualification and release-candidate installation/upgrade still require their own evidence. **T5 documentation and T6 release assessment** are tracked separately; no merge, tag or release is authorized by test results.
+
+The historical **v0.6.0 Autonomy Pass** remains paused in [ROADMAP.md](ROADMAP.md). There is no published GitHub Release, PyPI distribution or native installer asset for this source snapshot.
 
 ## ⌨️ Optional Commands
 Natural language is the default. Use a command only when you want a direct control point:

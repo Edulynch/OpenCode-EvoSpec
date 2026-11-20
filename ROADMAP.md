@@ -15,16 +15,23 @@ This roadmap is intentionally human-readable. It answers three questions:
 
 ## Current focus
 
-### E1 — first accepted Feature/Slice/Task and session recovery [Slice B functionally complete]
+### T5–T6 — documentation reconciliation and release-candidate assessment (not published)
 
-The compact contract, approved E0 method-level command/context boundaries, S1–S9 desk walkthroughs, premortem, and E0→E1 gate are documented in [`docs/methodology.md`](docs/methodology.md) and [`docs/e0-v2-validation.md`](docs/e0-v2-validation.md).
+The E0 V2 methodology was approved on **2026-11-12**. E1 selected repository/worktree-local state **without cross-computer synchronization**, and the first accepted Feature/Slice/Task with independent-session recovery was integrated in [PR #3](https://github.com/Edulynch/OpenCode-EvoSpec/pull/3). The source package remains **0.5.0**; this public repository has no published GitHub Release or native installer assets.
 
-- **Decisions:** the product owner approved the E0 methodology on 2026-11-12 and separately authorized a bounded E1 Vertical Slice B implementation. E1.2 selected a portable application with project/worktree-local state, **without synchronization between computers**.
-- **Completed Slice B (2026-11-13):** [PR #3](https://github.com/Edulynch/OpenCode-EvoSpec/pull/3) merged at `f2ff8edf4121e1e6435a338d3355e52c5e2bcaae`. A real terminal acceptance persisted an accepted Feature/Slice/initial Task and checkpoint; a fresh OpenCode 2.3.0 session read exactly the same context without mutation. Linux/Windows GitHub CI passed, and the owner reported Windows isolated qualification (128 Python + 20 Node PASS and independent native sessions A/B).
-- **Boundaries:** Core-owned immutable agreement records, one atomic state-revision publication boundary, and read-only context recovery. No auto-execution, Product Truth publication, release, remote sync, or old-state migration. Windows power-loss durability is **not certified**; terminal acceptance is **not** an unforgeable identity guarantee against processes running with the same user's rights. Neither risk is silently marked PASS.
-- **Next design gate:** reconcile E1.2 logical recommendations D-12A/B/C and E1.3 command/host/Core mapping under [issue #2](https://github.com/Edulynch/OpenCode-EvoSpec/issues/2). The broader E1 design phase remains open.
-- **Candidate next Vertical Slice C — proposal only:** resume an explicitly accepted Task after restart, then record revision-checked progress/a new checkpoint through Core while retaining the same Feature/Slice authority. A separately approved mini-spec, risk review and explicit implementation authorization are required; neither this roadmap entry nor Slice B's merge is a GO.
-- The Autonomy Pass plan below is preserved as historical planning with its task checkboxes unchanged; it is not an active E0 objective.
+**Integrated milestones (merged code/CI; not universal native qualification):**
+
+- **E1:** human-accepted first Slice and recovery, then guarded accepted Task progress ([PR #3](https://github.com/Edulynch/OpenCode-EvoSpec/pull/3), [PR #6](https://github.com/Edulynch/OpenCode-EvoSpec/pull/6)).
+- **R3-A/B:** objective criterion receipts and separately accepted Slice outcomes ([PR #14](https://github.com/Edulynch/OpenCode-EvoSpec/pull/14), [PR #16](https://github.com/Edulynch/OpenCode-EvoSpec/pull/16)), followed by Windows executable/permission corrections ([PR #33](https://github.com/Edulynch/OpenCode-EvoSpec/pull/33), [PR #34](https://github.com/Edulynch/OpenCode-EvoSpec/pull/34)).
+- **R4-A/B:** read-only indexes of active and multiple accepted Slices ([PR #19](https://github.com/Edulynch/OpenCode-EvoSpec/pull/19), [PR #21](https://github.com/Edulynch/OpenCode-EvoSpec/pull/21)).
+- **R5-A/B/C:** explicit next-Slice approval, canonical multi-Slice continuation and distinct second-Slice coverage/evidence/outcome ([PR #23](https://github.com/Edulynch/OpenCode-EvoSpec/pull/23), [PR #25](https://github.com/Edulynch/OpenCode-EvoSpec/pull/25), [PR #27](https://github.com/Edulynch/OpenCode-EvoSpec/pull/27)).
+- **R6-A/B:** human-approved Feature completion on schema 18 and explicit reopened Feature cycles on schema 19 ([PR #29](https://github.com/Edulynch/OpenCode-EvoSpec/pull/29), [PR #31](https://github.com/Edulynch/OpenCode-EvoSpec/pull/31)).
+
+**Independent native qualification (separate from CI and publication):** [T1 #35](https://github.com/Edulynch/OpenCode-EvoSpec/issues/35) isolated preflight PASS; [T2 #36](https://github.com/Edulynch/OpenCode-EvoSpec/issues/36) R3-B PASS; [T3 #37](https://github.com/Edulynch/OpenCode-EvoSpec/issues/37) second-Slice and idempotent acceptance PASS with three owner-confirmed `Allow once` prompts during the final replay; [T4 #38](https://github.com/Edulynch/OpenCode-EvoSpec/issues/38) PASS for **normal** recovery between two independent OpenCode sessions, preserving the same Core revision and fingerprint. Earlier blocked/uncertain attempts remain recorded in their issues.
+
+**Active closeout:** [T5 #39](https://github.com/Edulynch/OpenCode-EvoSpec/issues/39) reconciles documentation and follow-up issues; [T6 #40](https://github.com/Edulynch/OpenCode-EvoSpec/issues/40) will independently evaluate installation/upgrade smokes and a release-candidate `GO/NO_GO`. **`RELEASE_GO=NOT_APPROVED`** until the owner explicitly authorizes publication.
+
+**Limits:** R3-B local operational evidence is not an OS sandbox. The OpenCode v2.3.2 TUI generic custom-tool dialog displays a tool name but not the `repository_root` resource/metadata; the specifically approved qualification boundary used a separate root/fingerprint preflight and human-observed `Allow once`. Windows physical power-loss recovery, cross-machine synchronization and generalized native R6 testing are **not** claimed. E0 method-level proposals remain distinct from installed runtime commands. The historical Autonomy Pass below stays paused.
 
 ## Historical implementation planning (paused)
 
