@@ -1079,7 +1079,7 @@ async function executeProposeFileEdit(runtime, args, context) {
 
 // Keep the probe bounded and privacy-preserving. A prompt hook can also see
 // programmatic session.prompt calls; a permission "allow" may be a saved rule.
-function noteAutoHostObservation(runtime, sessionID, kind, effect) {
+function noteAutoHostObservation(runtime, sessionID, kind, effect, event = null) {
   const observation = autoHostObservations.get(runtime)
   if (!observation || typeof sessionID !== "string" || !sessionID.trim()) return
   let seen = observation.sessions.get(sessionID)
@@ -1087,12 +1087,19 @@ function noteAutoHostObservation(runtime, sessionID, kind, effect) {
     if (observation.sessions.size >= 64) {
       observation.sessions.delete(observation.sessions.keys().next().value)
     }
-    seen = { admitted: false, permissionEffects: new Set() }
+    seen = { admitted: false, permissionEffects: new Set(), ruleSourceShapeSeen: false }
     observation.sessions.set(sessionID, seen)
   }
   if (kind === "prompt") seen.admitted = true
   if (kind === "permission" && ["allow", "ask"].includes(effect)) {
     seen.permissionEffects.add(effect)
+    // An upstream host may eventually expose a rule source (#61767).
+    // Record only the presence of a candidate field, never its contents:
+    // prior plugins can also mutate events, so shape is not a signature.
+    if (event?.rule && typeof event.rule === "object"
+        && ["agent", "session", "saved"].includes(event.rule.source)) {
+      seen.ruleSourceShapeSeen = true
+    }
   }
 }
 
@@ -1136,6 +1143,56 @@ async function executeAutoHostReadiness(runtime, context) {
       "HUMAN_INTENT_PROVENANCE_UNAVAILABLE",
     ],
     explanation: "Prompt admission may be programmatic, and an allow effect may come from saved or configured rules. These observations are not consent, do not survive reload, and never bypass Core or host denials. R2-C1 is qualification only; E1 TTY gates remain unchanged.",
+  })
+}
+
+// R2-C2 detects candidate host API shapes without calling them. This report
+// is an integration dependency diagnostic, never an authority or TTY receipt.
+async function executeAutoContractProbe(runtime, context) {
+  const root = await sessionRoot(runtime, context)
+  if (typeof root !== "string" || !isAbsolute(root)) {
+    throw new Error("AUTO_CONTRACT_ROOT_UNAVAILABLE: session root must be absolute")
+  }
+  const observations = autoHostObservations.get(runtime)
+  const seen = observations?.sessions.get(context.sessionID)
+  const ruleField = seen?.ruleSourceShapeSeen === true
+  const savedList = typeof runtime?.permission?.saved?.list === "function"
+  return JSON.stringify({
+    code: "AUTO_DELEGATION_CONTRACT_BLOCKED",
+    version: "r2-c2-host-contract-v1",
+    mode: "READ_ONLY_COMPATIBILITY_PROBE",
+    session: {
+      session_id: context.sessionID,
+      repository_root: resolve(root),
+      root_source: "OPEN_CODE_SESSION_GET",
+    },
+    candidates: {
+      permission_rule_origin_field: ruleField ? "SHAPE_OBSERVED_UNQUALIFIED" : "NOT_OBSERVED",
+      saved_permission_list_api: savedList ? "API_PRESENT_UNQUALIFIED" : "NOT_EXPOSED",
+      prompt_hook: observations?.promptHookRegistered === true ? "PRESENT" : "UNAVAILABLE",
+      permission_evaluate_hook: observations?.permissionHookRegistered === true ? "PRESENT" : "UNAVAILABLE",
+    },
+    required_trust: {
+      user_prompt_origin: "UNVERIFIED",
+      effective_auto_mode_and_rule_origin: "UNVERIFIED",
+      policy_epoch_and_revocation: "UNVERIFIED",
+      exact_invocation_one_time_admission: "UNVERIFIED",
+      scoped_semantic_intent: "UNVERIFIED",
+    },
+    authority: {
+      user_acceptance_source: "NOT_ATTESTED",
+      delegated_core_authority: "NOT_GRANTED",
+      automatic_slice_acceptance_allowed: false,
+      automatic_edit_grant_allowed: false,
+      automatic_feature_completion_allowed: false,
+    },
+    blockers: [
+      "HUMAN_PROMPT_ORIGIN_ATTESTATION_REQUIRED",
+      "PERMISSION_MODE_AND_SOURCE_ATTESTATION_REQUIRED",
+      "HOST_SINGLE_USE_ADMISSION_REQUIRED",
+      "POLICY_REVOCATION_BINDING_REQUIRED",
+    ],
+    guidance: "Candidate APIs or fields, when observed, are not authenticated grants. Qualify host-issued provenance, scoped execution, revocation and a one-use binding before changing Core; do not infer consent from autoaccept, allow, saved rules, a user-role message, or model text. No Core mutation, permission request, API call, or file read was performed.",
   })
 }
 
@@ -1402,6 +1459,12 @@ const tools = [
     "Read-only R2-C1 host capability and provenance qualification for this OpenCode session. Never infers Auto consent or grants Feature, Slice, edit, or completion authority.",
     object({}),
     (_, context) => executeAutoHostReadiness(context.runtime, context),
+  ),
+  protocolTool(
+    "evospec_auto_contract",
+    "Read-only R2-C2 compatibility check for host-issued prompt and permission provenance. Candidate APIs remain unqualified: this tool never grants authority or completes work.",
+    object({}),
+    (_, context) => executeAutoContractProbe(context.runtime, context),
   ),
   protocolTool(
     "evospec_assessed_start",
@@ -1702,7 +1765,7 @@ export default {
     if (typeof runtime?.permission?.hook === "function") {
       await runtime.permission.hook("evaluate", (event) => {
         // Observe only the rule effect; never change it for the Auto probe.
-        noteAutoHostObservation(runtime, event.sessionID, "permission", event.effect)
+        noteAutoHostObservation(runtime, event.sessionID, "permission", event.effect, event)
         if (!R3B_HUMAN_PERMISSION_ACTIONS.has(event.action) || event.effect === "deny") return
         // Ask again even when a permissive default or saved approval would
         // otherwise let the host execute without showing a human decision.
