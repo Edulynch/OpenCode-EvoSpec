@@ -2634,7 +2634,11 @@ def validate_state(state: State) -> None:
         if (owner is None or owner.source != "SESSION_REQUEST"
                 or owner.source_reference != agreement.source_reference
                 or owner.statement != agreement.statement
-                or owner.title != agreement.statement or agreement.title != agreement.statement):
+                # The exact source statement retains user formatting.
+                # Only display titles may trim outer whitespace; internal
+                # line breaks and the original source digest remain untouched.
+                or owner.title != agreement.statement.strip()
+                or agreement.title != agreement.statement.strip()):
             raise StateValidationError("SESSION_REQUEST Slice must preserve exact original user scope")
     receipt = state.e1_schema_upgrade
     if receipt is not None:
