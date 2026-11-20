@@ -8,7 +8,7 @@ from pathlib import Path
 import unittest
 
 from evospec.domain import ExpectedRevision, StateValidationError, validate_state
-from evospec.services import CoreService, SessionRequestEvidence
+from evospec.services import CoreService, SessionRequestEvidence, StaleRevisionError
 from evospec.workflow import WorkflowError, WorkflowService
 from tests._tempdir import TemporaryDirectory
 
@@ -100,7 +100,9 @@ class SessionRequestFirstSliceTests(unittest.TestCase):
                 legitimate, expected_revision=ExpectedRevision(rev),
             )
             self.assertEqual(result.code, "SESSION_SLICE_RECORDED")
-            with self.assertRaises(WorkflowError):
+            # The revision guard intentionally raises its typed stale error
+            # before any ordinary workflow rejection is attempted.
+            with self.assertRaises(StaleRevisionError):
                 workflow.accept_first_slice_session(
                     replace(legitimate, message_id="msg_different"),
                     expected_revision=ExpectedRevision(rev),
