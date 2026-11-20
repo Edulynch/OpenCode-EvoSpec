@@ -989,10 +989,12 @@ async function currentSessionRequest(runtime, context) {
   const item = prior[lastUser]
   if (typeof item.id !== "string" || !/^msg_[A-Za-z0-9_-]{3,128}$/.test(item.id)
       || typeof item.text !== "string" || !item.text.trim()
-      || item.text !== item.text.trim() || item.text.length > 512
-      || /[\u0000-\u001f\u007f]/.test(item.text)
+      || item.text.length > 2048
+      || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(item.text)
       || (Array.isArray(item.files) && item.files.length > 0)) {
-    throw new Error("SESSION_REQUEST_SCOPE_INVALID: only a bounded, single-line admitted text request is supported")
+    // Preserve user formatting verbatim. A newline, indentation, or trailing
+    // CRLF is normal prompt content, not a reason to demand a new prompt.
+    throw new Error("SESSION_REQUEST_SCOPE_INVALID: request must be nonblank, within 2048 characters, without unsupported control characters or attachments")
   }
   return { message_id: item.id, request_text: item.text }
 }
