@@ -153,7 +153,7 @@ class SessionRequestFirstSliceTests(unittest.TestCase):
                 )
             with self.assertRaises(WorkflowError):
                 workflow.accept_first_slice_session(
-                    replace(legitimate, statement="X" * 513),
+                    replace(legitimate, statement="X" * 2049),
                     expected_revision=ExpectedRevision(rev),
                 )
             (root / "index.html").write_text("existing user data", encoding="utf-8")
