@@ -1041,10 +1041,16 @@ async function executeProposeFileEdit(runtime, args, context) {
   if (!Number.isSafeInteger(budget) || budget <= 0) {
     throw new Error("EDIT_BUDGET_INVALID: finite positive operation budget required")
   }
+  // Strict protocol requires all seven delta fields; null means
+  // unchanged, not an attempted removal of existing authority.
   const delta = {
     allowed_paths: paths,
     reversible_actions: actions,
     operation_budget: budget,
+    external_wait_allowed: null,
+    retry_budget: null,
+    irreversible_permissions: null,
+    stop_conditions: null,
   }
   // A stale revision is never replayed, and the proposal still needs a
   // separate exact AUTHORIZE / REJECT / NARROW human decision.
