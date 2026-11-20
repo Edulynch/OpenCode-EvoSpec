@@ -894,9 +894,82 @@ async function ensureInitializedForExplicitTask(runtime, root, task, context) {
   return parseContextResponse(result)
 }
 
+// This proposal does not create work; the human's interactive TTY
+// confirmation is the only accepted first-Slice authority.
+function firstSliceHandoffEligible(c) {
+  const q = c?.work_queue, inventory = c?.slice_acceptance_inventory
+  return c?.initialization_state === "INITIALIZED" && c.e1_schema_ready === true
+    && c.lifecycle === null && c.feature_id == null && c.change_id == null
+    && c.feature_completion == null && !c.completed_terminal
+    && !c.pending_intake && !c.side_work_active && !c.stale
+    && c.legal_actions?.includes("new")
+    && q?.total === 0 && q.complete === true
+    && inventory?.total === 0 && inventory.complete === true
+}
+
+function boundedAgreementText(value, field) {
+  if (typeof value !== "string" || !value.trim() || value.length > 2048
+      || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error("first-Slice " + field + " must be nonblank single-line text (max 2048)")
+  }
+  return value.trim()
+}
+
+function quoteShell(value) {
+  const escaped = globalThis.process.platform === "win32"
+    ? value.replace(/'/g, "''") : value.replace(/'/g, "'\"'\"'")
+  return "'" + escaped + "'"
+}
+
+async function executeFirstSliceHandoff(runtime, args, context) {
+  const root = await sessionRoot(runtime, context)
+  const c = parseContextResponse(await rawExecuteRequest(runtime, { action: "context" }, context))
+  if (c.revision !== args.expected_revision) {
+    throw new Error("STALE_REVISION: reread context before proposing first Slice")
+  }
+  if (!firstSliceHandoffEligible(c)) {
+    throw new Error("FIRST_SLICE_UNAVAILABLE: Core's initialized E1 work ledger is not demonstrably empty")
+  }
+  const agreement = {
+    feature: boundedAgreementText(args.feature, "Feature"),
+    slice: boundedAgreementText(args.slice, "Slice"),
+    task: boundedAgreementText(args.task, "Task"),
+    checkpoint: boundedAgreementText(args.checkpoint, "checkpoint"),
+  }
+  const argv = [
+    ...CLI_COMMAND, "--project", root, "accept-slice",
+    "--feature", agreement.feature, "--slice", agreement.slice,
+    "--task", agreement.task, "--checkpoint", agreement.checkpoint,
+    "--expected-revision", String(c.revision),
+  ]
+  return JSON.stringify({
+    code: "INTERACTIVE_FIRST_SLICE_APPROVAL_REQUIRED",
+    state: "READ_ONLY_PROPOSAL",
+    repository_root: root,
+    repository_id: c.repository_id,
+    revision: c.revision,
+    proposed_agreement: agreement,
+    terminal_command: (globalThis.process.platform === "win32" ? "& " : "")
+      + argv.map(quoteShell).join(" "),
+    instruction: "Show the agreement and command once. The human must run it in an interactive terminal, inspect Core's exact agreement and type ACEPTO there. Chat responses or OpenCode permission dialogs do not substitute for TTY acceptance. Then reread evospec_context; proceed only if the actual accepted Slice exists.",
+    limitations: "No criteria-file attached; Task progress, tests, Slice outcome, Feature completion, edit permissions and Git remain separate.",
+  })
+}
+
 async function executeStart(runtime, args, context) {
   const root = await sessionRoot(runtime, context)
-  await ensureInitializedForExplicitTask(runtime, root, args.intent, context)
+  const initialized = await ensureInitializedForExplicitTask(runtime, root, args.intent, context)
+  if (args.operation === "new" && args.intake_route !== "legacy"
+      && firstSliceHandoffEligible(initialized)) {
+    return JSON.stringify({
+      code: "FIRST_SLICE_HANDOFF_REQUIRED",
+      state: "NO_FEATURE_CREATED",
+      repository_root: root,
+      revision: initialized.revision,
+      next_tool: "evospec_first_slice_handoff",
+      instruction: "Propose the smallest user-observable first Slice, one initial Task and checkpoint; call the read-only handoff tool at this revision. Do not run legacy NEW before TTY approval.",
+    })
+  }
   const result = await spawnCommand(
     [...CLI_COMMAND, "--project", root, args.operation, args.intent],
     root,
@@ -1111,9 +1184,25 @@ const tools = [
   ),
   protocolTool(
     "evospec_start",
-    "Start natural EvoSpec NEW or CHANGE intake for the executing session repository; initialize only when Core permits and the explicit task identifies this repository.",
-    object({ operation: { type: "string", enum: ["new", "change"] }, intent: string }),
+    "Start session intake. A first new Feature in an empty E1 project returns a read-only first-Slice handoff; explicitly requested legacy routing remains available.",
+    object({
+      operation: { type: "string", enum: ["new", "change"] },
+      intent: string,
+      intake_route: { type: "string", enum: ["auto", "legacy"] },
+    }, ["operation", "intent"]),
     (args, context) => executeStart(context.runtime, args, context),
+  ),
+  protocolTool(
+    "evospec_first_slice_handoff",
+    "Prepare one revision-bound, read-only first-Slice agreement for an initialized empty E1 ledger. Return a human TTY approval command without accepting or writing anything.",
+    object({
+      expected_revision: nonnegativeInteger,
+      feature: { type: "string", minLength: 1, maxLength: 2048 },
+      slice: { type: "string", minLength: 1, maxLength: 2048 },
+      task: { type: "string", minLength: 1, maxLength: 2048 },
+      checkpoint: { type: "string", minLength: 1, maxLength: 2048 },
+    }),
+    (args, context) => executeFirstSliceHandoff(context.runtime, args, context),
   ),
   protocolTool(
     "evospec_assessed_start",
@@ -1442,7 +1531,7 @@ export default {
         type: "text",
         text: "For natural-language questions about where work stands or where to resume (¿dónde seguimos?, ¿en qué quedamos?, where were we?), load the evospec skill and call only evospec_context for the current session project. Report the known Feature, Slice, Task, and next checkpoint plainly; distinguish initial acceptance from later task_progress (REPORTED_UNVERIFIED), and disclose missing or ambiguous context. When there is no active Task, report accepted work_queue items as inactive and never choose or activate one on a status query. Read-only questions never initialize, continue, reaccept, or mutate. " +
           "If evospec_context is unavailable or fails, report that the authoritative context cannot be verified and stop; never replace it with Engram memories, previous session messages, other repositories, or guessed work. " +
-          "For explicit EvoSpec lifecycle work, load the evospec skill and call evospec_context before repository inspection, tests, or lifecycle mutations. Then use evospec_continuation and follow its deterministic adapter directive: SAFE_AUTOMATIC_OPERATION and in-envelope BOUNDED_DELEGATION continue; EXTERNAL_WAIT waits; HUMAN_MATERIAL_DECISION asks exactly Core's decision; STRUCTURAL_DEFECT fails closed; terminal with outcome null completes. Re-read context after every Core mutation, reevaluate STALE_REVISION before any retry, and never edit .evospec manually.",
+          "For a first new Feature in an empty initialized E1 project, use evospec_first_slice_handoff and require an interactive TTY acceptance; chat consent is not Slice acceptance. Never create legacy active work first. Reread canonical context after approval. For other explicit EvoSpec lifecycle work, load the evospec skill and call evospec_context before repository inspection, tests, or lifecycle mutations. Then use evospec_continuation and follow its deterministic adapter directive: SAFE_AUTOMATIC_OPERATION and in-envelope BOUNDED_DELEGATION continue; EXTERNAL_WAIT waits; HUMAN_MATERIAL_DECISION asks exactly Core's decision; STRUCTURAL_DEFECT fails closed; terminal with outcome null completes. Re-read context after every Core mutation, reevaluate STALE_REVISION before any retry, and never edit .evospec manually.",
       })
     })
   },
