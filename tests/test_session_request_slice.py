@@ -51,9 +51,14 @@ class SessionRequestFirstSliceTests(unittest.TestCase):
             self.assertEqual(state.agreements[1].title, REQUEST)
             self.assertEqual(state.agreements[0].source_reference, evidence.source_reference)
             self.assertTrue(evidence.source_reference.startswith("session:ses_test1234:msg_test1234:"))
-            self.assertEqual(state.active_context.current_work,
+            # The active context is guaranteed by the accepted first Slice,
+            # but the persisted State type also supports terminal/no-work states.
+            active = state.active_context
+            self.assertIsNotNone(active)
+            assert active is not None
+            self.assertEqual(active.current_work,
                              "Implementar únicamente el resultado expresado en la petición")
-            scope = state.active_context.autonomy_envelope
+            scope = active.autonomy_envelope
             self.assertEqual(tuple(map(str, scope.allowed_paths)), ("index.html",))
             self.assertEqual(scope.operation_budget, 8)
             self.assertEqual(scope.irreversible_permissions, ())
