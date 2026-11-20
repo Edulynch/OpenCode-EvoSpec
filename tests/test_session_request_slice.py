@@ -72,6 +72,65 @@ class SessionRequestFirstSliceTests(unittest.TestCase):
             self.assertEqual(retry.revision, state.revision)
             self.assertEqual(CoreService.open(root).recover().revision, state.revision)
 
+    def test_multiline_request_keeps_exact_message_and_trimmed_display_titles(self) -> None:
+        # User instructions commonly contain paragraphs, Markdown lists, and
+        # trailing newlines from the host. They are not a new approval request.
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = WorkflowService.open(root)
+            _ = workflow.init()
+            text = (
+                "  Quiero una aplicación para mis tareas.\r\n"
+                "\r\n"
+                "- Agregar tareas nuevas.\r\n"
+                "- Marcar o desmarcar las completadas.\r\n"
+                "\tNo publicar ni hacer commits.\r\n"
+            )
+            evidence = self.evidence(root, text)
+            initial = CoreService.open(root).recover().revision
+            result = workflow.accept_first_slice_session(
+                evidence, expected_revision=ExpectedRevision(initial),
+            )
+            self.assertEqual(result.code, "SESSION_SLICE_RECORDED")
+            state = CoreService.open(root).recover()
+            validate_state(state)
+            self.assertEqual(state.agreements[0].statement, text)
+            self.assertEqual(state.agreements[1].statement, text)
+            self.assertEqual(state.agreements[0].title, text.strip())
+            self.assertEqual(state.agreements[1].title, text.strip())
+            self.assertEqual(state.agreements[0].source_reference, evidence.source_reference)
+            self.assertEqual(
+                evidence.source_reference.rsplit(":", 1)[-1],
+                sha256(text.encode("utf-8")).hexdigest()[:16],
+            )
+            self.assertEqual(state.active_context.focus, text.strip())
+            self.assertFalse(state.slice_criteria_heads)
+            unchanged = workflow.accept_first_slice_session(
+                evidence, expected_revision=ExpectedRevision(state.revision),
+            )
+            self.assertEqual(unchanged.revision, state.revision)
+            # Whitespace remains part of the exact source evidence: changing
+            # even one line break without updating its digest is tampering.
+            forged = replace(state.agreements[0], statement=text.replace("\r\n", "\n"))
+            with self.assertRaises(StateValidationError):
+                validate_state(replace(state, agreements=(forged, state.agreements[1])))
+
+    def test_unsupported_control_characters_do_not_become_session_scope(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = WorkflowService.open(root)
+            _ = workflow.init()
+            revision = CoreService.open(root).recover().revision
+            for value in ("Tarea\x00invalida", "Tarea\x0binvalida", "  \n  "):
+                # The source must be rejected before publishing any agreement.
+                with self.subTest(value=repr(value)):
+                    with self.assertRaises(WorkflowError):
+                        workflow.accept_first_slice_session(
+                            self.evidence(root, value),
+                            expected_revision=ExpectedRevision(revision),
+                        )
+                    self.assertEqual(CoreService.open(root).recover().revision, revision)
+
     def test_rejects_existing_file_other_root_wrong_message_and_stale_state(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
