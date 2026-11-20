@@ -898,7 +898,9 @@ async function ensureInitializedForExplicitTask(runtime, root, task, context) {
 // confirmation is the only accepted first-Slice authority.
 function firstSliceHandoffEligible(c) {
   const q = c?.work_queue, inventory = c?.slice_acceptance_inventory
-  return c?.initialization_state === "INITIALIZED" && c.e1_schema_ready === true
+  // Core exposes a null E1 projection before the very first agreement.
+  // The interactive CLI revalidates actual persisted-schema writer eligibility.
+  return c?.initialization_state === "INITIALIZED" && c.e1_schema_ready !== false
     && c.lifecycle === null && c.feature_id == null && c.change_id == null
     && c.feature_completion == null && !c.completed_terminal
     && !c.pending_intake && !c.side_work_active && !c.stale
@@ -928,7 +930,7 @@ async function executeFirstSliceHandoff(runtime, args, context) {
     throw new Error("STALE_REVISION: reread context before proposing first Slice")
   }
   if (!firstSliceHandoffEligible(c)) {
-    throw new Error("FIRST_SLICE_UNAVAILABLE: Core's initialized E1 work ledger is not demonstrably empty")
+    throw new Error("FIRST_SLICE_UNAVAILABLE: the current projection cannot offer an empty-slot first-Slice handoff")
   }
   const agreement = {
     feature: boundedAgreementText(args.feature, "Feature"),
@@ -945,13 +947,14 @@ async function executeFirstSliceHandoff(runtime, args, context) {
   return JSON.stringify({
     code: "INTERACTIVE_FIRST_SLICE_APPROVAL_REQUIRED",
     state: "READ_ONLY_PROPOSAL",
+    writer_schema_verified: false,
     repository_root: root,
     repository_id: c.repository_id,
     revision: c.revision,
     proposed_agreement: agreement,
     terminal_command: (globalThis.process.platform === "win32" ? "& " : "")
       + argv.map(quoteShell).join(" "),
-    instruction: "Show the agreement and command once. The human must run it in an interactive terminal, inspect Core's exact agreement and type ACEPTO there. Chat responses or OpenCode permission dialogs do not substitute for TTY acceptance. Then reread evospec_context; proceed only if the actual accepted Slice exists.",
+    instruction: "Show the agreement and command once. This is a candidate only: Core checks the actual writer schema, empty ledger and repository identity when the human runs the command in an interactive terminal. They must inspect Core's exact agreement and type ACEPTO there. Chat responses or OpenCode permission dialogs do not substitute for TTY acceptance. Then reread evospec_context; proceed only if the actual accepted Slice exists.",
     limitations: "No criteria-file attached; Task progress, tests, Slice outcome, Feature completion, edit permissions and Git remain separate.",
   })
 }
