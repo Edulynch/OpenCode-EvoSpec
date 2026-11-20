@@ -13,6 +13,9 @@ const AGENT_COMMAND = __EVOSPEC_AGENT_COMMAND__
 const CLI_COMMAND = __EVOSPEC_CLI_COMMAND__
 const canonicalSnapshots = new Map()
 const explicitR3BPermissionHooks = new WeakSet()
+// Ephemeral observation only: no prompts, paths, message content, or permission
+// decisions are persisted, and no observation confers Core authority.
+const autoHostObservations = new WeakMap()
 const R3B_HUMAN_PERMISSION_ACTIONS = new Set([
   "evospec_criterion_test_r3b",
   "evospec_accept_slice_outcome",
@@ -1074,6 +1077,68 @@ async function executeProposeFileEdit(runtime, args, context) {
   })
 }
 
+// Keep the probe bounded and privacy-preserving. A prompt hook can also see
+// programmatic session.prompt calls; a permission "allow" may be a saved rule.
+function noteAutoHostObservation(runtime, sessionID, kind, effect) {
+  const observation = autoHostObservations.get(runtime)
+  if (!observation || typeof sessionID !== "string" || !sessionID.trim()) return
+  let seen = observation.sessions.get(sessionID)
+  if (!seen) {
+    if (observation.sessions.size >= 64) {
+      observation.sessions.delete(observation.sessions.keys().next().value)
+    }
+    seen = { admitted: false, permissionEffects: new Set() }
+    observation.sessions.set(sessionID, seen)
+  }
+  if (kind === "prompt") seen.admitted = true
+  if (kind === "permission" && ["allow", "ask"].includes(effect)) {
+    seen.permissionEffects.add(effect)
+  }
+}
+
+async function executeAutoHostReadiness(runtime, context) {
+  const root = await sessionRoot(runtime, context)
+  if (typeof root !== "string" || !isAbsolute(root)) {
+    throw new Error("AUTO_HOST_ROOT_UNAVAILABLE: session root must be absolute")
+  }
+  const observed = autoHostObservations.get(runtime)
+  const seen = observed?.sessions.get(context.sessionID)
+  // Never inspect configuration files, query settings, ask for permission,
+  // or classify a model-provided message as authenticated human intent.
+  return JSON.stringify({
+    code: "AUTO_HOST_ATTESTATION_UNAVAILABLE",
+    mode: "READ_ONLY_CAPABILITY_PROBE",
+    session: {
+      session_id: context.sessionID,
+      repository_root: resolve(root),
+      root_source: "OPEN_CODE_SESSION_GET",
+    },
+    observed_capabilities: {
+      prompt_hook_registered: observed?.promptHookRegistered === true,
+      permission_evaluate_hook_registered: observed?.permissionHookRegistered === true,
+      session_context_api_available: typeof runtime?.session?.context === "function",
+      permission_assert_api_available: typeof runtime?.permission?.assert === "function",
+      prompt_admission_seen_this_process: seen?.admitted === true,
+      permission_rule_effects_seen_this_process: [...(seen?.permissionEffects ?? [])],
+    },
+    trust: {
+      effective_auto_mode: "UNVERIFIED",
+      prompt_human_origin: "UNVERIFIED",
+      permission_allow_provenance: "UNVERIFIED",
+      durable_consent_receipt: "UNAVAILABLE",
+      delegated_core_authority: "NOT_GRANTED",
+    },
+    automatic_acceptance_allowed: false,
+    automatic_file_grant_allowed: false,
+    automatic_feature_completion_allowed: false,
+    blockers: [
+      "AUTO_MODE_PROVENANCE_UNAVAILABLE",
+      "HUMAN_INTENT_PROVENANCE_UNAVAILABLE",
+    ],
+    explanation: "Prompt admission may be programmatic, and an allow effect may come from saved or configured rules. These observations are not consent, do not survive reload, and never bypass Core or host denials. R2-C1 is qualification only; E1 TTY gates remain unchanged.",
+  })
+}
+
 async function executeStart(runtime, args, context) {
   const root = await sessionRoot(runtime, context)
   const initialized = await ensureInitializedForExplicitTask(runtime, root, args.intent, context)
@@ -1331,6 +1396,12 @@ const tools = [
       remaining_operations: { type: "integer", minimum: 1, maximum: 4 },
     }, ["expected_revision", "path"]),
     (args, context) => executeProposeFileEdit(context.runtime, args, context),
+  ),
+  protocolTool(
+    "evospec_auto_readiness",
+    "Read-only R2-C1 host capability and provenance qualification for this OpenCode session. Never infers Auto consent or grants Feature, Slice, edit, or completion authority.",
+    object({}),
+    (_, context) => executeAutoHostReadiness(context.runtime, context),
   ),
   protocolTool(
     "evospec_assessed_start",
@@ -1622,8 +1693,16 @@ const tools = [
 export default {
   id: "evospec",
   async setup(runtime) {
+    const autoObservation = {
+      sessions: new Map(),
+      promptHookRegistered: false,
+      permissionHookRegistered: false,
+    }
+    autoHostObservations.set(runtime, autoObservation)
     if (typeof runtime?.permission?.hook === "function") {
       await runtime.permission.hook("evaluate", (event) => {
+        // Observe only the rule effect; never change it for the Auto probe.
+        noteAutoHostObservation(runtime, event.sessionID, "permission", event.effect)
         if (!R3B_HUMAN_PERMISSION_ACTIONS.has(event.action) || event.effect === "deny") return
         // Ask again even when a permissive default or saved approval would
         // otherwise let the host execute without showing a human decision.
@@ -1631,6 +1710,7 @@ export default {
         event.message = "EvoSpec R3-B requires explicit approval. Inspect repository_root before proceeding."
       })
       explicitR3BPermissionHooks.add(runtime)
+      autoObservation.permissionHookRegistered = true
     }
     const runtimeTools = tools.map((definition) => ({
       ...definition,
@@ -1654,6 +1734,20 @@ export default {
     const names = new Set(registered.map((tool) => tool.id))
     const missing = runtimeTools.map((tool) => tool.name).filter((name) => !names.has(name))
     if (missing.length) throw new Error(`EvoSpec V2 tools were not registered: ${missing.join(", ")}`)
+    // The host's prompt admission hook is an observation, not proof that
+    // a human typed the prompt; session.prompt and commands can also invoke it.
+    // Older OpenCode hosts may lack this hook, so report unavailable instead
+    // of failing plugin startup or fabricating a source receipt.
+    if (typeof runtime?.session?.hook === "function") {
+      try {
+        await runtime.session.hook("prompt", (event) => {
+          noteAutoHostObservation(runtime, event.sessionID, "prompt")
+        })
+        autoObservation.promptHookRegistered = true
+      } catch {
+        autoObservation.promptHookRegistered = false
+      }
+    }
     await runtime.session.hook("context", (event) => {
       event.system.push({
         type: "text",
