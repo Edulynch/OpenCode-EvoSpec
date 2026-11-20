@@ -1216,6 +1216,17 @@ class AgentProtocolTests(unittest.TestCase):
             ))
             revision = started["result"]["revision"]
             before = CoreService.open(root).recover()
+            # Strict transport shape errors must stay separate from Core
+            # rejections and must not publish any pending decision.
+            malformed = json.loads(execute(root, request(
+                "propose_autonomy_expansion",
+                expected_revision=revision,
+                delta={"allowed_paths": ["index.html"]},
+            )))
+            self.assertEqual(malformed["error"]["code"], "INVALID_REQUEST")
+            self.assertIn("missing", malformed["error"]["detail"])
+            self.assertEqual(before, CoreService.open(root).recover())
+
             # No budget was supplied: the proposed envelope still has budget 0.
             invalid = json.loads(execute(root, request(
                 "propose_autonomy_expansion",
