@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import unittest
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,7 +29,7 @@ from evospec.domain import (
 from evospec.lifecycle import Classification, ReviewVerdict
 from evospec.persistence import JsonValue
 from evospec.services import CoreService
-from evospec.workflow import WorkflowService
+from evospec.workflow import WorkflowError, WorkflowService
 from tests._tempdir import TemporaryDirectory
 from tests.test_persistence_atomic import FailingReplace
 from tests.test_services_state import convergence_assessment
@@ -69,6 +70,140 @@ def activate_side(root: Path) -> int:
 
 
 class AgentProtocolTests(unittest.TestCase):
+    def test_session_request_round_trips_with_separate_workspace_fingerprint(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            initialized = json.loads(execute(root, request("init", expected_revision=0)))
+            repository_id = sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+            text = "A task list.\r\n\r\n- Add one.\r\n- Mark it done.\r\n"
+            accepted_response = json.loads(execute(
+                root,
+                request(
+                    "accept_first_slice_session",
+                    expected_revision=initialized["result"]["revision"],
+                    repository_id=repository_id,
+                    session_id="ses_protocol123",
+                    message_id="msg_protocol123",
+                    request_text=text,
+                ),
+            ))
+            self.assertNotIn("error", accepted_response)
+            self.assertEqual(accepted_response["result"]["code"], "SESSION_SLICE_RECORDED")
+
+            state_before_context = CoreService.open(root).recover()
+            recovered = json.loads(execute(root, request("context")))
+            context = recovered["context"]
+            accepted = context["accepted_slice"]
+            first_projection = accepted_response["context"]["accepted_slice"]
+            completion = context["feature_completion"]
+            self.assertIsInstance(completion, dict)
+            self.assertEqual(context["revision"], accepted_response["result"]["revision"])
+            self.assertEqual(CoreService.open(root).recover(), state_before_context)
+            self.assertEqual(accepted["feature_agreement_ref"], first_projection["feature_agreement_ref"])
+            self.assertEqual(accepted["slice_agreement_ref"], first_projection["slice_agreement_ref"])
+            self.assertEqual(accepted["task_id"], first_projection["task_id"])
+            self.assertEqual(accepted["checkpoint"], first_projection["checkpoint"])
+            self.assertEqual(accepted["source"], "SESSION_REQUEST")
+            self.assertEqual(
+                accepted["source_reference"],
+                "session:ses_protocol123:msg_protocol123:" + sha256(text.encode("utf-8")).hexdigest()[:16],
+            )
+            self.assertEqual(accepted["criteria_status"], "NOT_RECORDED")
+            self.assertIsNone(accepted["criteria_revision"])
+            self.assertEqual(accepted["session_request"], {
+                "statement": text,
+                "sha256": sha256(text.encode("utf-8")).hexdigest(),
+                "repository_id": repository_id,
+            })
+            self.assertEqual(accepted["initial_task"], "Implementar únicamente el resultado expresado en la petición")
+            inventory_item = context["slice_acceptance_inventory"]["items"][0]
+            self.assertEqual(inventory_item["authority_status"], "CANONICAL")
+            self.assertEqual(inventory_item["scope_status"], "ACTIVE")
+            self.assertEqual(context["continuation"]["status"], "ACTIVE_SLICE")
+            self.assertEqual(
+                context["continuation"]["active_slice"]["slice_agreement_ref"],
+                accepted["slice_agreement_ref"],
+            )
+            self.assertEqual(context["continuation"]["task"]["task_id"], accepted["task_id"])
+            self.assertEqual(context["input_snapshot"]["repository_id"], repository_id)
+            self.assertIsNone(context["slice_outcome"])
+            self.assertIsNone(context["criterion_verification"])
+            self.assertEqual(completion["status"], "BLOCKED")
+            self.assertIn("SCHEMA_17_REQUIRED", completion["blockers"])
+            self.assertIn("FEATURE_WORK_NOT_TERMINAL", completion["blockers"])
+            initial_fingerprint = context["input_snapshot"]["fingerprint"]
+            initial_revision = context["revision"]
+            initial_request = accepted["session_request"]
+            state_before_drift_read = CoreService.open(root).recover()
+
+            (root / "index.html").write_text("<main>changed workspace</main>\n", encoding="utf-8")
+            changed = json.loads(execute(root, request("context")))
+            self.assertEqual(CoreService.open(root).recover(), state_before_drift_read)
+            self.assertEqual(changed["context"]["revision"], initial_revision)
+            self.assertNotEqual(
+                changed["context"]["input_snapshot"]["fingerprint"], initial_fingerprint,
+            )
+            self.assertEqual(changed["context"]["accepted_slice"]["session_request"], initial_request)
+            self.assertEqual(changed["context"]["accepted_slice"]["criteria_status"], "NOT_RECORDED")
+            self.assertIsNone(changed["context"]["slice_outcome"])
+            self.assertIsNone(changed["context"]["criterion_verification"])
+            self.assertFalse(changed["context"]["continuation"]["terminal_history"])
+            self.assertEqual(changed["context"]["feature_completion"]["status"], "BLOCKED")
+
+    def test_session_request_context_fails_closed_when_workspace_scan_fails(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            initialized = json.loads(execute(root, request("init", expected_revision=0)))
+            repository_id = sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+            with patch(
+                "evospec.workflow.WorkflowService.input_snapshot",
+                side_effect=WorkflowError("workspace scan failed"),
+            ):
+                accepted = json.loads(execute(
+                    root,
+                    request(
+                        "accept_first_slice_session",
+                        expected_revision=initialized["result"]["revision"],
+                        repository_id=repository_id,
+                        session_id="ses_scanfail123",
+                        message_id="msg_scanfail123",
+                        request_text="A bounded request.",
+                    ),
+            ))
+
+            self.assertNotIn("error", accepted)
+            self.assertEqual(accepted["result"]["code"], "SESSION_SLICE_RECORDED")
+            self.assertIsNone(accepted["context"]["input_snapshot"])
+            committed = CoreService.open(root).recover()
+            self.assertEqual(committed.revision, accepted["result"]["revision"])
+            self.assertEqual(len(committed.agreements), 2)
+            before_context = CoreService.open(root).recover()
+            with patch(
+                "evospec.workflow.WorkflowService.input_snapshot",
+                side_effect=WorkflowError("workspace scan failed"),
+            ):
+                response = json.loads(execute(root, request("context")))
+
+            self.assertNotIn("error", response)
+            context = response["context"]
+            accepted_slice = context["accepted_slice"]
+            completion = context["feature_completion"]
+            self.assertEqual(context["revision"], committed.revision)
+            self.assertIsNone(context["input_snapshot"])
+            self.assertFalse(context["r3b_schema_ready"])
+            self.assertEqual(accepted_slice["source"], "SESSION_REQUEST")
+            self.assertEqual(accepted_slice["session_request"]["statement"], "A bounded request.")
+            self.assertEqual(context["slice_acceptance_inventory"]["items"][0]["authority_status"], "CANONICAL")
+            self.assertEqual(context["continuation"]["status"], "ACTIVE_SLICE")
+            self.assertIsNone(context["criterion_verification"])
+            self.assertIsNone(context["slice_outcome"])
+            self.assertEqual(completion["status"], "BLOCKED")
+            self.assertIn("INPUT_SNAPSHOT_UNAVAILABLE", completion["blockers"])
+            self.assertEqual(before_context.criterion_test_receipts, ())
+            self.assertEqual(before_context.slice_outcome_receipts, ())
+            self.assertEqual(before_context.feature_completion_receipts, ())
+            self.assertEqual(CoreService.open(root).recover(), before_context)
+
     def test_archived_b_raw_progress_omissions_remain_invalid_after_complete_intake(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

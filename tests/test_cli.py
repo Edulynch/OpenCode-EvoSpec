@@ -4,16 +4,22 @@ import argparse
 import io
 import json
 import unittest
+from hashlib import sha256
 from contextlib import chdir, redirect_stderr, redirect_stdout
 from importlib import metadata
 from pathlib import Path
 from unittest.mock import patch
 
 from evospec.cli import _parser, _version, main
-from evospec.domain import ReviewResult, VerificationEvidence
+from evospec.domain import ExpectedRevision, ReviewResult, VerificationEvidence
 from evospec.lifecycle import ReviewVerdict
 from evospec.opencode_integration import PLUGIN, _resource_bytes
-from evospec.services import CoreService
+from evospec.services import (
+    CoreService,
+    SessionRequestEvidence,
+    UserAcceptance,
+    slice_acceptance_statement,
+)
 from evospec.workflow import WorkflowService
 from tests._tempdir import TemporaryDirectory
 
@@ -249,6 +255,45 @@ class CliTests(unittest.TestCase):
             self.assertEqual(main(("--project", temporary, "status"), output), 0)
             self.assertIn("Flow: IN_PROGRESS / IMPLEMENT", output.getvalue())
             self.assertIn("Next: review (AUTOMATIC)", output.getvalue())
+
+    def test_status_labels_session_request_without_changing_tty_display(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = WorkflowService.open(root)
+            initialized = workflow.init()
+            text = "A short task-list request."
+            evidence = SessionRequestEvidence(
+                "ses_cli1234", "msg_cli1234", text,
+                sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16],
+            )
+            workflow.accept_first_slice_session(
+                evidence, expected_revision=ExpectedRevision(initialized.revision),
+            )
+            output = io.StringIO()
+
+            self.assertEqual(main(("--project", temporary, "status"), output), 0)
+
+            self.assertIn(
+                "Acceptance source: SESSION_REQUEST (original session request; not a TTY approval)",
+                output.getvalue(),
+            )
+            self.assertIn("Slice criteria: NOT_RECORDED", output.getvalue())
+
+        with TemporaryDirectory() as temporary:
+            workflow = WorkflowService.open(Path(temporary))
+            initialized = workflow.init()
+            statement = slice_acceptance_statement("Feature", "Slice", "Task", "Checkpoint", None)
+            workflow.accept_first_slice(
+                "Feature", "Slice", "Task", "Checkpoint",
+                UserAcceptance(statement, f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"),
+                expected_revision=ExpectedRevision(initialized.revision),
+            )
+            output = io.StringIO()
+
+            self.assertEqual(main(("--project", temporary, "status"), output), 0)
+
+            self.assertIn("Accepted Slice: Slice | Task ID:", output.getvalue())
+            self.assertNotIn("Acceptance source:", output.getvalue())
 
     def test_cli_uses_explicit_project_for_workflow_commands(self) -> None:
         # Given: an empty repository and output capture

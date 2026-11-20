@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 
 from .domain import AgreementRecord, AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, CriterionCoverageApproval, CriterionTestReceipt, ExpectedRevision, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, SliceCriteriaHead, SliceCriteriaRevision, SliceCriterion, SliceOutcomeReceipt, State, WorkItem, WorkingContext
 from .guidance import (
@@ -266,6 +267,16 @@ class AcceptedSliceContext:
     source_reference: str
     criteria_status: str = "NOT_RECORDED"
     criteria_revision: SliceCriteriaRevision | None = None
+    session_request: SessionRequestSnapshot | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRequestSnapshot:
+    """The immutable original request, distinct from TTY acceptance and tests."""
+
+    statement: str
+    sha256: str
+    repository_id: str
 
 
 def project_context(
@@ -276,18 +287,38 @@ def project_context(
     """Return a concise, deterministic projection of current workflow authority."""
     if inspection is None:
         inspection = workflow.inspect_locks()
-    if input_snapshot is None and inspection.state.r3b_schema_upgrade is not None:
+    state = inspection.state
+    slice_inventory = (
+        _slice_acceptance_inventory(state)
+        if state.initialization is not None else SliceAcceptanceInventory()
+    )
+    active_accepted_slice = _accepted_slice_context(state)
+    active_session_request = bool(
+        active_accepted_slice is not None
+        and active_accepted_slice.session_request is not None
+        and any(
+            item.slice_agreement_ref == active_accepted_slice.slice_agreement_ref
+            and item.authority_status == "CANONICAL"
+            and item.scope_status == "ACTIVE"
+            for item in slice_inventory.items
+        )
+    )
+    r3b_schema_ready = state.r3b_schema_upgrade is not None
+    if input_snapshot is None and (r3b_schema_ready or active_session_request):
         try:
             _, input_snapshot = workflow.input_snapshot(
-                expected_revision=ExpectedRevision(inspection.state.revision),
+                expected_revision=ExpectedRevision(state.revision),
             )
         except WorkflowError:
-            pass
+            # A failed optional scan must not hide a committed workflow result.
+            input_snapshot = None
     snapshot_unavailable = (
-        inspection.state.r3b_schema_upgrade is not None and input_snapshot is None
+        r3b_schema_ready and input_snapshot is None
     )
+    r3b_input_snapshot = input_snapshot if r3b_schema_ready else None
     completion = _feature_completion_summary(
-        workflow, inspection.state, inspection.active_context, input_snapshot,
+        workflow, state, inspection.active_context,
+        input_snapshot,
     )
     # A separate schema read could advertise a newer writer gate with an older revision.
     e1_schema_ready = inspection.e1_schema_ready
@@ -386,11 +417,11 @@ def project_context(
                 input_snapshot=input_snapshot,
                 repository_id=inspection.state.initialization.repository_id,
                 criterion_coverage_approvals=(
-                    () if input_snapshot is None else _current_cycle_coverage(
-                        workflow, inspection.state, input_snapshot,
+                    () if r3b_input_snapshot is None else _current_cycle_coverage(
+                        workflow, inspection.state, r3b_input_snapshot,
                     )
                 ),
-                slice_acceptance_inventory=_slice_acceptance_inventory(inspection.state),
+                slice_acceptance_inventory=slice_inventory,
                 feature_completion=completion,
           )
     locks = tuple(lock for lock in inspection.locks if lock.active and lock.feature_id == context.feature_id)
@@ -463,7 +494,7 @@ def project_context(
             _irreversible_authorization_summaries(inspection.state.irreversible_authorizations),
             inspection.state.pending_autonomy_expansion,
             None if inspection.state.initialization is None else inspection.state.initialization.repository_id,
-            _accepted_slice_context(inspection.state),
+            active_accepted_slice,
             None if context.task_progress is None else AgentTaskProgress(
                 context.task_progress.task_id,
                 context.task_progress.checkpoint,
@@ -480,14 +511,14 @@ def project_context(
              inspection.state.r3b_schema_upgrade is not None,
              input_snapshot,
               _slice_outcome_summary(
-                   workflow, inspection.state, context, input_snapshot, snapshot_unavailable,
+                   workflow, inspection.state, context, r3b_input_snapshot, snapshot_unavailable,
                ),
                criterion_coverage_approvals=(
                    ()
-                   if input_snapshot is None
-                   else _current_cycle_coverage(workflow, inspection.state, input_snapshot)
+                   if r3b_input_snapshot is None
+                   else _current_cycle_coverage(workflow, inspection.state, r3b_input_snapshot)
                ),
-               slice_acceptance_inventory=_slice_acceptance_inventory(inspection.state),
+               slice_acceptance_inventory=slice_inventory,
                feature_completion=completion,
        )
 
@@ -642,7 +673,7 @@ def _slice_acceptance_item(
         and feature.task_id is None and feature.initial_task is None and feature.checkpoint is None
         and isinstance(record.title, str) and record.title.strip()
         and isinstance(record.statement, str) and record.statement.strip()
-        and record.source == "INTERACTIVE_TERMINAL"
+        and _agreement_sources_compatible(feature, record)
         and isinstance(record.source_reference, str) and record.source_reference.strip()
         and isinstance(record.task_id, str) and record.task_id.strip()
         and isinstance(record.initial_task, str) and record.initial_task.strip()
@@ -650,7 +681,6 @@ def _slice_acceptance_item(
         and isinstance(feature.title, str) and feature.title.strip()
         and isinstance(feature.id, str) and feature.id
         and isinstance(feature.statement, str) and feature.statement.strip()
-        and feature.source == "INTERACTIVE_TERMINAL"
         and isinstance(feature.source_reference, str) and feature.source_reference.strip()
     )
 
@@ -848,6 +878,29 @@ def _accepted_slice_for_context(state: State, context: WorkingContext | None) ->
     slice_record = next((item for item in state.agreements if item.id == context.slice_agreement_ref), None)
     if feature is None or slice_record is None:
         return None
+    session_request = None
+    if feature.source == "SESSION_REQUEST" or slice_record.source == "SESSION_REQUEST":
+        repository_id = (
+            None if state.initialization is None else state.initialization.repository_id
+        )
+        if (
+            not _agreement_sources_compatible(feature, slice_record)
+            or feature.kind != "FEATURE" or slice_record.kind != "SLICE"
+            or repository_id is None
+            or feature.repository_id != repository_id
+            or slice_record.repository_id != repository_id
+            or feature.feature_id != slice_record.feature_id
+            or feature.change_id != slice_record.change_id
+            or context.feature_id != slice_record.feature_id
+            or context.change_id != slice_record.change_id
+            or context.feature_agreement_ref != feature.id
+        ):
+            return None
+        session_request = SessionRequestSnapshot(
+            slice_record.statement,
+            sha256(slice_record.statement.encode("utf-8")).hexdigest(),
+            repository_id,
+        )
     assert slice_record.task_id is not None
     assert slice_record.initial_task is not None
     assert slice_record.checkpoint is not None
@@ -860,6 +913,19 @@ def _accepted_slice_for_context(state: State, context: WorkingContext | None) ->
         slice_record.task_id, slice_record.initial_task, slice_record.checkpoint,
         slice_record.source, slice_record.source_reference,
         "NOT_RECORDED" if revision is None else "RECORDED", revision,
+        session_request,
+    )
+
+
+def _agreement_sources_compatible(feature: AgreementRecord, slice_record: AgreementRecord) -> bool:
+    if feature.source == "SESSION_REQUEST" or slice_record.source == "SESSION_REQUEST":
+        return (
+            feature.source == slice_record.source == "SESSION_REQUEST"
+            and feature.source_reference == slice_record.source_reference
+            and feature.statement == slice_record.statement
+        )
+    return (
+        feature.source == slice_record.source == "INTERACTIVE_TERMINAL"
     )
 
 

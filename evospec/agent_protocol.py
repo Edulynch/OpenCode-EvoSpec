@@ -205,7 +205,7 @@ def _accepted_slice_json(accepted: AcceptedSliceContext | None) -> dict[str, Jso
     # criteria head, without promoting parked work into active authority.
     if accepted is None:
         return None
-    return {
+    value: dict[str, JsonValue] = {
         "feature_agreement_ref": accepted.feature_agreement_ref,
         "slice_agreement_ref": accepted.slice_agreement_ref,
         "feature_title": accepted.feature_title,
@@ -218,6 +218,13 @@ def _accepted_slice_json(accepted: AcceptedSliceContext | None) -> dict[str, Jso
         "criteria_status": accepted.criteria_status,
         "criteria_revision": _criteria_revision_json(accepted.criteria_revision),
     }
+    if accepted.session_request is not None:
+        value["session_request"] = {
+            "statement": accepted.session_request.statement,
+            "sha256": accepted.session_request.sha256,
+            "repository_id": accepted.session_request.repository_id,
+        }
+    return value
 
 
 def _criteria_revision_json(revision: SliceCriteriaRevision | None) -> dict[str, JsonValue] | None:
