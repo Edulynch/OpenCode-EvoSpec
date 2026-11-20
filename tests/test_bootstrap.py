@@ -22,9 +22,16 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(project["scripts"]["evospec"], "evospec.cli:main")
         self.assertEqual(project["scripts"]["evospec-agent"], "evospec.agent_protocol:main")
         self.assertEqual(project["scripts"]["evospec-agent-protocol"], "evospec.agent_protocol:main")
+        # Keep the source-distribution contract aligned with the directory
+        # guidance bundled alongside EvoSpec's existing runtime assets.
         self.assertEqual(
             metadata["tool"]["setuptools"]["package-data"]["evospec"],
-            ["resources/opencode/**/*", "resources/dashboard/**/*"],
+            [
+                "AGENTS.md",
+                "resources/AGENTS.md",
+                "resources/opencode/**/*",
+                "resources/dashboard/**/*",
+            ],
         )
         self.assertFalse(metadata["tool"]["setuptools"]["include-package-data"])
         self.assertFalse(metadata["tool"]["setuptools"]["packages"]["find"]["namespaces"])
