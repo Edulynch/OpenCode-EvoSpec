@@ -79,6 +79,9 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn("¿dónde seguimos?", plugin)
         self.assertIn("call only evospec_context", plugin)
         self.assertIn("Read-only questions never initialize", plugin)
+        self.assertIn("evospec_first_slice_handoff", plugin)
+        self.assertIn("evospec_first_slice_handoff", skill)
+        self.assertIn("interactive terminal", skill)
         self.assertIn("¿dónde seguimos?", skill)
         self.assertIn("Call **only** `evospec_context`", skill)
         self.assertIn("accepted_slice.checkpoint", skill)
@@ -111,6 +114,96 @@ class OpenCodeIntegrationTests(unittest.TestCase):
             skill,
             (Path(__file__).parents[1] / ".opencode" / "skills" / "evospec" / "SKILL.md").read_text(encoding="utf-8"),
         )
+
+    def test_first_slice_handoff_is_read_only_tty_scoped_and_fails_closed(self) -> None:
+        # A natural new Feature should not occupy the empty E1 work slot
+        # before the user has seen and accepted the first Slice.
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "plugin.ts").write_text(_resources()[PLUGIN], encoding="utf-8")
+            (root / "continuation.mjs").write_text(_resources()[CONTINUATION], encoding="utf-8")
+            runner = root / "first-slice.ts"
+            runner.write_text(
+                '''import plugin from "./plugin.ts"
+const definitions = []
+const commands = []
+let canonical = { context: {
+  revision: 1, repository_id: "repo-1",
+  initialization_state: "INITIALIZED", e1_schema_ready: true,
+  lifecycle: null, feature_id: null, change_id: null,
+  feature_completion: null, completed_terminal: false,
+  pending_intake: false, side_work_active: false, stale: false,
+  legal_actions: ["new"], accepted_capabilities: [],
+  work_queue: { total: 0, complete: true },
+  slice_acceptance_inventory: { total: 0, complete: true },
+} }
+const assert = (condition, message) => { if (!condition) throw new Error(message) }
+const runtime = {
+  tool: {
+    transform: async (fn) => fn({ add: (item) => definitions.push(item) }),
+    list: async () => definitions.map((item) => ({ id: item.name })),
+  },
+  session: {
+    get: async () => ({ location: { directory: process.cwd() } }),
+    hook: async () => {},
+  },
+}
+await plugin.setup(runtime)
+Object.defineProperty(Bun, "spawn", { value(command) {
+  commands.push(command)
+  const output = command.includes("--project") ? "PROPOSED | 2" : JSON.stringify(canonical)
+  return { stdout: new Blob([output]).stream(), stderr: new Blob([""]).stream(), exited: Promise.resolve(0) }
+} })
+const call = async (name, args) => {
+  const tool = definitions.find((item) => item.name === name)
+  assert(tool, "missing registered tool " + name)
+  return tool.execute(args, { sessionID: "session-1", signal: new AbortController().signal })
+}
+const started = JSON.parse((await call("evospec_start", {
+  operation: "new", intent: "Create a simple task list"
+})).content)
+assert(started.code === "FIRST_SLICE_HANDOFF_REQUIRED", "fresh NEW returns E1 handoff, not legacy intake")
+assert(started.state === "NO_FEATURE_CREATED", "no premature work materialized")
+assert(!commands.some((cmd) => cmd.includes("new")), "fresh NEW must not run legacy CLI")
+const proposal = JSON.parse((await call("evospec_first_slice_handoff", {
+  expected_revision: 1, feature: "MiniLista",
+  slice: "Add and check tasks", task: "Create index.html",
+  checkpoint: "Browser test with persistence",
+})).content)
+assert(proposal.code === "INTERACTIVE_FIRST_SLICE_APPROVAL_REQUIRED", "proposal demands TTY approval")
+assert(proposal.state === "READ_ONLY_PROPOSAL", "proposal never records acceptance")
+assert(proposal.repository_root === process.cwd(), "handoff remains bound to executing session root")
+assert(proposal.revision === 1, "handoff binds the original Core revision")
+assert(proposal.terminal_command.includes("accept-slice"), "only first Slice CLI is offered")
+assert(proposal.terminal_command.includes("MiniLista"), "the proposed agreement is visible")
+assert(proposal.instruction.includes("ACEPTO"), "human terminal confirmation is explicit")
+assert(!commands.some((cmd) => cmd.includes("accept-slice")), "tool never silently executes approval")
+let rejected = false
+try { await call("evospec_first_slice_handoff", {
+  expected_revision: 2, feature: "MiniLista",
+  slice: "Add and check tasks", task: "Create index.html", checkpoint: "Browser",
+}) } catch (error) { rejected = String(error).includes("STALE_REVISION") }
+assert(rejected, "stale revisions must not produce a usable acceptance command")
+canonical.context.lifecycle = ["IN_PROGRESS", "IMPLEMENT"]
+rejected = false
+try { await call("evospec_first_slice_handoff", {
+  expected_revision: 1, feature: "MiniLista",
+  slice: "Add and check tasks", task: "Create index.html", checkpoint: "Browser",
+}) } catch (error) { rejected = String(error).includes("FIRST_SLICE_UNAVAILABLE") }
+assert(rejected, "an occupied work slot cannot gain a first-Slice handoff")
+canonical.context.lifecycle = null
+const legacy = JSON.parse((await call("evospec_start", {
+  operation: "new", intent: "Explicit legacy work", intake_route: "legacy",
+})).content)
+assert(legacy.intake === "PROPOSED | 2", "explicit legacy intake remains usable")
+assert(commands.some((cmd) => cmd.includes("new")), "legacy intent still reaches the CLI")
+''',
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                ("bun", "run", str(runner)), cwd=root, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_v2_plugin_registers_and_serializes_provider_neutral_typed_actions(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -158,9 +251,9 @@ const runtime = {
   },
 }
 await plugin.setup(runtime)
-assert(definitions.length === 28, "raw protocol tool and all typed helpers register")
+assert(definitions.length === 29, "raw protocol tool and all typed helpers register")
 const names = new Set(definitions.map((definition) => definition.name))
-for (const name of ["evospec", "evospec_start", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_criterion_test", "evospec_criterion_test_r3b", "evospec_accept_slice_outcome", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
+for (const name of ["evospec", "evospec_start", "evospec_first_slice_handoff", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_criterion_test", "evospec_criterion_test_r3b", "evospec_accept_slice_outcome", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
 const contextEntry = definitions.find((definition) => definition.name === "evospec_context")
 assert(contextEntry.options?.codemode === false, "canonical read-only context bypasses deferred Code Mode discovery")
 assert(definitions.filter((definition) => definition.options?.codemode === false).length === 1, "only canonical context is directly exposed")
