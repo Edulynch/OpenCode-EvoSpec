@@ -230,7 +230,7 @@ assert(commands.some((cmd) => cmd.includes("new")), "legacy intent still reaches
             runner = root / "session-intake.ts"
             runner.write_text(
                 '''import plugin from "./plugin.ts"
-const definitions = [], requests = []
+const definitions = [], requests = [], writes = []
 const assert = (test, message) => { if (!test) throw new Error(message) }
 const text = "Quiero una aplicación sencilla para llevar mis tareas y marcar las terminadas."
 const user = { type: "user", id: "msg_user0001", text, files: [] }
@@ -271,7 +271,7 @@ await plugin.setup(runtime)
 Object.defineProperty(Bun, "spawn", { value(command, opts) {
   assert(!command.includes("--project"), "no TTY CLI from native intake")
   const request = opts.stdin?.text()
-  if (request) requests.push(request.then((content) => JSON.parse(content)))
+  if (request) writes.push(request.then((content) => requests.push(JSON.parse(content))))
   const value = responseQueue.shift()
   assert(value !== undefined, "unexpected protocol request")
   return { stdout: new Blob([JSON.stringify(value)]).stream(),
@@ -290,7 +290,7 @@ responseQueue.push(idle, idle, { result: { code: "SESSION_SLICE_RECORDED" }, con
   ...canonical, revision: 8,
 } })
 const accepted = JSON.parse((await invoke()).content)
-await Promise.all(requests)
+await Promise.all(writes)
 assert(accepted.result.code === "SESSION_SLICE_RECORDED", "Core recorded session request")
 assert(assertions === 1, "host checks permission once")
 assert(requests.length === 3, "read, revalidate, one Core mutation only")
@@ -334,7 +334,7 @@ responseQueue.push(idle)
 rejected = false
 try { await invoke() } catch (e) { rejected = String(e).includes("SESSION_REQUEST_ROOT_CHANGED") }
 assert(rejected, "root change during host admission fails closed")
-await Promise.all(requests)
+await Promise.all(writes)
 assert(requests.filter((item) => item.action === "accept_first_slice_session").length === 1,
   "only successful admitted request may write")
 ''',
