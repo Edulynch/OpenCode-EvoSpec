@@ -140,7 +140,7 @@ A natural-language request does **not** become a durable agreement until the dis
 
 The agent context additionally exposes `feature_completion` for an unambiguous primary Feature: `feature_id`, `status` (`BLOCKED`, `READY_FOR_HUMAN_DECISION`, or `COMPLETE`), `receipt_id`, `blockers`, and exact `slice_agreement_refs`. The projection comes from canonical Core state; it does not infer completeness from the R4-B/R5-C truncated Slice index or a historical receipt flag. When a Slice's current evidence cannot be established under the same input snapshot, Core returns an explicit blocker rather than a speculative completion.
 
-**No writable Feature-completion agent protocol action exists.** The human must invoke the separate CLI `evospec complete-feature` from a genuine terminal, review the Feature-level condition and exhaustive Slice/outcome basis, and enter the exact `ACEPTO <token>`. That operation may explicitly migrate a schema-17 consumer state to schema 18 in the same approved atomic transaction; reading status never migrates a project. The immutable Feature receipt is independent of Slice outcomes, lifecycle terminal archives, Product Truth, Git merge and release. New Slices against a closed Feature remain blocked pending a separate reopening decision.
+**No general Feature-completion agent protocol action exists.** For ordinary Features, the human must invoke the separate CLI `evospec complete-feature` from a genuine terminal, review the Feature-level condition and exhaustive Slice/outcome basis, and enter the exact `ACEPTO <token>`. That operation may explicitly migrate a schema-17 consumer state to schema 18 in the same approved atomic transaction; reading status never migrates a project. The immutable Feature receipt is independent of Slice outcomes, lifecycle terminal archives, Product Truth, Git merge and release. New Slices against a closed Feature remain blocked pending a separate reopening decision. The narrow `request_scoped_objective` exception below cannot close an ordinary Feature.
 
 `outcome.kind` is exactly one of `HUMAN_MATERIAL_DECISION`, `SAFE_AUTOMATIC_OPERATION`, `BOUNDED_DELEGATION`, `EXTERNAL_WAIT`, or `STRUCTURAL_DEFECT`. It is derived from Core facts, not from an action name. `outcome.intervention` preserves the compatibility projection: `HUMAN_MATERIAL_DECISION` maps to `USER`; `SAFE_AUTOMATIC_OPERATION`, `BOUNDED_DELEGATION`, and `EXTERNAL_WAIT` map to `AUTOMATIC`; and `STRUCTURAL_DEFECT` maps to `NONE`. A `HUMAN_MATERIAL_DECISION` outcome always carries `material_decision` with one concrete decision and at least two distinct Core-offered options. Nonhuman outcomes cannot carry material-decision evidence. `BOUNDED_DELEGATION` is a typed disposition only; it does not create or persist authority. Missing decision choices are surfaced as `STRUCTURAL_DEFECT`, never as a user handoff. A terminal context has `outcome: null`; existing terminal and completion facts remain authoritative.
 
@@ -168,6 +168,7 @@ The protocol action names are not standalone CLI commands.
 | `verify` | Record typed technical evidence and whether it is sufficient. |
 | `reject` | Terminalize the active work through Core; when it is side work, restore its preserved primary. |
 | `converge` | Complete the explicit convergence decision after its gates pass. |
+| `request_scoped_objective` | Verify and close only the dedicated, Core-bounded static-heading request lane described below; this is not a generic application-completion action. |
 | `invalidate_assurance` | Explicitly clear stale review and verification assurance after changed implementation work. |
 
 `new` and `change` require the full typed assessment contract. The Core determines lifecycle authority from that assessment and the persisted state. The protocol does not provide a shortcut for choosing internal classifications.
@@ -238,6 +239,8 @@ The OpenCode V2 local plugin invokes this protocol through provider-neutral and 
 
 OpenCode is an integration client, not a Core dependency. The protocol remains usable by other agents and callers that can exchange the documented JSON messages.
 
+Direct Core, stdin-protocol, or Python calls are **trusted-local interfaces**. They carry no host-attested OpenCode session, permission, Auto-mode, or human identity; Core admission checks do not replace OpenCode's native permission boundary. An OpenCode agent must not use these interfaces as a fallback when a dedicated host tool is denied, canceled, or unavailable. For `request_scoped_objective`, the dedicated OpenCode tool is the only supported OpenCode mutation path. A permission or capability `allow` effect does not prove Auto-mode origin or authenticated human identity. This boundary does not protect against other code running as the same local OS user or provide atomic revocation, and Core-only or harness checks do not qualify native OpenCode behavior.
+
 ## R6-B Feature cycles and historical Slice evidence (schema 19)
 
 The read-only `feature_completion` projection now includes `cycle_id`, `cycle_state` (`OPEN` or `CLOSED`), `reopen_receipt_id` and a chronological `history` of reopen/completion receipts. The CLI `status` and agent context use the same Core eligibility projection; neither may migrate state or select work.
@@ -245,3 +248,43 @@ The read-only `feature_completion` projection now includes `cycle_id`, `cycle_st
 **No agent writer reopens a Feature.** The human must use `evospec reopen-feature` in a real terminal with an exact prior closure receipt, reason, purpose and revision, then confirm `ACEPTO <token>`. The atomic schema 18→19 conversion appends an immutable `FeatureReopenReceipt` while preserving schema-18 closures. It does not create or activate a Slice; `accept-next-slice` has its own human gate.
 
 When the new cycle is open, an **accepted terminal historical Slice** may receive fresh coverage via the TTY command `renew-r3b-coverage --slice-agreement-ref`. The existing OpenCode `evospec_criterion_test_r3b` tool can then execute its exact approved descriptor **only with real host permission** and Core's archived-scope/fingerprint validation. The separate `evospec_accept_slice_outcome` tool takes optional `slice_agreement_ref` for this case. Its provider-neutral action is `accept_historical_slice_outcome` with required fields `action`, `expected_revision`, `slice_agreement_ref` and `input_snapshot`; legacy `accept_slice_outcome` remains unchanged. The agent cannot synthesize a reopening or a human coverage decision. Stale evidence blocks closure, and all historical criteria remain applicable by default.
+
+## Request-scoped objective: one exact static heading
+
+`request_scoped_objective` is a deliberately narrow exception for a single static HTML page. It is not a general app builder or a writable shortcut for the normal Feature lifecycle. Core derives the heading and objective from the **original admitted request text**; it does not accept model-authored criteria, a caller-supplied result, closure prose, or an arbitrary implementation descriptor.
+
+The only supported request forms are:
+
+```text
+Create a static HTML page with the heading "X".
+Crea una página HTML estática con el encabezado «X».
+```
+
+The exact heading payload is the only requirement. Core's built-in `core-static-heading-v1` check reads the actual `index.html` bytes and accepts only its small inert HTML subset: the exact lowercase doctype/html/head/body structure with one visible matching `h1`, plus the explicitly supported optional UTF-8 meta, plain-text title, and language attribute. Scripts, styles, resources, extra content, another path, or additional request clauses are outside this lane. Unsupported or ambiguous requests must use the ordinary workflow and its existing decision/TTY gates; they are not generalized into an app objective.
+
+Keep these categories distinct:
+
+- **Requirements:** only the admitted exact request form and its extracted heading.
+- **Objective check:** Core's real built-in check of the current `index.html`; permission success, a model assertion, a simulated test, or fabricated output is not a passing check.
+- **Implementation choices:** choices that preserve this exact one-heading static result inside the accepted subset. They do not add paths, functionality, dependencies, external services, or new requirements.
+- **Material decisions:** the supported forms define none. Do not invent a choice or infer one from the permission flow; stop and use the ordinary decision path if a new material question arises.
+
+The dedicated host supplies the exact session, original message, repository identity, current revision and current workspace fingerprint. It rechecks the same session/root/request/revision/fingerprint around native permission and before mutation. Session provenance means the host observed the admitted message in that session; it is not authenticated human identity. This narrow lane does not require `ACEPTO` in a terminal, but host permission is still a separate boundary and does not itself prove request authorship, implementation success, or closure.
+
+The provider-neutral wire request has exactly these fields:
+
+```json
+{
+  "action": "request_scoped_objective",
+  "expected_revision": 12,
+  "repository_id": "<context.repository_id>",
+  "session_id": "<host session>",
+  "message_id": "<original admitted user message>",
+  "request_text": "Create a static HTML page with the heading \"Hello\".",
+  "input_fingerprint": "<64 lowercase hexadecimal characters>"
+}
+```
+
+Unknown or missing keys, a non-SHA-256 fingerprint, or incorrectly typed values are rejected. Core checks the exact original request and root-bound evidence again; stale revisions are not rebound. A successful evidence phase returns `REQUEST_OBJECTIVE_VERIFIED` after the actual objective evidence and Slice outcome are persisted. A separate call with the refreshed revision revalidates the same request and fresh workspace before normal terminal archival and Feature-receipt CAS, returning `REQUEST_OBJECTIVE_COMPLETE`. An exact completed replay returns `REQUEST_OBJECTIVE_ALREADY_COMPLETE` without another revision. If the actual page does not verify, context reports `status: "BLOCKED"` with blocker `REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED`; the failed check does not accept criteria or create an outcome or closure. Generic application requests are outside the two recognized forms and do not receive synthesized criteria. This lane does not publish Product Truth or authorize Git/release activity.
+
+Read-only context always includes `request_scoped_objective`, either `null` or the five Core-derived fields `status`, `source_reference`, `request_sha256`, `blockers`, and `heading`. The status is `PENDING`, `VERIFIED`, `BLOCKED`, or `COMPLETE`; blockers are Core's literal reasons, not model conclusions. After closure with no active work, context may compute the current workspace snapshot so a caller can reconcile the exact replay hash; an optional scan failure leaves context readable and does not create a new verification pass. The projection uses canonical Core state, not arbitrary client claims. In the OpenCode integration this action is available only through its dedicated host tool; the generic raw `evospec` tool refuses it. Automated protocol tests do not qualify a native permission dialog or a live OpenCode session.

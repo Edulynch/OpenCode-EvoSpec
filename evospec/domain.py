@@ -36,6 +36,17 @@ from .input_fingerprint import (
     TEST_ENVIRONMENT_PROFILE_ID,
     TEST_ENVIRONMENT_PROFILE_DIGEST,
 )
+from .request_scoped_objective import (
+    OBJECTIVE_TEST_KIND,
+    OBJECTIVE_TEST_TARGET,
+    REQUEST_SCOPED_OBJECTIVE,
+    derive_static_heading,
+)
+
+REQUEST_OBJECTIVE_ADMISSION_POLICY_ID = OBJECTIVE_TEST_KIND
+REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST = sha256(
+    b"core-static-heading-v1:strict-utf8:bounded-index.html:exact-single-h1"
+).hexdigest()
 
 FeatureId = NewType("FeatureId", str)
 ChangeId = NewType("ChangeId", str)
@@ -250,6 +261,41 @@ class SliceCriteriaRevision:
     previous_revision_id: str | None = None
     reason: str | None = None
     decision_statement: str | None = None
+
+
+def request_objective_criteria_revision(
+    slice_agreement_ref: str,
+    repository_id: str,
+    source_reference: str,
+    statement: str,
+) -> SliceCriteriaRevision | None:
+    """Derive the sole canonical criterion supported by the request verifier."""
+    objective = derive_static_heading(statement)
+    if objective is None:
+        return None
+    digest = sha256(json.dumps(
+        [slice_agreement_ref, source_reference],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()[:20]
+    criterion = SliceCriterion(
+        "request-objective-heading",
+        f"One attribute-free H1 exactly equals: {objective.heading}",
+        f"{OBJECTIVE_TEST_KIND}:{OBJECTIVE_TEST_TARGET}",
+    )
+    return SliceCriteriaRevision(
+        f"slice-criteria-objective-{digest}",
+        slice_agreement_ref,
+        repository_id,
+        "The requested static heading is present in index.html",
+        "index.html contains one plain H1 with the exact requested heading",
+        ("index.html",),
+        ("Every other file and behavior",),
+        ("No additional product decisions are included",),
+        (criterion,),
+        REQUEST_SCOPED_OBJECTIVE,
+        source_reference,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -571,6 +617,28 @@ def feature_completion_semantic_id(receipt: FeatureCompletionReceipt) -> str:
     return "feature-completion-" + sha256(json.dumps(
         values, ensure_ascii=False, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()[:20]
+
+
+def request_objective_completion_statement(
+    *,
+    source_reference: str,
+    request_sha256: str,
+    heading: str,
+    outcome_receipt_id: str,
+    input_fingerprint: str,
+    source_revision: int,
+) -> str:
+    """Canonical system provenance; it is explicitly not a human decision."""
+    return "\n".join((
+        "EvoSpec: Core request-scoped objective completion; not human approval or Product Truth publication",
+        f"Original session request: {source_reference}",
+        f"Request SHA-256: {request_sha256}",
+        f"Verified static heading: {heading}",
+        f"Slice outcome receipt: {outcome_receipt_id}",
+        f"Root input fingerprint: {input_fingerprint}",
+        f"Expected revision: {source_revision}",
+        "No Product Truth was published",
+    ))
 
 
 def feature_cycle_status(
@@ -2993,6 +3061,32 @@ def validate_state(state: State) -> None:
                           "expected_evidence": item.expected_evidence} for item in revision.criteria],
         }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if revision.previous_revision_id is None:
+            if revision.source == REQUEST_SCOPED_OBJECTIVE:
+                expected_objective = request_objective_criteria_revision(
+                    revision.slice_agreement_ref,
+                    revision.repository_id,
+                    revision.source_reference,
+                    agreement.statement,
+                )
+                owners = tuple(
+                    item for item in state.agreements
+                    if item.kind == "FEATURE"
+                    and item.feature_id == agreement.feature_id
+                    and item.change_id == agreement.change_id
+                )
+                if (
+                    expected_objective is None
+                    or revision != expected_objective
+                    or agreement.source != "SESSION_REQUEST"
+                    or len(owners) != 1
+                    or owners[0].source != "SESSION_REQUEST"
+                    or owners[0].statement != agreement.statement
+                    or owners[0].source_reference != agreement.source_reference
+                ):
+                    raise StateValidationError(
+                        "request-scoped criteria must be the exact Core-derived objective"
+                    )
+                continue
             initial = revision.reason is None and revision.source == "INTERACTIVE_TERMINAL"
             legacy_first_amendment = bool(revision.reason) and revision.source == "INTERACTIVE_TERMINAL_DECISION"
             if not (initial or legacy_first_amendment):
@@ -3029,6 +3123,8 @@ def validate_state(state: State) -> None:
             predecessor = revision_index.get(revision.previous_revision_id)
             if predecessor is None or predecessor.slice_agreement_ref != revision.slice_agreement_ref:
                 raise StateValidationError("Slice criteria predecessor is missing or belongs elsewhere")
+            if predecessor.source == REQUEST_SCOPED_OBJECTIVE:
+                raise StateValidationError("request-objective criteria are not amendable by decision")
             if not revision.reason or revision.source != "INTERACTIVE_TERMINAL_DECISION":
                 raise StateValidationError("criteria amendment requires an attributable separate decision")
         if revision.source == "INTERACTIVE_TERMINAL_DECISION":
@@ -3287,7 +3383,11 @@ def validate_state(state: State) -> None:
     if any(type(item) is not CriterionTestReceipt for item in state.criterion_test_receipts):
         raise StateValidationError("R3 test receipt shape is invalid")
     _unique((item.id for item in state.criterion_test_receipts), "R3 criterion test receipt")
-    if state.criterion_test_receipts and receipt is None:
+    if state.criterion_test_receipts and receipt is None and any(
+        revision_index.get(item.criteria_revision_id) is None
+        or revision_index[item.criteria_revision_id].source != REQUEST_SCOPED_OBJECTIVE
+        for item in state.criterion_test_receipts
+    ):
         raise StateValidationError("R3 test evidence requires explicit schema authority")
     for observation in state.criterion_test_receipts:
         revision = revision_index.get(observation.criteria_revision_id)
@@ -3299,18 +3399,27 @@ def validate_state(state: State) -> None:
             for item in revision.criteria if item.id == observation.criterion_id
         ):
             raise StateValidationError("R3 test command differs from the accepted evidence contract")
-        if observation.test_kind not in ("python-unittest", "node-test"):
-            raise StateValidationError("R3 evidence type is not an approved deterministic test")
-        if (observation.test_kind == "python-unittest" and
-                not re.fullmatch(r"tests(?:\.[A-Za-z_][A-Za-z0-9_]*)+", observation.test_target)):
-            raise StateValidationError("R3 Python test target is not a supported test module")
-        if (observation.test_kind == "node-test" and
-                not re.fullmatch(r"tests/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\.test\.mjs", observation.test_target)):
-            raise StateValidationError("R3 Node test target must be a relative test file")
+        request_objective_test = revision.source == REQUEST_SCOPED_OBJECTIVE
+        if request_objective_test:
+            if (
+                observation.test_kind != OBJECTIVE_TEST_KIND
+                or observation.test_target != OBJECTIVE_TEST_TARGET
+            ):
+                raise StateValidationError("request-objective evidence descriptor is not canonical")
+        else:
+            if observation.test_kind not in ("python-unittest", "node-test"):
+                raise StateValidationError("R3 evidence type is not an approved deterministic test")
+            if (observation.test_kind == "python-unittest" and
+                    not re.fullmatch(r"tests(?:\.[A-Za-z_][A-Za-z0-9_]*)+", observation.test_target)):
+                raise StateValidationError("R3 Python test target is not a supported test module")
+            if (observation.test_kind == "node-test" and
+                    not re.fullmatch(r"tests/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\.test\.mjs", observation.test_target)):
+                raise StateValidationError("R3 Node test target must be a relative test file")
         if (observation.exit_code < 0 or observation.source_revision < 0
                 or observation.recorded_revision != observation.source_revision + 1
                 or observation.recorded_revision > state.revision
-                or receipt is None or observation.source_revision < receipt.converted_revision
+                or (receipt is None and not request_objective_test)
+                or (receipt is not None and observation.source_revision < receipt.converted_revision)
                 or not re.fullmatch(r"[0-9a-f]{64}", observation.output_sha256)):
             raise StateValidationError("R3 test result has invalid revision or output identity")
         provenance = (
@@ -3359,7 +3468,26 @@ def validate_state(state: State) -> None:
         ).encode("utf-8")).hexdigest()[:20]
         if observation.id != expected_id:
             raise StateValidationError("R3 test receipt identity does not match its recorded result")
-        if has_r3b_provenance:
+        if request_objective_test:
+            if (
+                not has_r3b_provenance
+                or not is_sha256_digest(observation.input_fingerprint_before or "")
+                or observation.input_fingerprint_before != observation.input_fingerprint_after
+                or observation.input_policy_id != INPUT_POLICY_ID
+                or observation.input_policy_digest != INPUT_POLICY_DIGEST
+                or observation.admission_policy_id != REQUEST_OBJECTIVE_ADMISSION_POLICY_ID
+                or observation.admission_policy_digest != REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST
+                or observation.external_inputs
+                or observation.runtime_executable is not None
+                or observation.runtime_executable_sha256 is not None
+                or observation.runtime_version is not None
+                or observation.runtime_argv
+                or observation.environment_profile_id is not None
+                or observation.environment_profile_digest is not None
+                or has_coverage_binding
+            ):
+                raise StateValidationError("request-objective evidence must not claim runtime or coverage")
+        elif has_r3b_provenance:
             if (
                 r3b_receipt is None
                 or any(value is None for value in provenance)
@@ -3406,16 +3534,26 @@ def validate_state(state: State) -> None:
     if any(type(item) is not SliceOutcomeReceipt for item in state.slice_outcome_receipts):
         raise StateValidationError("Slice outcome receipt shape is invalid")
     _unique((item.id for item in state.slice_outcome_receipts), "Slice outcome receipt")
-    if state.slice_outcome_receipts and r3b_receipt is None:
+    if state.slice_outcome_receipts and r3b_receipt is None and any(
+        revision_index.get(item.criteria_revision_id) is None
+        or revision_index[item.criteria_revision_id].source != REQUEST_SCOPED_OBJECTIVE
+        for item in state.slice_outcome_receipts
+    ):
         raise StateValidationError("automatic Slice outcomes require explicit schema-17 authority")
     test_receipts = {item.id: item for item in state.criterion_test_receipts}
     for outcome in state.slice_outcome_receipts:
         agreement = agreement_index.get(outcome.slice_agreement_ref)
         criteria = revision_index.get(outcome.criteria_revision_id)
+        request_objective_outcome = (
+            criteria is not None and criteria.source == REQUEST_SCOPED_OBJECTIVE
+        )
         current_input_policy = (
             outcome.input_policy_id == INPUT_POLICY_ID
             and outcome.input_policy_digest == INPUT_POLICY_DIGEST
-            and outcome.admission_policy_digest == TEST_ADMISSION_POLICY_DIGEST
+            and outcome.admission_policy_digest == (
+                REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST
+                if request_objective_outcome else TEST_ADMISSION_POLICY_DIGEST
+            )
         )
         legacy_input_policy = (
             outcome.input_policy_id == LEGACY_INPUT_POLICY_ID
@@ -3433,9 +3571,25 @@ def validate_state(state: State) -> None:
             or len(outcome.evidence_receipt_ids) != len(set(outcome.evidence_receipt_ids))
             or len(outcome.evidence_receipt_ids) != len(criteria.criteria)
             or type(outcome.input_policy_id) is not str
-            or not (current_input_policy or legacy_input_policy)
+            or not (
+                current_input_policy
+                or legacy_input_policy
+                or request_objective_outcome and current_input_policy
+            )
             or type(outcome.admission_policy_id) is not str
-            or outcome.admission_policy_id != TEST_ADMISSION_POLICY_ID
+            or outcome.admission_policy_id != (
+                REQUEST_OBJECTIVE_ADMISSION_POLICY_ID
+                if request_objective_outcome else TEST_ADMISSION_POLICY_ID
+            )
+            or outcome.admission_policy_digest != (
+                REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST
+                if request_objective_outcome else outcome.admission_policy_digest
+            )
+            or (
+                not request_objective_outcome
+                and outcome.admission_policy_digest != TEST_ADMISSION_POLICY_DIGEST
+                and not legacy_input_policy
+            )
             or (
                 outcome.coverage_contract_digest is not None
                 and not is_sha256_digest(outcome.coverage_contract_digest)
@@ -3446,15 +3600,50 @@ def validate_state(state: State) -> None:
                 outcome.admission_policy_digest,
                 outcome.relevant_drift_digest,
             ))
-            or outcome.basis != "ALL_CRITERIA_FRESH_SUPPORTED_TESTS"
-            or outcome.source != "CORE_OBJECTIVE_ACCEPTANCE"
+            or (
+                outcome.basis != "REQUEST_SCOPED_STATIC_HEADING"
+                or outcome.source != REQUEST_SCOPED_OBJECTIVE
+                if request_objective_outcome
+                else outcome.basis != "ALL_CRITERIA_FRESH_SUPPORTED_TESTS"
+                or outcome.source != "CORE_OBJECTIVE_ACCEPTANCE"
+            )
             or outcome.source_revision < 0
             or outcome.recorded_revision != outcome.source_revision + 1
             or outcome.recorded_revision > state.revision
         ):
             raise StateValidationError("Slice outcome receipt is invalid")
         selected = tuple(test_receipts.get(identity) for identity in outcome.evidence_receipt_ids)
-        if any(
+        if request_objective_outcome:
+            criterion = criteria.criteria[0] if len(criteria.criteria) == 1 else None
+            if (
+                len(selected) != 1
+                or selected[0] is None
+                or criterion is None
+                or selected[0].exit_code != 0
+                or selected[0].criterion_id != criterion.id
+                or selected[0].test_kind != OBJECTIVE_TEST_KIND
+                or selected[0].test_target != OBJECTIVE_TEST_TARGET
+                or selected[0].slice_agreement_ref != outcome.slice_agreement_ref
+                or selected[0].criteria_revision_id != outcome.criteria_revision_id
+                or selected[0].input_fingerprint_before != outcome.input_fingerprint
+                or selected[0].input_fingerprint_after != outcome.input_fingerprint
+                or selected[0].input_policy_id != outcome.input_policy_id
+                or selected[0].input_policy_digest != outcome.input_policy_digest
+                or selected[0].admission_policy_id != outcome.admission_policy_id
+                or selected[0].admission_policy_digest != outcome.admission_policy_digest
+                or selected[0].source_revision != outcome.source_revision
+                or selected[0].recorded_revision != outcome.recorded_revision
+                or selected[0].runtime_executable is not None
+                or selected[0].runtime_executable_sha256 is not None
+                or selected[0].runtime_version is not None
+                or selected[0].runtime_argv
+                or selected[0].environment_profile_id is not None
+                or selected[0].environment_profile_digest is not None
+                or selected[0].coverage_approval_id is not None
+                or selected[0].coverage_contract_digest is not None
+            ):
+                raise StateValidationError("request-objective outcome must reference its Core proof")
+        elif any(
             receipt is None
             or receipt.exit_code != 0
             or receipt.slice_agreement_ref != outcome.slice_agreement_ref
@@ -3492,7 +3681,9 @@ def validate_state(state: State) -> None:
             criterion.id for criterion in criteria.criteria
         }:
             raise StateValidationError("Slice outcome must cover each current accepted criterion")
-        if outcome.coverage_contract_digest is not None:
+        if request_objective_outcome:
+            identity_valid = outcome.id == slice_outcome_semantic_id(outcome)
+        elif outcome.coverage_contract_digest is not None:
             selected_approvals = tuple(
                 coverage_by_id[receipt.coverage_approval_id]
                 for receipt in selected
@@ -3574,6 +3765,7 @@ def validate_state(state: State) -> None:
         reopening = reopens_by_cycle.get((closure.feature_id, closure.cycle_id))
         previous = closures_by_cycle.get((closure.feature_id, closure.cycle_id - 1))
         selected = tuple(outcomes_by_id.get(identity) for identity in closure.slice_outcome_receipt_ids)
+        request_objective_closure = closure.source == REQUEST_SCOPED_OBJECTIVE
         if (
             state.initialization is None
             or closure.repository_id != state.initialization.repository_id
@@ -3596,9 +3788,12 @@ def validate_state(state: State) -> None:
             or not closure.condition.strip() or closure.condition != closure.condition.strip()
             or len(closure.condition) > 2048
             or not is_sha256_digest(closure.input_fingerprint)
-            or closure.source != "INTERACTIVE_TERMINAL"
+            or closure.source not in ("INTERACTIVE_TERMINAL", REQUEST_SCOPED_OBJECTIVE)
             or type(closure.statement) is not str
-            or closure.source_reference != "tty:" + sha256(closure.statement.encode("utf-8")).hexdigest()[:12]
+            or (
+                not request_objective_closure
+                and closure.source_reference != "tty:" + sha256(closure.statement.encode("utf-8")).hexdigest()[:12]
+            )
             or not closure.statement.strip()
             or closure.source_revision < 0
             or closure.recorded_revision != closure.source_revision + 1
@@ -3608,29 +3803,81 @@ def validate_state(state: State) -> None:
             raise StateValidationError("Feature completion receipt authority or evidence is invalid")
         # Hash consistency alone is insufficient: the recorded human words must
         # still describe this exact Feature, condition, snapshot, and Slice set.
-        expected_statement = feature_completion_statement_text(
-            feature=records.features[closure.feature_id], condition=closure.condition,
-            repository_id=closure.repository_id, source_revision=closure.source_revision,
-            input_fingerprint=closure.input_fingerprint,
-            feature_agreement_refs=closure.feature_agreement_refs,
-            slice_outcomes=tuple(zip(closure.slice_agreement_refs, closure.slice_outcome_receipt_ids)),
-            previous_closure_exists=any(
-                other is not closure and other.recorded_revision <= closure.source_revision
-                for other in state.feature_completion_receipts
-            ),
-            schema19_retained=any(item.recorded_revision <= closure.source_revision
-                                  for item in state.feature_reopen_receipts),
-        ) if closure.cycle_id == 0 else feature_cycle_completion_statement_text(
-            feature=records.features[closure.feature_id], cycle_id=closure.cycle_id,
-            previous_reopen_receipt_id=reopening.id if reopening is not None else "",
-            condition=closure.condition, repository_id=closure.repository_id,
-            source_revision=closure.source_revision,
-            input_fingerprint=closure.input_fingerprint,
-            feature_agreement_refs=closure.feature_agreement_refs,
-            slice_outcomes=tuple(zip(closure.slice_agreement_refs, closure.slice_outcome_receipt_ids)),
-        )
+        if request_objective_closure:
+            request_agreement = next((
+                item for item in state.agreements
+                if item.kind == "SLICE" and item.id in closure.slice_agreement_refs
+            ), None)
+            request_features = tuple(
+                item for item in state.agreements
+                if item.kind == "FEATURE"
+                and item.feature_id == closure.feature_id
+            )
+            objective = None if request_agreement is None else derive_static_heading(
+                request_agreement.statement,
+            )
+            objective_outcome = (
+                selected[0]
+                if len(selected) == 1
+                and selected[0] is not None
+                and selected[0].source == REQUEST_SCOPED_OBJECTIVE
+                else None
+            )
+            expected_condition = (
+                None if objective is None
+                else f"Core verified request-scoped static heading: {objective.heading}"
+            )
+            expected_statement = None if (
+                request_agreement is None or objective is None or objective_outcome is None
+            ) else request_objective_completion_statement(
+                source_reference=request_agreement.source_reference,
+                request_sha256=sha256(request_agreement.statement.encode("utf-8")).hexdigest(),
+                heading=objective.heading,
+                outcome_receipt_id=objective_outcome.id,
+                input_fingerprint=closure.input_fingerprint,
+                source_revision=closure.source_revision,
+            )
+            if (
+                request_agreement is None
+                or len(state.agreements) != 2
+                or len(request_features) != 1
+                or request_agreement.feature_id != closure.feature_id
+                or request_agreement.source != "SESSION_REQUEST"
+                or request_features[0].source != "SESSION_REQUEST"
+                or request_features[0].statement != request_agreement.statement
+                or request_features[0].source_reference != request_agreement.source_reference
+                or closure.source_reference != request_agreement.source_reference
+                or objective is None
+                or objective_outcome is None
+                or expected_condition != closure.condition
+                or objective_outcome.input_fingerprint != closure.input_fingerprint
+                or closure.statement != expected_statement
+            ):
+                raise StateValidationError("request-objective Feature completion is not bound to its Core proof")
+        else:
+            expected_statement = feature_completion_statement_text(
+                feature=records.features[closure.feature_id], condition=closure.condition,
+                repository_id=closure.repository_id, source_revision=closure.source_revision,
+                input_fingerprint=closure.input_fingerprint,
+                feature_agreement_refs=closure.feature_agreement_refs,
+                slice_outcomes=tuple(zip(closure.slice_agreement_refs, closure.slice_outcome_receipt_ids)),
+                previous_closure_exists=any(
+                    other is not closure and other.recorded_revision <= closure.source_revision
+                    for other in state.feature_completion_receipts
+                ),
+                schema19_retained=any(item.recorded_revision <= closure.source_revision
+                                      for item in state.feature_reopen_receipts),
+            ) if closure.cycle_id == 0 else feature_cycle_completion_statement_text(
+                feature=records.features[closure.feature_id], cycle_id=closure.cycle_id,
+                previous_reopen_receipt_id=reopening.id if reopening is not None else "",
+                condition=closure.condition, repository_id=closure.repository_id,
+                source_revision=closure.source_revision,
+                input_fingerprint=closure.input_fingerprint,
+                feature_agreement_refs=closure.feature_agreement_refs,
+                slice_outcomes=tuple(zip(closure.slice_agreement_refs, closure.slice_outcome_receipt_ids)),
+            )
         if closure.statement != expected_statement:
-            raise StateValidationError("Feature completion statement differs from its human-approved basis")
+            raise StateValidationError("Feature completion statement differs from its authority basis")
     _unique(
         (agreement.task_id for agreement in state.agreements if agreement.task_id is not None),
         "Slice Task",

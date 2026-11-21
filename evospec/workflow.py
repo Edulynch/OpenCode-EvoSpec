@@ -99,6 +99,7 @@ from .services import (
     SessionRequestEvidence,
     NextActionable,
     ServiceError,
+    RequestScopedObjectiveStatus,
     SliceCriteriaSpec,
     SliceOutcomeEligibility,
     FeatureCompletionEligibility,
@@ -219,6 +220,57 @@ class WorkflowService:
         return self._result(
             "SESSION_SLICE_RECORDED", saved,
             "session request persisted with provenance and bounded single-file work; criteria not yet accepted",
+        )
+
+    def request_scoped_objective_status(
+        self, state: State, input_snapshot: InputSnapshot | None,
+    ) -> RequestScopedObjectiveStatus | None:
+        """Expose only the read-only Core projection for the original session request."""
+        try:
+            return self.__core.request_scoped_objective_status(state, input_snapshot)
+        except ServiceError:
+            return None
+
+    def request_scoped_objective(
+        self,
+        evidence: SessionRequestEvidence,
+        input_fingerprint: str,
+        *,
+        expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        """Run one bounded objective stage under exact session and revision authority."""
+        state = self._mutation_state(expected_revision)
+        try:
+            saved = self.__core.request_scoped_objective(
+                state, evidence, input_fingerprint,
+            )
+        except StaleRevisionError:
+            raise
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        receipt = next((
+            item for item in saved.feature_completion_receipts
+            if item.source == "REQUEST_SCOPED_OBJECTIVE"
+            and item.source_reference == evidence.source_reference
+        ), None)
+        if receipt is not None and saved.revision == state.revision:
+            code = "REQUEST_OBJECTIVE_ALREADY_COMPLETE"
+            message = "previous Core request-objective completion recovered without another write"
+        elif receipt is not None:
+            code = "REQUEST_OBJECTIVE_COMPLETE"
+            message = "Core-verified request objective completed without TTY approval or Product Truth publication"
+        else:
+            code = "REQUEST_OBJECTIVE_VERIFIED"
+            message = "Core verified and recorded the exact request objective; lifecycle remains active"
+        result = self._result(code, saved, message)
+        return replace(
+            result,
+            feature_id=str(receipt.feature_id) if receipt is not None else result.feature_id,
+            feature_completion_receipt=receipt,
+            slice_outcome_receipt=next((
+                item for item in reversed(saved.slice_outcome_receipts)
+                if item.source == "REQUEST_SCOPED_OBJECTIVE"
+            ), None),
         )
 
     def accept_next_slice(

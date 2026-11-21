@@ -29,6 +29,10 @@ ACTION_KEYS = {
     "resolve_autonomy_expansion": frozenset(("action", "expected_revision", "proposal_id", "decision", "narrowed_envelope")),
     "init": frozenset(("action", "expected_revision")),
     "accept_first_slice_session": frozenset(("action", "expected_revision", "repository_id", "session_id", "message_id", "request_text")),
+    "request_scoped_objective": frozenset((
+        "action", "expected_revision", "repository_id", "session_id",
+        "message_id", "request_text", "input_fingerprint",
+    )),
     "new": frozenset(("action", "expected_revision", "intent", "assessment")),
     "change": frozenset(("action", "expected_revision", "intent", "assessment")),
     "clarify": frozenset(("action", "expected_revision", "answers")),
@@ -174,6 +178,13 @@ def parse_input_snapshot(request: dict[str, JsonValue]) -> InputSnapshot:
     ):
         raise ProtocolError("input_snapshot is invalid")
     return snapshot
+
+
+def parse_input_fingerprint(request: dict[str, JsonValue]) -> str:
+    value = _string(request, "input_fingerprint")
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ProtocolError("input_fingerprint must be a lowercase SHA-256 digest")
+    return value
 
 
 def parse_repository_paths(request: dict[str, JsonValue], name: str) -> tuple[domain.RepositoryPath, ...]:

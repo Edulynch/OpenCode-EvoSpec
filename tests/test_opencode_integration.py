@@ -98,6 +98,8 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn("accepted Slice details attached to parked items", skill)
         self.assertIn("never select, reactivate", skill.lower())
         self.assertIn("accepted work_queue items as inactive", plugin)
+        self.assertIn("evospec_request_scoped_objective", skill)
+        self.assertIn("insufficient proof", skill)
 
         # Both slash consultations share the same read-only contract, even when natural
         # language activates the skill without a slash command.
@@ -113,11 +115,8 @@ class OpenCodeIntegrationTests(unittest.TestCase):
                 (Path(__file__).parents[1] / ".opencode" / "commands" / command).read_text(encoding="utf-8"),
             )
 
-        # Repository-local skill and the installable distribution have identical guidance.
-        self.assertEqual(
-            skill,
-            (Path(__file__).parents[1] / ".opencode" / "skills" / "evospec" / "SKILL.md").read_text(encoding="utf-8"),
-        )
+        self.assertIn("Session intake alone does not register formal Slice criteria", skill)
+        self.assertIn("trailing same-session user messages", skill)
 
     def test_first_slice_handoff_is_read_only_tty_scoped_and_fails_closed(self) -> None:
         # A natural new Feature should not occupy the empty E1 work slot
@@ -241,7 +240,7 @@ const text = [
   "- Marcar y desmarcar las terminadas.",
   "",
 ].join(String.fromCharCode(13, 10))
-const user = { type: "user", id: "msg_user0001", text, files: [] }
+const user = { type: "user", id: "msg_user0001", text }
 const assistant = { type: "assistant", id: "msg_assistant0001" }
 let messages = [user, assistant]
 const canonical = { revision: 7, repository_id: "repo-xyz",
@@ -325,6 +324,15 @@ const checksBeforeInvalid = assertions
 try { await invoke() } catch (e) { rejected = String(e).includes("SESSION_REQUEST_SCOPE_INVALID") }
 assert(rejected, "NUL must be rejected even though CRLF is permitted")
 assert(assertions === checksBeforeInvalid, "invalid input must fail before host permission")
+for (const [index, files] of [undefined, null, {}, "index.html", [{ path: "index.html" }]].entries()) {
+  messages = [{ ...user, files }, assistant]
+  responseQueue.push(idle)
+  const checksBeforeFiles = assertions
+  rejected = false
+  try { await invoke() } catch (e) { rejected = String(e).includes("SESSION_REQUEST_SCOPE_INVALID") }
+  assert(rejected, `malformed files shape ${index} must fail closed`)
+  assert(assertions === checksBeforeFiles, "malformed files must fail before host permission")
+}
 messages = [user, assistant]
 rejected = false
 messages = [user, { type: "assistant", id: "msg_other0001" }]
@@ -354,6 +362,280 @@ assert(rejected, "root change during host admission fails closed")
 await Promise.all(writes)
 assert(requests.filter((item) => item.action === "accept_first_slice_session").length === 1,
   "only successful admitted request may write")
+''',
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                ("bun", "run", str(runner)), cwd=root, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_request_scoped_objective_uses_only_bound_request_and_rechecks_host_admission(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "plugin.ts").write_text(_resources()[PLUGIN], encoding="utf-8")
+            (root / "continuation.mjs").write_text(_resources()[CONTINUATION], encoding="utf-8")
+            runner = root / "objective.ts"
+            runner.write_text(
+                '''import plugin from "./plugin.ts"
+import { createHash } from "node:crypto"
+import { realpath } from "node:fs/promises"
+import { resolve } from "node:path"
+
+const definitions = [], requests = [], writes = [], permissionRequests = []
+const assert = (condition, message) => { if (!condition) throw new Error(message) }
+const sessionID = "ses_test0001"
+const userMessageID = "msg_user0001"
+const firstAssistantMessageID = "msg_assistant0001"
+let activeAssistantMessageID = firstAssistantMessageID
+let activeCallID = "call_0001"
+const requestText = 'Create a static HTML page with the heading "Hello".'
+const digest = createHash("sha256").update(requestText, "utf8").digest("hex")
+const sourceReference = `session:${sessionID}:${userMessageID}:${digest.slice(0, 16)}`
+let messages = [{ type: "user", id: userMessageID, text: requestText, files: [] },
+  { type: "assistant", id: firstAssistantMessageID }]
+let currentRoot = process.cwd()
+let responseQueue = []
+let permissionBehavior = async () => {}
+let activeContext
+let activeExpectedRevision = 10
+const originalUser = { type: "user", id: userMessageID, text: requestText, files: [] }
+const firstAssistant = { type: "assistant", id: firstAssistantMessageID }
+const resumeUserOne = { type: "user", id: "msg_resume0001", text: "  continue\\r\\n", files: [] }
+const resumeUserTwo = { type: "user", id: "msg_resume0002", text: "continúa", files: [] }
+const makeContext = (revision, status, overrides = {}) => ({
+  context: {
+    revision, repository_id: "repo-1",
+    lifecycle: ["IN_PROGRESS", "IMPLEMENT"],
+    input_snapshot: { fingerprint: "a".repeat(64) },
+    request_scoped_objective: status === null ? null : {
+      status, source_reference: sourceReference, request_sha256: digest,
+      blockers: [], heading: "Hello",
+    },
+    ...overrides,
+  },
+})
+const runtime = {
+  tool: {
+    transform: async (fn) => fn({ add: (tool) => definitions.push(tool) }),
+    list: async () => definitions.map((tool) => ({ id: tool.name })),
+  },
+  session: {
+    get: async () => ({ location: { directory: currentRoot } }),
+    context: async ({ sessionID: id }) => {
+      assert(id === activeContext?.sessionID, "transcript belongs to the invoking session")
+      return messages
+    },
+    hook: async () => {},
+  },
+  permission: {
+    assert: async (request) => {
+      permissionRequests.push(request)
+      assert(request.sessionID === sessionID && request.agent === "build", "exact session and agent")
+      assert(request.source.type === "tool" && request.source.messageID === activeAssistantMessageID
+        && request.source.id === activeCallID, "permission is for the full invoking tool identity")
+      assert(request.action === "evospec_request_scoped_objective", "no unrelated or forced permission action")
+      const canonicalRoot = await realpath(process.cwd())
+      assert(request.resources.length === 2 && JSON.stringify(request.resources) === JSON.stringify([
+        canonicalRoot, resolve(canonicalRoot, "index.html"),
+      ]), "permission resources contain only the canonical root and resolved target")
+      assert(request.metadata && typeof request.metadata === "object"
+        && !Array.isArray(request.metadata) && request.save === undefined,
+      "permission metadata is distinct and no save pattern is offered")
+      const metadata = request.metadata
+      assert(JSON.stringify(Object.keys(metadata).sort()) === JSON.stringify([
+        "current_stage", "expected_revision", "input_fingerprint", "operation",
+        "repository_id", "repository_root", "request_sha256", "source_reference",
+      ].sort())
+        && metadata.operation === "request_scoped_objective"
+        && metadata.repository_root === canonicalRoot
+        && metadata.repository_id === "repo-1"
+        && metadata.source_reference === sourceReference
+        && metadata.request_sha256 === digest
+        && metadata.expected_revision === activeExpectedRevision
+        && metadata.input_fingerprint === "a".repeat(64)
+        && JSON.stringify(metadata.current_stage) === '["IN_PROGRESS","IMPLEMENT"]',
+      "permission captures the exact canonical objective scope")
+      await permissionBehavior(request)
+    },
+  },
+}
+await plugin.setup(runtime)
+Object.defineProperty(Bun, "spawn", { value(_command, options) {
+  if (options.stdin) writes.push(options.stdin.text().then((value) => requests.push(JSON.parse(value))))
+  const response = responseQueue.shift()
+  assert(response !== undefined, "unexpected Core request")
+  return { stdout: new Blob([JSON.stringify(response)]).stream(),
+    stderr: new Blob([""]).stream(), exited: Promise.resolve(0) }
+} })
+const tool = definitions.find((item) => item.name === "evospec_request_scoped_objective")
+assert(tool !== undefined, "dedicated objective tool registers")
+assert(JSON.stringify(tool.input.required) === '["expected_revision"]'
+  && JSON.stringify(Object.keys(tool.input.properties)) === '["expected_revision"]'
+  && tool.input.additionalProperties === false,
+"the model may supply only the current revision")
+const call = (args = { expected_revision: 10 }, invokingSessionID = sessionID) => {
+  activeExpectedRevision = args.expected_revision
+  activeContext = { sessionID: invokingSessionID, agent: "build", messageID: activeAssistantMessageID,
+    id: activeCallID, signal: new AbortController().signal }
+  return tool.execute(args, activeContext)
+}
+const verifiedContext = makeContext(11, "VERIFIED")
+const completeContext = makeContext(12, "COMPLETE")
+responseQueue.push(makeContext(10, "PENDING"), makeContext(10, "PENDING"),
+  { result: { code: "OBJECTIVE_VERIFIED" }, ...verifiedContext })
+let releasePermission
+permissionBehavior = () => new Promise((resolveGate) => { releasePermission = resolveGate })
+const pendingVerification = call()
+while (!releasePermission) await new Promise((resolveGate) => setTimeout(resolveGate, 0))
+releasePermission()
+const verified = JSON.parse((await pendingVerification).content)
+assert(verified.result.code === "OBJECTIVE_VERIFIED", "an ask that resolves permits the one Core step")
+await Promise.all(writes)
+const verifyMutation = requests[2]
+assert(JSON.stringify(Object.keys(verifyMutation).sort()) === JSON.stringify([
+  "action", "expected_revision", "input_fingerprint", "message_id",
+  "repository_id", "request_text", "session_id",
+].sort()), "Core receives no model-selected criterion, result, or host attestation")
+assert(verifyMutation.action === "request_scoped_objective"
+  && verifyMutation.expected_revision === 10
+  && verifyMutation.repository_id === "repo-1"
+  && verifyMutation.session_id === sessionID
+  && verifyMutation.message_id === userMessageID
+  && verifyMutation.request_text === requestText
+  && verifyMutation.input_fingerprint === "a".repeat(64),
+"Core mutation is exactly bound to the admitted user message and snapshot")
+
+// A same-session exact resume-only message can recover the original source.
+messages = [{ type: "user", id: userMessageID, text: requestText },
+  firstAssistant, resumeUserOne, resumeUserTwo,
+  { type: "assistant", id: "msg_assistant0002" }]
+activeAssistantMessageID = "msg_assistant0002"
+activeCallID = "call_0002"
+permissionBehavior = async () => {}
+responseQueue.push(verifiedContext, verifiedContext,
+  { result: { code: "OBJECTIVE_COMPLETE" }, ...completeContext })
+const closed = JSON.parse((await call({ expected_revision: 11 })).content)
+assert(closed.result.code === "OBJECTIVE_COMPLETE", "verified work closes after exact same-session resume")
+await Promise.all(writes)
+assert(requests[5].expected_revision === 11, "closure uses the fresh revision")
+assert(requests[5].message_id === userMessageID && requests[5].request_text === requestText,
+  "resume messages never replace the original source bytes or message identity")
+const permissionCount = permissionRequests.length
+responseQueue.push(completeContext)
+assert(JSON.parse((await call({ expected_revision: 12 })).content).code ===
+  "REQUEST_SCOPED_OBJECTIVE_COMPLETE", "complete re-entry is read-only")
+await Promise.all(writes)
+assert(permissionRequests.length === permissionCount, "complete replay does not request permission")
+
+// Missing and blocked objectives return canonical diagnostics before host admission.
+responseQueue.push(makeContext(12, null))
+assert(JSON.parse((await call({ expected_revision: 12 })).content).code ===
+  "REQUEST_SCOPED_OBJECTIVE_UNAVAILABLE", "missing objective is non-mutating")
+responseQueue.push(makeContext(12, "BLOCKED"))
+assert(JSON.parse((await call({ expected_revision: 12 })).content).code ===
+  "REQUEST_SCOPED_OBJECTIVE_BLOCKED", "Core blockers remain non-mutating")
+await Promise.all(writes)
+assert(permissionRequests.length === permissionCount, "absent and blocked states never reach host permission")
+
+const mutationsBeforeFailures = requests.filter((item) =>
+  item.action === "request_scoped_objective").length
+responseQueue.push(makeContext(10, "PENDING"))
+permissionBehavior = async () => { throw new Error("HOST_DENIED") }
+let rejected = false
+try { await call() } catch (error) { rejected = String(error).includes("HOST_DENIED") }
+assert(rejected, "native deny/cancellation propagates without fallback")
+await Promise.all(writes)
+
+const expectDriftBlocked = async (before, after, change, reason) => {
+  const mutations = requests.filter((item) => item.action === "request_scoped_objective").length
+  responseQueue = after === undefined ? [before] : [before, after]
+  permissionBehavior = async () => { await change() }
+  let failed = false
+  try { await call() } catch { failed = true }
+  assert(failed, reason)
+  await Promise.all(writes)
+  assert(requests.filter((item) => item.action === "request_scoped_objective").length === mutations,
+    reason + " prevents Core mutation")
+}
+currentRoot = process.cwd()
+await expectDriftBlocked(makeContext(10, "PENDING"), undefined,
+  async () => { currentRoot = resolve(process.cwd(), "..") }, "changed root")
+currentRoot = process.cwd()
+await expectDriftBlocked(makeContext(10, "PENDING"), undefined,
+  async () => { activeContext.sessionID = "ses_other0001" }, "changed session identity")
+activeContext.sessionID = sessionID
+await expectDriftBlocked(makeContext(10, "PENDING"), undefined,
+  async () => { messages[0] = { ...messages[0], text: 'Create a static HTML page with the heading "Changed".' } },
+  "changed current request")
+messages = [originalUser, firstAssistant, resumeUserOne, resumeUserTwo,
+  { type: "assistant", id: "msg_assistant0002" }]
+activeAssistantMessageID = "msg_assistant0002"
+activeCallID = "call_0002"
+permissionBehavior = async () => {}
+await expectDriftBlocked(makeContext(10, "PENDING"), makeContext(11, "PENDING"),
+  async () => {}, "changed revision")
+await expectDriftBlocked(makeContext(10, "PENDING"), makeContext(10, "PENDING", {
+  input_snapshot: { fingerprint: "b".repeat(64) },
+}), async () => {}, "changed fingerprint")
+assert(requests.filter((item) => item.action === "request_scoped_objective").length ===
+  mutationsBeforeFailures, "denial and every stale binding leave Core untouched")
+
+let blockedResumeCase = 0
+const expectSourceBlocked = async (transcript, reason, invokingSessionID = sessionID) => {
+  messages = transcript
+  activeAssistantMessageID = transcript.at(-1).id
+  activeCallID = `call_resume_blocked_${++blockedResumeCase}`
+  const permissions = permissionRequests.length
+  const requestCount = requests.length
+  responseQueue = [makeContext(10, "PENDING")]
+  permissionBehavior = async () => {}
+  let failed = false
+  try { await call({ expected_revision: 10 }, invokingSessionID) } catch { failed = true }
+  assert(failed, reason)
+  await Promise.all(writes)
+  assert(permissionRequests.length === permissions,
+    reason + " must fail before host permission")
+  assert(requests.slice(requestCount).every((item) => item.action === "context"),
+    reason + " must not mutate Core")
+}
+await expectSourceBlocked([originalUser, firstAssistant,
+  { type: "user", id: "msg_changed0001", text: "Actually make it blue.", files: [] },
+  { type: "assistant", id: "msg_assistant0003" }],
+"substantive follow-up is not skipped")
+await expectSourceBlocked([originalUser, firstAssistant,
+  { type: "user", id: "msg_resume_bad001", text: "continue", files: [{ path: "index.html" }] },
+  { type: "assistant", id: "msg_assistant0004" }],
+"resume with an attachment is malformed")
+for (const [index, files] of [undefined, null, {}, "index.html", [{ path: "index.html" }]].entries()) {
+  await expectSourceBlocked([
+    { ...originalUser, files }, firstAssistant,
+  ], `malformed original request files shape ${index}`)
+  await expectSourceBlocked([
+    originalUser, firstAssistant,
+    { type: "user", id: `msg_resume_bad${String(index).padStart(3, "0")}`,
+      text: "continue", files },
+    { type: "assistant", id: `msg_assistant_bad${String(index).padStart(3, "0")}` },
+  ], `malformed resume files shape ${index}`)
+}
+await expectSourceBlocked([originalUser, firstAssistant,
+  { type: "synthetic", id: "msg_synthetic001" }, resumeUserOne,
+  { type: "assistant", id: "msg_assistant0005" }],
+"synthetic event in the original-source trail is not skipped")
+await expectSourceBlocked([
+  { type: "user", id: "msg_resume0003", text: "continue", files: [] },
+  { type: "assistant", id: "msg_assistant0006" },
+], "lost original request cannot be recovered")
+await expectSourceBlocked([originalUser, firstAssistant,
+  { type: "assistant", id: "msg_assistant0007" }],
+"wrong session cannot reuse the source reference", "ses_other0001")
+
+// The general raw protocol surface cannot bypass the dedicated host gate.
+const raw = definitions.find((item) => item.name === "evospec")
+const rawDenied = JSON.parse((await raw.execute({ request: JSON.stringify({
+  action: "request_scoped_objective", expected_revision: 10,
+}) }, { sessionID })).content)
+assert(rawDenied.error.code === "DEDICATED_TOOL_REQUIRED", "raw objective mutation is denied")
 ''',
                 encoding="utf-8",
             )
@@ -757,9 +1039,9 @@ const runtime = {
   },
 }
 await plugin.setup(runtime)
-assert(definitions.length === 33, "raw protocol tool and all typed helpers register")
+assert(definitions.length === 34, "raw protocol tool and all typed helpers register")
 const names = new Set(definitions.map((definition) => definition.name))
-for (const name of ["evospec", "evospec_start", "evospec_first_slice_handoff", "evospec_session_first_slice", "evospec_propose_file_edit", "evospec_auto_readiness", "evospec_auto_contract", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_criterion_test", "evospec_criterion_test_r3b", "evospec_accept_slice_outcome", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
+for (const name of ["evospec", "evospec_start", "evospec_first_slice_handoff", "evospec_session_first_slice", "evospec_request_scoped_objective", "evospec_propose_file_edit", "evospec_auto_readiness", "evospec_auto_contract", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_criterion_test", "evospec_criterion_test_r3b", "evospec_accept_slice_outcome", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
 const contextEntry = definitions.find((definition) => definition.name === "evospec_context")
 assert(contextEntry.options?.codemode === false, "canonical read-only context bypasses deferred Code Mode discovery")
 assert(definitions.filter((definition) => definition.options?.codemode === false).length === 1, "only canonical context is directly exposed")
@@ -772,6 +1054,7 @@ assert(hookEvent.system[0].text.includes("evospec_context"), "context hook guide
 assert(hookEvent.system[0].text.includes("¿dónde seguimos?"), "context hook recognizes natural-language recovery")
 assert(hookEvent.system[0].text.includes("Read-only questions never initialize"), "status questions do not trigger lifecycle actions")
 assert(hookEvent.system[0].text.includes("SAFE_AUTOMATIC_OPERATION"), "context hook installs outcome-driven continuation defaults")
+assert(hookEvent.system[0].text.includes("evospec_request_scoped_objective"), "context hook guides bounded objective verification")
 let exitStatus = 0
 Object.defineProperty(Bun, "spawn", { value(command, options) {
   commands.push({ command, cwd: options.cwd })
