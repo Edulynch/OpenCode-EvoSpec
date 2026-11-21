@@ -32,6 +32,7 @@ class AcceptanceTests(unittest.TestCase):
                 "persistence.py",
                 "policies.py",
                 "ports.py",
+                "request_scoped_objective.py",
                 "services.py",
                 "workflow.py",
             },

@@ -15,6 +15,8 @@ from .guidance import (
     project,
 )
 from .input_fingerprint import InputSnapshot
+from .request_scoped_objective import REQUEST_SCOPED_OBJECTIVE
+from .services import RequestScopedObjectiveStatus
 from .workflow import ClarificationQuestion, WorkflowError, WorkflowService
 
 MAX_ACCEPTED_CAPABILITIES = 32
@@ -250,6 +252,7 @@ class AgentContext:
     criterion_coverage_approvals: tuple[CriterionCoverageApproval, ...] = ()
     slice_acceptance_inventory: SliceAcceptanceInventory = SliceAcceptanceInventory()
     feature_completion: FeatureCompletionSummary | None = None
+    request_scoped_objective: RequestScopedObjectiveStatus | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,7 +307,13 @@ def project_context(
         )
     )
     r3b_schema_ready = state.r3b_schema_upgrade is not None
-    if input_snapshot is None and (r3b_schema_ready or active_session_request):
+    request_scoped_objective = workflow.request_scoped_objective_status(
+        state, input_snapshot,
+    )
+    if input_snapshot is None and (
+        r3b_schema_ready or active_session_request
+        or request_scoped_objective is not None
+    ):
         try:
             _, input_snapshot = workflow.input_snapshot(
                 expected_revision=ExpectedRevision(state.revision),
@@ -312,6 +321,9 @@ def project_context(
         except WorkflowError:
             # A failed optional scan must not hide a committed workflow result.
             input_snapshot = None
+        request_scoped_objective = workflow.request_scoped_objective_status(
+            state, input_snapshot,
+        )
     snapshot_unavailable = (
         r3b_schema_ready and input_snapshot is None
     )
@@ -421,9 +433,10 @@ def project_context(
                         workflow, inspection.state, r3b_input_snapshot,
                     )
                 ),
-                slice_acceptance_inventory=slice_inventory,
-                feature_completion=completion,
-          )
+                 slice_acceptance_inventory=slice_inventory,
+                 feature_completion=completion,
+                 request_scoped_objective=request_scoped_objective,
+           )
     locks = tuple(lock for lock in inspection.locks if lock.active and lock.feature_id == context.feature_id)
     change = next((item for item in inspection.changes if item.id == context.change_id), None)
     current_assessments = () if change is None else change.lock_assessments
@@ -440,6 +453,9 @@ def project_context(
         workflow.clarification_questions(context)
         if context.change_id is not None and context.unresolved_material_decision
         else ()
+    )
+    request_scoped_objective_slice = _has_request_scoped_objective_criteria(
+        slice_inventory, context,
     )
     return AgentContext(
         inspection.state.revision,
@@ -510,17 +526,23 @@ def project_context(
              inspection.state.r3_schema_upgrade is not None,
              inspection.state.r3b_schema_upgrade is not None,
              input_snapshot,
-              _slice_outcome_summary(
-                   workflow, inspection.state, context, r3b_input_snapshot, snapshot_unavailable,
-               ),
+               _slice_outcome_summary(
+                    workflow,
+                    inspection.state,
+                    context,
+                    input_snapshot if request_scoped_objective_slice else r3b_input_snapshot,
+                    snapshot_unavailable,
+                    allow_request_scoped_objective=request_scoped_objective_slice,
+                ),
                criterion_coverage_approvals=(
                    ()
                    if r3b_input_snapshot is None
                    else _current_cycle_coverage(workflow, inspection.state, r3b_input_snapshot)
                ),
-               slice_acceptance_inventory=slice_inventory,
-               feature_completion=completion,
-       )
+                slice_acceptance_inventory=slice_inventory,
+                feature_completion=completion,
+                request_scoped_objective=request_scoped_objective,
+        )
 
 
 def _feature_completion_summary(
@@ -768,8 +790,19 @@ def _slice_acceptance_item(
                 or matches[0].repository_id != record.repository_id
                 or not isinstance(matches[0].outcome, str) or not matches[0].outcome.strip()
                 or not isinstance(matches[0].example, str) or not matches[0].example.strip()
-                or matches[0].source not in ("INTERACTIVE_TERMINAL", "INTERACTIVE_TERMINAL_DECISION")
+                or matches[0].source not in (
+                    "INTERACTIVE_TERMINAL",
+                    "INTERACTIVE_TERMINAL_DECISION",
+                    REQUEST_SCOPED_OBJECTIVE,
+                )
                 or not isinstance(matches[0].source_reference, str) or not matches[0].source_reference.strip()
+                or (
+                    matches[0].source == REQUEST_SCOPED_OBJECTIVE
+                    and (
+                        record.source != "SESSION_REQUEST"
+                        or matches[0].source_reference != record.source_reference
+                    )
+                )
                 or any(
                     not isinstance(values, tuple)
                     or not values
@@ -837,14 +870,34 @@ def _accepted_slice_context(state: State) -> AcceptedSliceContext | None:
     return _accepted_slice_for_context(state, state.active_context)
 
 
+def _has_request_scoped_objective_criteria(
+    inventory: SliceAcceptanceInventory, context: WorkingContext,
+) -> bool:
+    return context.slice_agreement_ref is not None and any(
+        item.slice_agreement_ref == context.slice_agreement_ref
+        and item.feature_id == str(context.feature_id)
+        and item.feature_agreement_ref == context.feature_agreement_ref
+        and item.authority_status == "CANONICAL"
+        and item.scope_status == "ACTIVE"
+        and item.criteria_status == "RECORDED"
+        and item.criteria_revision is not None
+        and item.criteria_revision.source == REQUEST_SCOPED_OBJECTIVE
+        for item in inventory.items
+    )
+
+
 def _slice_outcome_summary(
     workflow: WorkflowService,
     state: State,
     context: WorkingContext,
     snapshot: InputSnapshot | None,
     snapshot_unavailable: bool = False,
+    *,
+    allow_request_scoped_objective: bool = False,
 ) -> SliceOutcomeSummary | None:
-    if context.slice_agreement_ref is None or state.r3b_schema_upgrade is None:
+    if context.slice_agreement_ref is None or (
+        state.r3b_schema_upgrade is None and not allow_request_scoped_objective
+    ):
         return None
     history = tuple(
         item for item in state.slice_outcome_receipts

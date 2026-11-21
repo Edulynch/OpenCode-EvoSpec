@@ -17,6 +17,8 @@ import unicodedata
 from typing import TYPE_CHECKING, Never, final
 
 from .domain import (
+    AssessmentConfidence,
+    AssessmentEvidence,
     AgreementRecord,
     SliceCriterion,
     SliceCriteriaRevision,
@@ -71,6 +73,8 @@ from .domain import (
     RepositoryInitialization,
     RepositoryPath,
     ReviewEvidence,
+    ReviewEvidenceCategory,
+    ReviewEvidenceKind,
     ReviewFinding,
     ReviewInspection,
     ReviewResult,
@@ -96,6 +100,11 @@ from .domain import (
     feature_cycle_completion_statement_text,
     feature_completion_semantic_id,
     feature_completion_statement_text,
+    is_sha256_digest,
+    request_objective_criteria_revision,
+    request_objective_completion_statement,
+    REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
+    REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
     TaskProgress,
     TerminalArchive,
     VerificationEvidence,
@@ -129,11 +138,18 @@ from .lifecycle import (
     LifecycleError,
     LifecycleState,
     Phase,
+    ReviewVerdict,
     advance,
     can_converge,
     has_acceptable_review,
 )
-from .persistence import AtomicFailure, FileOperations, R3_SCHEMA, R3B_SCHEMA, _StateStore
+from .persistence import (
+    AtomicFailure,
+    FileOperations,
+    R3_SCHEMA,
+    R3B_SCHEMA,
+    _StateStore,
+)
 from .input_fingerprint import (
     COVERAGE_CONTRACT_VERSION,
     INPUT_FINGERPRINT_VERSION,
@@ -148,6 +164,15 @@ from .input_fingerprint import (
     TEST_ENVIRONMENT_PROFILE_DIGEST,
     sanitized_test_environment,
     test_environment_profile_digest,
+    read_repository_file,
+)
+from .request_scoped_objective import (
+    OBJECTIVE_TEST_KIND,
+    OBJECTIVE_TEST_TARGET,
+    REQUEST_SCOPED_OBJECTIVE,
+    StaticHeadingObjective,
+    derive_static_heading,
+    verify_static_heading,
 )
 
 if TYPE_CHECKING:
@@ -156,6 +181,14 @@ if TYPE_CHECKING:
 
 class ServiceError(Exception):
     """Raised when an explicit caller instruction conflicts with authority."""
+
+
+class RequestScopedObjectiveError(ServiceError):
+    """A stable reason code for one fail-closed request-objective operation."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        self.code = code
+        super().__init__(f"{code}: {detail}")
 
 
 class ServiceConstructionError(TypeError):
@@ -229,6 +262,15 @@ class FeatureCompletionEligibility:
     history: tuple[tuple[int, str | None, str | None], ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class RequestScopedObjectiveStatus:
+    status: str
+    source_reference: str
+    request_sha256: str
+    blockers: tuple[str, ...]
+    heading: str | None
+
+
 _PYTHON_TEST_RUNNER = (
     "import sys,unittest; root,module=sys.argv[1:3]; "
     "sys.path.insert(0,root); unittest.main(module=module,argv=[sys.argv[0]])"
@@ -236,6 +278,9 @@ _PYTHON_TEST_RUNNER = (
 _PYTHON_TEST_TARGET = re.compile(r"tests(?:\.[A-Za-z_][A-Za-z0-9_]*)+\Z")
 _NODE_TEST_TARGET = re.compile(r"tests/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\.test\.mjs\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_SESSION_SOURCE_REFERENCE = re.compile(
+    r"session:(ses_[A-Za-z0-9_-]{3,128}):(msg_[A-Za-z0-9_-]{3,128}):([0-9a-f]{16})\Z"
+)
 _WINDOWS_STAT_CTIME_DIFFERENCE = os.name == "nt"
 
 
@@ -3093,13 +3138,1105 @@ class CoreService:
         except AtomicFailure as error:
             self.__raise_e1_publication_error(current.revision, error)
 
+    def _request_objective_pair(
+        self, state: State,
+    ) -> tuple[AgreementRecord | None, AgreementRecord | None, tuple[str, ...]]:
+        session_slices = tuple(
+            item for item in state.agreements
+            if item.kind == "SLICE" and item.source == "SESSION_REQUEST"
+        )
+        if not session_slices:
+            return None, None, ()
+        if len(session_slices) != 1:
+            return None, None, ("REQUEST_OBJECTIVE_AMBIGUOUS_SESSION_REQUESTS",)
+        accepted = session_slices[0]
+        owners = tuple(
+            item for item in state.agreements
+            if item.kind == "FEATURE"
+            and item.feature_id == accepted.feature_id
+            and item.change_id == accepted.change_id
+        )
+        if (
+            len(owners) != 1
+            or owners[0].source != "SESSION_REQUEST"
+            or owners[0].source_reference != accepted.source_reference
+            or owners[0].statement != accepted.statement
+        ):
+            return None, None, ("REQUEST_OBJECTIVE_SESSION_PAIR_INVALID",)
+        return owners[0], accepted, ()
+
+    def _request_objective_evidence(
+        self, feature: AgreementRecord, accepted: AgreementRecord,
+    ) -> SessionRequestEvidence | None:
+        match = _SESSION_SOURCE_REFERENCE.fullmatch(accepted.source_reference)
+        if (
+            match is None
+            or feature.source_reference != accepted.source_reference
+            or feature.statement != accepted.statement
+        ):
+            return None
+        evidence = SessionRequestEvidence(
+            match.group(1), match.group(2), accepted.statement, accepted.repository_id,
+        )
+        return evidence if evidence.source_reference == accepted.source_reference else None
+
+    def _request_objective_scope_blockers(
+        self,
+        state: State,
+        evidence: SessionRequestEvidence,
+        snapshot: InputSnapshot | None,
+        *,
+        terminal: bool = False,
+        allow_objective_closure: bool = False,
+    ) -> tuple[str, ...]:
+        feature_agreement, accepted, pair_blockers = self._request_objective_pair(state)
+        blockers = list(pair_blockers)
+        if feature_agreement is None or accepted is None:
+            return tuple(blockers or ("REQUEST_OBJECTIVE_SESSION_SCOPE_UNAVAILABLE",))
+        root_identity = sha256(str(self.__repository_root.resolve()).encode("utf-8")).hexdigest()[:16]
+        if (
+            type(evidence) is not SessionRequestEvidence
+            or evidence.repository_id != root_identity
+            or evidence.repository_id != accepted.repository_id
+            or evidence.statement != accepted.statement
+            or evidence.source_reference != accepted.source_reference
+            or evidence.source != "SESSION_REQUEST"
+        ):
+            blockers.append("REQUEST_OBJECTIVE_SESSION_MISMATCH")
+        if derive_static_heading(accepted.statement) is None:
+            blockers.append("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST")
+        if (
+            state.initialization is None
+            or state.initialization.repository_id != root_identity
+            or len(state.agreements) != 2
+            or tuple(item.id for item in state.agreements) != (
+                feature_agreement.id, accepted.id,
+            )
+            or len(state.features) != 1
+            or len(state.changes) != 1
+            or state.features[0].id != accepted.feature_id
+            or state.features[0].side_of is not None
+            or state.changes[0].id != accepted.change_id
+            or state.changes[0].feature_id != accepted.feature_id
+            or state.changes[0].classification is not Classification.FEATURE
+            or accepted.task_id is None
+            or accepted.initial_task != SESSION_REQUEST_TASK
+            or accepted.checkpoint != SESSION_REQUEST_CHECKPOINT
+            or feature_agreement.repository_id != root_identity
+            or accepted.repository_id != root_identity
+        ):
+            blockers.append("REQUEST_OBJECTIVE_SCOPE_NOT_UNIQUE_PRIMARY")
+        objective_closures = tuple(
+            item for item in state.feature_completion_receipts
+            if item.source == REQUEST_SCOPED_OBJECTIVE
+            and item.feature_id == accepted.feature_id
+            and item.source_reference == accepted.source_reference
+        )
+        permitted_closure = (
+            allow_objective_closure
+            and len(state.feature_completion_receipts) == 1
+            and len(objective_closures) == 1
+            and not state.feature_reopen_receipts
+        )
+        if (
+            state.preserved_primary_context is not None
+            or state.preserved_primary_work_id is not None
+            or state.parked_work is not None
+            or state.pending_intake is not None
+            or state.deferred_side_request is not None
+            or state.shared_intents
+            or state.deferred_linked_intents
+            or state.work_relations
+            or state.pending_capability_selection is not None
+            or state.capability_selection_history
+            or state.pending_discovery_recovery is not None
+            or state.pending_autonomy_expansion is not None
+            or state.autonomy_expansion_history
+            or state.irreversible_authorizations
+            or state.locks
+            or state.lock_revisions
+            or state.lock_releases
+            or state.lock_authorizations
+            or state.change_lock_assessments
+            or state.r3_schema_upgrade is not None
+            or state.r3b_schema_upgrade is not None
+            or state.decisions
+            or state.observations
+            or state.drifts
+            or state.publications
+            or state.publication_history
+            or state.criterion_coverage_approvals
+            or state.feature_reopen_receipts
+            or state.completed_side_contexts
+            or state.feature_completion_receipts and not permitted_closure
+        ):
+            blockers.append("REQUEST_OBJECTIVE_FOREIGN_OR_MATERIAL_AUTHORITY")
+        objective_revisions = tuple(
+            item for item in state.slice_criteria_revisions
+            if item.source == REQUEST_SCOPED_OBJECTIVE
+        )
+        expected_revision = request_objective_criteria_revision(
+            accepted.id,
+            accepted.repository_id,
+            accepted.source_reference,
+            accepted.statement,
+        )
+        if (
+            len(state.slice_criteria_revisions) != len(objective_revisions)
+            or len(objective_revisions) > 1
+            or (objective_revisions and (
+                expected_revision is None or objective_revisions != (expected_revision,)
+            ))
+            or (
+                expected_revision is None
+                and (state.slice_criteria_heads or state.slice_criteria_revisions)
+            )
+            or (
+                objective_revisions
+                and (
+                    expected_revision is None
+                    or state.slice_criteria_heads
+                    != (SliceCriteriaHead(accepted.id, expected_revision.id),)
+                )
+            )
+        ):
+            blockers.append("REQUEST_OBJECTIVE_CRITERIA_NOT_CANONICAL")
+        if any(
+            item.criteria_revision_id not in {item.id for item in objective_revisions}
+            or item.test_kind != OBJECTIVE_TEST_KIND
+            or item.test_target != OBJECTIVE_TEST_TARGET
+            for item in state.criterion_test_receipts
+        ):
+            blockers.append("REQUEST_OBJECTIVE_FOREIGN_TEST_EVIDENCE")
+        if any(
+            item.source != REQUEST_SCOPED_OBJECTIVE
+            or item.slice_agreement_ref != accepted.id
+            for item in state.slice_outcome_receipts
+        ):
+            blockers.append("REQUEST_OBJECTIVE_FOREIGN_SLICE_OUTCOME")
+        active = state.active_context
+        if terminal:
+            archives = tuple(
+                item for item in state.terminal_archives
+                if item.context.slice_agreement_ref == accepted.id
+            )
+            if (
+                active is not None
+                or state.active_work_id is not None
+                or len(archives) != 1
+                or archives[0].context.status is not LifecycleState.ACCEPTED
+                or archives[0].context.phase is not Phase.DONE
+                or archives[0].parent_feature_id is not None
+                or archives[0].context.side_of is not None
+                or len(state.work_items) != 1
+                or state.work_items[0].operational_state is not OperationalState.DONE
+            ):
+                blockers.append("REQUEST_OBJECTIVE_TERMINAL_SCOPE_INVALID")
+        else:
+            if (
+                active is None
+                or active.feature_id != accepted.feature_id
+                or active.change_id != accepted.change_id
+                or active.side_of is not None
+                or active.status is not LifecycleState.PROPOSED
+                or active.phase is not Phase.RESEARCH
+                or active.feature_agreement_ref != feature_agreement.id
+                or active.slice_agreement_ref != accepted.id
+                or active.focus != accepted.title
+                or active.current_work != accepted.initial_task
+                or active.current_action is not None
+                or active.completed_work
+                or active.pending_work
+                or active.decision_ids
+                or active.constraint_ids
+                or active.observation_ids
+                or active.review is not None
+                or active.review_evidence
+                or active.review_findings
+                or active.task_progress is not None
+                or active.verification.sufficient
+                or active.verification.evidence
+                or active.convergence_complete
+                or active.unresolved_material_decision
+                or active.safety_facts.unresolved_decision_details
+                or active.safety_facts.material_clarifications
+                or active.publication is not None
+                or state.active_work_id != _work_id(active)
+                or state.work_items
+                or state.terminal_archives
+            ):
+                blockers.append("REQUEST_OBJECTIVE_ACTIVE_SCOPE_CHANGED")
+            else:
+                change = state.changes[0] if state.changes else None
+                expected_envelope = None if change is None else AutonomyEnvelope(
+                    change.intent,
+                    allowed_paths=(RepositoryPath(OBJECTIVE_TEST_TARGET),),
+                    operation_budget=8,
+                    reversible_actions=("progress", "assess_locks", "review", "verify", "edit"),
+                )
+                if (
+                    expected_envelope is None
+                    or active.autonomy_envelope != expected_envelope
+                ):
+                    blockers.append("REQUEST_OBJECTIVE_AUTONOMY_SCOPE_CHANGED")
+        if snapshot is None:
+            blockers.append("REQUEST_OBJECTIVE_INPUT_SNAPSHOT_UNAVAILABLE")
+        elif (
+            type(snapshot) is not InputSnapshot
+            or snapshot.version != INPUT_FINGERPRINT_VERSION
+            or snapshot.policy_id != INPUT_POLICY_ID
+            or snapshot.policy_digest != INPUT_POLICY_DIGEST
+            or snapshot.repository_id != root_identity
+            or not is_sha256_digest(snapshot.fingerprint)
+        ):
+            blockers.append("REQUEST_OBJECTIVE_INPUT_SNAPSHOT_INVALID")
+        else:
+            for path in snapshot.file_paths:
+                if path != OBJECTIVE_TEST_TARGET and not path.startswith(".opencode/"):
+                    blockers.append(f"REQUEST_OBJECTIVE_FOREIGN_FILE:{path}")
+            for path in snapshot.directory_paths:
+                if path != ".opencode" and not path.startswith(".opencode/"):
+                    blockers.append(f"REQUEST_OBJECTIVE_FOREIGN_DIRECTORY:{path}")
+            if OBJECTIVE_TEST_TARGET not in snapshot.file_paths:
+                blockers.append("REQUEST_OBJECTIVE_ARTIFACT_MISSING")
+            if not any(path == OBJECTIVE_TEST_TARGET for path, _ in snapshot.file_sha256):
+                blockers.append("REQUEST_OBJECTIVE_ARTIFACT_HASH_UNAVAILABLE")
+        return tuple(dict.fromkeys(blockers))
+
+    def _request_objective_artifact(
+        self, snapshot: InputSnapshot, heading: str,
+    ) -> tuple[str | None, tuple[str, ...]]:
+        expected_sha = next(
+            (digest for path, digest in snapshot.file_sha256 if path == OBJECTIVE_TEST_TARGET),
+            None,
+        )
+        if expected_sha is None or not _SHA256.fullmatch(expected_sha):
+            return None, ("REQUEST_OBJECTIVE_ARTIFACT_HASH_UNAVAILABLE",)
+        try:
+            content = read_repository_file(
+                self.__repository_root,
+                OBJECTIVE_TEST_TARGET,
+                expected_sha,
+                max_bytes=16_384,
+            )
+        except InputFingerprintError:
+            return None, ("REQUEST_OBJECTIVE_ARTIFACT_CHANGED",)
+        actual_sha = verify_static_heading(
+            # `derive_static_heading` supplied this exact accepted heading.
+            StaticHeadingObjective(heading),
+            content,
+        )
+        if actual_sha is None or actual_sha != expected_sha:
+            return None, ("REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED",)
+        return actual_sha, ()
+
+    def _request_objective_outcome_candidate(
+        self,
+        state: State,
+        snapshot: InputSnapshot,
+        context: WorkingContext,
+        accepted: AgreementRecord,
+    ) -> tuple[SliceOutcomeReceipt | None, tuple[str, ...]]:
+        feature_agreement = next((
+            item for item in state.agreements
+            if item.kind == "FEATURE"
+            and item.feature_id == accepted.feature_id
+            and item.change_id == accepted.change_id
+        ), None)
+        evidence = None if feature_agreement is None else self._request_objective_evidence(
+            feature_agreement, accepted,
+        )
+        if feature_agreement is None or evidence is None:
+            return None, ("REQUEST_OBJECTIVE_SESSION_PAIR_INVALID",)
+        blockers = self._request_objective_scope_blockers(
+            state,
+            evidence,
+            snapshot,
+            terminal=context.status is LifecycleState.ACCEPTED,
+            allow_objective_closure=(
+                context.status is LifecycleState.ACCEPTED
+                and bool(state.feature_completion_receipts)
+            ),
+        )
+        if blockers:
+            return None, blockers
+        objective = derive_static_heading(accepted.statement)
+        if objective is None:
+            return None, ("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",)
+        output_sha, artifact_blockers = self._request_objective_artifact(
+            snapshot, objective.heading,
+        )
+        if output_sha is None:
+            return None, artifact_blockers
+        criteria = next((
+            item for item in state.slice_criteria_revisions
+            if item.source == REQUEST_SCOPED_OBJECTIVE
+            and item.slice_agreement_ref == accepted.id
+        ), None)
+        if criteria is None:
+            return None, ("REQUEST_OBJECTIVE_PROOF_REQUIRED",)
+        head = next((
+            item for item in state.slice_criteria_heads
+            if item.slice_agreement_ref == accepted.id
+        ), None)
+        if head is None or head.revision_id != criteria.id:
+            return None, ("REQUEST_OBJECTIVE_CRITERIA_NOT_CURRENT",)
+        criterion = criteria.criteria[0]
+        proof = next((
+            item for item in reversed(state.criterion_test_receipts)
+            if item.criteria_revision_id == criteria.id
+            and item.slice_agreement_ref == accepted.id
+            and item.criterion_id == criterion.id
+            and item.test_kind == OBJECTIVE_TEST_KIND
+            and item.test_target == OBJECTIVE_TEST_TARGET
+            and item.exit_code == 0
+            and item.output_sha256 == output_sha
+            and item.input_fingerprint_before == snapshot.fingerprint
+            and item.input_fingerprint_after == snapshot.fingerprint
+            and item.input_policy_id == INPUT_POLICY_ID
+            and item.input_policy_digest == INPUT_POLICY_DIGEST
+            and item.admission_policy_id == REQUEST_OBJECTIVE_ADMISSION_POLICY_ID
+            and item.admission_policy_digest == REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST
+            and item.runtime_executable is None
+            and item.runtime_argv == ()
+            and item.coverage_approval_id is None
+        ), None)
+        if proof is None:
+            return None, ("REQUEST_OBJECTIVE_PROOF_STALE",)
+        receipt = SliceOutcomeReceipt(
+            "",
+            accepted.repository_id,
+            accepted.id,
+            criteria.id,
+            (proof.id,),
+            snapshot.fingerprint,
+            INPUT_POLICY_ID,
+            INPUT_POLICY_DIGEST,
+            REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
+            REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
+            _drift_identity_digest(state, context.change_id),
+            "REQUEST_SCOPED_STATIC_HEADING",
+            REQUEST_SCOPED_OBJECTIVE,
+            proof.source_revision,
+            proof.recorded_revision,
+            None,
+        )
+        receipt = replace(receipt, id=slice_outcome_semantic_id(receipt))
+        if context.status is LifecycleState.ACCEPTED:
+            archives = tuple(
+                item for item in state.terminal_archives
+                if item.context.slice_agreement_ref == accepted.id
+            )
+            if len(archives) != 1:
+                return None, ("REQUEST_OBJECTIVE_TERMINAL_PROOF_INVALID",)
+            archive = archives[0]
+            archived = archive.context
+            review = ReviewResult(ReviewVerdict.PASS, (), True)
+            review_evidence = (
+                ReviewEvidence(
+                    ReviewEvidenceCategory.TECHNICAL,
+                    ReviewEvidenceKind.FACT,
+                    "CORE_REQUEST_SCOPED_OBJECTIVE",
+                    True,
+                    f"Canonical criterion {criterion.id} passed strict static verifier",
+                    f"{receipt.id}:{proof.output_sha256}",
+                ),
+            )
+            verification = VerificationEvidence(
+                (f"{OBJECTIVE_TEST_KIND}:{OBJECTIVE_TEST_TARGET}:{proof.output_sha256}",),
+                True,
+            )
+            assessment = ConvergenceAssessment(
+                accepted.change_id,
+                False,
+                AssessmentConfidence.HIGH,
+                (AssessmentEvidence(
+                    "CORE_REQUEST_SCOPED_OBJECTIVE",
+                    RepositoryPath(OBJECTIVE_TEST_TARGET),
+                    accepted.feature_id,
+                ),),
+                "Core verified the exact bounded request objective; no Product Truth publication was requested or performed.",
+            )
+            work_item = next(
+                (item for item in state.work_items if item.id == _work_id(context)),
+                None,
+            )
+            if (
+                archived is None
+                or archived.feature_id != accepted.feature_id
+                or archived.change_id != accepted.change_id
+                or archived.classification is not Classification.FEATURE
+                or archived.focus != accepted.title
+                or archived.current_work != accepted.initial_task
+                or archived.feature_agreement_ref != feature_agreement.id
+                or archived.slice_agreement_ref != accepted.id
+                or archived.review != review
+                or archived.review_evidence != review_evidence
+                or archived.review_findings
+                or archived.verification != verification
+                or not archived.convergence_complete
+                or archived.publication is not None
+                or archived.task_progress is not None
+                or archive.convergence_assessment != assessment
+                or work_item is None
+                or work_item.operational_state is not OperationalState.DONE
+                or work_item.terminal_change_id != accepted.change_id
+            ):
+                return None, ("REQUEST_OBJECTIVE_TERMINAL_PROOF_INVALID",)
+        return receipt, ()
+
+    def request_scoped_objective_status(
+        self, state: State, snapshot: InputSnapshot | None,
+    ) -> RequestScopedObjectiveStatus | None:
+        """Project the exact SESSION_REQUEST objective without mutating authority."""
+        current = _authoritative_state(self.__persistence, state)
+        feature, accepted, pair_blockers = self._request_objective_pair(current)
+        if accepted is None:
+            if pair_blockers:
+                return RequestScopedObjectiveStatus("BLOCKED", "", "", pair_blockers, None)
+            return None
+        request_sha = sha256(accepted.statement.encode("utf-8")).hexdigest()
+        evidence = None if feature is None else self._request_objective_evidence(feature, accepted)
+        objective = derive_static_heading(accepted.statement)
+        if evidence is None:
+            return RequestScopedObjectiveStatus(
+                "BLOCKED", accepted.source_reference, request_sha,
+                ("REQUEST_OBJECTIVE_SESSION_PAIR_INVALID",), None,
+            )
+        if objective is None:
+            return RequestScopedObjectiveStatus(
+                "BLOCKED", accepted.source_reference, request_sha,
+                ("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",), None,
+            )
+        if snapshot is not None:
+            try:
+                scanned, actual_snapshot = self.input_snapshot(current.revision)
+            except ServiceError:
+                return RequestScopedObjectiveStatus(
+                    "BLOCKED", accepted.source_reference, request_sha,
+                    ("REQUEST_OBJECTIVE_INPUT_SNAPSHOT_UNAVAILABLE",), objective.heading,
+                )
+            if (
+                scanned != current
+                or snapshot != actual_snapshot
+                or snapshot.file_sha256 != actual_snapshot.file_sha256
+            ):
+                return RequestScopedObjectiveStatus(
+                    "BLOCKED", accepted.source_reference, request_sha,
+                    ("REQUEST_OBJECTIVE_INPUT_SNAPSHOT_INVALID",), objective.heading,
+                )
+            snapshot = actual_snapshot
+        cycle_id, _, closure = feature_cycle_status(current, accepted.feature_id)
+        if cycle_id != 0:
+            return RequestScopedObjectiveStatus(
+                "BLOCKED", accepted.source_reference, request_sha,
+                ("REQUEST_OBJECTIVE_FEATURE_REOPENED",), objective.heading,
+            )
+        if closure is not None:
+            if (
+                closure.source != REQUEST_SCOPED_OBJECTIVE
+                or closure.source_reference != accepted.source_reference
+            ):
+                return RequestScopedObjectiveStatus(
+                    "BLOCKED", accepted.source_reference, request_sha,
+                    ("REQUEST_OBJECTIVE_FEATURE_CLOSED_BY_OTHER_AUTHORITY",), objective.heading,
+                )
+            blockers = self._request_objective_scope_blockers(
+                current,
+                evidence,
+                snapshot,
+                terminal=True,
+                allow_objective_closure=True,
+            )
+            if blockers:
+                return RequestScopedObjectiveStatus(
+                    "BLOCKED", accepted.source_reference, request_sha, blockers, objective.heading,
+                )
+            if snapshot is None or closure.input_fingerprint != snapshot.fingerprint:
+                return RequestScopedObjectiveStatus(
+                    "BLOCKED", accepted.source_reference, request_sha,
+                    ("REQUEST_OBJECTIVE_PROOF_STALE",), objective.heading,
+                )
+            archived = next(
+                item.context for item in current.terminal_archives
+                if item.context.slice_agreement_ref == accepted.id
+            )
+            outcome, outcome_blockers = self._request_objective_outcome_candidate(
+                current, snapshot, archived, accepted,
+            )
+            if (
+                outcome is None
+                or outcome.id not in closure.slice_outcome_receipt_ids
+                or not any(item.id == outcome.id for item in current.slice_outcome_receipts)
+            ):
+                return RequestScopedObjectiveStatus(
+                    "BLOCKED", accepted.source_reference, request_sha,
+                    outcome_blockers or ("REQUEST_OBJECTIVE_PROOF_STALE",), objective.heading,
+                )
+            return RequestScopedObjectiveStatus(
+                "COMPLETE", accepted.source_reference, request_sha, (), objective.heading,
+            )
+        if any(item.feature_id == accepted.feature_id for item in current.feature_completion_receipts):
+            return RequestScopedObjectiveStatus(
+                "BLOCKED", accepted.source_reference, request_sha,
+                ("REQUEST_OBJECTIVE_FEATURE_CLOSED_BY_OTHER_AUTHORITY",), objective.heading,
+            )
+        blockers = self._request_objective_scope_blockers(
+            current, evidence, snapshot,
+        )
+        if blockers:
+            return RequestScopedObjectiveStatus(
+                "BLOCKED", accepted.source_reference, request_sha, blockers, objective.heading,
+            )
+        if not self.__persistence.request_objective_schema_ready():
+            # The first projection remains pending until the scoped Core writer
+            # creates the durable schema-20 proof bundle.
+            criteria_exists = any(
+                item.source == REQUEST_SCOPED_OBJECTIVE
+                and item.slice_agreement_ref == accepted.id
+                for item in current.slice_criteria_revisions
+            )
+            if criteria_exists:
+                return RequestScopedObjectiveStatus(
+                    "BLOCKED", accepted.source_reference, request_sha,
+                    ("REQUEST_OBJECTIVE_SCHEMA_NOT_CANONICAL",), objective.heading,
+                )
+        assert snapshot is not None
+        context = current.active_context
+        if context is None:
+            return RequestScopedObjectiveStatus(
+                "BLOCKED", accepted.source_reference, request_sha,
+                ("REQUEST_OBJECTIVE_ACTIVE_SCOPE_CHANGED",), objective.heading,
+            )
+        candidate, candidate_blockers = self._request_objective_outcome_candidate(
+            current, snapshot, context, accepted,
+        )
+        if candidate is None:
+            if candidate_blockers == ("REQUEST_OBJECTIVE_PROOF_REQUIRED",):
+                _, artifact_blockers = self._request_objective_artifact(snapshot, objective.heading)
+                if artifact_blockers:
+                    candidate_blockers = artifact_blockers
+                else:
+                    return RequestScopedObjectiveStatus(
+                        "PENDING", accepted.source_reference, request_sha, (), objective.heading,
+                    )
+            elif candidate_blockers == ("REQUEST_OBJECTIVE_PROOF_STALE",):
+                return RequestScopedObjectiveStatus(
+                    "PENDING", accepted.source_reference, request_sha,
+                    candidate_blockers, objective.heading,
+                )
+            else:
+                return RequestScopedObjectiveStatus(
+                    "BLOCKED", accepted.source_reference, request_sha,
+                    candidate_blockers, objective.heading,
+                )
+        elif any(item.id == candidate.id for item in current.slice_outcome_receipts):
+            return RequestScopedObjectiveStatus(
+                "VERIFIED", accepted.source_reference, request_sha, (), objective.heading,
+            )
+        else:
+            return RequestScopedObjectiveStatus(
+                "PENDING", accepted.source_reference, request_sha, (), objective.heading,
+            )
+
+    def request_scoped_objective(
+        self, state: State, evidence: SessionRequestEvidence, input_fingerprint: str,
+    ) -> State:
+        """Verify once, then close only the exact Core-derived request objective."""
+        current = _authoritative_state(self.__persistence, state)
+        if type(input_fingerprint) is not str or not _SHA256.fullmatch(input_fingerprint):
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_FINGERPRINT_INVALID",
+                "a canonical root-input SHA-256 fingerprint is required",
+            )
+        feature_agreement, accepted, pair_blockers = self._request_objective_pair(current)
+        if feature_agreement is None or accepted is None:
+            code = pair_blockers[0] if pair_blockers else "REQUEST_OBJECTIVE_SESSION_SCOPE_UNAVAILABLE"
+            raise RequestScopedObjectiveError(code, "one exact SESSION_REQUEST Feature/Slice pair is required")
+        expected_evidence = self._request_objective_evidence(feature_agreement, accepted)
+        if expected_evidence is None or evidence != expected_evidence:
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_SESSION_MISMATCH",
+                "the exact original session, message, request text, and repository are required",
+            )
+        objective = derive_static_heading(accepted.statement)
+        if objective is None:
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",
+                "the original request is outside the exact static-heading subset",
+            )
+        try:
+            scanned, snapshot = self.input_snapshot(current.revision)
+        except StaleRevisionError:
+            raise
+        except ServiceError as error:
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_INPUT_SNAPSHOT_UNAVAILABLE", str(error),
+            ) from error
+        if scanned != current:
+            raise StaleRevisionError(current.revision, scanned.revision)
+        if snapshot.fingerprint != input_fingerprint:
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_FINGERPRINT_STALE",
+                "caller fingerprint differs from the current safe root scan",
+            )
+        cycle_id, _, current_closure = feature_cycle_status(current, accepted.feature_id)
+        if cycle_id != 0:
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_FEATURE_REOPENED",
+                "a historical request-objective receipt cannot close a reopened Feature",
+            )
+        if current_closure is not None:
+            if (
+                current_closure.source != REQUEST_SCOPED_OBJECTIVE
+                or current_closure.source_reference != accepted.source_reference
+            ):
+                raise RequestScopedObjectiveError(
+                    "REQUEST_OBJECTIVE_FEATURE_CLOSED_BY_OTHER_AUTHORITY",
+                    "the current Feature closure is not this request-scoped objective",
+                )
+            closed_blockers = self._request_objective_scope_blockers(
+                current,
+                expected_evidence,
+                snapshot,
+                terminal=True,
+                allow_objective_closure=True,
+            )
+            if closed_blockers:
+                raise RequestScopedObjectiveError(closed_blockers[0], ", ".join(closed_blockers))
+            if current_closure.input_fingerprint != snapshot.fingerprint:
+                raise RequestScopedObjectiveError(
+                    "REQUEST_OBJECTIVE_PROOF_STALE",
+                    "the closed receipt is historical; current inputs differ from its verified snapshot",
+                )
+            archive = next(
+                item for item in current.terminal_archives
+                if item.context.slice_agreement_ref == accepted.id
+            )
+            outcome, outcome_blockers = self._request_objective_outcome_candidate(
+                current, snapshot, archive.context, accepted,
+            )
+            if (
+                outcome is None
+                or outcome.id not in current_closure.slice_outcome_receipt_ids
+                or not any(item.id == outcome.id for item in current.slice_outcome_receipts)
+            ):
+                code = outcome_blockers[0] if outcome_blockers else "REQUEST_OBJECTIVE_PROOF_STALE"
+                raise RequestScopedObjectiveError(code, ", ".join(outcome_blockers))
+            return current
+        blockers = self._request_objective_scope_blockers(current, evidence, snapshot)
+        if blockers:
+            raise RequestScopedObjectiveError(blockers[0], ", ".join(blockers))
+        context = current.active_context
+        assert context is not None
+        candidate, _ = self._request_objective_outcome_candidate(
+            current, snapshot, context, accepted,
+        )
+        if candidate is None or not any(
+            item.id == candidate.id for item in current.slice_outcome_receipts
+        ):
+            output_sha, artifact_blockers = self._request_objective_artifact(
+                snapshot, objective.heading,
+            )
+            if output_sha is None:
+                code = artifact_blockers[0] if artifact_blockers else "REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED"
+                raise RequestScopedObjectiveError(code, "Core could not verify index.html against the exact request")
+
+            def verify(locked: State) -> State:
+                scoped = self._request_objective_scope_blockers(
+                    locked, evidence, snapshot,
+                )
+                if scoped:
+                    raise RequestScopedObjectiveError(scoped[0], ", ".join(scoped))
+                content_sha, read_blockers = self._request_objective_artifact(
+                    snapshot, objective.heading,
+                )
+                if content_sha is None or content_sha != output_sha:
+                    code = read_blockers[0] if read_blockers else "REQUEST_OBJECTIVE_FINGERPRINT_STALE"
+                    raise RequestScopedObjectiveError(code, "verified artifact changed before publication")
+                criteria = request_objective_criteria_revision(
+                    accepted.id,
+                    accepted.repository_id,
+                    accepted.source_reference,
+                    accepted.statement,
+                )
+                if criteria is None:
+                    raise RequestScopedObjectiveError(
+                        "REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",
+                        "the original request no longer has a canonical objective",
+                    )
+                prior = tuple(
+                    item for item in locked.slice_criteria_revisions
+                    if item.slice_agreement_ref == accepted.id
+                )
+                if prior and prior != (criteria,):
+                    raise RequestScopedObjectiveError(
+                        "REQUEST_OBJECTIVE_CRITERIA_NOT_CANONICAL",
+                        "existing criteria do not equal the deterministic request objective",
+                    )
+                heads = locked.slice_criteria_heads
+                if not prior:
+                    if heads:
+                        raise RequestScopedObjectiveError(
+                            "REQUEST_OBJECTIVE_CRITERIA_NOT_CANONICAL",
+                            "the initial objective cannot replace another criteria head",
+                        )
+                    revisions = locked.slice_criteria_revisions + (criteria,)
+                    next_heads = locked.slice_criteria_heads + (
+                        SliceCriteriaHead(accepted.id, criteria.id),
+                    )
+                else:
+                    revisions = locked.slice_criteria_revisions
+                    next_heads = locked.slice_criteria_heads
+                criterion = criteria.criteria[0]
+                test_identity: list[object] = [
+                    accepted.id, criteria.id, criterion.id,
+                    OBJECTIVE_TEST_KIND, OBJECTIVE_TEST_TARGET, 0,
+                    content_sha, locked.revision,
+                ]
+                test_identity.extend((
+                    snapshot.fingerprint,
+                    INPUT_POLICY_ID,
+                    INPUT_POLICY_DIGEST,
+                    REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
+                    REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
+                    [],
+                    None,
+                    None,
+                    None,
+                    [],
+                    None,
+                    None,
+                ))
+                test_id = "criterion-test-" + sha256(json.dumps(
+                    test_identity, ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()[:20]
+                test_receipt = CriterionTestReceipt(
+                    test_id,
+                    accepted.id,
+                    criteria.id,
+                    criterion.id,
+                    OBJECTIVE_TEST_KIND,
+                    OBJECTIVE_TEST_TARGET,
+                    0,
+                    content_sha,
+                    locked.revision,
+                    locked.revision + 1,
+                    snapshot.fingerprint,
+                    snapshot.fingerprint,
+                    INPUT_POLICY_ID,
+                    INPUT_POLICY_DIGEST,
+                    REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
+                    REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
+                )
+                outcome = SliceOutcomeReceipt(
+                    "",
+                    accepted.repository_id,
+                    accepted.id,
+                    criteria.id,
+                    (test_receipt.id,),
+                    snapshot.fingerprint,
+                    INPUT_POLICY_ID,
+                    INPUT_POLICY_DIGEST,
+                    REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
+                    REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
+                    _drift_identity_digest(locked, accepted.change_id),
+                    "REQUEST_SCOPED_STATIC_HEADING",
+                    REQUEST_SCOPED_OBJECTIVE,
+                    locked.revision,
+                    locked.revision + 1,
+                    None,
+                )
+                outcome = replace(outcome, id=slice_outcome_semantic_id(outcome))
+                if any(item.id == outcome.id for item in locked.slice_outcome_receipts):
+                    return locked
+                return _prepare_state_publication(replace(
+                    locked,
+                    slice_criteria_revisions=revisions,
+                    slice_criteria_heads=next_heads,
+                    criterion_test_receipts=locked.criterion_test_receipts + (test_receipt,),
+                    slice_outcome_receipts=locked.slice_outcome_receipts + (outcome,),
+                ), locked.revision)
+
+            try:
+                verified = self.__persistence.transact_request_objective(
+                    current.revision,
+                    verify,
+                    expected_input_fingerprint=snapshot.fingerprint,
+                )
+            except AtomicFailure as error:
+                if "STALE_REVISION" in str(error):
+                    actual = self.__persistence.recover().revision
+                    raise StaleRevisionError(current.revision, actual) from error
+                if "FINGERPRINT_STALE" in str(error):
+                    raise RequestScopedObjectiveError(
+                        "REQUEST_OBJECTIVE_FINGERPRINT_STALE", str(error),
+                    ) from error
+                if "durability is uncertain" in str(error):
+                    raise DurabilityUncertainError(
+                        "REQUEST_OBJECTIVE_DURABILITY_UNKNOWN: recover before retry",
+                    ) from error
+                raise RequestScopedObjectiveError(
+                    "REQUEST_OBJECTIVE_PUBLICATION_FAILED", str(error),
+                ) from error
+            return verified
+        if not self.__persistence.request_objective_schema_ready():
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_SCHEMA_NOT_CANONICAL",
+                "request proof was not recovered from schema 20",
+            )
+        return self._complete_request_scoped_objective(
+            current, evidence, snapshot, accepted, feature_agreement,
+        )
+
+    def _complete_request_scoped_objective(
+        self,
+        current: State,
+        evidence: SessionRequestEvidence,
+        snapshot: InputSnapshot,
+        accepted: AgreementRecord,
+        feature_agreement: AgreementRecord,
+    ) -> State:
+        context = current.active_context
+        if context is None:
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_ACTIVE_SCOPE_CHANGED",
+                "the verified request no longer owns active primary work",
+            )
+        if context.change_id is None:
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_ACTIVE_SCOPE_CHANGED",
+                "the verified request no longer owns its accepted Change",
+            )
+        change_id = context.change_id
+        outcome, blockers = self._request_objective_outcome_candidate(
+            current, snapshot, context, accepted,
+        )
+        if outcome is None or not any(
+            item.id == outcome.id for item in current.slice_outcome_receipts
+        ):
+            code = blockers[0] if blockers else "REQUEST_OBJECTIVE_PROOF_STALE"
+            raise RequestScopedObjectiveError(code, ", ".join(blockers) or "fresh proof is required")
+        if (
+            context.phase is not Phase.RESEARCH
+            or context.status is not LifecycleState.PROPOSED
+            or context.feature_agreement_ref != feature_agreement.id
+            or context.slice_agreement_ref != accepted.id
+        ):
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_ACTIVE_SCOPE_CHANGED",
+                "lifecycle work changed after objective verification",
+            )
+        objective = derive_static_heading(accepted.statement)
+        assert objective is not None
+        criteria = next(
+            item for item in current.slice_criteria_revisions
+            if item.id == outcome.criteria_revision_id
+        )
+        criterion_receipt = next(
+            item for item in current.criterion_test_receipts
+            if item.id in outcome.evidence_receipt_ids
+        )
+        proof_reference = f"{outcome.id}:{criterion_receipt.output_sha256}"
+        review = ReviewResult(ReviewVerdict.PASS, (), True)
+        review_evidence = (
+            ReviewEvidence(
+                ReviewEvidenceCategory.TECHNICAL,
+                ReviewEvidenceKind.FACT,
+                "CORE_REQUEST_SCOPED_OBJECTIVE",
+                True,
+                f"Canonical criterion {criteria.criteria[0].id} passed strict static verifier",
+                proof_reference,
+            ),
+        )
+        verification = VerificationEvidence(
+            (f"{OBJECTIVE_TEST_KIND}:{OBJECTIVE_TEST_TARGET}:{criterion_receipt.output_sha256}",),
+            True,
+        )
+        assessment = ConvergenceAssessment(
+            change_id,
+            False,
+            AssessmentConfidence.HIGH,
+            (AssessmentEvidence(
+                "CORE_REQUEST_SCOPED_OBJECTIVE",
+                RepositoryPath(OBJECTIVE_TEST_TARGET),
+                context.feature_id,
+            ),),
+            "Core verified the exact bounded request objective; no Product Truth publication was requested or performed.",
+        )
+        stage = current
+        for status, phase in (
+            (LifecycleState.READY, Phase.READY),
+            (LifecycleState.IN_PROGRESS, Phase.IMPLEMENT),
+            (LifecycleState.IN_PROGRESS, Phase.REVIEW),
+        ):
+            active = stage.active_context
+            assert active is not None
+            if (active.status, active.phase) == (status, phase):
+                continue
+            next_pair = advance(
+                active.status, active.phase, status, phase,
+                active.unresolved_material_decision, active.review, active.verification,
+                active.convergence_complete,
+            )
+            stage = _validated(
+                replace(stage, active_context=replace(
+                    active, status=next_pair[0], phase=next_pair[1],
+                )),
+                "request-objective lifecycle preparation was rejected",
+            )
+        active = stage.active_context
+        assert active is not None
+        stage = _validated(replace(
+            stage,
+            active_context=replace(
+                active,
+                review=review,
+                review_evidence=review_evidence,
+                review_findings=(),
+            ),
+        ), "request-objective Core review proof was rejected")
+        active = stage.active_context
+        assert active is not None
+        pair = advance(
+            active.status, active.phase,
+            LifecycleState.VERIFYING, Phase.VERIFY,
+            active.unresolved_material_decision, active.review, active.verification,
+            active.convergence_complete,
+        )
+        stage = _validated(replace(
+            stage, active_context=replace(active, status=pair[0], phase=pair[1]),
+        ), "request-objective review transition was rejected")
+        active = stage.active_context
+        assert active is not None
+        stage = _validated(replace(
+            stage, active_context=replace(active, verification=verification),
+        ), "request-objective verification proof was rejected")
+        active = stage.active_context
+        assert active is not None
+        pair = advance(
+            active.status, active.phase,
+            LifecycleState.VERIFYING, Phase.CONVERGE,
+            active.unresolved_material_decision, active.review, active.verification,
+            active.convergence_complete,
+        )
+        stage = _validated(replace(
+            stage, active_context=replace(active, status=pair[0], phase=pair[1]),
+        ), "request-objective convergence transition was rejected")
+        active = stage.active_context
+        assert active is not None
+        stage = _validated(replace(
+            stage, active_context=replace(active, convergence_complete=True),
+        ), "request-objective convergence confirmation was rejected")
+        active = stage.active_context
+        assert active is not None
+        pair = advance(
+            active.status, active.phase,
+            LifecycleState.ACCEPTED, Phase.DONE,
+            active.unresolved_material_decision, active.review, active.verification,
+            active.convergence_complete,
+        )
+        terminal = replace(active, status=pair[0], phase=pair[1])
+        stage = _accept_without_publication_candidate(stage, assessment)
+        terminal_context = stage.terminal_archives[-1].context
+        if terminal_context != terminal:
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_TERMINAL_PROOF_MISMATCH",
+                "accepted archive differs from the validated Core lifecycle path",
+            )
+        feature_id = str(accepted.feature_id)
+        feature_records, slices, outcomes, feature_blockers = self._feature_completion_basis(
+            stage, feature_id, snapshot,
+        )
+        if feature_blockers:
+            raise RequestScopedObjectiveError(
+                feature_blockers[0], ", ".join(feature_blockers),
+            )
+        condition = f"Core verified request-scoped static heading: {objective.heading}"
+        statement = request_objective_completion_statement(
+            source_reference=accepted.source_reference,
+            request_sha256=sha256(accepted.statement.encode("utf-8")).hexdigest(),
+            heading=objective.heading,
+            outcome_receipt_id=outcomes[0].id,
+            input_fingerprint=snapshot.fingerprint,
+            source_revision=current.revision,
+        )
+
+        def close(locked: State) -> State:
+            if locked != current:
+                raise RequestScopedObjectiveError(
+                    "REQUEST_OBJECTIVE_STALE_REVISION",
+                    "authority changed after the validated terminal stage was prepared",
+                )
+            scoped = self._request_objective_scope_blockers(
+                locked, evidence, snapshot,
+            )
+            if scoped:
+                raise RequestScopedObjectiveError(scoped[0], ", ".join(scoped))
+            fresh_outcome, fresh_blockers = self._request_objective_outcome_candidate(
+                locked, snapshot, context, accepted,
+            )
+            if (
+                fresh_outcome is None
+                or fresh_outcome.id != outcome.id
+                or not any(item.id == fresh_outcome.id for item in locked.slice_outcome_receipts)
+            ):
+                raise RequestScopedObjectiveError(
+                    "REQUEST_OBJECTIVE_PROOF_STALE",
+                    ", ".join(fresh_blockers) or "outcome changed before terminal publication",
+                )
+            receipt = FeatureCompletionReceipt(
+                "",
+                snapshot.repository_id,
+                accepted.feature_id,
+                tuple(item.id for item in feature_records),
+                condition,
+                tuple(item.id for item in slices),
+                tuple(item.id for item in outcomes),
+                snapshot.fingerprint,
+                statement,
+                REQUEST_SCOPED_OBJECTIVE,
+                accepted.source_reference,
+                locked.revision,
+                locked.revision + 1,
+                0,
+            )
+            receipt = replace(receipt, id=feature_completion_semantic_id(receipt))
+            return _prepare_state_publication(replace(
+                stage,
+                feature_completion_receipts=stage.feature_completion_receipts + (receipt,),
+            ), locked.revision)
+
+        try:
+            return self.__persistence.transact_feature_completion(
+                current.revision,
+                close,
+                expected_input_fingerprint=snapshot.fingerprint,
+                request_objective=True,
+            )
+        except AtomicFailure as error:
+            if "expected revision is stale" in str(error):
+                actual = self.__persistence.recover().revision
+                raise StaleRevisionError(current.revision, actual) from error
+            if "FINGERPRINT_STALE" in str(error):
+                raise RequestScopedObjectiveError(
+                    "REQUEST_OBJECTIVE_FINGERPRINT_STALE", str(error),
+                ) from error
+            if "durability is uncertain" in str(error):
+                raise DurabilityUncertainError(
+                    "REQUEST_OBJECTIVE_DURABILITY_UNKNOWN: recover before retry",
+                ) from error
+            if isinstance(error, RequestScopedObjectiveError):
+                raise error
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_COMPLETION_FAILED", str(error),
+            ) from error
+
     def _slice_outcome_candidate(
         self, state: State, snapshot: InputSnapshot,
         scope_override: tuple[WorkingContext, AgreementRecord] | None = None,
     ) -> tuple[SliceOutcomeReceipt | None, tuple[str, ...]]:
         blockers: list[str] = []
-        if state.r3b_schema_upgrade is None or not self.__persistence.r3b_schema_ready():
-            return None, ("SCHEMA_17_REQUIRED",)
         if (
             type(snapshot) is not InputSnapshot
             or snapshot.version != INPUT_FINGERPRINT_VERSION
@@ -3126,6 +4263,12 @@ class CoreService:
         )
         if criteria is None or head is None:
             return None, ("CURRENT_CRITERIA_HEAD_UNAVAILABLE",)
+        if criteria.source == REQUEST_SCOPED_OBJECTIVE:
+            return self._request_objective_outcome_candidate(
+                state, snapshot, context, accepted,
+            )
+        if state.r3b_schema_upgrade is None or not self.__persistence.r3b_schema_ready():
+            return None, ("SCHEMA_17_REQUIRED",)
         if (
             context.unresolved_material_decision
             or context.safety_facts.unresolved_decision_details
@@ -3312,6 +4455,11 @@ class CoreService:
             receipt, blockers = self._slice_outcome_candidate(locked, snapshot, scope)
             if receipt is None:
                 raise ServiceError("Slice outcome is blocked: " + ", ".join(blockers))
+            if receipt.source == REQUEST_SCOPED_OBJECTIVE:
+                raise RequestScopedObjectiveError(
+                    "REQUEST_OBJECTIVE_USE_SCOPED_WRITER",
+                    "only the request-scoped Core verifier may publish this objective receipt",
+                )
             if any(item.id == receipt.id for item in locked.slice_outcome_receipts):
                 return locked
             return _prepare_state_publication(
@@ -3348,8 +4496,6 @@ class CoreService:
             or snapshot.policy_id != INPUT_POLICY_ID or snapshot.policy_digest != INPUT_POLICY_DIGEST
         ):
             return (), (), (), ("ROOT_AUTHORITY_UNAVAILABLE",)
-        if current.r3b_schema_upgrade is None or not self.__persistence.r3b_schema_ready():
-            blockers.append("SCHEMA_17_REQUIRED")
         feature_records = tuple(sorted(
             (item for item in current.agreements if item.kind == "FEATURE" and str(item.feature_id) == feature_id),
             key=lambda item: item.id,
@@ -3358,6 +4504,42 @@ class CoreService:
             (item for item in current.agreements if item.kind == "SLICE" and str(item.feature_id) == feature_id),
             key=lambda item: item.id,
         ))
+        request_objective_path = (
+            self.__persistence.request_objective_schema_ready()
+            and current.r3_schema_upgrade is None
+            and current.r3b_schema_upgrade is None
+            and len(current.agreements) == 2
+            and len(feature_records) == 1
+            and len(slices) == 1
+            and slices[0].source == "SESSION_REQUEST"
+            and len(current.slice_criteria_revisions) == 1
+            and current.slice_criteria_revisions[0].source == REQUEST_SCOPED_OBJECTIVE
+            and current.slice_criteria_revisions[0].slice_agreement_ref == slices[0].id
+            and current.slice_criteria_heads == (
+                SliceCriteriaHead(slices[0].id, current.slice_criteria_revisions[0].id),
+            )
+            and bool(current.slice_outcome_receipts)
+            and all(
+                item.source == REQUEST_SCOPED_OBJECTIVE
+                and item.slice_agreement_ref == slices[0].id
+                for item in current.slice_outcome_receipts
+            )
+            and all(
+                item.criteria_revision_id == current.slice_criteria_revisions[0].id
+                and item.slice_agreement_ref == slices[0].id
+                and item.test_kind == OBJECTIVE_TEST_KIND
+                and item.test_target == OBJECTIVE_TEST_TARGET
+                for item in current.criterion_test_receipts
+            )
+        )
+        if (
+            not request_objective_path
+            and (
+                current.r3b_schema_upgrade is None
+                or not self.__persistence.r3b_schema_ready()
+            )
+        ):
+            blockers.append("SCHEMA_17_REQUIRED")
         if not feature_records or not slices:
             blockers.append("FEATURE_SLICE_INVENTORY_UNAVAILABLE")
         if any(

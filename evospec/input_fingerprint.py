@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import unicodedata
 from collections.abc import Mapping
@@ -190,6 +191,7 @@ class InputSnapshot:
     total_bytes: int
     file_paths: tuple[str, ...] = ()
     directory_paths: tuple[str, ...] = ()
+    file_sha256: tuple[tuple[str, str], ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,7 +418,95 @@ def repository_input_snapshot(root: Path, repository_id: str) -> InputSnapshot:
         first_total,
         tuple(item.path for item in first),
         first_directories,
+        tuple((item.path, item.content_sha256) for item in first),
     )
+
+
+def read_repository_file(
+    root: Path, relative: str, expected_sha256: str, *, max_bytes: int,
+) -> bytes:
+    """Read one already-scanned repository file through the scanner's safe checks."""
+    if (
+        type(relative) is not str
+        or not relative
+        or "\\" in relative
+        or ":" in relative
+        or any(part in ("", ".", "..") for part in relative.split("/"))
+        or unicodedata.normalize("NFC", relative) != relative
+        or type(expected_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or type(max_bytes) is not int
+        or max_bytes < 0
+    ):
+        raise InputFingerprintError("repository file request is not canonical")
+    try:
+        root_info = root.lstat()
+        if stat.S_ISLNK(root_info.st_mode) or _is_reparse_point(root_info):
+            raise InputFingerprintError("repository root is a symlink or reparse point")
+        resolved = root.resolve(strict=True)
+        if not stat.S_ISDIR(resolved.stat().st_mode):
+            raise InputFingerprintError("repository root is not a regular directory")
+        path = resolved
+        for part in relative.split("/")[:-1]:
+            path = path / part
+            info = path.lstat()
+            if _is_reparse_point(info) or stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise InputFingerprintError("repository file parent is unsafe")
+        path = path / relative.split("/")[-1]
+        before = path.lstat()
+    except InputFingerprintError:
+        raise
+    except (OSError, RuntimeError) as error:
+        raise InputFingerprintError("repository file cannot be inspected safely") from error
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or _is_reparse_point(before)
+        or before.st_nlink != 1
+        or before.st_size < 0
+        or before.st_size > max_bytes
+    ):
+        raise InputFingerprintError("repository file is unsafe or exceeds its fixed byte limit")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise InputFingerprintError("repository file cannot be opened safely") from error
+    content = bytearray()
+    digest = hashlib.sha256()
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _is_reparse_point(opened)
+            or opened.st_nlink != 1
+            or not _same_file(before, opened, path_to_descriptor=True)
+        ):
+            raise InputFingerprintError("repository file changed or is unsafe during reading")
+        try:
+            while chunk := os.read(descriptor, min(_CHUNK_SIZE, max_bytes + 1 - len(content))):
+                content.extend(chunk)
+                digest.update(chunk)
+                if len(content) > max_bytes:
+                    raise InputFingerprintError("repository file exceeds its fixed byte limit")
+            after = os.fstat(descriptor)
+            current = path.lstat()
+        except OSError as error:
+            raise InputFingerprintError("repository file changed or became unreadable during reading") from error
+        if (
+            _is_reparse_point(after)
+            or _is_reparse_point(current)
+            or not _same_file(opened, after)
+            or not _same_file(after, current, path_to_descriptor=True)
+            or len(content) != after.st_size
+            or digest.hexdigest() != expected_sha256
+        ):
+            raise InputFingerprintError("repository file no longer matches its verified snapshot")
+        return bytes(content)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise InputFingerprintError("repository file handle could not be closed safely") from error
 
 
 def sanitized_test_environment(
@@ -487,4 +577,5 @@ __all__ = (
     "R3B_COVERAGE_CONTRACT",
     "R3B_APPROVAL_POLICY_TEXT",
     "repository_input_snapshot",
+    "read_repository_file",
 )
