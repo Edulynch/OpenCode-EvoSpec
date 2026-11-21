@@ -971,17 +971,22 @@ function hasNoAttachments(item) {
 }
 
 function objectiveResumeMessage(item) {
+  return validSessionRequest(item)
+    && ["continue", "continúa"].includes(item.text.trim())
+}
+
+function validSessionRequest(item) {
   return item?.type === "user"
     && typeof item.id === "string"
     && /^msg_[A-Za-z0-9_-]{3,128}$/.test(item.id)
     && typeof item.text === "string"
     && item.text.length <= 2048
     && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(item.text)
+    && item.text.trim().length > 0
     && hasNoAttachments(item)
-    && ["continue", "continúa"].includes(item.text.trim())
 }
 
-async function currentSessionRequest(runtime, context, options = {}) {
+async function currentSessionRequest(runtime, context) {
   if (typeof runtime?.session?.context !== "function"
       || typeof context.messageID !== "string" || !context.messageID.startsWith("msg_")) {
     throw new Error("INPUT_PROVENANCE_UNAVAILABLE: OpenCode session context or tool message identity is missing")
@@ -1000,30 +1005,141 @@ async function currentSessionRequest(runtime, context, options = {}) {
   if (lastUser < 0) {
     throw new Error("INPUT_PROVENANCE_UNAVAILABLE: no admitted user request precedes this tool call")
   }
-  let requestIndex = lastUser
-  if (options.allowObjectiveResume === true) {
-    while (requestIndex >= 0 && objectiveResumeMessage(prior[requestIndex])) {
-      requestIndex = prior.findLastIndex((item, index) =>
-        index < requestIndex && item?.type === "user")
-    }
-  }
-  if (requestIndex < 0) {
-    throw new Error("INPUT_PROVENANCE_UNAVAILABLE: the original objective request is no longer attributable")
-  }
-  if (prior.slice(requestIndex + 1).some((item) => item?.type === "synthetic")) {
+  if (prior.slice(lastUser + 1).some((item) => item?.type === "synthetic")) {
     throw new Error("INPUT_PROVENANCE_UNAVAILABLE: a synthetic event separates the request from this tool")
   }
-  const item = prior[requestIndex]
-  if (typeof item.id !== "string" || !/^msg_[A-Za-z0-9_-]{3,128}$/.test(item.id)
-      || typeof item.text !== "string" || !item.text.trim()
-      || item.text.length > 2048
-      || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(item.text)
-      || !hasNoAttachments(item)) {
+  const item = prior[lastUser]
+  if (!validSessionRequest(item)) {
     // Preserve user formatting verbatim. A newline, indentation, or trailing
     // CRLF is normal prompt content, not a reason to demand a new prompt.
     throw new Error("SESSION_REQUEST_SCOPE_INVALID: request must be nonblank, within 2048 characters, without unsupported control characters or attachments")
   }
   return { message_id: item.id, request_text: item.text }
+}
+
+function validSessionMessageID(value) {
+  return typeof value === "string" && /^msg_[A-Za-z0-9_-]{3,128}$/.test(value)
+}
+
+function validSessionModelReference(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && typeof value.id === "string" && value.id.length > 0
+    && typeof value.providerID === "string" && value.providerID.length > 0
+}
+
+function validSessionAssistant(item) {
+  return item?.type === "assistant"
+    && validSessionMessageID(item.id)
+    && typeof item.agent === "string" && item.agent.length > 0
+    && validSessionModelReference(item.model)
+    && Array.isArray(item.content)
+    && item.time !== null && typeof item.time === "object" && !Array.isArray(item.time)
+    && Object.hasOwn(item.time, "created")
+}
+
+// V2.3.2 typed session controls; their payloads never become request intent.
+function validSessionControl(item) {
+  if (item?.type === "idle") {
+    return ["succeeded", "failed", "interrupted"].includes(item.outcome)
+      && (item.error === undefined
+        || (item.error !== null && typeof item.error === "object" && !Array.isArray(item.error)))
+  }
+  if (item?.type === "agent-switched") {
+    return typeof item.agent === "string" && item.agent.length > 0
+      && (item.previous === undefined
+        || (typeof item.previous === "string" && item.previous.length > 0))
+  }
+  if (item?.type === "model-switched") {
+    return validSessionModelReference(item.model)
+      && (item.previous === undefined || validSessionModelReference(item.previous))
+  }
+  return false
+}
+
+async function requestScopedObjectiveSource(runtime, context, objective) {
+  if (typeof runtime?.session?.context !== "function") {
+    throw new Error("INPUT_PROVENANCE_UNAVAILABLE: OpenCode session context is unavailable")
+  }
+  const sessionID = context?.sessionID
+  const invokingMessageID = context?.messageID
+  if (typeof sessionID !== "string" || !/^ses_[A-Za-z0-9_-]{3,128}$/.test(sessionID)
+      || !validSessionMessageID(invokingMessageID)) {
+    throw new Error("INPUT_PROVENANCE_UNAVAILABLE: exact executing session or assistant message identity is missing")
+  }
+
+  const reference = typeof objective?.source_reference === "string"
+    ? /^session:(ses_[A-Za-z0-9_-]{3,128}):(msg_[A-Za-z0-9_-]{3,128}):([0-9a-f]{16})$/.exec(objective.source_reference)
+    : null
+  const expectedDigest = objective?.request_sha256
+  if (!reference || reference[1] !== sessionID
+      || typeof expectedDigest !== "string" || !/^[0-9a-f]{64}$/.test(expectedDigest)
+      || reference[3] !== expectedDigest.slice(0, 16)) {
+    throw new Error("REQUEST_SCOPED_OBJECTIVE_SOURCE_MISMATCH: Core source reference is not canonical for this session and digest")
+  }
+
+  const messages = await runtime.session.context({ sessionID })
+  if (!Array.isArray(messages) || messages.length > 4096) {
+    throw new Error("INPUT_PROVENANCE_UNAVAILABLE: admitted session transcript is unavailable or unbounded")
+  }
+  const sourceID = reference[2]
+  const sourceIndexes = []
+  const invokingIndexes = []
+  for (let index = 0; index < messages.length; index++) {
+    if (messages[index]?.id === sourceID) sourceIndexes.push(index)
+    if (messages[index]?.id === invokingMessageID) invokingIndexes.push(index)
+  }
+  if (sourceIndexes.length !== 1 || invokingIndexes.length !== 1) {
+    throw new Error("INPUT_PROVENANCE_UNAVAILABLE: source and invoking assistant IDs must each identify one session record")
+  }
+  const sourceIndex = sourceIndexes[0]
+  const invokingIndex = invokingIndexes[0]
+  const original = messages[sourceIndex]
+  if (sourceIndex >= invokingIndex || original?.type !== "user") {
+    throw new Error("INPUT_PROVENANCE_UNAVAILABLE: Core source is not a unique user record before this invocation")
+  }
+  if (!validSessionRequest(original)) {
+    throw new Error("SESSION_REQUEST_SCOPE_INVALID: original request must be nonblank, within 2048 characters, without unsupported control characters or attachments")
+  }
+  const digest = createHash("sha256").update(original.text, "utf8").digest("hex")
+  if (digest !== expectedDigest || digest.slice(0, 16) !== reference[3]) {
+    throw new Error("REQUEST_SCOPED_OBJECTIVE_SOURCE_MISMATCH: original request bytes do not match Core's full digest")
+  }
+
+  const invoking = messages[invokingIndex]
+  if (!validSessionAssistant(invoking)) {
+    throw new Error("INPUT_PROVENANCE_UNAVAILABLE: invoking message ID does not identify a valid assistant record")
+  }
+  const seenIDs = new Set()
+  for (let index = sourceIndex; index <= invokingIndex; index++) {
+    const item = messages[index]
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error("INPUT_PROVENANCE_UNAVAILABLE: malformed session event occurs in the source-to-invocation span")
+    }
+    if (item.type === "synthetic") {
+      throw new Error("INPUT_PROVENANCE_UNAVAILABLE: synthetic event attribution is unavailable; OpenCode v2.3.2 exposes no protected notificationID correlation")
+    }
+    if (!validSessionMessageID(item.id) || seenIDs.has(item.id)) {
+      throw new Error("INPUT_PROVENANCE_UNAVAILABLE: malformed or duplicate message ID occurs in the source-to-invocation span")
+    }
+    seenIDs.add(item.id)
+    if (index === sourceIndex) continue
+    if (index === invokingIndex) continue
+    if (item.type === "user") {
+      if (!objectiveResumeMessage(item)) {
+        throw new Error("INPUT_PROVENANCE_UNAVAILABLE: a later user message is substantive, malformed, or has attachments")
+      }
+      continue
+    }
+    if (item.type === "assistant") {
+      if (!validSessionAssistant(item)) {
+        throw new Error("INPUT_PROVENANCE_UNAVAILABLE: malformed assistant event occurs in the source-to-invocation span")
+      }
+      continue
+    }
+    if (validSessionControl(item)) continue
+    throw new Error("INPUT_PROVENANCE_UNAVAILABLE: unknown, malformed, or unsupported event occurs in the source-to-invocation span")
+  }
+  return { message_id: original.id, request_text: original.text, request_sha256: digest }
 }
 
 async function executeSessionFirstSlice(runtime, args, context) {
@@ -1117,16 +1233,6 @@ function requestScopedObjectiveBinding(snapshot, expectedRevision) {
   }
 }
 
-function assertRequestScopedObjectiveSource(snapshot, original, sessionID) {
-  const digest = createHash("sha256").update(original.request_text, "utf8").digest("hex")
-  const sourceReference = `session:${sessionID}:${original.message_id}:${digest.slice(0, 16)}`
-  if (snapshot.objective.request_sha256 !== digest
-      || snapshot.objective.source_reference !== sourceReference) {
-    throw new Error("REQUEST_SCOPED_OBJECTIVE_SOURCE_MISMATCH: the current admitted request is not the canonical objective source")
-  }
-  return digest
-}
-
 async function executeRequestScopedObjective(runtime, args, context) {
   if (typeof runtime?.permission?.assert !== "function"
       || typeof runtime?.session?.get !== "function") {
@@ -1158,8 +1264,8 @@ async function executeRequestScopedObjective(runtime, args, context) {
     return JSON.stringify({ code: "REQUEST_SCOPED_OBJECTIVE_COMPLETE", context: before })
   }
 
-  const original = await currentSessionRequest(runtime, context, { allowObjectiveResume: true })
-  const requestDigest = assertRequestScopedObjectiveSource(binding, original, requester.sessionID)
+  const original = await requestScopedObjectiveSource(runtime, context, binding.objective)
+  const requestDigest = original.request_sha256
   const indexPath = resolve(root, "index.html")
   const metadata = {
     operation: "request_scoped_objective",
@@ -1190,12 +1296,6 @@ async function executeRequestScopedObjective(runtime, args, context) {
       || resolve(await realpath(currentSessionPath)) !== resolve(root)) {
     throw new Error("REQUEST_SCOPED_OBJECTIVE_ROOT_CHANGED: project moved during host admission")
   }
-  const freshRequest = await currentSessionRequest(runtime, context, { allowObjectiveResume: true })
-  if (freshRequest.message_id !== original.message_id
-      || freshRequest.request_text !== original.request_text
-      || createHash("sha256").update(freshRequest.request_text, "utf8").digest("hex") !== requestDigest) {
-    throw new Error("REQUEST_SCOPED_OBJECTIVE_REQUEST_CHANGED: admitted request changed during host admission")
-  }
   const latest = parseContextResponse(
     await rawExecuteRequest(runtime, { action: "context" }, context, root)
   )
@@ -1208,6 +1308,12 @@ async function executeRequestScopedObjective(runtime, args, context) {
       || JSON.stringify(latestBinding.objective) !== JSON.stringify(binding.objective)
       || JSON.stringify(latestBinding.stage) !== JSON.stringify(binding.stage)) {
     throw new Error("REQUEST_SCOPED_OBJECTIVE_STALE: source, scope, stage, revision, or inputs changed during host admission")
+  }
+  const freshRequest = await requestScopedObjectiveSource(runtime, context, latestBinding.objective)
+  if (freshRequest.message_id !== original.message_id
+      || freshRequest.request_text !== original.request_text
+      || freshRequest.request_sha256 !== requestDigest) {
+    throw new Error("REQUEST_SCOPED_OBJECTIVE_REQUEST_CHANGED: admitted request changed during host admission")
   }
 
   return rawExecuteRequest(runtime, {
