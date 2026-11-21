@@ -7,6 +7,9 @@ dependencies = []
 license = "MIT"
 license-files = ["LICENSE"]
 
+[project.optional-dependencies]
+semantic-browser = ["playwright==1.65.2"]
+
 [project.scripts]
 evospec = "evospec.cli:main"
 evospec-agent = "evospec.agent_protocol:main"

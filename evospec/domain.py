@@ -40,12 +40,19 @@ from .request_scoped_objective import (
     OBJECTIVE_TEST_KIND,
     OBJECTIVE_TEST_TARGET,
     REQUEST_SCOPED_OBJECTIVE,
-    derive_static_heading,
+    TASK_APP_TEST_KIND,
+    TASK_APP_TEST_TARGET,
+    PersonalTasksObjective,
+    StaticHeadingObjective,
+    derive_request_objective,
 )
 
 REQUEST_OBJECTIVE_ADMISSION_POLICY_ID = OBJECTIVE_TEST_KIND
 REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST = sha256(
     b"core-static-heading-v1:strict-utf8:bounded-index.html:exact-single-h1"
+).hexdigest()
+SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST = sha256(
+    b"core-personal-tasks-browser-v1:playwright-1.65.2:chromium:REQUEST_SCOPED_PERSONAL_TASKS"
 ).hexdigest()
 
 FeatureId = NewType("FeatureId", str)
@@ -241,6 +248,7 @@ class SliceCriterion:
     id: str
     expected_result: str
     expected_evidence: str
+    provenance: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,8 +277,8 @@ def request_objective_criteria_revision(
     source_reference: str,
     statement: str,
 ) -> SliceCriteriaRevision | None:
-    """Derive the sole canonical criterion supported by the request verifier."""
-    objective = derive_static_heading(statement)
+    """Derive exact immutable criteria for a bounded request objective."""
+    objective = derive_request_objective(statement)
     if objective is None:
         return None
     digest = sha256(json.dumps(
@@ -278,24 +286,88 @@ def request_objective_criteria_revision(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")).hexdigest()[:20]
-    criterion = SliceCriterion(
-        "request-objective-heading",
-        f"One attribute-free H1 exactly equals: {objective.heading}",
-        f"{OBJECTIVE_TEST_KIND}:{OBJECTIVE_TEST_TARGET}",
-    )
+    if isinstance(objective, StaticHeadingObjective):
+        criterion = SliceCriterion(
+            "request-objective-heading",
+            f"One attribute-free H1 exactly equals: {objective.heading}",
+            f"{OBJECTIVE_TEST_KIND}:{OBJECTIVE_TEST_TARGET}",
+        )
+        outcome = "The requested static heading is present in index.html"
+        example = "index.html contains one plain H1 with the exact requested heading"
+        decisions = ("No additional product decisions are included",)
+        criteria = (criterion,)
+    else:
+        criteria = tuple(
+            SliceCriterion(
+                f"request-objective-{operation}",
+                {
+                    "create": "A personal task can be created and is durably retained in the app.",
+                    "consult": "The app lists the personal tasks that have been created.",
+                    "complete": "A personal task can be marked complete and its completed state is retained.",
+                }[operation],
+                f"{TASK_APP_TEST_KIND}:{TASK_APP_TEST_TARGET}",
+                "EXPLICIT_REQUEST" if operation in objective.explicit_operations else "DERIVED_OBJECTIVE",
+            )
+            for operation in objective.operations
+        )
+        outcome = "The bounded personal-tasks objective is implemented in index.html"
+        example = "The requested personal-task operations work through the local web app"
+        decisions = (
+            "AGENT_IMPLEMENTATION_CHOICE: UI, layout, and local persistence details are discretionary and are not acceptance criteria",
+        )
     return SliceCriteriaRevision(
         f"slice-criteria-objective-{digest}",
         slice_agreement_ref,
         repository_id,
-        "The requested static heading is present in index.html",
-        "index.html contains one plain H1 with the exact requested heading",
+        outcome,
+        example,
         ("index.html",),
         ("Every other file and behavior",),
-        ("No additional product decisions are included",),
-        (criterion,),
+        decisions,
+        criteria,
         REQUEST_SCOPED_OBJECTIVE,
         source_reference,
     )
+
+
+def request_objective_policy(
+    criteria: SliceCriteriaRevision,
+) -> tuple[str, str, str]:
+    """Return the fixed admission policy and outcome basis for canonical criteria."""
+    if type(criteria) is not SliceCriteriaRevision or criteria.source != REQUEST_SCOPED_OBJECTIVE:
+        raise DomainError("request-objective policy requires Core-derived criteria")
+    if len(criteria.criteria) == 1 and criteria.criteria[0].id == "request-objective-heading":
+        return (
+            OBJECTIVE_TEST_KIND,
+            REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
+            "REQUEST_SCOPED_STATIC_HEADING",
+        )
+    if tuple(item.id for item in criteria.criteria) and all(
+        item.id.startswith("request-objective-")
+        and item.expected_evidence == f"{TASK_APP_TEST_KIND}:{TASK_APP_TEST_TARGET}"
+        and item.provenance in ("EXPLICIT_REQUEST", "DERIVED_OBJECTIVE")
+        for item in criteria.criteria
+    ):
+        return (
+            TASK_APP_TEST_KIND,
+            SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
+            "REQUEST_SCOPED_PERSONAL_TASKS",
+        )
+    raise DomainError("request-objective criteria have no canonical admission policy")
+
+
+def request_objective_completion_condition(
+    objective: StaticHeadingObjective | PersonalTasksObjective,
+) -> str:
+    """Render the exact Core-verified request objective used for closure."""
+    if type(objective) is StaticHeadingObjective:
+        return f"Core verified request-scoped static heading: {objective.heading}"
+    if type(objective) is PersonalTasksObjective:
+        return (
+            "Core verified request-scoped personal tasks objective: "
+            + ", ".join(objective.operations)
+        )
+    raise DomainError("request-objective completion requires a canonical objective")
 
 
 @dataclass(frozen=True, slots=True)
@@ -623,17 +695,38 @@ def request_objective_completion_statement(
     *,
     source_reference: str,
     request_sha256: str,
-    heading: str,
+    heading: str | None = None,
     outcome_receipt_id: str,
     input_fingerprint: str,
     source_revision: int,
+    operations: tuple[str, ...] = (),
 ) -> str:
     """Canonical system provenance; it is explicitly not a human decision."""
+    if heading is not None and not operations:
+        return "\n".join((
+            "EvoSpec: Core request-scoped objective completion; not human approval or Product Truth publication",
+            f"Original session request: {source_reference}",
+            f"Request SHA-256: {request_sha256}",
+            f"Verified static heading: {heading}",
+            f"Slice outcome receipt: {outcome_receipt_id}",
+            f"Root input fingerprint: {input_fingerprint}",
+            f"Expected revision: {source_revision}",
+            "No Product Truth was published",
+        ))
+    if (
+        heading is not None
+        or type(operations) is not tuple
+        or not operations
+        or any(operation not in ("create", "consult", "complete") for operation in operations)
+        or len(set(operations)) != len(operations)
+        or operations != tuple(operation for operation in ("create", "consult", "complete") if operation in operations)
+    ):
+        raise DomainError("request-objective completion statement has no canonical objective")
     return "\n".join((
         "EvoSpec: Core request-scoped objective completion; not human approval or Product Truth publication",
         f"Original session request: {source_reference}",
         f"Request SHA-256: {request_sha256}",
-        f"Verified static heading: {heading}",
+        f"Verified personal-tasks operations: {', '.join(operations)}",
         f"Slice outcome receipt: {outcome_receipt_id}",
         f"Root input fingerprint: {input_fingerprint}",
         f"Expected revision: {source_revision}",
@@ -3051,6 +3144,10 @@ def validate_state(state: State) -> None:
             _identity(criterion.id, "Slice criterion")
             _text(criterion.expected_result, "expected result")
             _text(criterion.expected_evidence, "expected evidence")
+            if criterion.provenance not in (None, "EXPLICIT_REQUEST", "DERIVED_OBJECTIVE"):
+                raise StateValidationError("Slice criterion provenance is invalid")
+            if criterion.provenance is not None and revision.source != REQUEST_SCOPED_OBJECTIVE:
+                raise StateValidationError("criterion provenance is reserved for Core-derived request objectives")
         # Reconstruct the exact mini-spec that the human saw. A changed JSON
         # record must not silently retain the old terminal authorization.
         canonical_spec = json.dumps({
@@ -3401,8 +3498,12 @@ def validate_state(state: State) -> None:
             raise StateValidationError("R3 test command differs from the accepted evidence contract")
         request_objective_test = revision.source == REQUEST_SCOPED_OBJECTIVE
         if request_objective_test:
+            try:
+                expected_test_kind, _, _ = request_objective_policy(revision)
+            except DomainError as error:
+                raise StateValidationError("request-objective criteria have no canonical policy") from error
             if (
-                observation.test_kind != OBJECTIVE_TEST_KIND
+                observation.test_kind != expected_test_kind
                 or observation.test_target != OBJECTIVE_TEST_TARGET
             ):
                 raise StateValidationError("request-objective evidence descriptor is not canonical")
@@ -3469,14 +3570,18 @@ def validate_state(state: State) -> None:
         if observation.id != expected_id:
             raise StateValidationError("R3 test receipt identity does not match its recorded result")
         if request_objective_test:
+            try:
+                expected_admission_id, expected_admission_digest, _ = request_objective_policy(revision)
+            except DomainError as error:
+                raise StateValidationError("request-objective criteria have no canonical policy") from error
             if (
                 not has_r3b_provenance
                 or not is_sha256_digest(observation.input_fingerprint_before or "")
                 or observation.input_fingerprint_before != observation.input_fingerprint_after
                 or observation.input_policy_id != INPUT_POLICY_ID
                 or observation.input_policy_digest != INPUT_POLICY_DIGEST
-                or observation.admission_policy_id != REQUEST_OBJECTIVE_ADMISSION_POLICY_ID
-                or observation.admission_policy_digest != REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST
+                or observation.admission_policy_id != expected_admission_id
+                or observation.admission_policy_digest != expected_admission_digest
                 or observation.external_inputs
                 or observation.runtime_executable is not None
                 or observation.runtime_executable_sha256 is not None
@@ -3547,12 +3652,18 @@ def validate_state(state: State) -> None:
         request_objective_outcome = (
             criteria is not None and criteria.source == REQUEST_SCOPED_OBJECTIVE
         )
+        request_policy: tuple[str, str, str] | None = None
+        if request_objective_outcome:
+            try:
+                request_policy = request_objective_policy(criteria)
+            except DomainError as error:
+                raise StateValidationError("request-objective criteria have no canonical policy") from error
         current_input_policy = (
             outcome.input_policy_id == INPUT_POLICY_ID
             and outcome.input_policy_digest == INPUT_POLICY_DIGEST
             and outcome.admission_policy_digest == (
-                REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST
-                if request_objective_outcome else TEST_ADMISSION_POLICY_DIGEST
+                request_policy[1]
+                if request_policy is not None else TEST_ADMISSION_POLICY_DIGEST
             )
         )
         legacy_input_policy = (
@@ -3578,12 +3689,12 @@ def validate_state(state: State) -> None:
             )
             or type(outcome.admission_policy_id) is not str
             or outcome.admission_policy_id != (
-                REQUEST_OBJECTIVE_ADMISSION_POLICY_ID
-                if request_objective_outcome else TEST_ADMISSION_POLICY_ID
+                request_policy[0]
+                if request_policy is not None else TEST_ADMISSION_POLICY_ID
             )
             or outcome.admission_policy_digest != (
-                REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST
-                if request_objective_outcome else outcome.admission_policy_digest
+                request_policy[1]
+                if request_policy is not None else outcome.admission_policy_digest
             )
             or (
                 not request_objective_outcome
@@ -3594,6 +3705,7 @@ def validate_state(state: State) -> None:
                 outcome.coverage_contract_digest is not None
                 and not is_sha256_digest(outcome.coverage_contract_digest)
             )
+            or (request_objective_outcome and outcome.coverage_contract_digest is not None)
             or any(not is_sha256_digest(value) for value in (
                 outcome.input_fingerprint,
                 outcome.input_policy_digest,
@@ -3601,7 +3713,7 @@ def validate_state(state: State) -> None:
                 outcome.relevant_drift_digest,
             ))
             or (
-                outcome.basis != "REQUEST_SCOPED_STATIC_HEADING"
+                outcome.basis != (request_policy[2] if request_policy is not None else "")
                 or outcome.source != REQUEST_SCOPED_OBJECTIVE
                 if request_objective_outcome
                 else outcome.basis != "ALL_CRITERIA_FRESH_SUPPORTED_TESTS"
@@ -3614,35 +3726,44 @@ def validate_state(state: State) -> None:
             raise StateValidationError("Slice outcome receipt is invalid")
         selected = tuple(test_receipts.get(identity) for identity in outcome.evidence_receipt_ids)
         if request_objective_outcome:
-            criterion = criteria.criteria[0] if len(criteria.criteria) == 1 else None
+            assert request_policy is not None
+            expected_criterion_ids = tuple(item.id for item in criteria.criteria)
             if (
-                len(selected) != 1
-                or selected[0] is None
-                or criterion is None
-                or selected[0].exit_code != 0
-                or selected[0].criterion_id != criterion.id
-                or selected[0].test_kind != OBJECTIVE_TEST_KIND
-                or selected[0].test_target != OBJECTIVE_TEST_TARGET
-                or selected[0].slice_agreement_ref != outcome.slice_agreement_ref
-                or selected[0].criteria_revision_id != outcome.criteria_revision_id
-                or selected[0].input_fingerprint_before != outcome.input_fingerprint
-                or selected[0].input_fingerprint_after != outcome.input_fingerprint
-                or selected[0].input_policy_id != outcome.input_policy_id
-                or selected[0].input_policy_digest != outcome.input_policy_digest
-                or selected[0].admission_policy_id != outcome.admission_policy_id
-                or selected[0].admission_policy_digest != outcome.admission_policy_digest
-                or selected[0].source_revision != outcome.source_revision
-                or selected[0].recorded_revision != outcome.recorded_revision
-                or selected[0].runtime_executable is not None
-                or selected[0].runtime_executable_sha256 is not None
-                or selected[0].runtime_version is not None
-                or selected[0].runtime_argv
-                or selected[0].environment_profile_id is not None
-                or selected[0].environment_profile_digest is not None
-                or selected[0].coverage_approval_id is not None
-                or selected[0].coverage_contract_digest is not None
+                len(selected) != len(criteria.criteria)
+                or any(
+                    receipt is None
+                    or receipt.exit_code != 0
+                    or receipt.criterion_id != criterion.id
+                    or receipt.test_kind != request_policy[0]
+                    or receipt.test_target != OBJECTIVE_TEST_TARGET
+                    or receipt.slice_agreement_ref != outcome.slice_agreement_ref
+                    or receipt.criteria_revision_id != outcome.criteria_revision_id
+                    or receipt.input_fingerprint_before != outcome.input_fingerprint
+                    or receipt.input_fingerprint_after != outcome.input_fingerprint
+                    or receipt.input_policy_id != outcome.input_policy_id
+                    or receipt.input_policy_digest != outcome.input_policy_digest
+                    or receipt.admission_policy_id != outcome.admission_policy_id
+                    or receipt.admission_policy_digest != outcome.admission_policy_digest
+                    or receipt.source_revision != outcome.source_revision
+                    or receipt.recorded_revision != outcome.recorded_revision
+                    or receipt.runtime_executable is not None
+                    or receipt.runtime_executable_sha256 is not None
+                    or receipt.runtime_version is not None
+                    or receipt.runtime_argv
+                    or receipt.environment_profile_id is not None
+                    or receipt.environment_profile_digest is not None
+                    or receipt.coverage_approval_id is not None
+                    or receipt.coverage_contract_digest is not None
+                    for criterion, receipt in zip(criteria.criteria, selected)
+                )
+                or tuple(receipt.criterion_id for receipt in selected if receipt is not None)
+                != expected_criterion_ids
+                or (
+                    request_policy[2] == "REQUEST_SCOPED_PERSONAL_TASKS"
+                    and len({receipt.output_sha256 for receipt in selected if receipt is not None}) != 1
+                )
             ):
-                raise StateValidationError("request-objective outcome must reference its Core proof")
+                raise StateValidationError("request-objective outcome must reference every matching Core proof")
         elif any(
             receipt is None
             or receipt.exit_code != 0
@@ -3813,7 +3934,7 @@ def validate_state(state: State) -> None:
                 if item.kind == "FEATURE"
                 and item.feature_id == closure.feature_id
             )
-            objective = None if request_agreement is None else derive_static_heading(
+            objective = None if request_agreement is None else derive_request_objective(
                 request_agreement.statement,
             )
             objective_outcome = (
@@ -3824,18 +3945,35 @@ def validate_state(state: State) -> None:
                 else None
             )
             expected_condition = (
-                None if objective is None
-                else f"Core verified request-scoped static heading: {objective.heading}"
+                None if objective is None else request_objective_completion_condition(objective)
             )
             expected_statement = None if (
                 request_agreement is None or objective is None or objective_outcome is None
             ) else request_objective_completion_statement(
                 source_reference=request_agreement.source_reference,
                 request_sha256=sha256(request_agreement.statement.encode("utf-8")).hexdigest(),
-                heading=objective.heading,
+                heading=objective.heading if isinstance(objective, StaticHeadingObjective) else None,
                 outcome_receipt_id=objective_outcome.id,
                 input_fingerprint=closure.input_fingerprint,
                 source_revision=closure.source_revision,
+                operations=objective.operations if isinstance(objective, PersonalTasksObjective) else (),
+            )
+            objective_proofs = (
+                ()
+                if objective_outcome is None
+                else tuple(
+                    test_receipts.get(identity)
+                    for identity in objective_outcome.evidence_receipt_ids
+                )
+            )
+            objective_archives = () if request_agreement is None else tuple(
+                item for item in state.terminal_archives
+                if item.context.feature_id == closure.feature_id
+                and item.context.change_id == request_agreement.change_id
+            )
+            objective_work = () if request_agreement is None else tuple(
+                item for item in state.work_items
+                if item.terminal_change_id == request_agreement.change_id
             )
             if (
                 request_agreement is None
@@ -3851,7 +3989,31 @@ def validate_state(state: State) -> None:
                 or objective_outcome is None
                 or expected_condition != closure.condition
                 or objective_outcome.input_fingerprint != closure.input_fingerprint
+                or objective_outcome.recorded_revision > closure.source_revision
+                or any(
+                    proof is None or proof.recorded_revision > closure.source_revision
+                    for proof in objective_proofs
+                )
                 or closure.statement != expected_statement
+                or len(objective_archives) != 1
+                or objective_archives[0].context.status is not LifecycleState.ACCEPTED
+                or objective_archives[0].context.phase is not Phase.DONE
+                or objective_archives[0].context.publication is not None
+                or objective_archives[0].parent_feature_id is not None
+                or objective_archives[0].context.review is None
+                or objective_archives[0].context.review.verdict is not ReviewVerdict.PASS
+                or not objective_archives[0].context.verification.sufficient
+                or not objective_archives[0].context.convergence_complete
+                or objective_archives[0].convergence_assessment is None
+                or objective_archives[0].convergence_assessment.change_id != request_agreement.change_id
+                or objective_archives[0].convergence_assessment.product_truth_changed
+                or any(
+                    item.feature_id == closure.feature_id
+                    for item in state.publications + state.publication_history
+                )
+                or len(objective_work) != 1
+                or objective_work[0].operational_state is not OperationalState.DONE
+                or objective_work[0].context is not None
             ):
                 raise StateValidationError("request-objective Feature completion is not bound to its Core proof")
         else:

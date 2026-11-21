@@ -1219,6 +1219,20 @@ function requestScopedObjectiveBinding(snapshot, expectedRevision) {
   if (!["PENDING", "VERIFIED"].includes(objective.status)) {
     throw new Error("REQUEST_SCOPED_OBJECTIVE_CONTEXT_INVALID: objective status is unsupported")
   }
+  const criteria = objective.criteria
+  const semanticProjectionValid = objective.kind === undefined
+    ? criteria === undefined
+    : objective.kind === "PERSONAL_TASKS_WEB" && objective.heading === null
+      && Array.isArray(criteria) && [2, 3].includes(criteria.length)
+      && criteria.every((item) => item && typeof item === "object" && !Array.isArray(item)
+        && Object.keys(item).length === 2
+        && typeof item.operation === "string"
+        && ["EXPLICIT_REQUEST", "DERIVED_OBJECTIVE"].includes(item.provenance))
+      && JSON.stringify(criteria.map((item) => item.operation)) === JSON.stringify(
+        criteria.length === 2 ? ["create", "consult"] : ["create", "consult", "complete"],
+      )
+      && criteria.every((item) =>
+        item.operation !== "complete" || item.provenance === "EXPLICIT_REQUEST")
   const fingerprint = snapshot.input_snapshot?.fingerprint
   if (typeof snapshot.repository_id !== "string" || !snapshot.repository_id.trim()
       || typeof fingerprint !== "string" || !/^[0-9a-f]{64}$/.test(fingerprint)
@@ -1226,6 +1240,7 @@ function requestScopedObjectiveBinding(snapshot, expectedRevision) {
       || typeof objective.request_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(objective.request_sha256)
       || !Array.isArray(objective.blockers) || objective.blockers.some((item) => typeof item !== "string")
       || !(objective.heading === null || typeof objective.heading === "string")
+      || !semanticProjectionValid
       || !Array.isArray(snapshot.lifecycle) || snapshot.lifecycle.length < 2
       || snapshot.lifecycle.some((item) => typeof item !== "string")) {
     throw new Error("REQUEST_SCOPED_OBJECTIVE_CONTEXT_INVALID: canonical identity, stage, or objective fields are incomplete")
@@ -2194,6 +2209,10 @@ export default {
       }
     }
     await runtime.session.hook("context", (event) => {
+      event.system.push({
+        type: "text",
+        text: "For a canonical request_scoped_objective with kind PERSONAL_TASKS_WEB, use Core's ordered criteria as the complete product boundary: create and consult are the baseline operations; include complete only when Core lists it with provenance EXPLICIT_REQUEST. Layout, appearance, and persistence implementation details are discretionary. Do not write unless the exact admitted SESSION_REQUEST source is current, Core reports only REQUEST_OBJECTIVE_ARTIFACT_MISSING and REQUEST_OBJECTIVE_ARTIFACT_HASH_UNAVAILABLE, index.html is absent, no material decision is pending, and the current Core scope and operation budget still allow editing only index.html. Then create only index.html with a visible text entry [data-evo-action=\"task-input\"], a visible native add button [data-evo-action=\"add-task\"], and one visible [data-evo-task] row per actual task with its exact title; add a native [data-evo-action=\"complete-task\"] checkbox only for an explicitly requested complete operation. Add no other files, requirements, external dependencies, or network behavior. Use normal host file permission and keep the existing session/source/root/revision/fingerprint checks; do not add a permission gate or suggest TTY acceptance. Reread context after the file creation, call evospec_request_scoped_objective only for the same-source PENDING state, and make a separate fresh-revision call only after VERIFIED; stop at COMPLETE. For read-only, material, unsupported, or out-of-scope requests, do not write or suggest terminal recovery: report Core's exact blocker and give only safe ordinary-workflow guidance.",
+      })
       event.system.push({
         type: "text",
         text: "For natural-language questions about where work stands or where to resume (¿dónde seguimos?, ¿en qué quedamos?, where were we?), load the evospec skill and call only evospec_context for the current session project. Report the known Feature, Slice, Task, and next checkpoint plainly; distinguish initial acceptance from later task_progress (REPORTED_UNVERIFIED), and disclose missing or ambiguous context. When there is no active Task, report accepted work_queue items as inactive and never choose or activate one on a status query. Read-only questions never initialize, continue, reaccept, or mutate. " +

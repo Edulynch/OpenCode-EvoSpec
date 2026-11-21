@@ -100,6 +100,12 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn("accepted work_queue items as inactive", plugin)
         self.assertIn("evospec_request_scoped_objective", skill)
         self.assertIn("insufficient proof", skill)
+        self.assertIn("PERSONAL_TASKS_WEB", plugin)
+        self.assertIn('data-evo-action=\\"task-input\\"', plugin)
+        self.assertIn('data-evo-action=\\"add-task\\"', plugin)
+        self.assertIn("data-evo-task", plugin)
+        self.assertIn("complete only when Core lists it with provenance EXPLICIT_REQUEST", plugin)
+        self.assertIn("do not write or suggest terminal/TTY recovery", skill)
 
         # Both slash consultations share the same read-only contract, even when natural
         # language activates the skill without a slash command.
@@ -816,6 +822,198 @@ assert(rawDenied.error.code === "DEDICATED_TOOL_REQUIRED", "raw objective mutati
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_personal_tasks_objective_uses_core_criteria_without_model_authored_scope(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "plugin.ts").write_text(_resources()[PLUGIN], encoding="utf-8")
+            (root / "continuation.mjs").write_text(_resources()[CONTINUATION], encoding="utf-8")
+            runner = root / "semantic-objective.ts"
+            runner.write_text(
+                '''import plugin from "./plugin.ts"
+import { createHash } from "node:crypto"
+import { realpath } from "node:fs/promises"
+import { resolve } from "node:path"
+
+const definitions = [], requests = [], writes = [], permissions = []
+const assert = (condition, message) => { if (!condition) throw new Error(message) }
+const sessionID = "ses_semantic001"
+const assistantID = "msg_assistant_semantic001"
+let requestText = "Build a web app to manage my personal tasks"
+let digest = createHash("sha256").update(requestText, "utf8").digest("hex")
+let sourceReference = `session:${sessionID}:msg_user_semantic001:${digest.slice(0, 16)}`
+const objective = {
+  status: "PENDING", source_reference: sourceReference, request_sha256: digest,
+  blockers: [], heading: null, kind: "PERSONAL_TASKS_WEB",
+  criteria: [
+    { operation: "create", provenance: "DERIVED_OBJECTIVE" },
+    { operation: "consult", provenance: "DERIVED_OBJECTIVE" },
+  ],
+}
+const context = (revision) => ({ context: {
+  revision, repository_id: "repo-semantic", lifecycle: ["IN_PROGRESS", "IMPLEMENT"],
+  input_snapshot: { fingerprint: "a".repeat(64) },
+  request_scoped_objective: objective,
+} })
+const user = { type: "user", id: "msg_user_semantic001", text: requestText, files: [] }
+const assistant = {
+  type: "assistant", id: assistantID, agent: "build",
+  model: { id: "model-test", providerID: "provider-test" },
+  content: [], time: { created: 0 },
+}
+let messages = [user, assistant], activeContext, deny = false
+let responseQueue = []
+const runtime = {
+  tool: {
+    transform: async (fn) => fn({ add: (tool) => definitions.push(tool) }),
+    list: async () => definitions.map((tool) => ({ id: tool.name })),
+  },
+  session: {
+    get: async () => ({ location: { directory: process.cwd() } }),
+    context: async ({ sessionID: id }) => {
+      assert(id === activeContext.sessionID, "source belongs to the executing session")
+      return messages
+    },
+    hook: async () => {},
+  },
+  permission: {
+    assert: async (request) => {
+      permissions.push(request)
+      assert(request.action === "evospec_request_scoped_objective",
+        "existing objective permission action remains the only gate")
+      assert(request.resources.length === 2
+        && request.resources[1] === resolve(await realpath(process.cwd()), "index.html"),
+      "permission remains bound to the exact index target")
+      if (deny) throw new Error("HOST_DENIED")
+    },
+  },
+}
+await plugin.setup(runtime)
+Object.defineProperty(Bun, "spawn", { value(_command, options) {
+  if (options.stdin) writes.push(options.stdin.text().then((value) => requests.push(JSON.parse(value))))
+  const response = responseQueue.shift()
+  assert(response !== undefined, "unexpected Core request")
+  return { stdout: new Blob([JSON.stringify(response)]).stream(),
+    stderr: new Blob([""]).stream(), exited: Promise.resolve(0) }
+} })
+const tool = definitions.find((item) => item.name === "evospec_request_scoped_objective")
+assert(tool && JSON.stringify(Object.keys(tool.input.properties)) === '["expected_revision"]'
+  && tool.input.additionalProperties === false,
+"only revision is accepted; no criteria or operation argument is exposed")
+const invoke = (args) => {
+  activeContext = { sessionID, agent: "build", messageID: assistantID, id: "call_semantic001",
+    signal: new AbortController().signal }
+  return tool.execute(args, activeContext)
+}
+const bindCanonicalRequest = (text, criteria) => {
+  requestText = text
+  digest = createHash("sha256").update(requestText, "utf8").digest("hex")
+  sourceReference = `session:${sessionID}:${user.id}:${digest.slice(0, 16)}`
+  objective.source_reference = sourceReference
+  objective.request_sha256 = digest
+  objective.criteria = criteria
+  user.text = requestText
+}
+const verifyAt = async (revision) => {
+  responseQueue.push(context(revision), context(revision), {
+    result: { code: "REQUEST_OBJECTIVE_VERIFIED" }, ...context(revision + 1),
+  })
+  const verified = JSON.parse((await invoke({
+    expected_revision: revision,
+    criteria: [{ operation: "delete", provenance: "EXPLICIT_REQUEST" }],
+  })).content)
+  await Promise.all(writes)
+  assert(verified.result.code === "REQUEST_OBJECTIVE_VERIFIED",
+    "valid Core provenance reaches the dedicated verifier")
+}
+responseQueue.push(context(10), context(10), {
+  result: { code: "REQUEST_OBJECTIVE_VERIFIED" }, ...context(11),
+})
+const result = JSON.parse((await invoke({
+  expected_revision: 10,
+  criteria: [{ operation: "delete", provenance: "EXPLICIT_REQUEST" }],
+})).content)
+await Promise.all(writes)
+assert(result.result.code === "REQUEST_OBJECTIVE_VERIFIED", "Core response is returned")
+const mutation = requests.findLast((item) => item.action === "request_scoped_objective")
+assert(mutation.request_text === requestText && mutation.message_id === user.id,
+  "the exact original natural-language source, not agent text, reaches Core")
+assert(JSON.stringify(Object.keys(mutation).sort()) === JSON.stringify([
+  "action", "expected_revision", "input_fingerprint", "message_id",
+  "repository_id", "request_text", "session_id",
+].sort()), "Core receives no model-authored criteria or operations")
+assert(permissions.length === 1, "semantic verification uses one existing permission assertion")
+const raw = definitions.find((item) => item.name === "evospec")
+const rawResult = JSON.parse((await raw.execute({ request: JSON.stringify({
+  action: "request_scoped_objective", expected_revision: 10,
+}) }, { sessionID })).content)
+assert(rawResult.error.code === "DEDICATED_TOOL_REQUIRED",
+  "the raw protocol still cannot bypass the dedicated host gate")
+
+bindCanonicalRequest(
+  "Build a web app to manage my personal tasks, where I can add tasks and view tasks",
+  [
+    { operation: "create", provenance: "EXPLICIT_REQUEST" },
+    { operation: "consult", provenance: "EXPLICIT_REQUEST" },
+  ],
+)
+await verifyAt(11)
+assert(requests.findLast((item) => item.action === "request_scoped_objective").request_text
+  === requestText, "explicit create and consult criteria remain bound to their original wording")
+
+const explicitCompleteRequest =
+  "Build a web app to manage my personal tasks, where I can add tasks and view tasks and mark tasks done"
+const explicitCompleteCriteria = [
+  { operation: "create", provenance: "EXPLICIT_REQUEST" },
+  { operation: "consult", provenance: "EXPLICIT_REQUEST" },
+  { operation: "complete", provenance: "EXPLICIT_REQUEST" },
+]
+bindCanonicalRequest(explicitCompleteRequest, explicitCompleteCriteria)
+await verifyAt(12)
+
+const rejectProjectionBeforeAdmission = async (revision, criteria, message) => {
+  objective.criteria = criteria
+  const admissionCount = permissions.length
+  const mutationCount = requests.filter((item) => item.action === "request_scoped_objective").length
+  responseQueue.push(context(revision))
+  let rejected = false
+  try { await invoke({ expected_revision: revision }) }
+  catch (error) {
+    rejected = String(error).includes("REQUEST_SCOPED_OBJECTIVE_CONTEXT_INVALID")
+  }
+  await Promise.all(writes)
+  assert(rejected && permissions.length === admissionCount
+    && requests.filter((item) => item.action === "request_scoped_objective").length === mutationCount,
+  message)
+}
+await rejectProjectionBeforeAdmission(13, [
+  { operation: "create", provenance: "DERIVED_OBJECTIVE" },
+  { operation: "consult", provenance: "DERIVED_OBJECTIVE" },
+  { operation: "complete", provenance: "DERIVED_OBJECTIVE" },
+], "derived complete is rejected before host admission")
+await rejectProjectionBeforeAdmission(13, [
+  { operation: "create", provenance: "EXPLICIT_REQUEST" },
+  { operation: "consult", provenance: "EXPLICIT_REQUEST" },
+  { operation: "complete", provenance: "UNKNOWN" },
+], "unknown complete provenance is rejected before host admission")
+bindCanonicalRequest(explicitCompleteRequest, explicitCompleteCriteria)
+const mutations = requests.filter((item) => item.action === "request_scoped_objective").length
+deny = true
+responseQueue.push(context(14))
+let rejected = false
+try { await invoke({ expected_revision: 14 }) }
+catch (error) { rejected = String(error).includes("HOST_DENIED") }
+await Promise.all(writes)
+assert(rejected && permissions.length === 4, "host denial stops the semantic route")
+assert(requests.filter((item) => item.action === "request_scoped_objective").length === mutations,
+  "denial cannot record semantic proof")
+''',
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                ("bun", "run", str(runner)), cwd=root, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_accepted_slice_file_edit_helper_proposes_exact_bounded_delta(self) -> None:
         # A fresh E1 accepted Slice may request one file, but the tool must
         # preserve all Core constraints and never resolve the human decision.
@@ -1222,11 +1420,12 @@ assert(recoveryTool.input.additionalProperties === false, "typed recovery tool r
 assert(JSON.stringify(recoveryTool.input.required) === JSON.stringify(["expected_revision", "repository_id", "feature_id", "change_id", "legacy_detail"]), "typed recovery tool requires exact recovery identity and detail only")
 const hookEvent = { system: [] }
 runtime.contextHook(hookEvent)
-assert(hookEvent.system[0].text.includes("evospec_context"), "context hook guides agents to canonical EvoSpec context")
-assert(hookEvent.system[0].text.includes("¿dónde seguimos?"), "context hook recognizes natural-language recovery")
-assert(hookEvent.system[0].text.includes("Read-only questions never initialize"), "status questions do not trigger lifecycle actions")
-assert(hookEvent.system[0].text.includes("SAFE_AUTOMATIC_OPERATION"), "context hook installs outcome-driven continuation defaults")
-assert(hookEvent.system[0].text.includes("evospec_request_scoped_objective"), "context hook guides bounded objective verification")
+const contextInstructions = hookEvent.system.map((item) => item.text).join("\\n")
+assert(contextInstructions.includes("evospec_context"), "context hook guides agents to canonical EvoSpec context")
+assert(contextInstructions.includes("¿dónde seguimos?"), "context hook recognizes natural-language recovery")
+assert(contextInstructions.includes("Read-only questions never initialize"), "status questions do not trigger lifecycle actions")
+assert(contextInstructions.includes("SAFE_AUTOMATIC_OPERATION"), "context hook installs outcome-driven continuation defaults")
+assert(contextInstructions.includes("evospec_request_scoped_objective"), "context hook guides bounded objective verification")
 let exitStatus = 0
 Object.defineProperty(Bun, "spawn", { value(command, options) {
   commands.push({ command, cwd: options.cwd })

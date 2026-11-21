@@ -104,11 +104,20 @@ from .domain import (
     WorkRelationKind,
     VerificationEvidence,
     WorkingContext,
+    request_objective_criteria_revision,
+    request_objective_policy,
+    is_sha256_digest,
     validate_state,
 )
 from .lifecycle import Classification, LifecycleState, Phase, ReviewVerdict
 from .discovery import DiscoveryPolicy
-from .input_fingerprint import InputFingerprintError, InputSnapshot, repository_input_snapshot
+from .input_fingerprint import (
+    INPUT_POLICY_DIGEST,
+    INPUT_POLICY_ID,
+    InputFingerprintError,
+    InputSnapshot,
+    repository_input_snapshot,
+)
 from .request_scoped_objective import REQUEST_SCOPED_OBJECTIVE
 
 JsonValue: TypeAlias = (
@@ -122,6 +131,7 @@ R3B_SCHEMA: Final = 17
 FEATURE_COMPLETION_SCHEMA: Final = 18
 FEATURE_CYCLE_SCHEMA: Final = 19
 REQUEST_OBJECTIVE_SCHEMA: Final = 20
+SEMANTIC_REQUEST_OBJECTIVE_SCHEMA: Final = 21
 LEGACY_WRITE_SCHEMA: Final = 13
 E1_TASK_PROGRESS_SCHEMA: Final = 14
 INTEGRATION_REGISTRY_SCHEMA: Final = 1
@@ -177,6 +187,7 @@ STATE_FIELDS_V17: Final = STATE_FIELDS_V17_LEGACY | frozenset(("criterion_covera
 STATE_FIELDS_V18: Final = STATE_FIELDS_V17 | frozenset(("feature_completion_receipts",))
 STATE_FIELDS_V19: Final = STATE_FIELDS_V18 | frozenset(("feature_reopen_receipts",))
 STATE_FIELDS_V20: Final = STATE_FIELDS_V19
+STATE_FIELDS_V21: Final = STATE_FIELDS_V20
 CONTEXT_FIELDS: Final = frozenset(
     (
         "feature_id",
@@ -808,8 +819,12 @@ def _slice_criteria_to_json(revision: SliceCriteriaRevision) -> JsonValue:
         "exclusions": list(revision.exclusions),
         "decisions": list(revision.decisions),
         "criteria": [
-            {"id": item.id, "expected_result": item.expected_result,
-             "expected_evidence": item.expected_evidence}
+            {
+                "id": item.id,
+                "expected_result": item.expected_result,
+                "expected_evidence": item.expected_evidence,
+                **({"provenance": item.provenance} if item.provenance is not None else {}),
+            }
             for item in revision.criteria
         ],
         "source": revision.source,
@@ -827,9 +842,19 @@ def _slice_criteria_from_json(value: JsonValue) -> SliceCriteriaRevision:
             _string(item["id"], "criterion id"),
             _string(item["expected_result"], "expected result"),
             _string(item["expected_evidence"], "expected evidence"),
+            _string(item["provenance"], "criterion provenance")
+            if "provenance" in item else None,
         )
         for entry in _array(raw["criteria"], "criteria")
-        for item in (_object(entry, frozenset(("id", "expected_result", "expected_evidence")), "criterion"),)
+        for item in (
+            _object(
+                entry,
+                frozenset(("id", "expected_result", "expected_evidence", "provenance"))
+                if isinstance(entry, dict) and "provenance" in entry
+                else frozenset(("id", "expected_result", "expected_evidence")),
+                "criterion",
+            ),
+        )
     )
     return SliceCriteriaRevision(
         _string(raw["id"], "criteria revision id"),
@@ -1781,7 +1806,7 @@ def _criterion_test_from_json(value: JsonValue, schema: int) -> CriterionTestRec
     )
     raw = _object(value, allowed, "R3 criterion test")
     def optional_r3_string(key: str, label: str) -> str | None:
-        if key not in raw or schema == REQUEST_OBJECTIVE_SCHEMA and raw[key] is None:
+        if key not in raw or schema in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA) and raw[key] is None:
             return None
         return _string(raw[key], label)
 
@@ -1982,10 +2007,12 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                     decoded.pop(field)
         if schema in (9, 10):
             raw = _object(decoded, STATE_FIELDS_V10, "state")
-        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA):
+        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA):
             decoded_fields = set(decoded)
             if schema == REQUEST_OBJECTIVE_SCHEMA and decoded_fields == set(STATE_FIELDS_V20):
                 raw = _object(decoded, STATE_FIELDS_V20, "state")
+            elif schema == SEMANTIC_REQUEST_OBJECTIVE_SCHEMA and decoded_fields == set(STATE_FIELDS_V21):
+                raw = _object(decoded, STATE_FIELDS_V21, "state")
             elif schema == FEATURE_CYCLE_SCHEMA and decoded_fields == set(STATE_FIELDS_V19):
                 raw = _object(decoded, STATE_FIELDS_V19, "state")
             elif schema == FEATURE_COMPLETION_SCHEMA and decoded_fields == set(STATE_FIELDS_V18):
@@ -2067,7 +2094,7 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 legacy_fields,
                 "state",
             )
-        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA):
+        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA):
             raise DecodeError("unknown state schema")
         (
             initialization, deferred, intake, selection, recovery, selection_history,
@@ -2171,7 +2198,7 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 for item in _array(raw["feature_reopen_receipts"], "Feature reopening receipts")
             ) if schema >= FEATURE_CYCLE_SCHEMA else (),
         )
-        if schema >= R3B_SCHEMA and schema != REQUEST_OBJECTIVE_SCHEMA and state.r3b_schema_upgrade is None:
+        if schema >= R3B_SCHEMA and schema not in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA) and state.r3b_schema_upgrade is None:
             raise DecodeError("schema 17 requires an explicit R3-B conversion receipt")
         if schema == FEATURE_CYCLE_SCHEMA and not state.feature_reopen_receipts:
             raise DecodeError("schema 19 requires explicit Feature reopening authority")
@@ -2182,11 +2209,14 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
         )
         if schema < REQUEST_OBJECTIVE_SCHEMA and has_request_objective:
             raise DecodeError("request-objective authority requires schema 20")
-        if schema == REQUEST_OBJECTIVE_SCHEMA and not (
-            any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_criteria_revisions)
-            and any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_outcome_receipts)
-        ):
-            raise DecodeError("schema 20 requires canonical request-objective proof")
+        if schema in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA):
+            lane = _request_objective_schema_for_state(state)
+            if (
+                lane != schema
+                or not any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_criteria_revisions)
+                or not any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_outcome_receipts)
+            ):
+                raise DecodeError(f"schema {schema} requires its canonical request-objective proof")
         validate_state(state)
         _validate_capability_selection_authority(state, schema)
         contexts = tuple(
@@ -2657,25 +2687,65 @@ def _pending_intake_from_json(value: JsonValue) -> PendingIntake | None:
     return PendingIntake(IntakeId(_string(item["id"], "intake id")), _string(item["intent"], "intake intent"), FeatureId(_string(item["deferred_from_feature_id"], "intake feature")), None if completed is None else ChangeId(completed), _optional_string(item["target_hint"], "intake target"))
 
 
+def _request_objective_schema_for_state(state: State) -> int | None:
+    """Identify the static or semantic lane from the immutable session agreement."""
+    features = tuple(item for item in state.agreements if item.kind == "FEATURE")
+    slices = tuple(item for item in state.agreements if item.kind == "SLICE")
+    if (
+        len(state.agreements) != 2
+        or len(features) != 1
+        or len(slices) != 1
+        or features[0].source != "SESSION_REQUEST"
+        or slices[0].source != "SESSION_REQUEST"
+        or features[0].statement != slices[0].statement
+        or features[0].source_reference != slices[0].source_reference
+        or features[0].feature_id != slices[0].feature_id
+        or features[0].change_id != slices[0].change_id
+        or state.initialization is None
+        or slices[0].repository_id != state.initialization.repository_id
+    ):
+        return None
+    expected = request_objective_criteria_revision(
+        slices[0].id, slices[0].repository_id, slices[0].source_reference,
+        slices[0].statement,
+    )
+    if expected is None:
+        return None
+    if state.slice_criteria_revisions and state.slice_criteria_revisions != (expected,):
+        return None
+    if state.slice_criteria_heads and state.slice_criteria_heads != (
+        SliceCriteriaHead(slices[0].id, expected.id),
+    ):
+        return None
+    if bool(state.slice_criteria_revisions) != bool(state.slice_criteria_heads):
+        return None
+    return (
+        REQUEST_OBJECTIVE_SCHEMA
+        if expected.criteria[0].id == "request-objective-heading"
+        else SEMANTIC_REQUEST_OBJECTIVE_SCHEMA
+    )
+
+
 def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
     """Preserve each accepted layout until a scoped authority decision changes it."""
-    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA):
+    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA):
         raise ValueError("unsupported state writer schema")
     if schema < SCHEMA and (state.slice_criteria_revisions or state.slice_criteria_heads):
         raise ValueError("Slice criteria cannot be silently downgraded")
     if (
         schema >= R3B_SCHEMA
-        and schema != REQUEST_OBJECTIVE_SCHEMA
+        and schema not in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA)
         and state.r3b_schema_upgrade is None
     ):
         raise ValueError("schema 17 requires its separate human-approved conversion receipt")
     if schema == FEATURE_CYCLE_SCHEMA and not state.feature_reopen_receipts:
         raise ValueError("schema 19 requires a human reopening receipt")
-    if schema == REQUEST_OBJECTIVE_SCHEMA and not (
-        any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_criteria_revisions)
-        and any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_outcome_receipts)
+    if schema in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA) and (
+        _request_objective_schema_for_state(state) != schema
+        or not any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_criteria_revisions)
+        or not any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_outcome_receipts)
     ):
-        raise ValueError("schema 20 requires canonical request-objective proof")
+        raise ValueError(f"schema {schema} requires its canonical request-objective proof")
     if schema < REQUEST_OBJECTIVE_SCHEMA and (
         any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_criteria_revisions)
         or any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_outcome_receipts)
@@ -2942,12 +3012,12 @@ class _StateStore:
             expected_id = sha256(str(self.__root).encode("utf-8")).hexdigest()[:16]
             if state.initialization is None or state.initialization.repository_id != expected_id:
                 raise RecoveryError("accepted Slice state belongs to a different repository root")
-        return state, (schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA) if state.agreements else None)
+        return state, (schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA) if state.agreements else None)
 
     def e1_schema_ready(self) -> bool:
         """Legacy state remains readable but cannot silently enter the E1 writer path."""
         raw = _read_json(_artifact_path(self.__root, "state.json"))
-        return isinstance(raw, dict) and raw.get("schema") in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA)
+        return isinstance(raw, dict) and raw.get("schema") in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA)
 
     def r3_schema_ready(self) -> bool:
         """Schema 15 stays readable; it never becomes an R3 writer without consent."""
@@ -2960,9 +3030,11 @@ class _StateStore:
         return isinstance(raw, dict) and raw.get("schema") in (R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA)
 
     def request_objective_schema_ready(self) -> bool:
-        """Only the scoped Core objective writer may select schema 20."""
+        """Recognize either exact canonical request-objective writer schema."""
         raw = _read_json(_artifact_path(self.__root, "state.json"))
-        return isinstance(raw, dict) and raw.get("schema") == REQUEST_OBJECTIVE_SCHEMA
+        return isinstance(raw, dict) and raw.get("schema") in (
+            REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
+        )
 
     def r3b_upgrade_eligible(self) -> bool:
         raw = _read_json(_artifact_path(self.__root, "state.json"))
@@ -3140,7 +3212,7 @@ class _StateStore:
             if upgrade and (source_digest is None or self.state_source_sha256() != source_digest):
                 raise AtomicFailure("E1 conversion source identity changed after human approval")
             source_schema = self.__writer_schema_locked(current, allow_e1_upgrade=upgrade)
-            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA):
+            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA):
                 raise AtomicFailure("E1_TASK_PROGRESS_REQUIRES_SCHEMA_14")
             candidate = transform(current)
             if candidate.revision != current.revision + 1:
@@ -3186,7 +3258,7 @@ class _StateStore:
             if source_digest is not None and self.state_source_sha256() != source_digest:
                 raise AtomicFailure("R3-B conversion source identity changed after human approval")
             output_schema = self.__writer_schema_locked(current, allow_r3b_upgrade=upgrade)
-            if output_schema not in (R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA):
+            if output_schema not in (R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA):
                 raise AtomicFailure("R3B_SCHEMA_UPGRADE_REQUIRED")
             if not upgrade and expected_input_fingerprint is None:
                 raise AtomicFailure("R3-B operation requires its observed workspace fingerprint")
@@ -3223,7 +3295,9 @@ class _StateStore:
             output_schema = self.__writer_schema_locked(
                 current, allow_request_objective=True,
             )
-            if output_schema != REQUEST_OBJECTIVE_SCHEMA or current.initialization is None:
+            if output_schema not in (
+                REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
+            ) or current.initialization is None:
                 raise AtomicFailure("REQUEST_OBJECTIVE_SCHEMA_UNAVAILABLE")
             try:
                 snapshot = repository_input_snapshot(
@@ -3236,12 +3310,18 @@ class _StateStore:
             candidate = transform(current)
             if candidate == current:
                 raw = _read_json(_artifact_path(self.__root, "state.json"))
-                if not isinstance(raw, dict) or raw.get("schema") != REQUEST_OBJECTIVE_SCHEMA:
+                if not isinstance(raw, dict) or raw.get("schema") != output_schema:
                     raise AtomicFailure("REQUEST_OBJECTIVE_SCHEMA_UPGRADE_REQUIRED")
                 return current
             if candidate.revision != current.revision + 1:
                 raise AtomicFailure("REQUEST_OBJECTIVE must publish exactly one revision")
-            self.__validate_request_objective_delta(current, candidate)
+            try:
+                validate_state(candidate)
+            except StateValidationError as error:
+                raise AtomicFailure(f"REQUEST_OBJECTIVE candidate is invalid: {error}") from error
+            self.__validate_request_objective_delta(
+                current, candidate, expected_input_fingerprint, output_schema,
+            )
             try:
                 after = repository_input_snapshot(
                     self.__root, current.initialization.repository_id,
@@ -3264,9 +3344,26 @@ class _StateStore:
             )
             return candidate
 
-    def __validate_request_objective_delta(self, current: State, candidate: State) -> None:
+    def __validate_request_objective_delta(
+        self, current: State, candidate: State,
+        expected_input_fingerprint: str, output_schema: int,
+    ) -> None:
         criteria_added = len(candidate.slice_criteria_revisions) - len(current.slice_criteria_revisions)
         heads_added = len(candidate.slice_criteria_heads) - len(current.slice_criteria_heads)
+        proof_added = len(candidate.criterion_test_receipts) - len(current.criterion_test_receipts)
+        outcome_added = len(candidate.slice_outcome_receipts) - len(current.slice_outcome_receipts)
+        if (
+            _request_objective_schema_for_state(candidate) != output_schema
+            or not candidate.slice_criteria_revisions
+        ):
+            raise AtomicFailure("REQUEST_OBJECTIVE candidate is not the selected canonical lane")
+        criteria = candidate.slice_criteria_revisions[-1]
+        try:
+            policy_id, policy_digest, outcome_basis = request_objective_policy(criteria)
+        except DomainError as error:
+            raise AtomicFailure("REQUEST_OBJECTIVE criteria have no canonical policy") from error
+        new_proofs = candidate.criterion_test_receipts[len(current.criterion_test_receipts):]
+        new_outcomes = candidate.slice_outcome_receipts[len(current.slice_outcome_receipts):]
         if criteria_added not in (0, 1) or heads_added not in (0, 1):
             raise AtomicFailure("REQUEST_OBJECTIVE may append at most one canonical criteria head")
         if (
@@ -3275,10 +3372,10 @@ class _StateStore:
             or candidate.slice_criteria_heads[:len(current.slice_criteria_heads)]
             != current.slice_criteria_heads
             or heads_added != criteria_added
-            or len(candidate.criterion_test_receipts) != len(current.criterion_test_receipts) + 1
+            or proof_added != len(criteria.criteria)
             or candidate.criterion_test_receipts[:len(current.criterion_test_receipts)]
             != current.criterion_test_receipts
-            or len(candidate.slice_outcome_receipts) != len(current.slice_outcome_receipts) + 1
+            or outcome_added != 1
             or candidate.slice_outcome_receipts[:len(current.slice_outcome_receipts)]
             != current.slice_outcome_receipts
             or replace(
@@ -3291,6 +3388,61 @@ class _StateStore:
             ) != current
         ):
             raise AtomicFailure("REQUEST_OBJECTIVE changed authority outside its exact receipt bundle")
+        if tuple(item.criterion_id for item in new_proofs) != tuple(
+            item.id for item in criteria.criteria
+        ):
+            raise AtomicFailure("REQUEST_OBJECTIVE must append one ordered proof per criterion")
+        if any(
+            proof.slice_agreement_ref != criteria.slice_agreement_ref
+            or proof.criteria_revision_id != criteria.id
+            or proof.test_kind != policy_id
+            or proof.test_target != "index.html"
+            or proof.exit_code != 0
+            or proof.source_revision != current.revision
+            or proof.recorded_revision != candidate.revision
+            or proof.input_fingerprint_before != expected_input_fingerprint
+            or proof.input_fingerprint_after != expected_input_fingerprint
+            or proof.input_policy_id != INPUT_POLICY_ID
+            or proof.input_policy_digest != INPUT_POLICY_DIGEST
+            or proof.admission_policy_id != policy_id
+            or proof.admission_policy_digest != policy_digest
+            or proof.external_inputs
+            or proof.runtime_executable is not None
+            or proof.runtime_executable_sha256 is not None
+            or proof.runtime_version is not None
+            or proof.runtime_argv
+            or proof.environment_profile_id is not None
+            or proof.environment_profile_digest is not None
+            or proof.coverage_approval_id is not None
+            or proof.coverage_contract_digest is not None
+            or not is_sha256_digest(proof.output_sha256)
+            for proof in new_proofs
+        ):
+            raise AtomicFailure("REQUEST_OBJECTIVE proof bundle has unsupported or mismatched provenance")
+        if (
+            output_schema == SEMANTIC_REQUEST_OBJECTIVE_SCHEMA
+            and len({proof.output_sha256 for proof in new_proofs}) != 1
+        ):
+            # One browser execution observes one artifact; each criterion gets a
+            # separate receipt, all naming that same exact verified byte stream.
+            raise AtomicFailure("REQUEST_OBJECTIVE browser proofs must name one artifact digest")
+        outcome = new_outcomes[0]
+        if (
+            outcome.evidence_receipt_ids != tuple(item.id for item in new_proofs)
+            or outcome.slice_agreement_ref != criteria.slice_agreement_ref
+            or outcome.criteria_revision_id != criteria.id
+            or outcome.repository_id != criteria.repository_id
+            or outcome.input_fingerprint != expected_input_fingerprint
+            or outcome.input_policy_id != INPUT_POLICY_ID
+            or outcome.input_policy_digest != INPUT_POLICY_DIGEST
+            or outcome.admission_policy_id != policy_id
+            or outcome.admission_policy_digest != policy_digest
+            or outcome.basis != outcome_basis
+            or outcome.source != REQUEST_SCOPED_OBJECTIVE
+            or outcome.source_revision != current.revision
+            or outcome.recorded_revision != candidate.revision
+        ):
+            raise AtomicFailure("REQUEST_OBJECTIVE outcome differs from its exact proof bundle")
 
     def transact_feature_completion(
         self, expected_revision: int, transform: Callable[[State], State],
@@ -3309,10 +3461,12 @@ class _StateStore:
             if (
                 output_schema not in (
                     FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA,
-                    REQUEST_OBJECTIVE_SCHEMA,
+                    REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
                 )
                 or current.initialization is None
-                or request_objective and output_schema != REQUEST_OBJECTIVE_SCHEMA
+                or request_objective and output_schema not in (
+                    REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
+                )
             ):
                 raise AtomicFailure("FEATURE_COMPLETION_REQUIRES_SCHEMA_17")
             try:
@@ -3323,6 +3477,10 @@ class _StateStore:
                 raise AtomicFailure("Feature completion root inputs changed before publication")
             candidate = transform(current)
             if request_objective:
+                try:
+                    validate_state(candidate)
+                except StateValidationError as error:
+                    raise AtomicFailure(f"REQUEST_OBJECTIVE completion candidate is invalid: {error}") from error
                 if candidate.revision != current.revision + 1:
                     raise AtomicFailure("REQUEST_OBJECTIVE completion must publish exactly one revision")
                 if (
@@ -3378,7 +3536,7 @@ class _StateStore:
             if current.revision != expected_revision:
                 raise AtomicFailure("Feature reopening expected revision is stale")
             output_schema = self.__writer_schema_locked(current, allow_feature_reopening=True)
-            if output_schema not in (FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA) or current.initialization is None:
+            if output_schema not in (FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA) or current.initialization is None:
                 raise AtomicFailure("FEATURE_REOPENING_REQUIRES_SCHEMA_18")
             try:
                 snapshot = repository_input_snapshot(self.__root, current.initialization.repository_id)
@@ -3432,27 +3590,8 @@ class _StateStore:
         source_schema = raw["schema"]
         if allow_request_objective:
             if source_schema == SCHEMA:
-                feature_agreements = tuple(
-                    item for item in current.agreements
-                    if item.kind == "FEATURE"
-                )
-                slice_agreements = tuple(
-                    item for item in current.agreements
-                    if item.kind == "SLICE"
-                )
                 if (
-                    len(current.agreements) != 2
-                    or len(feature_agreements) != 1
-                    or len(slice_agreements) != 1
-                    or any(
-                        item.source != "SESSION_REQUEST"
-                        or item.statement != slice_agreements[0].statement
-                        or item.source_reference != slice_agreements[0].source_reference
-                        or item.feature_id != slice_agreements[0].feature_id
-                        or item.change_id != slice_agreements[0].change_id
-                        for item in feature_agreements
-                    )
-                    or slice_agreements[0].source != "SESSION_REQUEST"
+                    _request_objective_schema_for_state(current) is None
                     or current.r3_schema_upgrade is not None
                     or current.r3b_schema_upgrade is not None
                     or current.slice_criteria_revisions
@@ -3462,9 +3601,12 @@ class _StateStore:
                     or current.criterion_coverage_approvals
                 ):
                     raise AtomicFailure("REQUEST_OBJECTIVE_REQUIRES_EXACT_UNCONVERTED_SESSION_REQUEST")
-                return REQUEST_OBJECTIVE_SCHEMA
+                lane = _request_objective_schema_for_state(current)
+                assert lane is not None
+                return lane
             if (
-                source_schema != REQUEST_OBJECTIVE_SCHEMA
+                source_schema not in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA)
+                or _request_objective_schema_for_state(current) != source_schema
                 or current.r3b_schema_upgrade is not None
                 or not current.slice_outcome_receipts
                 or not any(
@@ -3474,7 +3616,7 @@ class _StateStore:
                 or current.feature_completion_receipts
             ):
                 raise AtomicFailure("REQUEST_OBJECTIVE_REQUIRES_ACCEPTED_SCHEMA_15_AUTHORITY")
-            return REQUEST_OBJECTIVE_SCHEMA
+            return source_schema
         if allow_e1_upgrade:
             if source_schema != LEGACY_WRITE_SCHEMA or not current.agreements:
                 raise AtomicFailure("only accepted E1 schema-13 authority may be converted")
@@ -3488,29 +3630,37 @@ class _StateStore:
                 raise AtomicFailure("only unconverted schema-16 authority may enter R3-B")
             return R3B_SCHEMA
         if allow_feature_completion:
-            if source_schema == REQUEST_OBJECTIVE_SCHEMA:
-                if not current.slice_outcome_receipts or not any(
-                    item.source == REQUEST_SCOPED_OBJECTIVE
-                    for item in current.slice_criteria_revisions
+            if source_schema in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA):
+                if (
+                    _request_objective_schema_for_state(current) != source_schema
+                    or not current.slice_outcome_receipts
+                    or not any(
+                        item.source == REQUEST_SCOPED_OBJECTIVE
+                        for item in current.slice_criteria_revisions
+                    )
                 ):
                     raise AtomicFailure("REQUEST_OBJECTIVE completion requires its Core proof")
-                return REQUEST_OBJECTIVE_SCHEMA
+                return source_schema
             if source_schema not in (R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA) or current.r3b_schema_upgrade is None:
                 raise AtomicFailure("Feature completion requires explicitly upgraded R3-B authority")
             return FEATURE_CYCLE_SCHEMA if source_schema == FEATURE_CYCLE_SCHEMA else FEATURE_COMPLETION_SCHEMA
         if allow_feature_reopening:
-            if source_schema == REQUEST_OBJECTIVE_SCHEMA and current.feature_completion_receipts:
-                return REQUEST_OBJECTIVE_SCHEMA
+            if (
+                source_schema in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA)
+                and current.feature_completion_receipts
+                and _request_objective_schema_for_state(current) == source_schema
+            ):
+                return source_schema
             if source_schema not in (FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA) or not current.feature_completion_receipts:
                 raise AtomicFailure("Feature reopening requires a previous completed Feature")
             return FEATURE_CYCLE_SCHEMA
         if source_schema == LEGACY_WRITE_SCHEMA and current.agreements:
             raise AtomicFailure("E1_SCHEMA_UPGRADE_REQUIRED: ordinary writers are read-only")
         if allow_criteria_upgrade:
-            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA):
+            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA):
                 raise AtomicFailure("Slice criteria amendment requires E1 schema 14 or 15")
             return max(SCHEMA, source_schema)
-        return source_schema if source_schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA) else LEGACY_WRITE_SCHEMA
+        return source_schema if source_schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA) else LEGACY_WRITE_SCHEMA
 
     def __publish_state_locked(
         self, state: State, *, strict_directory: bool = False, allow_e1_upgrade: bool = False,
