@@ -103,7 +103,8 @@ jobs:
         run: uv run --python ${{ matrix.python }} --extra semantic-browser python -m playwright install chromium
       - name: Linux real-browser proof BLOCKED (no verified process boundary)
         if: runner.os == 'Linux'
-        run: echo "::warning::BLOCKED/unimplemented: Linux browser verification is unavailable before worker launch; deterministic Core tests remain enabled."
+        run: |
+          echo "::warning::BLOCKED/unimplemented: Linux browser verification is unavailable before worker launch; deterministic Core tests remain enabled."
       - name: Required Windows real-browser request objective tests
         if: runner.os == 'Windows'
         env:
