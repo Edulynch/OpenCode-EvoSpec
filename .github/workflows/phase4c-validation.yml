@@ -98,6 +98,19 @@ jobs:
         run: uv python install ${{ matrix.python }}
       - name: Source tests
         run: uv run --python ${{ matrix.python }} python -m unittest discover -v
+      - name: Install sandboxed Chromium
+        if: runner.os == 'Windows'
+        run: uv run --python ${{ matrix.python }} --extra semantic-browser python -m playwright install chromium
+      - name: Linux real-browser proof BLOCKED (no verified process boundary)
+        if: runner.os == 'Linux'
+        run: |
+          echo "::warning::BLOCKED/unimplemented: Linux browser verification is unavailable before worker launch; deterministic Core tests remain enabled."
+      - name: Required Windows real-browser request objective tests
+        if: runner.os == 'Windows'
+        env:
+          EVOSPEC_RUN_BROWSER_TESTS: "1"
+          EVOSPEC_REQUIRE_BROWSER_TESTS: "1"
+        run: uv run --python ${{ matrix.python }} --extra semantic-browser python -m unittest -v tests.test_request_objective_browser
       - name: Windows Python 3.13 runtime metadata regression
         if: runner.os == 'Windows'
         # The reported false executable drift occurred in Python 3.13 on Windows.

@@ -8,8 +8,20 @@ import json
 from pathlib import Path
 import unittest
 
-from evospec.domain import ExpectedRevision, OperationalState, validate_state
-from evospec.persistence import REQUEST_OBJECTIVE_SCHEMA, SCHEMA
+from evospec.domain import (
+    CriterionTestReceipt,
+    ExpectedRevision,
+    OperationalState,
+    request_objective_criteria_revision,
+    validate_state,
+)
+from evospec.persistence import (
+    REQUEST_OBJECTIVE_SCHEMA,
+    SCHEMA,
+    _criterion_test_to_json,
+    _slice_criteria_to_json,
+    encode_json,
+)
 from evospec.request_scoped_objective import REQUEST_SCOPED_OBJECTIVE
 from evospec.services import (
     CoreService,
@@ -298,6 +310,62 @@ class RequestObjectiveLifecycleTests(unittest.TestCase):
         assert stale_projection is not None
         self.assertEqual(stale_projection.status, "BLOCKED")
         self.assertIn("REQUEST_OBJECTIVE_PROOF_STALE", stale_projection.blockers)
+
+
+class StaticSchema20CompatibilityTests(unittest.TestCase):
+    def test_static_criteria_and_receipt_match_pinned_schema20_bytes(self) -> None:
+        # Expectations reconstructed from the schema-20 helpers at
+        # e4a709ec2695f1a2d337ede26440fdf1204d8a68.
+        self.assertEqual(REQUEST_OBJECTIVE_SCHEMA, 20)
+        criteria = request_objective_criteria_revision(
+            "slice-baseline-20",
+            "repo-baseline-20",
+            "session/msg",
+            REQUEST,
+        )
+        self.assertIsNotNone(criteria)
+        assert criteria is not None
+        self.assertEqual(
+            criteria.id,
+            "slice-criteria-objective-718274352d7056ad7d2c",
+        )
+        criteria_bytes = encode_json(_slice_criteria_to_json(criteria))
+        self.assertEqual(
+            sha256(criteria_bytes).hexdigest(),
+            "ba42eda6fed47a8f4e5cf9ab1f364c9bf190cf99ac2949a743f34b18329fd420",
+        )
+        criteria_value = json.loads(criteria_bytes)
+        self.assertNotIn("provenance", criteria_value["criteria"][0])
+
+        proof = CriterionTestReceipt(
+            "criterion-test-b936719130af04605c81",
+            "slice-baseline-20",
+            criteria.id,
+            "request-objective-heading",
+            "core-static-heading-v1",
+            "index.html",
+            0,
+            "e6c6fa2f0fa41caad762d598002beff647a13a43e44ac5c16597fa7a96cba155",
+            7,
+            8,
+            "1" * 64,
+            "1" * 64,
+            "r3-root-input-v2",
+            "981300466a2e2881c4cd38090c37244552d23d9b5f058ef19a444d351e2c5d90",
+            "core-static-heading-v1",
+            "0b619428a4b30f6aa2f71aecee85f32f8723fa92a2fe7503700d87242a326da2",
+        )
+        receipt_bytes = encode_json(
+            _criterion_test_to_json(proof, REQUEST_OBJECTIVE_SCHEMA),
+        )
+        self.assertEqual(
+            sha256(receipt_bytes).hexdigest(),
+            "a0bf50eced567cba23fe513876a88e263f65222c68254246f9b82690c4361902",
+        )
+        receipt_value = json.loads(receipt_bytes)
+        self.assertEqual(receipt_value["id"], "criterion-test-b936719130af04605c81")
+        self.assertNotIn("coverage_approval_id", receipt_value)
+        self.assertNotIn("coverage_contract_digest", receipt_value)
 
 
 if __name__ == "__main__":

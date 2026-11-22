@@ -289,4 +289,47 @@ The provider-neutral wire request has exactly these fields:
 
 Unknown or missing keys, a non-SHA-256 fingerprint, or incorrectly typed values are rejected. Core checks the exact original request and root-bound evidence again; stale revisions are not rebound. A successful evidence phase returns `REQUEST_OBJECTIVE_VERIFIED` after the actual objective evidence and Slice outcome are persisted. A separate call with the refreshed revision revalidates the same request and fresh workspace before normal terminal archival and Feature-receipt CAS, returning `REQUEST_OBJECTIVE_COMPLETE`. An exact completed replay returns `REQUEST_OBJECTIVE_ALREADY_COMPLETE` without another revision. If the actual page does not verify, context reports `status: "BLOCKED"` with blocker `REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED`; the failed check does not accept criteria or create an outcome or closure. Generic application requests are outside the two recognized forms and do not receive synthesized criteria. This lane does not publish Product Truth or authorize Git/release activity.
 
-Read-only context always includes `request_scoped_objective`, either `null` or the five Core-derived fields `status`, `source_reference`, `request_sha256`, `blockers`, and `heading`. The status is `PENDING`, `VERIFIED`, `BLOCKED`, or `COMPLETE`; blockers are Core's literal reasons, not model conclusions. After closure with no active work, context may compute the current workspace snapshot so a caller can reconcile the exact replay hash; an optional scan failure leaves context readable and does not create a new verification pass. The projection uses canonical Core state, not arbitrary client claims. In the OpenCode integration this action is available only through its dedicated host tool; the generic raw `evospec` tool refuses it. Automated protocol tests do not qualify a native permission dialog or a live OpenCode session.
+Read-only context always includes `request_scoped_objective`, either `null` or the five Core-derived static-heading fields `status`, `source_reference`, `request_sha256`, `blockers`, and `heading`. The personal-task variant adds `kind` and ordered `criteria`; see the next section. The status is `PENDING`, `VERIFIED`, `BLOCKED`, or `COMPLETE`; blockers are Core's literal reasons, not model conclusions. After closure with no active work, context may compute the current workspace snapshot so a caller can reconcile the exact replay hash; an optional scan failure leaves context readable and does not create a new verification pass. The projection uses canonical Core state, not arbitrary client claims. In the OpenCode integration this action is available only through its dedicated host tool; the generic raw `evospec` tool refuses it. Automated protocol tests do not qualify a native permission dialog or a live OpenCode session.
+
+## Request-scoped objective: personal-task web app
+
+The static-heading form above remains unchanged and continues to work with schema 20. A separate schema-21 Core path recognizes only its bounded English/Spanish personal-task web-app grammar, for example:
+
+```text
+Build a web app to manage my personal tasks
+Quiero una aplicación web para administrar mis tareas personales
+```
+
+For a recognized original `SESSION_REQUEST`, read-only context adds these fields to `request_scoped_objective` (the legacy `heading` remains present and is `null`):
+
+```json
+{
+  "kind": "PERSONAL_TASKS_WEB",
+  "criteria": [
+    {"operation": "create", "provenance": "DERIVED_OBJECTIVE"},
+    {"operation": "consult", "provenance": "DERIVED_OBJECTIVE"}
+  ]
+}
+```
+
+`create` and `consult` are the bounded baseline. `complete` appears only when the original request explicitly asks for it, with `provenance: "EXPLICIT_REQUEST"`; never add an operation from model-authored arguments. When Core later projects the accepted `criteria_revision`, criterion `provenance` is serialized only when populated, so existing static and legacy criterion objects keep their original keys. No generic request fields or request-scoped writer fields are added.
+
+The only target remains `index.html`. Creation is eligible only when Core's exact source, current root/revision, missing-artifact blockers, and existing path/action/operation budget support that file, with no material decision or out-of-scope request. UI, layout, and persistence implementation details are discretionary; do not ask for a design choice or add unrequested features. The browser verifier uses these stable visible affordances:
+
+- A visible text input: `[data-evo-action="task-input"]`.
+- A visible native add button: `[data-evo-action="add-task"]`.
+- One visible `[data-evo-task]` row for each actual task, showing that task's exact title.
+- Only for an explicitly requested `complete` criterion, a native checkbox `[data-evo-action="complete-task"]` in the corresponding task row.
+
+Core runs the built-in Playwright 1.65.2 Chromium verifier against the actual page; it does not accept a mock, model claim, or externally supplied proof. The verifier uses an ephemeral browser context, not a user browser/profile. Missing dependencies or an unavailable safe isolated runtime/control produce a Core blocker; there is no fallback to weaker proof. To provision the optional Windows verifier in an isolated Python environment from the source checkout, install the `semantic-browser` extra and its Chromium binary explicitly:
+
+```text
+python -m pip install '.[semantic-browser]'
+python -m playwright install chromium
+```
+
+Core does not download browser binaries automatically. The same dedicated `evospec_request_scoped_objective` call still takes only the current `expected_revision`; Core derives criteria from the persisted original request and runs the real proof. A successful proof returns `REQUEST_OBJECTIVE_VERIFIED`; a separate call at the fresh revision rechecks the same source and current inputs before `REQUEST_OBJECTIVE_COMPLETE`. A failed/unavailable proof, material decision, stale or unsupported request, or missing scope blocks without accepting criteria or closing the Feature. The path does not add a permission, TTY, release, or native-host qualification claim.
+
+The qualifying browser verifier currently runs only on Windows. Its browser process uses a kill-on-close Windows Job Object, a 2 GiB aggregate memory bound, and a total deadline; these controls are not an OS sandbox or an atomic host guarantee. Linux and other native platforms do not launch the browser or issue semantic objective receipts: Core blocks with `REQUEST_OBJECTIVE_BROWSER_UNAVAILABLE` rather than falling back. The optional extra is not part of default installs; Windows CI installs it and requires the browser tests. This does not change the standard release runtime, and the static-heading objective remains available. See the [browser verifier implementation](../evospec/request_scoped_objective_browser.py) for canonical runtime details.
+
+The current semantic proof closes each verifier-owned Page, creates a fresh harness-owned Page in the same offline browser context, and spends one exact-URL top-frame document GET to serve the scanned `index.html` bytes. After adding tasks, it requires exactly the same two visible rows after replacement; for explicit completion it changes one task, replaces the Page again, and requires both task identities and checkbox states to persist. App-owned same-URL reloads, other navigations, subframes, popups, downloads, and external resources fail closed. This checks same-origin, same-context full-document retention only; it does not establish durability across a browser/context/process restart or a remote store. Schema-21 v1 receipts and closures remain integrity-readable as history, but the v1 policy ID/digest pair is stale for current qualification; current proof uses the durability-aware v2 pair. An old closure stays stored and terminal while current status/replay fails closed as stale. No schema migration or historical-record rewrite occurs.

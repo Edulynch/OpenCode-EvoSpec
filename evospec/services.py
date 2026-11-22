@@ -102,9 +102,9 @@ from .domain import (
     feature_completion_statement_text,
     is_sha256_digest,
     request_objective_criteria_revision,
+    request_objective_policy,
+    request_objective_completion_condition,
     request_objective_completion_statement,
-    REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
-    REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
     TaskProgress,
     TerminalArchive,
     VerificationEvidence,
@@ -170,9 +170,16 @@ from .request_scoped_objective import (
     OBJECTIVE_TEST_KIND,
     OBJECTIVE_TEST_TARGET,
     REQUEST_SCOPED_OBJECTIVE,
+    TASK_APP_TEST_KIND,
+    TASK_APP_TEST_TARGET,
+    PersonalTasksObjective,
     StaticHeadingObjective,
-    derive_static_heading,
+    derive_request_objective,
     verify_static_heading,
+)
+from .request_scoped_objective_browser import (
+    BrowserObjectiveError,
+    verify_personal_tasks,
 )
 
 if TYPE_CHECKING:
@@ -269,6 +276,8 @@ class RequestScopedObjectiveStatus:
     request_sha256: str
     blockers: tuple[str, ...]
     heading: str | None
+    kind: str | None = None
+    criteria: tuple[tuple[str, str], ...] = ()
 
 
 _PYTHON_TEST_RUNNER = (
@@ -3203,7 +3212,8 @@ class CoreService:
             or evidence.source != "SESSION_REQUEST"
         ):
             blockers.append("REQUEST_OBJECTIVE_SESSION_MISMATCH")
-        if derive_static_heading(accepted.statement) is None:
+        objective = derive_request_objective(accepted.statement)
+        if objective is None:
             blockers.append("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST")
         if (
             state.initialization is None
@@ -3281,6 +3291,17 @@ class CoreService:
             accepted.source_reference,
             accepted.statement,
         )
+        expected_test_kind = (
+            request_objective_policy(expected_revision)[0]
+            if expected_revision is not None else None
+        )
+        expected_criterion_ids = (
+            {item.id for item in expected_revision.criteria}
+            if expected_revision is not None else set()
+        )
+        expected_test_kinds = {expected_test_kind}
+        if isinstance(objective, PersonalTasksObjective):
+            expected_test_kinds.add(TASK_APP_TEST_KIND)
         if (
             len(state.slice_criteria_revisions) != len(objective_revisions)
             or len(objective_revisions) > 1
@@ -3299,12 +3320,23 @@ class CoreService:
                     != (SliceCriteriaHead(accepted.id, expected_revision.id),)
                 )
             )
+            or (
+                expected_revision is not None
+                and not objective_revisions
+                and state.slice_criteria_heads
+            )
         ):
             blockers.append("REQUEST_OBJECTIVE_CRITERIA_NOT_CANONICAL")
+        expected_target = (
+            TASK_APP_TEST_TARGET
+            if isinstance(objective, PersonalTasksObjective)
+            else OBJECTIVE_TEST_TARGET
+        )
         if any(
             item.criteria_revision_id not in {item.id for item in objective_revisions}
-            or item.test_kind != OBJECTIVE_TEST_KIND
-            or item.test_target != OBJECTIVE_TEST_TARGET
+            or item.criterion_id not in expected_criterion_ids
+            or item.test_kind not in expected_test_kinds
+            or item.test_target != expected_target
             for item in state.criterion_test_receipts
         ):
             blockers.append("REQUEST_OBJECTIVE_FOREIGN_TEST_EVIDENCE")
@@ -3403,32 +3435,100 @@ class CoreService:
                 blockers.append("REQUEST_OBJECTIVE_ARTIFACT_HASH_UNAVAILABLE")
         return tuple(dict.fromkeys(blockers))
 
-    def _request_objective_artifact(
-        self, snapshot: InputSnapshot, heading: str,
-    ) -> tuple[str | None, tuple[str, ...]]:
+    def _read_request_objective_artifact(
+        self,
+        snapshot: InputSnapshot,
+        objective: StaticHeadingObjective | PersonalTasksObjective,
+    ) -> tuple[bytes | None, str | None, tuple[str, ...]]:
         expected_sha = next(
             (digest for path, digest in snapshot.file_sha256 if path == OBJECTIVE_TEST_TARGET),
             None,
         )
         if expected_sha is None or not _SHA256.fullmatch(expected_sha):
-            return None, ("REQUEST_OBJECTIVE_ARTIFACT_HASH_UNAVAILABLE",)
+            return None, None, ("REQUEST_OBJECTIVE_ARTIFACT_HASH_UNAVAILABLE",)
+        max_bytes = (
+            262_144 if isinstance(objective, PersonalTasksObjective) else 16_384
+        )
         try:
             content = read_repository_file(
                 self.__repository_root,
                 OBJECTIVE_TEST_TARGET,
                 expected_sha,
-                max_bytes=16_384,
+                max_bytes=max_bytes,
             )
         except InputFingerprintError:
-            return None, ("REQUEST_OBJECTIVE_ARTIFACT_CHANGED",)
-        actual_sha = verify_static_heading(
-            # `derive_static_heading` supplied this exact accepted heading.
-            StaticHeadingObjective(heading),
-            content,
+            return None, None, ("REQUEST_OBJECTIVE_ARTIFACT_CHANGED",)
+        actual_sha = sha256(content).hexdigest()
+        if isinstance(objective, StaticHeadingObjective):
+            # The legacy static verifier remains byte-for-byte unchanged.
+            verified_sha = verify_static_heading(objective, content)
+            if verified_sha is None or verified_sha != expected_sha:
+                return None, None, ("REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED",)
+        if actual_sha != expected_sha:
+            return None, None, ("REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED",)
+        return content, actual_sha, ()
+
+    def _request_objective_artifact(
+        self,
+        snapshot: InputSnapshot,
+        objective: StaticHeadingObjective | PersonalTasksObjective,
+    ) -> tuple[str | None, tuple[str, ...]]:
+        _, output_sha, blockers = self._read_request_objective_artifact(
+            snapshot, objective,
         )
-        if actual_sha is None or actual_sha != expected_sha:
-            return None, ("REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED",)
-        return actual_sha, ()
+        return output_sha, blockers
+
+    def _request_objective_terminal_evidence(
+        self,
+        objective: StaticHeadingObjective | PersonalTasksObjective,
+        criteria: SliceCriteriaRevision,
+        outcome: SliceOutcomeReceipt,
+        proofs: tuple[CriterionTestReceipt, ...],
+    ) -> tuple[ReviewResult, tuple[ReviewEvidence, ...], VerificationEvidence]:
+        review = ReviewResult(ReviewVerdict.PASS, (), True)
+        if isinstance(objective, StaticHeadingObjective):
+            proof = proofs[0]
+            review_evidence = (
+                ReviewEvidence(
+                    ReviewEvidenceCategory.TECHNICAL,
+                    ReviewEvidenceKind.FACT,
+                    "CORE_REQUEST_SCOPED_OBJECTIVE",
+                    True,
+                    f"Canonical criterion {criteria.criteria[0].id} passed strict static verifier",
+                    f"{outcome.id}:{proof.output_sha256}",
+                ),
+            )
+            verification = VerificationEvidence(
+                (
+                    f"{OBJECTIVE_TEST_KIND}:{OBJECTIVE_TEST_TARGET}:"
+                    f"{proof.output_sha256}",
+                ),
+                True,
+            )
+            return review, review_evidence, verification
+
+        review_evidence = tuple(
+            ReviewEvidence(
+                ReviewEvidenceCategory.TECHNICAL,
+                ReviewEvidenceKind.FACT,
+                "CORE_REQUEST_SCOPED_OBJECTIVE",
+                True,
+                f"Canonical criterion {criterion.id} passed isolated personal-tasks browser verifier on index.html",
+                f"{outcome.id}:{proof.id}:{proof.output_sha256}",
+            )
+            for criterion, proof in zip(criteria.criteria, proofs, strict=True)
+        )
+        verification = VerificationEvidence(
+            tuple(
+                (
+                    f"{proof.test_kind}:{proof.test_target}:{criterion.id}:"
+                    f"{proof.id}:{proof.output_sha256}"
+                )
+                for criterion, proof in zip(criteria.criteria, proofs, strict=True)
+            ),
+            True,
+        )
+        return review, review_evidence, verification
 
     def _request_objective_outcome_candidate(
         self,
@@ -3460,11 +3560,11 @@ class CoreService:
         )
         if blockers:
             return None, blockers
-        objective = derive_static_heading(accepted.statement)
+        objective = derive_request_objective(accepted.statement)
         if objective is None:
             return None, ("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",)
         output_sha, artifact_blockers = self._request_objective_artifact(
-            snapshot, objective.heading,
+            snapshot, objective,
         )
         if output_sha is None:
             return None, artifact_blockers
@@ -3475,50 +3575,94 @@ class CoreService:
         ), None)
         if criteria is None:
             return None, ("REQUEST_OBJECTIVE_PROOF_REQUIRED",)
+        expected_criteria = request_objective_criteria_revision(
+            accepted.id,
+            accepted.repository_id,
+            accepted.source_reference,
+            accepted.statement,
+        )
+        if expected_criteria is None or criteria != expected_criteria:
+            return None, ("REQUEST_OBJECTIVE_CRITERIA_NOT_CANONICAL",)
         head = next((
             item for item in state.slice_criteria_heads
             if item.slice_agreement_ref == accepted.id
         ), None)
         if head is None or head.revision_id != criteria.id:
             return None, ("REQUEST_OBJECTIVE_CRITERIA_NOT_CURRENT",)
-        criterion = criteria.criteria[0]
-        proof = next((
-            item for item in reversed(state.criterion_test_receipts)
-            if item.criteria_revision_id == criteria.id
-            and item.slice_agreement_ref == accepted.id
-            and item.criterion_id == criterion.id
-            and item.test_kind == OBJECTIVE_TEST_KIND
-            and item.test_target == OBJECTIVE_TEST_TARGET
-            and item.exit_code == 0
-            and item.output_sha256 == output_sha
-            and item.input_fingerprint_before == snapshot.fingerprint
-            and item.input_fingerprint_after == snapshot.fingerprint
-            and item.input_policy_id == INPUT_POLICY_ID
-            and item.input_policy_digest == INPUT_POLICY_DIGEST
-            and item.admission_policy_id == REQUEST_OBJECTIVE_ADMISSION_POLICY_ID
-            and item.admission_policy_digest == REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST
-            and item.runtime_executable is None
-            and item.runtime_argv == ()
-            and item.coverage_approval_id is None
-        ), None)
-        if proof is None:
+        test_kind, admission_digest, outcome_basis = request_objective_policy(criteria)
+        target = (
+            TASK_APP_TEST_TARGET
+            if isinstance(objective, PersonalTasksObjective)
+            else OBJECTIVE_TEST_TARGET
+        )
+        batches: dict[
+            tuple[int, int, str, str, str],
+            dict[str, list[CriterionTestReceipt]],
+        ] = {}
+        criterion_ids = {item.id for item in criteria.criteria}
+        for proof in state.criterion_test_receipts:
+            if (
+                proof.criteria_revision_id != criteria.id
+                or proof.slice_agreement_ref != accepted.id
+                or proof.criterion_id not in criterion_ids
+                or proof.test_kind != test_kind
+                or proof.test_target != target
+                or proof.exit_code != 0
+                or proof.output_sha256 != output_sha
+                or proof.input_fingerprint_before != snapshot.fingerprint
+                or proof.input_fingerprint_after != snapshot.fingerprint
+                or proof.input_policy_id != INPUT_POLICY_ID
+                or proof.input_policy_digest != INPUT_POLICY_DIGEST
+                or proof.admission_policy_id != test_kind
+                or proof.admission_policy_digest != admission_digest
+                or proof.external_inputs
+                or proof.runtime_executable is not None
+                or proof.runtime_executable_sha256 is not None
+                or proof.runtime_version is not None
+                or proof.runtime_argv
+                or proof.environment_profile_id is not None
+                or proof.environment_profile_digest is not None
+                or proof.coverage_approval_id is not None
+                or proof.coverage_contract_digest is not None
+                or proof.recorded_revision != proof.source_revision + 1
+            ):
+                continue
+            key = (
+                proof.source_revision,
+                proof.recorded_revision,
+                proof.input_fingerprint_before or "",
+                proof.input_fingerprint_after or "",
+                proof.output_sha256,
+            )
+            batches.setdefault(key, {}).setdefault(proof.criterion_id, []).append(proof)
+        complete_batches: list[
+            tuple[tuple[int, int, str, str, str], tuple[CriterionTestReceipt, ...]]
+        ] = []
+        for key, batch in batches.items():
+            if all(len(batch.get(criterion.id, ())) == 1 for criterion in criteria.criteria):
+                complete_batches.append((
+                    key,
+                    tuple(batch[criterion.id][0] for criterion in criteria.criteria),
+                ))
+        if not complete_batches:
             return None, ("REQUEST_OBJECTIVE_PROOF_STALE",)
+        _, proofs = max(complete_batches, key=lambda item: item[0][1])
         receipt = SliceOutcomeReceipt(
             "",
             accepted.repository_id,
             accepted.id,
             criteria.id,
-            (proof.id,),
+            tuple(item.id for item in proofs),
             snapshot.fingerprint,
             INPUT_POLICY_ID,
             INPUT_POLICY_DIGEST,
-            REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
-            REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
+            test_kind,
+            admission_digest,
             _drift_identity_digest(state, context.change_id),
-            "REQUEST_SCOPED_STATIC_HEADING",
+            outcome_basis,
             REQUEST_SCOPED_OBJECTIVE,
-            proof.source_revision,
-            proof.recorded_revision,
+            proofs[0].source_revision,
+            proofs[0].recorded_revision,
             None,
         )
         receipt = replace(receipt, id=slice_outcome_semantic_id(receipt))
@@ -3531,20 +3675,8 @@ class CoreService:
                 return None, ("REQUEST_OBJECTIVE_TERMINAL_PROOF_INVALID",)
             archive = archives[0]
             archived = archive.context
-            review = ReviewResult(ReviewVerdict.PASS, (), True)
-            review_evidence = (
-                ReviewEvidence(
-                    ReviewEvidenceCategory.TECHNICAL,
-                    ReviewEvidenceKind.FACT,
-                    "CORE_REQUEST_SCOPED_OBJECTIVE",
-                    True,
-                    f"Canonical criterion {criterion.id} passed strict static verifier",
-                    f"{receipt.id}:{proof.output_sha256}",
-                ),
-            )
-            verification = VerificationEvidence(
-                (f"{OBJECTIVE_TEST_KIND}:{OBJECTIVE_TEST_TARGET}:{proof.output_sha256}",),
-                True,
+            review, review_evidence, verification = self._request_objective_terminal_evidence(
+                objective, criteria, receipt, proofs,
             )
             assessment = ConvergenceAssessment(
                 accepted.change_id,
@@ -3597,7 +3729,7 @@ class CoreService:
             return None
         request_sha = sha256(accepted.statement.encode("utf-8")).hexdigest()
         evidence = None if feature is None else self._request_objective_evidence(feature, accepted)
-        objective = derive_static_heading(accepted.statement)
+        objective = derive_request_objective(accepted.statement)
         if evidence is None:
             return RequestScopedObjectiveStatus(
                 "BLOCKED", accepted.source_reference, request_sha,
@@ -3608,38 +3740,91 @@ class CoreService:
                 "BLOCKED", accepted.source_reference, request_sha,
                 ("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",), None,
             )
+        canonical_criteria = request_objective_criteria_revision(
+            accepted.id,
+            accepted.repository_id,
+            accepted.source_reference,
+            accepted.statement,
+        )
+        if canonical_criteria is None:
+            return RequestScopedObjectiveStatus(
+                "BLOCKED", accepted.source_reference, request_sha,
+                ("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",), None,
+            )
+        if isinstance(objective, PersonalTasksObjective):
+            if any(
+                criterion.provenance not in ("EXPLICIT_REQUEST", "DERIVED_OBJECTIVE")
+                for criterion in canonical_criteria.criteria
+            ):
+                return RequestScopedObjectiveStatus(
+                    "BLOCKED", accepted.source_reference, request_sha,
+                    ("REQUEST_OBJECTIVE_CRITERIA_NOT_CANONICAL",), None,
+                )
+            kind = "PERSONAL_TASKS_WEB"
+            criteria_projection = tuple(
+                (operation, criterion.provenance)
+                for operation, criterion in zip(
+                    objective.operations, canonical_criteria.criteria, strict=True,
+                )
+            )
+            if any(provenance is None for _, provenance in criteria_projection):
+                return RequestScopedObjectiveStatus(
+                    "BLOCKED", accepted.source_reference, request_sha,
+                    ("REQUEST_OBJECTIVE_CRITERIA_NOT_CANONICAL",), None,
+                )
+            criteria_projection = tuple(
+                (operation, provenance)
+                for operation, provenance in criteria_projection
+                if provenance is not None
+            )
+            heading = None
+        else:
+            kind = None
+            criteria_projection = ()
+            heading = objective.heading
+
+        def projection(
+            status: str, blockers: tuple[str, ...] = (),
+        ) -> RequestScopedObjectiveStatus:
+            return RequestScopedObjectiveStatus(
+                status,
+                accepted.source_reference,
+                request_sha,
+                blockers,
+                heading,
+                kind,
+                criteria_projection,
+            )
+
         if snapshot is not None:
             try:
                 scanned, actual_snapshot = self.input_snapshot(current.revision)
             except ServiceError:
-                return RequestScopedObjectiveStatus(
-                    "BLOCKED", accepted.source_reference, request_sha,
-                    ("REQUEST_OBJECTIVE_INPUT_SNAPSHOT_UNAVAILABLE",), objective.heading,
+                return projection(
+                    "BLOCKED", ("REQUEST_OBJECTIVE_INPUT_SNAPSHOT_UNAVAILABLE",),
                 )
             if (
                 scanned != current
                 or snapshot != actual_snapshot
                 or snapshot.file_sha256 != actual_snapshot.file_sha256
             ):
-                return RequestScopedObjectiveStatus(
-                    "BLOCKED", accepted.source_reference, request_sha,
-                    ("REQUEST_OBJECTIVE_INPUT_SNAPSHOT_INVALID",), objective.heading,
+                return projection(
+                    "BLOCKED", ("REQUEST_OBJECTIVE_INPUT_SNAPSHOT_INVALID",),
                 )
             snapshot = actual_snapshot
         cycle_id, _, closure = feature_cycle_status(current, accepted.feature_id)
         if cycle_id != 0:
-            return RequestScopedObjectiveStatus(
-                "BLOCKED", accepted.source_reference, request_sha,
-                ("REQUEST_OBJECTIVE_FEATURE_REOPENED",), objective.heading,
+            return projection(
+                "BLOCKED", ("REQUEST_OBJECTIVE_FEATURE_REOPENED",),
             )
         if closure is not None:
             if (
                 closure.source != REQUEST_SCOPED_OBJECTIVE
                 or closure.source_reference != accepted.source_reference
             ):
-                return RequestScopedObjectiveStatus(
-                    "BLOCKED", accepted.source_reference, request_sha,
-                    ("REQUEST_OBJECTIVE_FEATURE_CLOSED_BY_OTHER_AUTHORITY",), objective.heading,
+                return projection(
+                    "BLOCKED",
+                    ("REQUEST_OBJECTIVE_FEATURE_CLOSED_BY_OTHER_AUTHORITY",),
                 )
             blockers = self._request_objective_scope_blockers(
                 current,
@@ -3649,14 +3834,9 @@ class CoreService:
                 allow_objective_closure=True,
             )
             if blockers:
-                return RequestScopedObjectiveStatus(
-                    "BLOCKED", accepted.source_reference, request_sha, blockers, objective.heading,
-                )
+                return projection("BLOCKED", blockers)
             if snapshot is None or closure.input_fingerprint != snapshot.fingerprint:
-                return RequestScopedObjectiveStatus(
-                    "BLOCKED", accepted.source_reference, request_sha,
-                    ("REQUEST_OBJECTIVE_PROOF_STALE",), objective.heading,
-                )
+                return projection("BLOCKED", ("REQUEST_OBJECTIVE_PROOF_STALE",))
             archived = next(
                 item.context for item in current.terminal_archives
                 if item.context.slice_agreement_ref == accepted.id
@@ -3669,75 +3849,59 @@ class CoreService:
                 or outcome.id not in closure.slice_outcome_receipt_ids
                 or not any(item.id == outcome.id for item in current.slice_outcome_receipts)
             ):
-                return RequestScopedObjectiveStatus(
-                    "BLOCKED", accepted.source_reference, request_sha,
-                    outcome_blockers or ("REQUEST_OBJECTIVE_PROOF_STALE",), objective.heading,
+                return projection(
+                    "BLOCKED",
+                    outcome_blockers or ("REQUEST_OBJECTIVE_PROOF_STALE",),
                 )
-            return RequestScopedObjectiveStatus(
-                "COMPLETE", accepted.source_reference, request_sha, (), objective.heading,
-            )
+            return projection("COMPLETE")
         if any(item.feature_id == accepted.feature_id for item in current.feature_completion_receipts):
-            return RequestScopedObjectiveStatus(
-                "BLOCKED", accepted.source_reference, request_sha,
-                ("REQUEST_OBJECTIVE_FEATURE_CLOSED_BY_OTHER_AUTHORITY",), objective.heading,
+            return projection(
+                "BLOCKED",
+                ("REQUEST_OBJECTIVE_FEATURE_CLOSED_BY_OTHER_AUTHORITY",),
             )
         blockers = self._request_objective_scope_blockers(
             current, evidence, snapshot,
         )
         if blockers:
-            return RequestScopedObjectiveStatus(
-                "BLOCKED", accepted.source_reference, request_sha, blockers, objective.heading,
-            )
+            return projection("BLOCKED", blockers)
         if not self.__persistence.request_objective_schema_ready():
             # The first projection remains pending until the scoped Core writer
-            # creates the durable schema-20 proof bundle.
+            # creates the durable static or semantic proof bundle.
             criteria_exists = any(
                 item.source == REQUEST_SCOPED_OBJECTIVE
                 and item.slice_agreement_ref == accepted.id
                 for item in current.slice_criteria_revisions
             )
             if criteria_exists:
-                return RequestScopedObjectiveStatus(
-                    "BLOCKED", accepted.source_reference, request_sha,
-                    ("REQUEST_OBJECTIVE_SCHEMA_NOT_CANONICAL",), objective.heading,
+                return projection(
+                    "BLOCKED", ("REQUEST_OBJECTIVE_SCHEMA_NOT_CANONICAL",),
                 )
         assert snapshot is not None
         context = current.active_context
         if context is None:
-            return RequestScopedObjectiveStatus(
-                "BLOCKED", accepted.source_reference, request_sha,
-                ("REQUEST_OBJECTIVE_ACTIVE_SCOPE_CHANGED",), objective.heading,
+            return projection(
+                "BLOCKED", ("REQUEST_OBJECTIVE_ACTIVE_SCOPE_CHANGED",),
             )
         candidate, candidate_blockers = self._request_objective_outcome_candidate(
             current, snapshot, context, accepted,
         )
         if candidate is None:
             if candidate_blockers == ("REQUEST_OBJECTIVE_PROOF_REQUIRED",):
-                _, artifact_blockers = self._request_objective_artifact(snapshot, objective.heading)
+                _, artifact_blockers = self._request_objective_artifact(
+                    snapshot, objective,
+                )
                 if artifact_blockers:
                     candidate_blockers = artifact_blockers
                 else:
-                    return RequestScopedObjectiveStatus(
-                        "PENDING", accepted.source_reference, request_sha, (), objective.heading,
-                    )
+                    return projection("PENDING")
             elif candidate_blockers == ("REQUEST_OBJECTIVE_PROOF_STALE",):
-                return RequestScopedObjectiveStatus(
-                    "PENDING", accepted.source_reference, request_sha,
-                    candidate_blockers, objective.heading,
-                )
+                return projection("PENDING", candidate_blockers)
             else:
-                return RequestScopedObjectiveStatus(
-                    "BLOCKED", accepted.source_reference, request_sha,
-                    candidate_blockers, objective.heading,
-                )
+                return projection("BLOCKED", candidate_blockers)
         elif any(item.id == candidate.id for item in current.slice_outcome_receipts):
-            return RequestScopedObjectiveStatus(
-                "VERIFIED", accepted.source_reference, request_sha, (), objective.heading,
-            )
+            return projection("VERIFIED")
         else:
-            return RequestScopedObjectiveStatus(
-                "PENDING", accepted.source_reference, request_sha, (), objective.heading,
-            )
+            return projection("PENDING")
 
     def request_scoped_objective(
         self, state: State, evidence: SessionRequestEvidence, input_fingerprint: str,
@@ -3759,11 +3923,11 @@ class CoreService:
                 "REQUEST_OBJECTIVE_SESSION_MISMATCH",
                 "the exact original session, message, request text, and repository are required",
             )
-        objective = derive_static_heading(accepted.statement)
+        objective = derive_request_objective(accepted.statement)
         if objective is None:
             raise RequestScopedObjectiveError(
                 "REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",
-                "the original request is outside the exact static-heading subset",
+                "the original request is outside the exact supported objective subset",
             )
         try:
             scanned, snapshot = self.input_snapshot(current.revision)
@@ -3835,12 +3999,47 @@ class CoreService:
         if candidate is None or not any(
             item.id == candidate.id for item in current.slice_outcome_receipts
         ):
-            output_sha, artifact_blockers = self._request_objective_artifact(
-                snapshot, objective.heading,
+            content, output_sha, artifact_blockers = self._read_request_objective_artifact(
+                snapshot, objective,
             )
-            if output_sha is None:
+            if content is None or output_sha is None:
                 code = artifact_blockers[0] if artifact_blockers else "REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED"
                 raise RequestScopedObjectiveError(code, "Core could not verify index.html against the exact request")
+            if isinstance(objective, PersonalTasksObjective):
+                try:
+                    verified_sha = verify_personal_tasks(content, objective.operations)
+                except BrowserObjectiveError as error:
+                    raise RequestScopedObjectiveError(error.code, str(error)) from error
+                if verified_sha != output_sha:
+                    raise RequestScopedObjectiveError(
+                        "REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED",
+                        "browser proof did not identify the exact scanned index.html bytes",
+                    )
+                try:
+                    rescanned, after_browser = self.input_snapshot(current.revision)
+                except StaleRevisionError:
+                    raise
+                except ServiceError as error:
+                    raise RequestScopedObjectiveError(
+                        "REQUEST_OBJECTIVE_INPUT_SNAPSHOT_UNAVAILABLE", str(error),
+                    ) from error
+                if rescanned != current:
+                    raise StaleRevisionError(current.revision, rescanned.revision)
+                if (
+                    after_browser.fingerprint != snapshot.fingerprint
+                    or after_browser.file_sha256 != snapshot.file_sha256
+                ):
+                    raise RequestScopedObjectiveError(
+                        "REQUEST_OBJECTIVE_FINGERPRINT_STALE",
+                        "root inputs changed while the browser objective was running",
+                    )
+                after_blockers = self._request_objective_scope_blockers(
+                    current, evidence, after_browser,
+                )
+                if after_blockers:
+                    raise RequestScopedObjectiveError(
+                        after_blockers[0], ", ".join(after_blockers),
+                    )
 
             def verify(locked: State) -> State:
                 scoped = self._request_objective_scope_blockers(
@@ -3849,7 +4048,7 @@ class CoreService:
                 if scoped:
                     raise RequestScopedObjectiveError(scoped[0], ", ".join(scoped))
                 content_sha, read_blockers = self._request_objective_artifact(
-                    snapshot, objective.heading,
+                    snapshot, objective,
                 )
                 if content_sha is None or content_sha != output_sha:
                     code = read_blockers[0] if read_blockers else "REQUEST_OBJECTIVE_FINGERPRINT_STALE"
@@ -3888,60 +4087,57 @@ class CoreService:
                 else:
                     revisions = locked.slice_criteria_revisions
                     next_heads = locked.slice_criteria_heads
-                criterion = criteria.criteria[0]
-                test_identity: list[object] = [
-                    accepted.id, criteria.id, criterion.id,
-                    OBJECTIVE_TEST_KIND, OBJECTIVE_TEST_TARGET, 0,
-                    content_sha, locked.revision,
-                ]
-                test_identity.extend((
-                    snapshot.fingerprint,
-                    INPUT_POLICY_ID,
-                    INPUT_POLICY_DIGEST,
-                    REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
-                    REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
-                    [],
-                    None,
-                    None,
-                    None,
-                    [],
-                    None,
-                    None,
-                ))
-                test_id = "criterion-test-" + sha256(json.dumps(
-                    test_identity, ensure_ascii=False, separators=(",", ":"),
-                ).encode("utf-8")).hexdigest()[:20]
-                test_receipt = CriterionTestReceipt(
-                    test_id,
-                    accepted.id,
-                    criteria.id,
-                    criterion.id,
-                    OBJECTIVE_TEST_KIND,
-                    OBJECTIVE_TEST_TARGET,
-                    0,
-                    content_sha,
-                    locked.revision,
-                    locked.revision + 1,
-                    snapshot.fingerprint,
-                    snapshot.fingerprint,
-                    INPUT_POLICY_ID,
-                    INPUT_POLICY_DIGEST,
-                    REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
-                    REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
+                test_kind, admission_digest, outcome_basis = request_objective_policy(
+                    criteria,
                 )
+                target = (
+                    TASK_APP_TEST_TARGET
+                    if isinstance(objective, PersonalTasksObjective)
+                    else OBJECTIVE_TEST_TARGET
+                )
+                test_receipts: list[CriterionTestReceipt] = []
+                for criterion in criteria.criteria:
+                    test_identity: list[object] = [
+                        accepted.id, criteria.id, criterion.id,
+                        test_kind, target, 0, content_sha, locked.revision,
+                        snapshot.fingerprint, INPUT_POLICY_ID, INPUT_POLICY_DIGEST,
+                        test_kind, admission_digest, [],
+                        None, None, None, [], None, None,
+                    ]
+                    test_id = "criterion-test-" + sha256(json.dumps(
+                        test_identity, ensure_ascii=False, separators=(",", ":"),
+                    ).encode("utf-8")).hexdigest()[:20]
+                    test_receipts.append(CriterionTestReceipt(
+                        test_id,
+                        accepted.id,
+                        criteria.id,
+                        criterion.id,
+                        test_kind,
+                        target,
+                        0,
+                        content_sha,
+                        locked.revision,
+                        locked.revision + 1,
+                        snapshot.fingerprint,
+                        snapshot.fingerprint,
+                        INPUT_POLICY_ID,
+                        INPUT_POLICY_DIGEST,
+                        test_kind,
+                        admission_digest,
+                    ))
                 outcome = SliceOutcomeReceipt(
                     "",
                     accepted.repository_id,
                     accepted.id,
                     criteria.id,
-                    (test_receipt.id,),
+                    tuple(item.id for item in test_receipts),
                     snapshot.fingerprint,
                     INPUT_POLICY_ID,
                     INPUT_POLICY_DIGEST,
-                    REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
-                    REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
+                    test_kind,
+                    admission_digest,
                     _drift_identity_digest(locked, accepted.change_id),
-                    "REQUEST_SCOPED_STATIC_HEADING",
+                    outcome_basis,
                     REQUEST_SCOPED_OBJECTIVE,
                     locked.revision,
                     locked.revision + 1,
@@ -3954,7 +4150,7 @@ class CoreService:
                     locked,
                     slice_criteria_revisions=revisions,
                     slice_criteria_heads=next_heads,
-                    criterion_test_receipts=locked.criterion_test_receipts + (test_receipt,),
+                    criterion_test_receipts=locked.criterion_test_receipts + tuple(test_receipts),
                     slice_outcome_receipts=locked.slice_outcome_receipts + (outcome,),
                 ), locked.revision)
 
@@ -3983,7 +4179,7 @@ class CoreService:
         if not self.__persistence.request_objective_schema_ready():
             raise RequestScopedObjectiveError(
                 "REQUEST_OBJECTIVE_SCHEMA_NOT_CANONICAL",
-                "request proof was not recovered from schema 20",
+                "request proof was not recovered from its canonical schema",
             )
         return self._complete_request_scoped_objective(
             current, evidence, snapshot, accepted, feature_agreement,
@@ -4027,31 +4223,30 @@ class CoreService:
                 "REQUEST_OBJECTIVE_ACTIVE_SCOPE_CHANGED",
                 "lifecycle work changed after objective verification",
             )
-        objective = derive_static_heading(accepted.statement)
-        assert objective is not None
+        objective = derive_request_objective(accepted.statement)
+        if objective is None:
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",
+                "the accepted request no longer has a canonical objective",
+            )
         criteria = next(
             item for item in current.slice_criteria_revisions
             if item.id == outcome.criteria_revision_id
         )
-        criterion_receipt = next(
-            item for item in current.criterion_test_receipts
-            if item.id in outcome.evidence_receipt_ids
+        proofs = tuple(
+            next(
+                item for item in current.criterion_test_receipts
+                if item.id == receipt_id
+            )
+            for receipt_id in outcome.evidence_receipt_ids
         )
-        proof_reference = f"{outcome.id}:{criterion_receipt.output_sha256}"
-        review = ReviewResult(ReviewVerdict.PASS, (), True)
-        review_evidence = (
-            ReviewEvidence(
-                ReviewEvidenceCategory.TECHNICAL,
-                ReviewEvidenceKind.FACT,
-                "CORE_REQUEST_SCOPED_OBJECTIVE",
-                True,
-                f"Canonical criterion {criteria.criteria[0].id} passed strict static verifier",
-                proof_reference,
-            ),
-        )
-        verification = VerificationEvidence(
-            (f"{OBJECTIVE_TEST_KIND}:{OBJECTIVE_TEST_TARGET}:{criterion_receipt.output_sha256}",),
-            True,
+        if len(proofs) != len(criteria.criteria):
+            raise RequestScopedObjectiveError(
+                "REQUEST_OBJECTIVE_PROOF_STALE",
+                "the outcome does not contain one current receipt per canonical criterion",
+            )
+        review, review_evidence, verification = self._request_objective_terminal_evidence(
+            objective, criteria, outcome, proofs,
         )
         assessment = ConvergenceAssessment(
             change_id,
@@ -4152,14 +4347,21 @@ class CoreService:
             raise RequestScopedObjectiveError(
                 feature_blockers[0], ", ".join(feature_blockers),
             )
-        condition = f"Core verified request-scoped static heading: {objective.heading}"
+        condition = request_objective_completion_condition(objective)
         statement = request_objective_completion_statement(
             source_reference=accepted.source_reference,
             request_sha256=sha256(accepted.statement.encode("utf-8")).hexdigest(),
-            heading=objective.heading,
+            heading=(
+                objective.heading
+                if isinstance(objective, StaticHeadingObjective) else None
+            ),
             outcome_receipt_id=outcomes[0].id,
             input_fingerprint=snapshot.fingerprint,
             source_revision=current.revision,
+            operations=(
+                objective.operations
+                if isinstance(objective, PersonalTasksObjective) else ()
+            ),
         )
 
         def close(locked: State) -> State:
@@ -4504,6 +4706,30 @@ class CoreService:
             (item for item in current.agreements if item.kind == "SLICE" and str(item.feature_id) == feature_id),
             key=lambda item: item.id,
         ))
+        request_slice = slices[0] if len(slices) == 1 else None
+        expected_request_criteria = (
+            None if request_slice is None else request_objective_criteria_revision(
+                request_slice.id,
+                request_slice.repository_id,
+                request_slice.source_reference,
+                request_slice.statement,
+            )
+        )
+        expected_request_test_kind = (
+            None if expected_request_criteria is None
+            else request_objective_policy(expected_request_criteria)[0]
+        )
+        expected_request_test_kinds = {expected_request_test_kind}
+        if (
+            expected_request_criteria is not None
+            and expected_request_criteria.criteria
+            and all(
+                item.expected_evidence
+                == f"{TASK_APP_TEST_KIND}:{TASK_APP_TEST_TARGET}"
+                for item in expected_request_criteria.criteria
+            )
+        ):
+            expected_request_test_kinds.add(TASK_APP_TEST_KIND)
         request_objective_path = (
             self.__persistence.request_objective_schema_ready()
             and current.r3_schema_upgrade is None
@@ -4514,6 +4740,8 @@ class CoreService:
             and slices[0].source == "SESSION_REQUEST"
             and len(current.slice_criteria_revisions) == 1
             and current.slice_criteria_revisions[0].source == REQUEST_SCOPED_OBJECTIVE
+            and expected_request_criteria is not None
+            and current.slice_criteria_revisions[0] == expected_request_criteria
             and current.slice_criteria_revisions[0].slice_agreement_ref == slices[0].id
             and current.slice_criteria_heads == (
                 SliceCriteriaHead(slices[0].id, current.slice_criteria_revisions[0].id),
@@ -4527,7 +4755,7 @@ class CoreService:
             and all(
                 item.criteria_revision_id == current.slice_criteria_revisions[0].id
                 and item.slice_agreement_ref == slices[0].id
-                and item.test_kind == OBJECTIVE_TEST_KIND
+                and item.test_kind in expected_request_test_kinds
                 and item.test_target == OBJECTIVE_TEST_TARGET
                 for item in current.criterion_test_receipts
             )

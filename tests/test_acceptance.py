@@ -33,6 +33,7 @@ class AcceptanceTests(unittest.TestCase):
                 "policies.py",
                 "ports.py",
                 "request_scoped_objective.py",
+                "request_scoped_objective_browser.py",
                 "services.py",
                 "workflow.py",
             },

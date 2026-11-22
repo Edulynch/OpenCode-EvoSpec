@@ -56,7 +56,12 @@ from .input_fingerprint import (
     InputSnapshot,
 )
 from .persistence import JsonValue, RecoveryError
-from .services import ServiceError, StaleRevisionError, SessionRequestEvidence
+from .services import (
+    RequestScopedObjectiveStatus,
+    ServiceError,
+    StaleRevisionError,
+    SessionRequestEvidence,
+)
 from .workflow import (
     ClarificationAnswer,
     WorkflowError,
@@ -241,13 +246,34 @@ def _criteria_revision_json(revision: SliceCriteriaRevision | None) -> dict[str,
         "decisions": list(revision.decisions),
         "criteria": [
             {"id": item.id, "expected_result": item.expected_result,
-             "expected_evidence": item.expected_evidence}
+             "expected_evidence": item.expected_evidence,
+             **({"provenance": item.provenance} if item.provenance is not None else {})}
             for item in revision.criteria
         ],
         "source": revision.source,
         "source_reference": revision.source_reference,
         "reason": revision.reason,
     }
+
+
+def _request_scoped_objective_json(
+    objective: RequestScopedObjectiveStatus,
+) -> dict[str, JsonValue]:
+    kind = getattr(objective, "kind", None)
+    value: dict[str, JsonValue] = {
+        "status": objective.status,
+        "source_reference": objective.source_reference,
+        "request_sha256": objective.request_sha256,
+        "blockers": list(objective.blockers),
+        "heading": objective.heading,
+    }
+    if kind is not None:
+        value["kind"] = kind
+        value["criteria"] = [
+            {"operation": operation, "provenance": provenance}
+            for operation, provenance in getattr(objective, "criteria", ())
+        ]
+    return value
 
 
 def _slice_acceptance_item_json(item: SliceAcceptanceItem) -> dict[str, JsonValue]:
@@ -410,13 +436,8 @@ def context_json(context: AgentContext) -> dict[str, JsonValue]:
                 "total_bytes": context.input_snapshot.total_bytes,
             },
             "request_scoped_objective": None
-            if context.request_scoped_objective is None else {
-                "status": context.request_scoped_objective.status,
-                "source_reference": context.request_scoped_objective.source_reference,
-                "request_sha256": context.request_scoped_objective.request_sha256,
-                "blockers": list(context.request_scoped_objective.blockers),
-                "heading": context.request_scoped_objective.heading,
-            },
+            if context.request_scoped_objective is None
+            else _request_scoped_objective_json(context.request_scoped_objective),
             "r3b_coverage_approvals": [
                 _coverage_approval_json(item)
                 for item in context.criterion_coverage_approvals

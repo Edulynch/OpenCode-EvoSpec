@@ -8,7 +8,11 @@ from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
-from evospec.agent_protocol import execute
+from evospec.agent_protocol import (
+    _criteria_revision_json,
+    _request_scoped_objective_json,
+    execute,
+)
 from evospec.discovery import MAX_EXTERNAL_SDD_COMMAND_ENTRIES
 from evospec.domain import (
     Change,
@@ -22,13 +26,15 @@ from evospec.domain import (
     ReviewResult,
     SemanticLock,
     SemanticLockRevision,
+    SliceCriterion,
+    SliceCriteriaRevision,
     VerificationEvidence,
     WorkRelation,
     WorkRelationKind,
 )
 from evospec.lifecycle import Classification, ReviewVerdict
 from evospec.persistence import JsonValue
-from evospec.services import CoreService
+from evospec.services import CoreService, RequestScopedObjectiveStatus
 from evospec.workflow import WorkflowError, WorkflowService
 from tests._tempdir import TemporaryDirectory
 from tests.test_persistence_atomic import FailingReplace
@@ -195,6 +201,128 @@ class AgentProtocolTests(unittest.TestCase):
             ))
             self.assertEqual(replay["result"]["code"], "REQUEST_OBJECTIVE_ALREADY_COMPLETE")
             self.assertEqual(replay["result"]["revision"], revision)
+
+    def test_request_objective_wire_adds_typed_fields_only_for_semantic_kind(self) -> None:
+        legacy = _request_scoped_objective_json(RequestScopedObjectiveStatus(
+            status="PENDING",
+            source_reference="session:ses_test0001:msg_test0001:0123456789abcdef",
+            request_sha256="a" * 64,
+            blockers=(),
+            heading="Hello",
+        ))
+        self.assertEqual(set(legacy), {
+            "status", "source_reference", "request_sha256", "blockers", "heading",
+        })
+        semantic = _request_scoped_objective_json(RequestScopedObjectiveStatus(
+            status="PENDING",
+            source_reference="session:ses_test0001:msg_test0001:0123456789abcdef",
+            request_sha256="b" * 64,
+            blockers=(),
+            heading=None,
+            kind="PERSONAL_TASKS_WEB",
+            criteria=(("create", "DERIVED_OBJECTIVE"), ("consult", "DERIVED_OBJECTIVE")),
+        ))
+        self.assertEqual(semantic, {
+            "status": "PENDING",
+            "source_reference": "session:ses_test0001:msg_test0001:0123456789abcdef",
+            "request_sha256": "b" * 64,
+            "blockers": [],
+            "heading": None,
+            "kind": "PERSONAL_TASKS_WEB",
+            "criteria": [
+                {"operation": "create", "provenance": "DERIVED_OBJECTIVE"},
+                {"operation": "consult", "provenance": "DERIVED_OBJECTIVE"},
+            ],
+        })
+
+    def test_criteria_revision_provenance_is_optional_on_wire(self) -> None:
+        def revision(provenance: str | None) -> SliceCriteriaRevision:
+            return SliceCriteriaRevision(
+                "criteria-semantic",
+                "agreement-slice",
+                "repo-semantic",
+                "Personal tasks work",
+                "Add and consult tasks",
+                ("index.html",),
+                ("other files",),
+                (),
+                (SliceCriterion(
+                    "request-objective-create",
+                    "A task can be created",
+                    "core-personal-tasks-browser-v1:index.html",
+                    provenance,
+                ),),
+                "REQUEST_SCOPED_OBJECTIVE",
+                "session:ses_semantic123:msg_semantic123:0123456789abcdef",
+            )
+
+        legacy_projection = _criteria_revision_json(revision(None))
+        assert legacy_projection is not None
+        legacy_criteria = legacy_projection["criteria"]
+        assert isinstance(legacy_criteria, list)
+        self.assertEqual(len(legacy_criteria), 1)
+        legacy_criterion = legacy_criteria[0]
+        assert isinstance(legacy_criterion, dict)
+        self.assertEqual(set(legacy_criterion), {
+            "id", "expected_result", "expected_evidence",
+        })
+        semantic_projection = _criteria_revision_json(
+            revision("DERIVED_OBJECTIVE")
+        )
+        assert semantic_projection is not None
+        semantic_criteria = semantic_projection["criteria"]
+        assert isinstance(semantic_criteria, list)
+        self.assertEqual(len(semantic_criteria), 1)
+        semantic_criterion = semantic_criteria[0]
+        assert isinstance(semantic_criterion, dict)
+        self.assertEqual(set(semantic_criterion), {
+            "id", "expected_result", "expected_evidence", "provenance",
+        })
+        self.assertEqual(
+            semantic_criterion["provenance"],
+            "DERIVED_OBJECTIVE",
+        )
+
+    def test_personal_tasks_objective_projection_is_additive(self) -> None:
+        if not {"kind", "criteria"} <= RequestScopedObjectiveStatus.__dataclass_fields__.keys():
+            self.skipTest("Core request-objective status projection has not added semantic fields")
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            initialized = json.loads(execute(root, request("init", expected_revision=0)))
+            repository_id = sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+            request_text = "Build a web app to manage my personal tasks"
+            admitted = json.loads(execute(
+                root,
+                request(
+                    "accept_first_slice_session",
+                    expected_revision=initialized["result"]["revision"],
+                    repository_id=repository_id,
+                    session_id="ses_semantic123",
+                    message_id="msg_semantic123",
+                    request_text=request_text,
+                ),
+            ))
+            self.assertEqual(admitted["result"]["code"], "SESSION_SLICE_RECORDED")
+
+            context = json.loads(execute(root, request("context")))["context"]
+            objective = context["request_scoped_objective"]
+            self.assertEqual(set(objective), {
+                "status", "source_reference", "request_sha256", "blockers",
+                "heading", "kind", "criteria",
+            })
+            self.assertEqual(objective["kind"], "PERSONAL_TASKS_WEB")
+            self.assertIsNone(objective["heading"])
+            self.assertEqual(
+                objective["criteria"],
+                [
+                    {"operation": "create", "provenance": "DERIVED_OBJECTIVE"},
+                    {"operation": "consult", "provenance": "DERIVED_OBJECTIVE"},
+                ],
+            )
+            self.assertEqual(
+                objective["request_sha256"],
+                sha256(request_text.encode("utf-8")).hexdigest(),
+            )
 
     def test_request_scoped_objective_protocol_rejects_bad_fields_stale_and_incomplete_page(self) -> None:
         with TemporaryDirectory() as temporary:
