@@ -22,6 +22,7 @@
       <div class="header-status">
         <p id="load-status" class="load-status" role="status">Connecting</p>
         <p id="project-summary" class="project-summary">Loading the current project status.</p>
+        <button id="refresh-context" class="refresh-button" type="button">Refresh acceptance data</button>
       </div>
     </header>
 
@@ -30,61 +31,54 @@
         <div class="section-heading">
           <div>
             <p class="eyebrow">Acceptance index</p>
-            <h2 id="active-slice-heading">Accepted Slices</h2>
+            <h2 id="active-slice-heading">Feature and Slice acceptance</h2>
           </div>
           <span id="active-slice-status" class="status-label" data-status="waiting">Loading</span>
         </div>
         <div id="active-slice-content" class="active-slice-content">
-          <p class="empty-state">Loading the active Slice and acceptance criteria.</p>
-        </div>
-      </section>
-      <section id="current-work-section" class="operational-section current-work-section" aria-labelledby="current-work-heading" hidden>
-        <div class="section-heading">
-          <p class="eyebrow">Happening now</p>
-          <h2 id="current-work-heading">Current work</h2>
-        </div>
-        <div class="current-work-summary">
-          <div>
-            <strong id="current-work-title">Active work</strong>
-            <p id="current-work-explanation">No current work is recorded.</p>
-          </div>
-          <span id="current-work-status" class="status-label">In progress</span>
+          <p class="empty-state">Loading Feature agreements, Slices, and acceptance criteria.</p>
         </div>
       </section>
 
-      <section id="blocked-section" class="operational-section blocked-section" aria-labelledby="blocked-heading" aria-live="polite" hidden>
-        <div class="section-heading">
-          <p class="eyebrow">Needs attention</p>
-          <h2 id="blocked-heading">Blocked work</h2>
-        </div>
-        <div id="blocked-list" class="blocked-list"></div>
-      </section>
-
-      <section class="dashboard-tabs" aria-label="Dashboard detail views">
-        <div class="dashboard-tablist" role="tablist" aria-label="Dashboard details">
-          <button id="tab-features" class="dashboard-tab" type="button" role="tab" aria-selected="true" aria-controls="features-panel" tabindex="0">Features</button>
-          <button id="tab-technical" class="dashboard-tab" type="button" role="tab" aria-selected="false" aria-controls="technical-panel" tabindex="-1">Technical details</button>
-        </div>
-
-        <section id="features-panel" class="features-section" role="tabpanel" aria-labelledby="tab-features">
-          <div class="section-heading">
-            <div>
-              <p class="eyebrow">Features</p>
-              <h2 id="features-heading">Published features</h2>
+      <details id="technical-inspection" class="technical-inspection">
+        <summary>Technical inspection — workflow and Core diagnostics, not acceptance status</summary>
+        <p class="technical-disclosure-note">Capability publication, Task state, and work-queue diagnostics do not establish Feature completion or Slice acceptance.</p>
+        <div class="technical-inspection-content">
+          <section id="current-work-section" class="operational-section current-work-section" aria-labelledby="current-work-heading" hidden>
+            <div class="section-heading">
+              <p class="eyebrow">Happening now</p>
+              <h2 id="current-work-heading">Current work</h2>
             </div>
-          </div>
-          <div id="feature-filters" class="feature-filters" role="group" aria-label="Filter features by status">
-            <button id="feature-filter-all" class="feature-filter" type="button" data-feature-filter="all" aria-pressed="true">All</button>
-            <button id="feature-filter-completed" class="feature-filter" type="button" data-feature-filter="completed" aria-pressed="false">Completed</button>
-            <button id="feature-filter-blocked" class="feature-filter" type="button" data-feature-filter="blocked" aria-pressed="false">Blocked</button>
-          </div>
-          <div id="features-list" class="feature-list"></div>
-        </section>
+            <div class="current-work-summary">
+              <div>
+                <strong id="current-work-title">Active work</strong>
+                <p id="current-work-explanation">No current work is recorded.</p>
+              </div>
+              <span id="current-work-status" class="status-label">In progress</span>
+            </div>
+          </section>
 
-        <section id="technical-panel" class="technical-panel" role="tabpanel" aria-labelledby="tab-technical" hidden>
+          <section id="blocked-section" class="operational-section blocked-section" aria-labelledby="blocked-heading" aria-live="polite" hidden>
+            <div class="section-heading">
+              <p class="eyebrow">Needs attention</p>
+              <h2 id="blocked-heading">Blocked work</h2>
+            </div>
+            <div id="blocked-list" class="blocked-list"></div>
+          </section>
+
+          <section class="capabilities-section" aria-labelledby="capabilities-heading">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Publication diagnostics</p>
+                <h2 id="capabilities-heading">Published capabilities</h2>
+              </div>
+            </div>
+            <div id="features-list" class="feature-list"></div>
+          </section>
+
           <div id="technical-content" class="technical-content"></div>
-        </section>
-      </section>
+        </div>
+      </details>
     </main>
     <script src="dashboard.js"></script>
   </body>

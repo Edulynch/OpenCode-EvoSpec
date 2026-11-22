@@ -356,8 +356,10 @@ class DashboardTests(unittest.TestCase):
 
     def test_packaged_dashboard_source_declares_event_lifecycle_contract(self) -> None:
         source = files("evospec").joinpath("resources", "dashboard", "dashboard.js").read_text(encoding="utf-8")
-        self.assertRegex(source, r'let\s+selectedTab\s*=\s*["\']features["\']')
-        self.assertRegex(source, r'(?s)function\s+render\s*\(.*?selectTab\(selectedTab\)')
+        shell = files("evospec").joinpath("resources", "dashboard", "index.html").read_text(encoding="utf-8")
+        self.assertRegex(source, r"function\s+renderAcceptanceIndex\s*\(")
+        self.assertRegex(source, r"function\s+renderTechnical\s*\(")
+        self.assertIn('<details id="technical-inspection"', shell)
         self.assertRegex(source, r'new\s+EventSource\(\s*["\']/api/events["\']\s*\)')
         self.assertRegex(source, r'(?s)addEventListener\(\s*["\']revision["\'].*?loadContext\(')
         self.assertRegex(source, r'(?s)(?:onopen|addEventListener\(\s*["\']open["\']).*?(?:clearInterval|stop\w*Fallback)')
@@ -365,7 +367,7 @@ class DashboardTests(unittest.TestCase):
         self.assertRegex(source, r'(?s)addEventListener\(\s*["\']pagehide["\'].*?\.close\(\)')
         self.assertRegex(source, r'(?s)addEventListener\(\s*["\']pagehide["\'].*?(?:clearInterval|stop\w*Fallback)')
 
-    def test_dashboard_browser_projects_tabs_exact_work_and_collapsed_technical_details(self) -> None:
+    def test_dashboard_browser_projects_primary_acceptance_and_disclosed_diagnostics(self) -> None:
         fixtures = self._dashboard_fixture()
         desktop = self._run_dashboard_browser(fixtures)
         narrow = self._run_dashboard_browser(fixtures, "375,800")
@@ -440,9 +442,13 @@ class DashboardTests(unittest.TestCase):
   const fixtures = {fixtures_json};
   const state = {{ context: fixtures.linked, listeners: [] }};
   const intervals = new Map();
+  const fetchCalls = [];
   window.__dashboardFixture = state.context;
   window.__dashboardFixtures = fixtures;
-  window.fetch = () => Promise.resolve({{ ok: true, json: async () => state.context }});
+  window.fetch = (url, options) => {{
+    fetchCalls.push({{ url, options }});
+    return Promise.resolve({{ ok: true, json: async () => state.context }});
+  }};
   window.setInterval = (callback) => {{ const identifier = {{}}; intervals.set(identifier, callback); return identifier; }};
   window.clearInterval = (identifier) => {{ intervals.delete(identifier); }};
   class DashboardEventSource {{
@@ -461,6 +467,7 @@ class DashboardTests(unittest.TestCase):
   const sources = [];
   window.EventSource = DashboardEventSource;
   window.__dashboardTest = {{
+    fetchCalls,
     setContext: (context) => {{ state.context = context; window.__dashboardFixture = context; }},
     normalRefresh: () => sources.forEach((source) => source.emit("open")),
     revision: () => sources.forEach((source) => source.emit("revision")),
@@ -487,112 +494,65 @@ class DashboardTests(unittest.TestCase):
     const bounds = element.getBoundingClientRect();
     return !element.hidden && style.display !== "none" && style.visibility !== "hidden" && bounds.height > 0;
   };
-   const ids = (selector) => Array.from(document.querySelectorAll(selector)).map((element) => element.dataset.featureId || element.dataset.workId);
-   const sameMembers = (left, right) => JSON.stringify([...left].sort()) === JSON.stringify([...right].sort());
-   const click = (element) => element.click();
-   const key = (element, value) => element.dispatchEvent(new KeyboardEvent("keydown", { key: value, bubbles: true }));
-   const assertSelectedTab = (name) => {
-     const features = document.querySelector('#tab-features');
-     const technical = document.querySelector('#tab-technical');
-     const featurePanel = document.querySelector('#features-panel');
-     const technicalPanel = document.querySelector('#technical-panel');
-     const featuresSelected = name === "features";
-     require(features && technical && featurePanel && technicalPanel, "both tabs and tab panels must render");
-     require(features.getAttribute("aria-selected") === String(featuresSelected) && features.tabIndex === (featuresSelected ? 0 : -1) && featurePanel.hidden === !featuresSelected, `Features must be ${featuresSelected ? "selected" : "unselected"} with matching roving tabindex and panel visibility`);
-     require(technical.getAttribute("aria-selected") === String(!featuresSelected) && technical.tabIndex === (featuresSelected ? -1 : 0) && technicalPanel.hidden === featuresSelected, `Technical must be ${featuresSelected ? "unselected" : "selected"} with matching roving tabindex and panel visibility`);
-   };
-   const output = document.createElement("output");
+  const click = (element) => element.click();
+  const output = document.createElement("output");
   output.id = "dashboard-test-results";
   document.body.append(output);
 
   setTimeout(async () => {
-    const expectedFeatures = ["feature-alpha", "feature-beta", "feature-gamma", "feature-duplicate-a", "feature-duplicate-b", "feature-epsilon", "feature-zeta", "feature-eta", "feature-blocked"];
-    const acceptedFeatures = expectedFeatures.filter((id) => id !== "feature-alpha" && id !== "feature-blocked");
-    const expectedWorks = ["work-alpha-active", "work-alpha-done", "work-blocked"];
     await sleep(20);
 
-    check("focused skip link reserves space above the Current Work summary", () => {
+    check("focused skip link reserves space above the acceptance index", () => {
       const skipLink = document.querySelector(".skip-link");
-      const summary = document.querySelector("#current-work-section .current-work-summary");
-      require(skipLink && summary && visible(summary), "linked fixture must render a focusable skip link and visible Current Work summary");
+      const index = document.querySelector("#active-slice-section");
+      require(skipLink && index && visible(index), "the acceptance index and skip link must render");
       skipLink.focus();
       const skipStyle = getComputedStyle(skipLink);
       const skipBounds = skipLink.getBoundingClientRect();
       require(document.activeElement === skipLink, "skip link must be the active focused element");
       require(visible(skipLink), "focused skip link must be visible");
       require(skipStyle.position === "static", "focused skip link must remain in normal flow");
-      const summaryBounds = summary.getBoundingClientRect();
-      require(skipBounds.right <= summaryBounds.left || skipBounds.left >= summaryBounds.right || skipBounds.bottom <= summaryBounds.top || skipBounds.top >= summaryBounds.bottom, "focused skip link must not intersect the visible Current Work summary");
+      const indexBounds = index.getBoundingClientRect();
+      require(skipBounds.right <= indexBounds.left || skipBounds.left >= indexBounds.right || skipBounds.bottom <= indexBounds.top || skipBounds.top >= indexBounds.bottom, "focused skip link must not intersect the acceptance index");
     });
 
-    check("human-first dashboard labels identify the current, blocked, and published work", () => {
-      const currentHeadings = Array.from(document.querySelectorAll('#current-work-heading'));
-      const blockedHeadings = Array.from(document.querySelectorAll('#blocked-heading'));
-      const featuresHeadings = Array.from(document.querySelectorAll('#features-heading'));
-      require(currentHeadings.length === 1 && currentHeadings[0].textContent.trim() === "Current work", "Current work must appear once as the operational heading");
-      require(blockedHeadings.length === 1 && blockedHeadings[0].textContent.trim() === "Blocked work", "Blocked work must appear once as the operational heading");
-      require(featuresHeadings.length === 1 && featuresHeadings[0].textContent.trim() === "Published features", "Published features must name the feature projection");
+    check("acceptance index is the only primary projection", () => {
+      const index = document.querySelector("#active-slice-section");
+      const inspection = document.querySelector("#technical-inspection");
+      require(index && index.querySelector("#active-slice-content"), "Feature/Slice acceptance must be the primary section");
+      require(inspection && !inspection.open, "technical inspection must start collapsed");
+      require(!index.textContent.includes("Current work") && !index.textContent.includes("Published capabilities"), "operational projections must not appear in the primary acceptance view");
       require(document.querySelector('#load-status').textContent.trim() === "Live", "a connected event stream must use the simple Live status");
     });
 
-    check("semantic tabs expose exactly two native tab controls", () => {
-      const tablist = document.querySelector('[role="tablist"]');
-      const features = document.querySelector('#tab-features[role="tab"]');
-      const technical = document.querySelector('#tab-technical[role="tab"]');
-      require(tablist && tablist.contains(features) && tablist.contains(technical) && tablist.querySelectorAll('[role="tab"]').length === 2, "Features and Technical must be the only tabs in one tablist");
-      require(features.getAttribute("aria-controls") === "features-panel" && technical.getAttribute("aria-controls") === "technical-panel", "tabs must own their corresponding panels");
-      const featurePanel = document.querySelector('#features-panel[role="tabpanel"]');
-      const technicalPanel = document.querySelector('#technical-panel[role="tabpanel"]');
-      require(featurePanel && featurePanel.getAttribute("aria-labelledby") === "tab-features", "features panel must be labelled by Features tab");
-      require(technicalPanel && technicalPanel.getAttribute("aria-labelledby") === "tab-technical", "technical panel must be labelled by Technical tab");
-      assertSelectedTab("features");
-      require(!visible(technicalPanel), "Features must be the visible default tab and Technical fully collapsed");
-      require(!document.querySelector('#current-work-section').closest('[role="tabpanel"]') && !document.querySelector('#blocked-section').closest('[role="tabpanel"]'), "Current Work and Blocked must remain outside tab panels");
+    const previousFetchCount = window.__dashboardTest.fetchCalls.length;
+    click(document.querySelector("#refresh-context"));
+    await sleep(20);
+    check("manual refresh only requests the read-only Core context", () => {
+      const calls = window.__dashboardTest.fetchCalls.slice(previousFetchCount);
+      require(calls.length > 0 && calls.every((call) => call.url === "/api/context" && call.options.method === undefined), "manual refresh must use the context GET only");
     });
 
-    check("feature projection renders accepted capabilities as human-facing title and state rows", () => {
-      require(sameMembers(ids('#features-list > article[data-feature-id]'), expectedFeatures), "feature rows must map one-for-one to accepted capabilities by distinct id");
-      require(document.querySelectorAll('#features-list > article[data-feature-id]').length === 9, "all nine capabilities must render even when titles duplicate");
-      require(document.querySelectorAll('#features-list [data-work-id]').length === 0, "feature rows must keep work identifiers in Technical Details");
-      const alpha = document.querySelector('[data-feature-id="feature-alpha"]');
-      require(alpha.querySelector('.feature-title').textContent.trim() === "Duplicate capability", "feature rows must retain the accepted capability title");
-      require(alpha.querySelector('.status-label').textContent.trim() === "In progress", "an exactly linked active work item must project its human state");
-      const noWork = document.querySelector('[data-feature-id="feature-beta"]');
-      require(noWork.querySelector('.status-label').textContent.trim() === "Completed", "accepted capabilities without exactly linked work must project as Completed");
-      require(Array.from(document.querySelectorAll('#features-list > article[data-feature-id]')).every((row) => row.children.length === 2 && row.querySelector('.feature-title') && row.querySelector('.status-label')), "feature rows must contain only a title and human state");
-      require(document.querySelector('#blocked-list').textContent.includes("Blocked work") && !document.querySelector('#blocked-list').textContent.includes("Unassociated work"), "unlinked blocked work must use a neutral human fallback without exposing linkage state");
-    });
-
-    check("feature filters use human state labels and preserve exact linkage projection", () => {
-      require(Array.from(document.querySelectorAll('[data-feature-filter]')).map((button) => button.textContent.trim()).join(",") === "All,Completed,Blocked", "feature filters must use human state labels");
-      click(document.querySelector('#feature-filter-blocked'));
-      require(sameMembers(ids('#features-list > article[data-feature-id]'), ["feature-blocked"]), "Blocked filter must show only the blocked capability");
-      require(document.querySelector('[data-feature-id="feature-blocked"] .status-label').textContent.trim() === "Blocked", "Blocked must remain visibly canonical in the human projection");
-      click(document.querySelector('#feature-filter-completed'));
-      require(sameMembers(ids('#features-list > article[data-feature-id]'), acceptedFeatures), "Completed filter must include only the seven completed presentation capabilities");
-      click(document.querySelector('#feature-filter-all'));
-      require(document.querySelector('[data-feature-id="feature-alpha"] .status-label').textContent.trim() === "In progress", "returning to All must retain the exact active-work projection");
-    });
-
-    check("tab keyboard navigation wraps and changes accessible visibility", () => {
-      const features = document.querySelector('#tab-features');
-      const technical = document.querySelector('#tab-technical');
-      features.focus();
-      key(features, "ArrowLeft");
-      require(document.activeElement === technical && technical.getAttribute("aria-selected") === "true", "ArrowLeft must wrap Features to Technical");
-      key(technical, "ArrowRight");
-      require(document.activeElement === features && features.getAttribute("aria-selected") === "true", "ArrowRight must wrap Technical to Features");
-      click(technical);
-      const technicalPanel = document.querySelector('#technical-panel');
-      assertSelectedTab("technical");
-      require(visible(technicalPanel), "Technical click must select and visibly reveal its panel");
+    check("native disclosure provides keyboard access to technical projections", () => {
+      const inspection = document.querySelector("#technical-inspection");
+      const summary = inspection.querySelector("summary");
+      require(summary && !inspection.open, "the technical summary must be present and collapsed");
+      summary.focus();
+      require(document.activeElement === summary, "technical inspection summary must receive keyboard focus");
+      click(summary);
+      require(inspection.open, "activating the summary must disclose diagnostics");
+      require(inspection.querySelector("#current-work-section") && inspection.querySelector("#blocked-section"), "work and blocker diagnostics must be inside the disclosure");
+      require(inspection.querySelector("#features-list"), "capability publication must be inside the disclosure");
+      require(document.querySelectorAll("#features-list > article[data-feature-id]").length === 9, "all capabilities must remain inspectable");
+      require(Array.from(document.querySelectorAll("#features-list > article")).every((row) => !row.querySelector(".status-label")), "Task state must not become Feature completion");
+      require(inspection.querySelector("#blocked-list .status-label")?.textContent.trim() === "Blocked", "blocked work remains available in diagnostics");
     });
 
     check("technical records start closed and retain the complete raw context last", () => {
-      const panel = document.querySelector('#technical-panel');
-      const details = Array.from(panel.querySelectorAll('details'));
+      const inspection = document.querySelector("#technical-inspection");
+      const details = Array.from(inspection.querySelectorAll("#technical-content details"));
       const raw = document.querySelector('#technical-raw');
-      require(details.length > 1 && details.every((entry) => !entry.open), "technical sections must be separate native details closed on first entry");
+      require(details.length > 1 && details.every((entry) => !entry.open), "technical records must be separate disclosures closed on first entry");
       require(details.at(-1) === raw && raw && raw.querySelectorAll('summary').length === 1 && raw.querySelector('summary').textContent.trim() === "Raw JSON" && raw.querySelectorAll('pre').length === 1, "the final technical detail must expose one Raw JSON summary and one preformatted payload");
       require(JSON.stringify(JSON.parse(raw.querySelector('pre').textContent)) === JSON.stringify(window.__dashboardFixture), "raw technical JSON must exactly equal the received fixture");
       click(raw.querySelector('summary'));
@@ -603,29 +563,22 @@ class DashboardTests(unittest.TestCase):
     window.__dashboardTest.setContext(window.__dashboardFixtures.inactive);
     window.__dashboardTest.normalRefresh();
     await sleep(20);
-    check("normal context refresh preserves selected Technical tab and open raw disclosure", () => {
+    check("normal context refresh preserves the inspection disclosure and open raw record", () => {
       const raw = document.querySelector('#technical-raw');
-      assertSelectedTab("technical");
-      require(raw.open, "normal context refresh must retain the selected Technical tab and its raw disclosure state");
-      click(document.querySelector('#tab-features'));
-      require(document.querySelector('#technical-panel').hidden && document.querySelector('#technical-panel').getBoundingClientRect().height === 0, "an opened hidden technical panel must not retain layout height");
-      click(document.querySelector('#tab-technical'));
-      click(document.querySelector('#feature-filter-all'));
+      require(document.querySelector("#technical-inspection").open, "context refresh must preserve the outer technical disclosure");
+      require(raw.open, "normal context refresh must retain the raw disclosure state");
       const current = document.querySelector('#current-work-section');
       require(current.hidden && !visible(current), "current work must hide when queue.active is null despite leftover progress");
     });
     window.__dashboardTest.setContext(window.__dashboardFixtures.live);
     window.__dashboardTest.revision();
     await sleep(20);
-    check("SSE revision refresh preserves Technical while unpublished active work stays current", () => {
-      assertSelectedTab("technical");
+    check("SSE refresh preserves diagnostics while unpublished active work stays diagnostic", () => {
+      require(document.querySelector("#technical-inspection").open, "SSE refresh must preserve the open inspection disclosure");
       require(document.querySelector('#current-work-section').hidden === false, "an active unpublished work item must remain visible as Current Work");
       require(document.querySelectorAll('#features-list > article[data-feature-id]').length === 9, "live fixture must render eight Accepted capabilities and one Blocked capability");
       require(!document.querySelector('#features-list [data-work-id="work-live-unpublished"]'), "unpublished active work must not fabricate a feature row");
-      click(document.querySelector('#feature-filter-completed'));
-      require(document.querySelectorAll('#features-list > article[data-feature-id]').length === 8, "Completed filter must exclude the sole Blocked capability");
-      click(document.querySelector('#feature-filter-blocked'));
-      require(sameMembers(ids('#features-list > article[data-feature-id]'), ["feature-live-blocked"]), "Blocked filter must show the sole blocked capability");
+      require(Array.from(document.querySelectorAll("#features-list > article")).every((row) => !row.querySelector(".status-label")), "Task statuses must not create Feature completion badges");
     });
     window.__dashboardTest.reconnecting();
     await sleep(20);
@@ -636,37 +589,27 @@ class DashboardTests(unittest.TestCase):
     window.__dashboardTest.startPolling();
     window.__dashboardTest.poll();
     await sleep(20);
-    check("polling fallback refresh preserves Technical without overflow", () => {
-      assertSelectedTab("technical");
+    check("polling fallback preserves the open inspection disclosure without overflow", () => {
+      require(document.querySelector("#technical-inspection").open, "polling refresh must preserve the open inspection disclosure");
       require(document.querySelector('#load-status').textContent.trim() === "Polling", "a closed event stream must retain the Polling status");
       require(document.documentElement.scrollWidth <= document.documentElement.clientWidth, "dashboard must not overflow horizontally at the configured viewport width");
     });
     window.__dashboardTest.setContext({ ...window.__dashboardFixtures.linked, revision: 105 });
     window.__dashboardTest.reconnect();
     await sleep(20);
-    check("SSE reconnect refresh preserves Technical and its raw disclosure", () => {
-      assertSelectedTab("technical");
+    check("SSE reconnect refresh preserves the technical disclosure", () => {
+      require(document.querySelector("#technical-inspection").open, "reconnect refresh must preserve the open inspection disclosure");
       require(document.querySelector('#load-status').textContent.trim() === "Live", "a restored event stream must return to the Live status");
       require(document.querySelector('#technical-raw').open, "SSE reconnect must retain the open Raw JSON disclosure");
-    });
-    click(document.querySelector('#tab-features'));
-    check("Features click reverses tab selection with coherent hidden Technical panel", () => {
-      assertSelectedTab("features");
-      const technical = document.querySelector('#technical-panel');
-      require(technical.hidden && getComputedStyle(technical).display === "none" && technical.getBoundingClientRect().height === 0, "Features selection must fully hide the Technical panel");
-      require(document.documentElement.scrollWidth <= document.documentElement.clientWidth, "dashboard must not overflow after returning to Features");
     });
     window.__dashboardTest.setContext({ ...window.__dashboardFixtures.empty, revision: 106 });
     window.__dashboardTest.revision();
     await sleep(20);
-    check("empty capabilities and queue retain Features safely at desktop and narrow widths", () => {
-      click(document.querySelector('#feature-filter-all'));
+    check("empty capabilities retain an honest diagnostic state at all viewport widths", () => {
       const list = document.querySelector('#features-list');
       require(list.querySelectorAll('article[data-feature-id]').length === 0 && list.querySelector('.empty-state'), "empty context must render the feature empty state without phantom rows");
       require(document.documentElement.scrollWidth <= document.documentElement.clientWidth, "dashboard must not overflow horizontally at the configured viewport width");
-      assertSelectedTab("features");
-      const technical = document.querySelector('#technical-panel');
-      require(technical.hidden && getComputedStyle(technical).display === "none" && technical.getBoundingClientRect().height === 0, "hidden technical panel must be display-none and height-zero at every viewport");
+      require(!document.querySelector("#active-slice-content").textContent.includes("Published capabilities"), "capability diagnostics must stay out of the primary acceptance view");
     });
     output.textContent = JSON.stringify(results);
   }, 40);

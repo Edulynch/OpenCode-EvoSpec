@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises"
 import { runInNewContext } from "node:vm"
 
 const dashboardSource = await readFile(new URL("../evospec/resources/dashboard/dashboard.js", import.meta.url), "utf8")
+const dashboardHtml = await readFile(new URL("../evospec/resources/dashboard/index.html", import.meta.url), "utf8")
 
 class Element {
   constructor(tagName) {
@@ -162,24 +163,19 @@ function makeResponse(context, ok = true) {
 
 function makeDashboard(fetcher) {
   const ids = new Map([
-    "load-status", "project-summary", "current-work-section", "current-work-title",
+    "load-status", "project-summary", "refresh-context", "current-work-section", "current-work-title",
     "current-work-status", "current-work-explanation", "active-slice-status",
     "active-slice-content", "blocked-section", "blocked-list", "features-list",
-    "tab-features", "tab-technical", "features-panel", "technical-panel", "technical-content",
+    "technical-content",
   ].map((id) => [id, new Element(id)]))
   ids.get("active-slice-status").textContent = "Loading"
   ids.get("active-slice-content").append(Object.assign(new Element("p"), {
     className: "empty-state",
     textContent: "Loading the active Slice and acceptance criteria.",
   }))
-  const filters = ["all", "completed", "blocked"].map((filter) => {
-    const button = new Element("button")
-    button.dataset.featureFilter = filter
-    return button
-  })
   const document = {
     getElementById: (id) => ids.get(id) ?? null,
-    querySelectorAll: (selector) => selector === "[data-feature-filter]" ? filters : [],
+    querySelectorAll: () => [],
     createElement: (tagName) => new Element(tagName),
     createTextNode: (text) => Object.assign(new Element("#text"), { textContent: text }),
   }
@@ -236,7 +232,7 @@ function makeDashboard(fetcher) {
     },
     clearInterval: (id) => intervals.delete(id),
   }, { filename: "dashboard.js" })
-  return { ids, filters, fetchCalls, sources, windowListeners, intervals }
+  return { ids, fetchCalls, sources, windowListeners, intervals }
 }
 
 function descendants(root) {
@@ -258,6 +254,18 @@ function rowResult(row) {
 function statusBadges(app) {
   return descendants(app.ids.get("active-slice-content")).filter((element) => element.className === "status-label")
 }
+
+test("acceptance is the primary view and workflow/capability diagnostics are disclosed separately", () => {
+  const primary = dashboardHtml.split(/<details id="technical-inspection"/, 1)[0]
+  const diagnostics = dashboardHtml.match(/<details id="technical-inspection"[\s\S]*?<\/details>/)?.[0] ?? ""
+  assert.match(primary, /id="active-slice-section"/)
+  assert.doesNotMatch(primary, /current-work-section|blocked-section|features-list|Published features/)
+  assert.match(diagnostics, /Technical inspection/)
+  assert.match(diagnostics, /current-work-section/)
+  assert.match(diagnostics, /blocked-section/)
+  assert.match(diagnostics, /features-list/)
+  assert.match(diagnostics, /do not establish Feature completion or Slice acceptance/i)
+})
 
 async function waitFor(predicate, message = "dashboard did not settle") {
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -290,7 +298,7 @@ test("renders Feature, active Slice, and current criteria from the canonical GET
   assert.ok(content.includes(`Agreed outcome: ${accepted.criteria_revision.outcome}`))
   assert.deepEqual(criterionRows(app).map(rowResult), accepted.criteria_revision.criteria.map((criterion) => criterion.expected_result))
   assert.equal(criterionRows(app).length, accepted.criteria_revision.criteria.length)
-  assert.deepEqual(criterionRows(app).map(rowStatus), accepted.criteria_revision.criteria.map(() => "Pending"))
+  assert.deepEqual(criterionRows(app).map(rowStatus), accepted.criteria_revision.criteria.map(() => "Pending verification"))
   for (const privateValue of [
     accepted.feature_agreement_ref,
     accepted.slice_agreement_ref,
@@ -298,6 +306,8 @@ test("renders Feature, active Slice, and current criteria from the canonical GET
     accepted.criteria_revision.id,
     ...accepted.criteria_revision.criteria.map((criterion) => criterion.id),
     ...accepted.criteria_revision.criteria.map((criterion) => criterion.expected_evidence),
+    "ACTIVE_CONTEXT",
+    "CANONICAL",
   ]) {
     assert.equal(content.includes(privateValue), false, `primary index leaked ${privateValue}`)
   }
@@ -306,6 +316,7 @@ test("renders Feature, active Slice, and current criteria from the canonical GET
   assert.equal(app.fetchCalls[0].options.method, undefined)
   const technicalRevision = descendants(app.ids.get("technical-content")).find((element) => element.id === "technical-slice-agreements")
   assert.ok(technicalRevision?.textContent.includes(`criteria revision ${accepted.criteria_revision.id}`))
+  assert.ok(technicalRevision?.textContent.includes("ACTIVE_CONTEXT"), "technical provenance remains inspectable")
 })
 
 test("READY and completed Tasks never become Slice acceptance", async () => {
@@ -326,15 +337,23 @@ test("READY and completed Tasks never become Slice acceptance", async () => {
   assert.ok(noSlice.ids.get("active-slice-content").textContent.includes("No active accepted Slice."))
 })
 
+test("a completed Task does not project Feature completion in capability diagnostics", async () => {
+  const app = await loadedDashboard(makeContext({ outcome: "READY" }))
+  const capability = descendants(app.ids.get("features-list")).find((element) => element.dataset.featureId === "feature-1")
+  assert.ok(capability)
+  assert.equal(descendants(capability).some((element) => element.className === "status-label"), false)
+  assert.ok(capability.textContent.includes("Personal task list"))
+})
+
 test("only a CURRENT outcome with its matching canonical receipt says Slice accepted", async () => {
   const accepted = await loadedDashboard(makeContext({ outcome: "CURRENT" }))
   assert.equal(accepted.ids.get("active-slice-status").textContent, "Slice accepted")
   const primary = accepted.ids.get("active-slice-content").textContent
   const activeCard = descendants(accepted.ids.get("active-slice-content")).find((element) => element.className === "acceptance-slice")
-  assert.ok(activeCard?.textContent.includes("Agreed scope"))
+  assert.ok(activeCard?.textContent.includes("Slice status"))
   assert.ok(activeCard?.textContent.includes("Agreed outcome: The agreed task outcome is visible"))
   assert.ok(activeCard?.textContent.includes("Outcome acceptance"))
-  assert.ok(activeCard?.textContent.includes("Criterion verification"))
+  assert.ok(activeCard?.textContent.includes("Agreed acceptance criteria"))
   assert.ok(activeCard?.textContent.includes("Slice accepted"))
   for (const privateValue of ["private-hash", "private-evidence", "private-receipt", "TASK-private", "AC-1", "private-test-target", "feature-ref-private", "slice-ref-private"]) {
     assert.equal(primary.includes(privateValue), false, `primary index leaked ${privateValue}`)
@@ -355,16 +374,36 @@ test("only a CURRENT outcome with its matching canonical receipt says Slice acce
   assert.equal((await loadedDashboard(wrongCriteriaReceipt)).ids.get("active-slice-status").textContent, "Acceptance status unavailable")
 })
 
+test("legacy acceptance rejects a CURRENT receipt from another repository, Slice, or criteria revision", async () => {
+  const mismatches = [
+    ["repository_id", "another-repository"],
+    ["slice_agreement_ref", "another-slice"],
+    ["criteria_revision_id", "another-criteria-revision"],
+  ]
+  for (const [field, value] of mismatches) {
+    const context = makeContext({ outcome: "CURRENT" })
+    delete context.slice_acceptance_inventory
+    context.slice_outcome.receipt[field] = value
+    const app = await loadedDashboard(context)
+    assert.equal(
+      app.ids.get("active-slice-status").textContent,
+      "Acceptance status unavailable",
+      `${field} mismatch must not claim current acceptance`,
+    )
+    assert.equal(statusBadges(app).some((badge) => badge.textContent === "Slice accepted"), false)
+  }
+})
+
 test("criterion states remain distinct and legacy VERIFIED freshness is not current", async () => {
   const specifications = [
-    { status: "UNVERIFIED", label: "Pending" },
-    { status: "FAILED", fresh_for_current_workspace: false, label: "Failed" },
-    { status: "STALE", fresh_for_current_workspace: false, label: "Revalidate" },
-    { status: "REVALIDATION_REQUIRED", fresh_for_current_workspace: false, label: "Revalidate" },
+    { status: "UNVERIFIED", label: "Pending verification" },
+    { status: "FAILED", fresh_for_current_workspace: false, label: "Verification failed" },
+    { status: "STALE", fresh_for_current_workspace: false, label: "Revalidation required" },
+    { status: "REVALIDATION_REQUIRED", fresh_for_current_workspace: false, label: "Revalidation required" },
     { status: "VERIFIED", fresh_for_current_workspace: true, label: "Verified (current)" },
-    { status: "VERIFIED", fresh_for_current_workspace: false, label: "Verified (freshness unavailable)" },
-    { status: "VERIFIED", label: "Verified (freshness unavailable)" },
-    { status: "FUTURE_STATE", fresh_for_current_workspace: true, label: "Status unavailable" },
+    { status: "VERIFIED", fresh_for_current_workspace: false, label: "Verified (currentness unavailable)" },
+    { status: "VERIFIED", label: "Verified (currentness unavailable)" },
+    { status: "FUTURE_STATE", fresh_for_current_workspace: true, label: "Verification unavailable" },
   ]
   const context = makeContext({
     criteriaTitles: specifications.map((_, index) => `Criterion ${index + 1}`),
@@ -391,7 +430,7 @@ test("missing Slice, criteria, old schema, unknown state, and context errors fai
   const emptyCriteria = makeContext({ criteriaRevision: { id: "criteria-empty", criteria: [] } })
   assert.equal((await loadedDashboard(emptyCriteria)).ids.get("active-slice-status").textContent, "Status unavailable")
 
-  for (const [outcome, label] of [["BLOCKED", "Blocked"], ["STALE", "Revalidate"], ["REVALIDATION_REQUIRED", "Revalidate"]]) {
+  for (const [outcome, label] of [["BLOCKED", "Acceptance blocked"], ["STALE", "Revalidation required"], ["REVALIDATION_REQUIRED", "Revalidation required"]]) {
     const app = await loadedDashboard(makeContext({ outcome }))
     assert.equal(app.ids.get("active-slice-status").textContent, label)
   }
@@ -441,6 +480,12 @@ test("groups accepted Slices by canonical Feature identity and never evaluates i
         historical_receipt: true,
       }),
       makeItem({
+        slice_agreement_ref: "slice-blocked",
+        slice_title: "Blocked parked Slice",
+        scope_status: "PARKED",
+        operational_state: "BLOCKED",
+      }),
+      makeItem({
         slice_agreement_ref: "slice-inactive",
         slice_title: "Agreement-only Slice",
         scope_status: "INACTIVE",
@@ -477,12 +522,18 @@ test("groups accepted Slices by canonical Feature identity and never evaluates i
       }),
     ],
   }
+  context.slice_acceptance_inventory.items.unshift(context.slice_acceptance_inventory.items.pop())
+  context.slice_acceptance_inventory.total = context.slice_acceptance_inventory.items.length
   const app = await loadedDashboard(context)
   const groups = descendants(app.ids.get("active-slice-content")).filter((element) => element.className === "acceptance-feature-group")
   assert.equal(groups.length, 2)
-  assert.deepEqual(groups.map((group) => group.dataset.featureId), ["feature-1", "feature-2"])
-  assert.equal(descendants(groups[0]).filter((element) => element.className === "acceptance-slice").length, 5)
-  assert.equal(descendants(groups[1]).filter((element) => element.className === "acceptance-slice").length, 1)
+  const featureTitle = (group) => descendants(group).find((element) => element.className === "acceptance-feature-title").textContent
+  assert.deepEqual(groups.map(featureTitle), ["Different Feature", "Personal task list"])
+  assert.ok(groups.every((group) => group.dataset.featureId === undefined), "primary Feature groups must not expose technical IDs")
+  const featureOne = groups.find((group) => featureTitle(group) === "Personal task list")
+  const featureTwo = groups.find((group) => featureTitle(group) === "Different Feature")
+  assert.equal(descendants(featureOne).filter((element) => element.className === "acceptance-slice").length, 6)
+  assert.equal(descendants(featureTwo).filter((element) => element.className === "acceptance-slice").length, 1)
   assert.equal(app.ids.get("active-slice-status").textContent, "Ready for acceptance")
   const card = (title) => descendants(app.ids.get("active-slice-content")).find((element) =>
     element.className === "acceptance-slice" && element.textContent.includes(title)
@@ -493,6 +544,7 @@ test("groups accepted Slices by canonical Feature identity and never evaluates i
   assert.ok(parked?.textContent.includes("historical outcome receipt"))
   assert.ok(parked?.textContent.includes("parked-only result"))
   assert.equal(parked?.textContent.includes("private parked evidence"), false)
+  assert.ok(card("Blocked parked Slice")?.textContent.includes("Blocked (parked)"))
   const inactive = card("Agreement-only Slice")
   assert.ok(inactive?.textContent.includes("Current acceptance not evaluated"))
   assert.ok(inactive?.textContent.includes("Acceptance criteria are not recorded"))
@@ -660,17 +712,14 @@ test("explicit null repository identity invalidates lower-revision acceptance un
   assert.equal(statusBadges(app).some((badge) => badge.textContent === "Slice accepted" || badge.textContent === "Verified (current)"), false)
 })
 
-test("refresh and dashboard navigation make read-only context requests", async () => {
+test("manual refresh and revision events make only read-only GET requests", async () => {
   const app = await loadedDashboard(makeContext({ outcome: "CURRENT" }))
-  app.ids.get("tab-technical").click()
-  assert.equal(app.ids.get("technical-panel").hidden, false)
-  app.ids.get("tab-features").click()
-  assert.equal(app.ids.get("features-panel").hidden, false)
-  app.filters[1].click()
   assert.equal(app.sources[0].url, "/api/events")
-  app.sources[0].emit("revision", { data: JSON.stringify({ revision: 7 }) })
+  app.ids.get("refresh-context").click()
   await waitFor(() => app.fetchCalls.length === 2)
+  app.sources[0].emit("revision", { data: JSON.stringify({ revision: 7 }) })
+  await waitFor(() => app.fetchCalls.length === 3)
   await waitFor(() => app.ids.get("active-slice-status").textContent === "Slice accepted")
-  assert.ok(app.fetchCalls.every((call) => call.url === "/api/context" && (call.options.method === undefined || call.options.method === "GET")))
+  assert.ok(app.fetchCalls.every((call) => call.url === "/api/context" && call.options.method === undefined))
   assert.ok(app.fetchCalls.every((call) => call.options.headers.Accept === "application/json"))
 })
