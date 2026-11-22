@@ -53,6 +53,7 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn('windowsHide: globalThis.process.platform === "win32"', plugin)
         self.assertIn("runtime.tool.transform", plugin)
         self.assertIn('"evospec_context"', plugin)
+        self.assertIn('"evospec_auto_readiness"', plugin)
         self.assertIn('{ codemode: false }', plugin)
         self.assertIn('"evospec_start"', plugin)
         self.assertIn('"evospec_assessed_start"', plugin)
@@ -338,6 +339,115 @@ assert(requests.filter((item) => item.action === "propose_autonomy_expansion").l
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_auto_first_probe_observes_hooks_but_never_attests_user_or_grants_authority(self) -> None:
+        # A host permission "allow" can be saved policy, not Auto consent.
+        # Prompt admission can originate in another tool, not a human.
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "plugin.ts").write_text(_resources()[PLUGIN], encoding="utf-8")
+            (root / "continuation.mjs").write_text(_resources()[CONTINUATION], encoding="utf-8")
+            runner = root / "auto-readiness.ts"
+            runner.write_text(
+                '''import plugin from "./plugin.ts"
+
+const definitions = []
+let permissionAssertions = 0
+const assert = (check, message) => { if (!check) throw new Error(message) }
+const runtime = {
+  session: {
+    get: async ({ sessionID }) => ({
+      location: { directory: process.cwd() },
+    }),
+    context: async () => [],
+    hook: async (name, callback) => {
+      if (name === "prompt") runtime.promptHook = callback
+      else if (name === "context") runtime.contextHook = callback
+      else throw new Error("unknown session hook")
+    },
+  },
+  permission: {
+    hook: async (name, callback) => {
+      assert(name === "evaluate", "only existing permissions evaluation hook")
+      runtime.permissionHook = callback
+    },
+    assert: async () => { permissionAssertions++; throw new Error("must not request permission") },
+  },
+  tool: {
+    transform: async (callback) => callback({ add: (entry) => definitions.push(entry) }),
+    list: async () => definitions.map((entry) => ({ id: entry.name })),
+  },
+}
+await plugin.setup(runtime)
+const tool = definitions.find((entry) => entry.name === "evospec_auto_readiness")
+assert(tool !== undefined, "read-only host qualification tool must register")
+Object.defineProperty(Bun, "spawn", { value() { throw new Error("probe must not use CLI") } })
+const call = async (sessionID) => JSON.parse((await tool.execute({}, {
+  sessionID, signal: new AbortController().signal,
+})).content)
+const before = await call("ses-1")
+assert(before.code === "AUTO_HOST_ATTESTATION_UNAVAILABLE", "no host grant from capability probe")
+assert(before.mode === "READ_ONLY_CAPABILITY_PROBE", "never a mutation")
+assert(before.session.repository_root === process.cwd(), "bind to live executing root")
+assert(before.observed_capabilities.prompt_hook_registered, "observes registered prompt hook")
+assert(before.observed_capabilities.permission_evaluate_hook_registered, "observes registered permission hook")
+assert(before.observed_capabilities.session_context_api_available, "API presence is observable")
+assert(before.observed_capabilities.prompt_admission_seen_this_process === false, "no invented prompt")
+assert(before.trust.effective_auto_mode === "UNVERIFIED", "no Auto config attestation")
+assert(before.trust.prompt_human_origin === "UNVERIFIED", "no human attribution")
+assert(before.automatic_acceptance_allowed === false, "no false Slice consent")
+assert(before.automatic_file_grant_allowed === false, "no unauthorized editing")
+assert(before.automatic_feature_completion_allowed === false, "no false completion")
+runtime.promptHook({
+  sessionID: "ses-1", messageID: "msg-1",
+  prompt: { text: "programmatic submission is also a prompt" },
+})
+const permission = { sessionID: "ses-1", action: "edit", effect: "allow", resources: ["index.html"] }
+runtime.permissionHook(permission)
+assert(permission.effect === "allow", "passive observer must not alter normal host policy")
+const after = await call("ses-1")
+assert(after.observed_capabilities.prompt_admission_seen_this_process, "observed admission")
+assert(JSON.stringify(after.observed_capabilities.permission_rule_effects_seen_this_process) === '["allow"]',
+  "report observed effect, not its provenance")
+assert(after.trust.effective_auto_mode === "UNVERIFIED", "allow is not proof of Auto")
+assert(after.trust.prompt_human_origin === "UNVERIFIED", "prompt hook is not a human signature")
+assert(after.automatic_acceptance_allowed === false, "no authority after observations")
+const other = await call("ses-2")
+assert(other.observed_capabilities.prompt_admission_seen_this_process === false,
+  "observation from another session cannot be inherited")
+assert(other.observed_capabilities.permission_rule_effects_seen_this_process.length === 0,
+  "permission effect must remain session scoped")
+assert(permissionAssertions === 0, "readiness must never invoke permission.assert")
+
+// Older host lacking a prompt hook or permission API must report the gap,
+// not promote a missing capability to a trusted grant.
+const definitions2 = []
+const limited = {
+  session: {
+    get: async () => ({ location: { directory: process.cwd() } }),
+    hook: async (name) => { if (name !== "context") throw new Error("unsupported hook") },
+  },
+  tool: {
+    transform: async (cb) => cb({ add: (entry) => definitions2.push(entry) }),
+    list: async () => definitions2.map((entry) => ({ id: entry.name })),
+  },
+}
+await plugin.setup(limited)
+const limitedTool = definitions2.find((entry) => entry.name === "evospec_auto_readiness")
+const unavailable = JSON.parse((await limitedTool.execute({}, {
+  sessionID: "ses-limited", signal: new AbortController().signal,
+})).content)
+assert(unavailable.observed_capabilities.prompt_hook_registered === false, "unsupported prompt hook")
+assert(unavailable.observed_capabilities.permission_evaluate_hook_registered === false, "no permission hook")
+assert(unavailable.observed_capabilities.permission_assert_api_available === false, "no permission assert")
+assert(unavailable.automatic_acceptance_allowed === false, "missing API fails closed")
+''',
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                ("bun", "run", str(runner)), cwd=root, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_v2_plugin_registers_and_serializes_provider_neutral_typed_actions(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -384,9 +494,9 @@ const runtime = {
   },
 }
 await plugin.setup(runtime)
-assert(definitions.length === 30, "raw protocol tool and all typed helpers register")
+assert(definitions.length === 31, "raw protocol tool and all typed helpers register")
 const names = new Set(definitions.map((definition) => definition.name))
-for (const name of ["evospec", "evospec_start", "evospec_first_slice_handoff", "evospec_propose_file_edit", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_criterion_test", "evospec_criterion_test_r3b", "evospec_accept_slice_outcome", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
+for (const name of ["evospec", "evospec_start", "evospec_first_slice_handoff", "evospec_propose_file_edit", "evospec_auto_readiness", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_criterion_test", "evospec_criterion_test_r3b", "evospec_accept_slice_outcome", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
 const contextEntry = definitions.find((definition) => definition.name === "evospec_context")
 assert(contextEntry.options?.codemode === false, "canonical read-only context bypasses deferred Code Mode discovery")
 assert(definitions.filter((definition) => definition.options?.codemode === false).length === 1, "only canonical context is directly exposed")
