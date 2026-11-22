@@ -4,21 +4,16 @@
   const byId = (id) => document.getElementById(id);
   const elements = Object.freeze({
     loadStatus: byId("load-status"), projectSummary: byId("project-summary"),
+    refreshContext: byId("refresh-context"),
     currentWorkSection: byId("current-work-section"), currentWorkTitle: byId("current-work-title"),
     currentWorkStatus: byId("current-work-status"), currentWorkExplanation: byId("current-work-explanation"),
     activeSliceStatus: byId("active-slice-status"), activeSliceContent: byId("active-slice-content"),
     blockedSection: byId("blocked-section"),
     blockedList: byId("blocked-list"), featuresList: byId("features-list"),
-    featureFilterButtons: Array.from(document.querySelectorAll("[data-feature-filter]")),
-    tabs: [byId("tab-features"), byId("tab-technical")],
-    panels: [byId("features-panel"), byId("technical-panel")],
     technicalContent: byId("technical-content")
   });
 
-  let selectedFeatureFilter = "all";
-  let selectedTab = "features";
   const technicalOpenState = new Map();
-  let latestFeatureRender;
   let activeSliceMessage;
   let activeCriterionStatuses = [];
   let acceptanceStatuses = [];
@@ -46,8 +41,6 @@
     element.append(empty);
     return empty;
   };
-  const safeId = (value) => String(value).replace(/[^a-zA-Z0-9_-]+/g, "-");
-
   function humanStatus(work) {
     const state = String(work.operational_state || "").toUpperCase();
     if (state === "DONE") return "Completed";
@@ -97,13 +90,10 @@
     return humanStatus(work || {});
   }
 
-  function renderHeader(context, queue) {
-    const active = activeWork(queue);
+  function renderHeader(context) {
     if (context.dashboard_error) elements.projectSummary.textContent = "The latest project status could not be loaded.";
-    else if (context.stale) elements.projectSummary.textContent = "Project status needs an updated assessment.";
-    else if (arrayValue(queue.blocked).length) elements.projectSummary.textContent = "Work is active, with blocked work needing attention.";
-    else if (active) elements.projectSummary.textContent = "Current work is underway.";
-    else elements.projectSummary.textContent = "No current work needs attention.";
+    else if (context.stale) elements.projectSummary.textContent = "Project context needs an updated assessment.";
+    else elements.projectSummary.textContent = "Read-only view of the Feature and Slice agreements available from Core.";
   }
 
   function renderCurrentWork(queue, progress, capabilities) {
@@ -120,31 +110,41 @@
 
   function criterionPresentation(verification) {
     const status = String(objectValue(verification).status || "").toUpperCase();
-    if (status === "UNVERIFIED") return ["Pending", "waiting"];
-    if (status === "FAILED") return ["Failed", "failed"];
-    if (status === "STALE" || status === "REVALIDATION_REQUIRED") return ["Revalidate", "stale"];
+    if (status === "UNVERIFIED") return ["Pending verification", "waiting"];
+    if (status === "FAILED") return ["Verification failed", "failed"];
+    if (status === "STALE" || status === "REVALIDATION_REQUIRED") return ["Revalidation required", "stale"];
     if (status === "VERIFIED") {
       return verification.fresh_for_current_workspace === true
         ? ["Verified (current)", "verified"]
-        : ["Verified (freshness unavailable)", "waiting"];
+        : ["Verified (currentness unavailable)", "waiting"];
     }
-    return ["Status unavailable", "waiting"];
+    return ["Verification unavailable", "waiting"];
   }
 
-  function outcomePresentation(outcome) {
+  function outcomePresentation(outcome, accepted, repositoryId) {
     const value = objectValue(outcome);
     const status = String(value.status || "").toUpperCase();
     if (status === "CURRENT") {
       const receipt = objectValue(value.receipt);
-      if (typeof value.latest_receipt_id === "string" && value.latest_receipt_id !== "" && receipt.id === value.latest_receipt_id) {
+      const revision = objectValue(objectValue(accepted).criteria_revision);
+      if (
+        typeof value.latest_receipt_id === "string" && value.latest_receipt_id.trim()
+        && receipt.id === value.latest_receipt_id
+        && typeof repositoryId === "string" && repositoryId.trim()
+        && receipt.repository_id === repositoryId
+        && typeof accepted?.slice_agreement_ref === "string" && accepted.slice_agreement_ref.trim()
+        && receipt.slice_agreement_ref === accepted.slice_agreement_ref
+        && typeof revision.id === "string" && revision.id.trim()
+        && receipt.criteria_revision_id === revision.id
+      ) {
         return ["Slice accepted", "accepted", "Current canonical acceptance is recorded."];
       }
-      return ["Acceptance status unavailable", "waiting", "The canonical acceptance receipt is unavailable."];
+      return ["Acceptance status unavailable", "waiting", "The current receipt does not match this repository, Slice, and criteria revision."];
     }
     if (status === "READY") return ["Ready for acceptance", "ready", "Ready for acceptance; this Slice is not yet accepted."];
-    if (status === "BLOCKED") return ["Blocked", "blocked", "Acceptance is blocked by unresolved requirements."];
+    if (status === "BLOCKED") return ["Acceptance blocked", "blocked", "Acceptance is blocked by unresolved requirements."];
     if (status === "STALE" || status === "REVALIDATION_REQUIRED") {
-      return ["Revalidate", "stale", "Evidence needs revalidation before acceptance."];
+      return ["Revalidation required", "stale", "Evidence needs revalidation before acceptance."];
     }
     return ["Acceptance status unavailable", "waiting", "The canonical acceptance status is not available."];
   }
@@ -213,7 +213,7 @@
       unavailable("Acceptance criteria are not available for this context.");
       return;
     }
-    const [outcomeLabel, outcomeTone, outcomeMessage] = outcomePresentation(context.slice_outcome);
+    const [outcomeLabel, outcomeTone, outcomeMessage] = outcomePresentation(context.slice_outcome, accepted, context.repository_id);
     setStatus(outcomeLabel, outcomeTone);
     activeSliceMessage = create("p", "active-slice-note", outcomeMessage);
     elements.activeSliceContent.append(activeSliceMessage);
@@ -378,20 +378,16 @@
       groups.get(key).items.push(item);
     });
 
-    [...groups.values()]
-      .sort((left, right) => left.featureId.localeCompare(right.featureId))
-      .forEach((group) => {
+      [...groups.values()].forEach((group) => {
         const article = create("article", "acceptance-feature-group");
-        article.dataset.featureId = group.featureId;
         article.append(create("p", "eyebrow", "Feature"), create("h3", "acceptance-feature-title", group.title));
-        group.items
-          .sort((left, right) => left.slice_agreement_ref.localeCompare(right.slice_agreement_ref))
-          .forEach((item) => appendAcceptanceSlice(article, item, item === activeItem, context));
+        group.items.forEach((item) => appendAcceptanceSlice(article, item, item === activeItem, context));
         elements.activeSliceContent.append(article);
       });
     if (unassociated.length) {
       const article = create("article", "acceptance-unassociated");
       article.append(create("h3", "", "Unassociated Slice records"));
+      article.append(create("p", "empty-state", "These records could not be matched to a canonical Feature; their criteria and acceptance are not inferred."));
       unassociated.forEach((item) => {
         const row = create("p", "empty-state", textValue(item.slice_title, "Slice agreement details unavailable."));
         article.append(row);
@@ -407,7 +403,7 @@
     }
     const receipt = objectValue(outcome.receipt);
     if (
-      typeof outcome.latest_receipt_id === "string" && outcome.latest_receipt_id !== ""
+      typeof outcome.latest_receipt_id === "string" && outcome.latest_receipt_id.trim()
       && receipt.id === outcome.latest_receipt_id
       && receipt.repository_id === context.repository_id
       && receipt.slice_agreement_ref === item.slice_agreement_ref
@@ -424,19 +420,17 @@
     const revision = objectValue(item.criteria_revision);
     const scopeLabels = {
       ACTIVE: "Active",
-      PARKED: "Parked",
-      QUEUED: `Queued${item.operational_state ? ` (${item.operational_state})` : ""}`,
+      PARKED: item.operational_state === "BLOCKED" ? "Blocked (parked)" : item.operational_state === "FROZEN" ? "Paused (parked)" : "Parked",
+      QUEUED: "Queued",
       PRESERVED: "Preserved primary work (inactive)",
       HISTORICAL: "Historical context (not current)",
       INACTIVE: "Inactive (agreement only)",
     };
-    slice.append(create("p", "eyebrow", "Agreed scope"));
+    slice.append(create("p", "eyebrow", "Slice status"));
     const scopeLabel = create("span", "status-label", scopeLabels[item.scope_status]);
-    scopeLabel.dataset.status = item.scope_status === "ACTIVE" ? "in-review" : "waiting";
+    scopeLabel.dataset.status = item.scope_status === "ACTIVE" ? "in-review" : item.operational_state === "BLOCKED" ? "blocked" : "waiting";
     acceptanceStatuses.push(scopeLabel);
-    const provenanceDetails = [`Scope provenance: ${textValue(item.provenance, "unavailable")}`];
-    if (item.operational_state) provenanceDetails.push(`Operational state: ${item.operational_state}`);
-    slice.append(scopeLabel, create("p", "acceptance-provenance", provenanceDetails.join("; ")));
+    slice.append(scopeLabel);
     if (typeof revision.outcome === "string" && revision.outcome.trim()) {
       slice.append(create("p", "acceptance-scope-outcome", `Agreed outcome: ${revision.outcome.trim()}`));
     }
@@ -471,7 +465,7 @@
       )) {
         slice.append(create("p", "empty-state", "Acceptance criteria are unavailable; this record is malformed."));
       } else {
-        slice.append(create("h5", "active-slice-criteria-heading", "Criterion verification"));
+        slice.append(create("h5", "active-slice-criteria-heading", "Agreed acceptance criteria"));
         const verificationRecords = isActive ? arrayValue(context.criterion_verification).map(objectValue) : [];
         const list = create("ul", "active-slice-criteria");
         list.setAttribute("aria-label", `${item.slice_title} criterion verification`);
@@ -483,7 +477,7 @@
             : [];
           const [label, tone] = isActive
             ? criterionPresentation(matches.length === 1 ? matches[0] : null)
-            : ["Not evaluated", "waiting"];
+            : ["Not evaluated for this inactive Slice", "waiting"];
           const row = create("li", "active-slice-criterion");
           const status = create("span", "status-label", label);
           status.dataset.status = tone;
@@ -535,61 +529,17 @@
     });
   }
 
-  function projectFeatures(context, queue) {
-    const capabilities = arrayValue(context.accepted_capabilities).map(objectValue);
-    const works = arrayValue(queue.all).map(objectValue);
-    return capabilities.map((capability) => ({
-      key: `feature-${safeId(capability.feature_id)}`,
-      featureId: capability.feature_id,
-      title: capabilityTitle(capability),
-      capability,
-      works: works.filter((work) => work.feature_id === capability.feature_id)
-    })).sort((left, right) => left.title.localeCompare(right.title) || String(left.featureId).localeCompare(String(right.featureId)));
-  }
-
-  function featureStatus(feature) {
-    const active = feature.works.find(workIsActive);
-    if (active) return humanStatus(active);
-    const blocked = feature.works.find((work) => humanStatus(work) === "Blocked");
-    if (blocked) return "Blocked";
-    const pending = feature.works.find((work) => humanStatus(work) !== "Completed");
-    return pending ? humanStatus(pending) : "Completed";
-  }
-
-  function renderFeatureFilters() {
-    elements.featureFilterButtons.forEach((button) => {
-      button.setAttribute("aria-pressed", String(button.dataset.featureFilter === selectedFeatureFilter));
-    });
-  }
-
-  function filterFeatures(features) {
-    if (selectedFeatureFilter === "all") return features;
-    if (selectedFeatureFilter === "blocked") return features.filter((feature) => feature.status === "Blocked");
-    return features.filter((feature) => feature.status === "Completed");
-  }
-
-  function selectFeatureFilter(filter) {
-    selectedFeatureFilter = filter;
-    renderFeatureFilters();
-    if (latestFeatureRender) renderFeatures(latestFeatureRender.context, latestFeatureRender.queue, latestFeatureRender.progress);
-  }
-
-  function renderFeatures(context, queue, progress) {
-    latestFeatureRender = { context, queue, progress };
-    renderFeatureFilters();
+  function renderFeatures(context) {
     clear(elements.featuresList);
-    const features = filterFeatures(projectFeatures(context, queue).map((feature) => ({ ...feature, status: featureStatus(feature) })));
-    if (!features.length) {
-      appendEmpty(elements.featuresList, "No features match this filter.");
+    const capabilities = arrayValue(context.accepted_capabilities).map(objectValue);
+    if (!capabilities.length) {
+      appendEmpty(elements.featuresList, "No published capabilities are available.");
       return;
     }
-    features.forEach((feature) => {
+    capabilities.forEach((capability) => {
       const article = create("article", "feature-row");
-      article.dataset.featureId = feature.featureId;
-      const status = feature.status;
-      const label = create("span", "status-label", status);
-      label.dataset.status = statusTone(status);
-      article.append(create("span", "feature-title", feature.title), label);
+      if (typeof capability.feature_id === "string") article.dataset.featureId = capability.feature_id;
+      article.append(create("span", "feature-title", capabilityTitle(capability)));
       elements.featuresList.append(article);
     });
   }
@@ -632,10 +582,6 @@
       ["Lifecycle", arrayValue(context.lifecycle).join(", ")], ["Queue", `${textValue(queue.total, "0")} work items`],
       ["Queue complete", queue.complete === true ? "Yes" : "No"], ["Current action", objectValue(context.progress).current_action]
     ]);
-    const capabilities = arrayValue(context.accepted_capabilities).map(objectValue);
-    appendTechnicalRecord(elements.technicalContent, "technical-capabilities", "Accepted capabilities", capabilities.map((capability) => [
-      capabilityTitle(capability), capability.feature_id
-    ]));
     const works = arrayValue(queue.all).map(objectValue);
     appendTechnicalRecord(elements.technicalContent, "technical-work-items", "Work items", works.map((work) => [
       textValue(work.id, "Unknown work"), `${humanStatus(work)}${work.reason || work.blocker ? `: ${textValue(work.reason || work.blocker)}` : ""}`
@@ -647,7 +593,7 @@
         const revision = objectValue(item.criteria_revision);
         return [
           textValue(item.slice_title, "Slice"),
-          `Feature agreement ${textValue(item.feature_agreement_ref)}; Slice agreement ${textValue(item.slice_agreement_ref)}; criteria revision ${textValue(revision.id, "not recorded")}; provenance ${textValue(item.provenance)}; agreed outcome ${textValue(revision.outcome)}`,
+          `Feature agreement ${textValue(item.feature_agreement_ref)}; Slice agreement ${textValue(item.slice_agreement_ref)}; criteria revision ${textValue(revision.id, "not recorded")}; provenance ${textValue(item.provenance)}; operational state ${textValue(item.operational_state)}; agreed outcome ${textValue(revision.outcome)}`,
         ];
       })
     );
@@ -678,41 +624,12 @@
     const queue = objectValue(context.work_queue);
     const progress = objectValue(context.progress);
     const capabilities = arrayValue(context.accepted_capabilities).map(objectValue);
-    renderHeader(context, queue);
+    renderHeader(context);
     renderAcceptanceIndex(context);
     renderCurrentWork(queue, progress, capabilities);
     renderBlocked(queue, capabilities);
-    renderFeatures(context, queue, progress);
+    renderFeatures(context);
     renderTechnical(contextPayload, context, queue);
-    selectTab(selectedTab);
-  }
-
-  function selectTab(name, shouldFocus = false) {
-    selectedTab = name === "technical" ? "technical" : "features";
-    const selectedIndex = selectedTab === "technical" ? 1 : 0;
-    elements.tabs.forEach((tab, index) => {
-      const selected = index === selectedIndex;
-      tab.setAttribute("aria-selected", String(selected));
-      tab.tabIndex = selected ? 0 : -1;
-      elements.panels[index].hidden = !selected;
-    });
-    if (shouldFocus) elements.tabs[selectedIndex].focus();
-  }
-
-  function wireTabs() {
-    elements.tabs.forEach((tab, index) => {
-      tab.addEventListener("click", () => selectTab(index === 1 ? "technical" : "features"));
-      tab.addEventListener("keydown", (event) => {
-        let nextIndex;
-        if (event.key === "ArrowLeft") nextIndex = (index + elements.tabs.length - 1) % elements.tabs.length;
-        if (event.key === "ArrowRight") nextIndex = (index + 1) % elements.tabs.length;
-        if (event.key === "Home") nextIndex = 0;
-        if (event.key === "End") nextIndex = elements.tabs.length - 1;
-        if (nextIndex === undefined) return;
-        event.preventDefault();
-        selectTab(nextIndex === 1 ? "technical" : "features", true);
-      });
-    });
   }
 
   const fallbackIntervalMs = 5000;
@@ -811,10 +728,7 @@
     if (eventSource) eventSource.close();
     stopFallback();
   });
-  elements.featureFilterButtons.forEach((button) => {
-    button.addEventListener("click", () => selectFeatureFilter(button.dataset.featureFilter));
-  });
-  wireTabs();
+  elements.refreshContext.addEventListener("click", loadContext);
   loadContext();
   connectEvents();
 })();
