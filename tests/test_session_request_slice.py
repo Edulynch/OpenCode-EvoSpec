@@ -7,6 +7,7 @@ from hashlib import sha256
 from pathlib import Path
 import unittest
 
+from evospec.agent import _accepted_slice_for_context, _slice_acceptance_inventory
 from evospec.domain import ExpectedRevision, StateValidationError, validate_state
 from evospec.services import CoreService, SessionRequestEvidence, StaleRevisionError
 from evospec.workflow import WorkflowError, WorkflowService
@@ -191,6 +192,37 @@ class SessionRequestFirstSliceTests(unittest.TestCase):
             other_source = replace(state.agreements[1], source="INTERACTIVE_TERMINAL")
             with self.assertRaises(StateValidationError):
                 validate_state(replace(state, agreements=(state.agreements[0], other_source)))
+
+    def test_mismatched_session_pair_is_not_projected_as_canonical(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = WorkflowService.open(root)
+            workflow.init()
+            evidence = self.evidence(root)
+            workflow.accept_first_slice_session(
+                evidence, expected_revision=ExpectedRevision(CoreService.open(root).recover().revision),
+            )
+            state = CoreService.open(root).recover()
+            feature, accepted_slice = state.agreements
+            mismatches = (
+                replace(feature, source_reference=feature.source_reference + ":other"),
+                replace(feature, statement="a different message"),
+                replace(feature, source="INTERACTIVE_TERMINAL"),
+            )
+
+            for mismatched_feature in mismatches:
+                with self.subTest(feature=mismatched_feature):
+                    malformed = replace(state, agreements=(mismatched_feature, accepted_slice))
+                    with self.assertRaises(StateValidationError):
+                        validate_state(malformed)
+                    inventory = _slice_acceptance_inventory(malformed)
+                    self.assertFalse(inventory.complete)
+                    self.assertEqual(inventory.items[0].authority_status, "UNAVAILABLE")
+                    self.assertEqual(inventory.items[0].scope_status, "UNAVAILABLE")
+                    self.assertIsNone(inventory.items[0].feature_id)
+                    self.assertIsNone(
+                        _accepted_slice_for_context(malformed, malformed.active_context),
+                    )
 
 
 if __name__ == "__main__":

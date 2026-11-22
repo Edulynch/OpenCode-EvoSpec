@@ -579,6 +579,11 @@ def _render_status(context: AgentContext, output: TextIO) -> None:
                 f"| Pending checkpoint: {context.accepted_slice.checkpoint}",
                 file=output,
             )
+            if context.accepted_slice.source == "SESSION_REQUEST":
+                print(
+                    "Acceptance source: SESSION_REQUEST (original session request; not a TTY approval)",
+                    file=output,
+                )
             # Expected evidence is part of the scope, never proof of execution.
             print(f"Slice criteria: {context.accepted_slice.criteria_status}", file=output)
             if context.accepted_slice.criteria_revision is not None:
