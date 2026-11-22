@@ -56,7 +56,12 @@ from .input_fingerprint import (
     InputSnapshot,
 )
 from .persistence import JsonValue, RecoveryError
-from .services import ServiceError, StaleRevisionError, SessionRequestEvidence
+from .services import (
+    RequestScopedObjectiveStatus,
+    ServiceError,
+    StaleRevisionError,
+    SessionRequestEvidence,
+)
 from .workflow import (
     ClarificationAnswer,
     WorkflowError,

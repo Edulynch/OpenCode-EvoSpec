@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import unittest
+from typing import cast
 from unittest.mock import call, patch
 
 from evospec.domain import (
@@ -70,7 +71,7 @@ class _SemanticObjectiveFixture:
 
     def setUp(self) -> None:
         temporary = TemporaryDirectory(prefix="evospec-semantic-objective-")
-        self.addCleanup(temporary.cleanup)
+        cast(unittest.TestCase, cast(object, self)).addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
         self.workflow = WorkflowService.open(self.root)
         self.workflow.init()
@@ -256,6 +257,8 @@ class SemanticObjectiveLifecycleTests(_SemanticObjectiveFixture, unittest.TestCa
         for proof, review_evidence in zip(
             proofs, archived.review_evidence, strict=True,
         ):
+            assert review_evidence.reference is not None
+            assert proof.output_sha256 is not None
             self.assertIn(proof.criterion_id, review_evidence.value)
             self.assertIn(proof.id, review_evidence.reference)
             self.assertIn(proof.output_sha256, review_evidence.reference)

@@ -400,9 +400,10 @@ def _without_question_opener(tokens: tuple[str, ...]) -> tuple[str, ...] | None:
 
 
 def _parse_main_core(tokens: tuple[str, ...]) -> bool:
-    tokens = _without_question_opener(tokens)
-    if tokens is None or not tokens:
+    normalized_tokens = _without_question_opener(tokens)
+    if normalized_tokens is None or not normalized_tokens:
         return False
+    tokens = normalized_tokens
 
     for prefix_end in _request_prefix_ends(tokens):
         for app_end in _app_phrase_ends(tokens, prefix_end):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import FrozenInstanceError
 import unittest
+from typing import cast
 
 from evospec.request_scoped_objective import (
     OBJECTIVE_TEST_KIND,
@@ -180,6 +181,7 @@ class RequestScopedObjectiveTests(unittest.TestCase):
             with self.subTest(statement=statement):
                 objective = derive_personal_tasks(statement)
                 self.assertEqual(objective, PersonalTasksObjective())
+                assert objective is not None
                 self.assertEqual(objective.operations, ("create", "consult"))
 
     def test_polite_alternate_order_and_accent_normalization(self) -> None:
@@ -214,6 +216,7 @@ class RequestScopedObjectiveTests(unittest.TestCase):
             english,
             PersonalTasksObjective(explicit_operations=("create", "complete")),
         )
+        assert english is not None
         self.assertEqual(english.operations, ("create", "consult", "complete"))
 
         spanish = derive_personal_tasks(
@@ -241,7 +244,7 @@ class RequestScopedObjectiveTests(unittest.TestCase):
     def test_objective_is_frozen_and_request_dispatch_preserves_static_first(self) -> None:
         objective = PersonalTasksObjective()
         with self.assertRaises(FrozenInstanceError):
-            objective.explicit_operations = ("complete",)  # type: ignore[misc]
+            setattr(objective, "explicit_operations", ("complete",))
 
         self.assertEqual(
             derive_request_objective('Create a static HTML page with the heading "Hello".'),
@@ -288,7 +291,7 @@ class RequestScopedObjectiveTests(unittest.TestCase):
         ):
             with self.subTest(statement=statement):
                 self.assertIsNone(derive_personal_tasks(statement))
-        self.assertIsNone(derive_personal_tasks(None))  # type: ignore[arg-type]
+        self.assertIsNone(derive_personal_tasks(cast(str, cast(object, None))))
 
 
 if __name__ == "__main__":

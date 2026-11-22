@@ -4,6 +4,7 @@ import hashlib
 import os
 import sys
 import unittest
+from typing import cast
 from unittest.mock import patch
 
 import evospec.request_scoped_objective_browser as browser_verifier
@@ -78,7 +79,10 @@ class BrowserInputContractTests(unittest.TestCase):
         self.assert_not_verified(b"x" * 262_145, ("create", "consult"))
         self.assert_not_verified(b"<html></html>", ("consult", "create"))
         self.assert_not_verified(b"<html></html>", ("create", "consult", "delete"))
-        self.assert_not_verified(b"<html></html>", ("create", []))  # type: ignore[arg-type]
+        self.assert_not_verified(
+            b"<html></html>",
+            cast(tuple[str, ...], ("create", [])),
+        )
 
     def test_missing_optional_browser_is_reported_as_unavailable(self) -> None:
         with patch(

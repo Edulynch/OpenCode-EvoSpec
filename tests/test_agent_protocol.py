@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from types import SimpleNamespace
 import unittest
 from hashlib import sha256
 from pathlib import Path
@@ -204,7 +203,7 @@ class AgentProtocolTests(unittest.TestCase):
             self.assertEqual(replay["result"]["revision"], revision)
 
     def test_request_objective_wire_adds_typed_fields_only_for_semantic_kind(self) -> None:
-        legacy = _request_scoped_objective_json(SimpleNamespace(
+        legacy = _request_scoped_objective_json(RequestScopedObjectiveStatus(
             status="PENDING",
             source_reference="session:ses_test0001:msg_test0001:0123456789abcdef",
             request_sha256="a" * 64,
@@ -214,7 +213,7 @@ class AgentProtocolTests(unittest.TestCase):
         self.assertEqual(set(legacy), {
             "status", "source_reference", "request_sha256", "blockers", "heading",
         })
-        semantic = _request_scoped_objective_json(SimpleNamespace(
+        semantic = _request_scoped_objective_json(RequestScopedObjectiveStatus(
             status="PENDING",
             source_reference="session:ses_test0001:msg_test0001:0123456789abcdef",
             request_sha256="b" * 64,
@@ -257,13 +256,28 @@ class AgentProtocolTests(unittest.TestCase):
                 "session:ses_semantic123:msg_semantic123:0123456789abcdef",
             )
 
-        legacy_criterion = _criteria_revision_json(revision(None))["criteria"][0]
+        legacy_projection = _criteria_revision_json(revision(None))
+        assert legacy_projection is not None
+        legacy_criteria = legacy_projection["criteria"]
+        assert isinstance(legacy_criteria, list)
+        self.assertEqual(len(legacy_criteria), 1)
+        legacy_criterion = legacy_criteria[0]
+        assert isinstance(legacy_criterion, dict)
         self.assertEqual(set(legacy_criterion), {
             "id", "expected_result", "expected_evidence",
         })
-        semantic_criterion = _criteria_revision_json(
+        semantic_projection = _criteria_revision_json(
             revision("DERIVED_OBJECTIVE")
-        )["criteria"][0]
+        )
+        assert semantic_projection is not None
+        semantic_criteria = semantic_projection["criteria"]
+        assert isinstance(semantic_criteria, list)
+        self.assertEqual(len(semantic_criteria), 1)
+        semantic_criterion = semantic_criteria[0]
+        assert isinstance(semantic_criterion, dict)
+        self.assertEqual(set(semantic_criterion), {
+            "id", "expected_result", "expected_evidence", "provenance",
+        })
         self.assertEqual(
             semantic_criterion["provenance"],
             "DERIVED_OBJECTIVE",

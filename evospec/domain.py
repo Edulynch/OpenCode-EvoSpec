@@ -3653,7 +3653,7 @@ def validate_state(state: State) -> None:
             criteria is not None and criteria.source == REQUEST_SCOPED_OBJECTIVE
         )
         request_policy: tuple[str, str, str] | None = None
-        if request_objective_outcome:
+        if criteria is not None and criteria.source == REQUEST_SCOPED_OBJECTIVE:
             try:
                 request_policy = request_objective_policy(criteria)
             except DomainError as error:

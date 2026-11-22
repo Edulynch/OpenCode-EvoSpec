@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, Protocol, TypeAlias, cast
 
 _BrowserErrorCode: TypeAlias = Literal[
     "REQUEST_OBJECTIVE_BROWSER_UNAVAILABLE",
@@ -47,6 +47,14 @@ _CONTENT_SECURITY_POLICY = (
     "worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; "
     "font-src 'none'; media-src 'none'; manifest-src 'none'"
 )
+
+
+class _WindowsPopenHandle(Protocol):
+    _handle: int
+
+
+class _WorkerOutputPipe(Protocol):
+    def read1(self, size: int = -1, /) -> bytes: ...
 
 
 class BrowserObjectiveError(RuntimeError):
@@ -227,7 +235,9 @@ class _WindowsJob:
     def attach(self, process: subprocess.Popen[bytes]) -> None:
         from ctypes import wintypes
 
-        process_handle = wintypes.HANDLE(process._handle)  # type: ignore[attr-defined]
+        process_handle = wintypes.HANDLE(
+            cast(_WindowsPopenHandle, cast(object, process))._handle
+        )
         if not self._kernel.AssignProcessToJobObject(self._handle, process_handle):
             raise _unavailable("The verifier worker could not be assigned to its job.")
         is_contained = wintypes.BOOL()
@@ -332,8 +342,9 @@ def _run_isolated_worker(
             if process is None or process.stdout is None:
                 thread_errors.append(True)
                 return
+            output_pipe = cast(_WorkerOutputPipe, cast(object, process.stdout))
             while True:
-                chunk = process.stdout.read1(256)
+                chunk = output_pipe.read1(256)
                 if not chunk:
                     return
                 available = _MAX_WORKER_OUTPUT - len(stdout)
