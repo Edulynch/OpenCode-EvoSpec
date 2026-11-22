@@ -28,6 +28,7 @@ from .agent_protocol_schema import (
     parse_lock_assessments,
     parse_nonblank_string,
     parse_nonblank_strings,
+    parse_input_fingerprint,
     parse_input_snapshot,
     parse_narrowed_autonomy_envelope,
     parse_operational_state,
@@ -408,6 +409,14 @@ def context_json(context: AgentContext) -> dict[str, JsonValue]:
                 "directory_count": context.input_snapshot.directory_count,
                 "total_bytes": context.input_snapshot.total_bytes,
             },
+            "request_scoped_objective": None
+            if context.request_scoped_objective is None else {
+                "status": context.request_scoped_objective.status,
+                "source_reference": context.request_scoped_objective.source_reference,
+                "request_sha256": context.request_scoped_objective.request_sha256,
+                "blockers": list(context.request_scoped_objective.blockers),
+                "heading": context.request_scoped_objective.heading,
+            },
             "r3b_coverage_approvals": [
                 _coverage_approval_json(item)
                 for item in context.criterion_coverage_approvals
@@ -680,6 +689,17 @@ def _dispatch(
                     statement=parse_nonblank_string(request, "request_text"),
                     repository_id=parse_nonblank_string(request, "repository_id"),
                 ),
+                expected_revision=parse_expected_revision(request),
+            )
+        case "request_scoped_objective":
+            return workflow.request_scoped_objective(
+                SessionRequestEvidence(
+                    session_id=parse_nonblank_string(request, "session_id"),
+                    message_id=parse_nonblank_string(request, "message_id"),
+                    statement=parse_nonblank_string(request, "request_text"),
+                    repository_id=parse_nonblank_string(request, "repository_id"),
+                ),
+                parse_input_fingerprint(request),
                 expected_revision=parse_expected_revision(request),
             )
         case "new":

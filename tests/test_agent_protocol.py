@@ -70,6 +70,283 @@ def activate_side(root: Path) -> int:
 
 
 class AgentProtocolTests(unittest.TestCase):
+    def test_request_scoped_objective_protocol_verifies_closes_and_recovers(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            initialized = json.loads(execute(root, request("init", expected_revision=0)))
+            self.assertIsNone(initialized["context"]["request_scoped_objective"])
+            repository_id = sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+            request_text = 'Create a static HTML page with the heading "Hello".'
+            session_id = "ses_objective123"
+            message_id = "msg_objective123"
+            admitted = json.loads(execute(
+                root,
+                request(
+                    "accept_first_slice_session",
+                    expected_revision=initialized["result"]["revision"],
+                    repository_id=repository_id,
+                    session_id=session_id,
+                    message_id=message_id,
+                    request_text=request_text,
+                ),
+            ))
+            self.assertEqual(admitted["result"]["code"], "SESSION_SLICE_RECORDED")
+            self.assertEqual(
+                admitted["result"]["revision"],
+                initialized["result"]["revision"] + 1,
+            )
+            self.assertEqual(
+                admitted["context"]["request_scoped_objective"]["status"],
+                "BLOCKED",
+            )
+            self.assertIn(
+                "REQUEST_OBJECTIVE_ARTIFACT_MISSING",
+                admitted["context"]["request_scoped_objective"]["blockers"],
+            )
+            (root / "index.html").write_text(
+                "<!doctype html><html><head></head><body>"
+                "<h1>Hello</h1></body></html>",
+                encoding="utf-8",
+            )
+            ready = json.loads(execute(root, request("context")))["context"]
+            self.assertEqual(ready["request_scoped_objective"]["status"], "PENDING")
+            self.assertNotIn(
+                "REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED",
+                ready["request_scoped_objective"]["blockers"],
+            )
+            _, snapshot = WorkflowService.open(root).input_snapshot(
+                expected_revision=ExpectedRevision(ready["revision"]),
+            )
+            fields: dict[str, JsonValue] = {
+                "repository_id": repository_id,
+                "session_id": session_id,
+                "message_id": message_id,
+                "request_text": request_text,
+                "input_fingerprint": snapshot.fingerprint,
+            }
+
+            verified = json.loads(execute(
+                root,
+                request(
+                    "request_scoped_objective",
+                    expected_revision=ready["revision"],
+                    **fields,
+                ),
+            ))
+
+            self.assertEqual(verified["result"]["code"], "REQUEST_OBJECTIVE_VERIFIED")
+            self.assertEqual(
+                verified["result"]["revision"],
+                ready["revision"] + 1,
+            )
+            proof = verified["context"]["request_scoped_objective"]
+            self.assertEqual(
+                set(proof),
+                {"status", "source_reference", "request_sha256", "blockers", "heading"},
+            )
+            self.assertEqual(proof["status"], "VERIFIED")
+            self.assertEqual(proof["source_reference"], (
+                f"session:{session_id}:{message_id}:"
+                f"{sha256(request_text.encode('utf-8')).hexdigest()[:16]}"
+            ))
+            self.assertEqual(proof["request_sha256"], sha256(request_text.encode("utf-8")).hexdigest())
+            self.assertEqual(proof["heading"], "Hello")
+            self.assertEqual(proof["blockers"], [])
+            criteria = verified["context"]["accepted_slice"]["criteria_revision"]
+            self.assertEqual(criteria["source"], "REQUEST_SCOPED_OBJECTIVE")
+            self.assertEqual(criteria["source_reference"], proof["source_reference"])
+            self.assertEqual(verified["context"]["slice_outcome"]["status"], "CURRENT")
+            self.assertNotEqual(verified["context"]["feature_completion"]["status"], "COMPLETE")
+            self.assertEqual(
+                verified["context"]["input_snapshot"]["fingerprint"],
+                snapshot.fingerprint,
+            )
+
+            completed = json.loads(execute(
+                root,
+                request(
+                    "request_scoped_objective",
+                    expected_revision=verified["result"]["revision"],
+                    **fields,
+                ),
+            ))
+            self.assertEqual(completed["result"]["code"], "REQUEST_OBJECTIVE_COMPLETE")
+            self.assertEqual(
+                completed["result"]["revision"],
+                verified["result"]["revision"] + 1,
+            )
+
+            recovered = json.loads(execute(root, request("context")))["context"]
+            self.assertEqual(recovered["request_scoped_objective"]["status"], "COMPLETE")
+            self.assertEqual(recovered["feature_completion"]["status"], "COMPLETE")
+            self.assertIsNotNone(recovered["feature_completion"]["receipt_id"])
+            self.assertEqual(
+                recovered["input_snapshot"]["fingerprint"],
+                snapshot.fingerprint,
+            )
+            revision = recovered["revision"]
+            replay = json.loads(execute(
+                root,
+                request(
+                    "request_scoped_objective",
+                    expected_revision=revision,
+                    **fields,
+                ),
+            ))
+            self.assertEqual(replay["result"]["code"], "REQUEST_OBJECTIVE_ALREADY_COMPLETE")
+            self.assertEqual(replay["result"]["revision"], revision)
+
+    def test_request_scoped_objective_protocol_rejects_bad_fields_stale_and_incomplete_page(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            initialized = json.loads(execute(root, request("init", expected_revision=0)))
+            repository_id = sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+            request_text = 'Create a static HTML page with the heading "Hello".'
+            admitted = json.loads(execute(
+                root,
+                request(
+                    "accept_first_slice_session",
+                    expected_revision=initialized["result"]["revision"],
+                    repository_id=repository_id,
+                    session_id="ses_objective123",
+                    message_id="msg_objective123",
+                    request_text=request_text,
+                ),
+            ))
+            self.assertEqual(admitted["result"]["code"], "SESSION_SLICE_RECORDED")
+            self.assertEqual(
+                admitted["result"]["revision"],
+                initialized["result"]["revision"] + 1,
+            )
+            self.assertEqual(
+                admitted["context"]["request_scoped_objective"]["status"],
+                "BLOCKED",
+            )
+            self.assertIn(
+                "REQUEST_OBJECTIVE_ARTIFACT_MISSING",
+                admitted["context"]["request_scoped_objective"]["blockers"],
+            )
+            (root / "index.html").write_text(
+                "<!doctype html><html><head></head><body>"
+                "<h1>Not Hello</h1></body></html>",
+                encoding="utf-8",
+            )
+            blocked = json.loads(execute(root, request("context")))["context"]
+            self.assertEqual(blocked["request_scoped_objective"]["status"], "BLOCKED")
+            self.assertIn(
+                "REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED",
+                blocked["request_scoped_objective"]["blockers"],
+            )
+            self.assertEqual(blocked["accepted_slice"]["criteria_status"], "NOT_RECORDED")
+            _, snapshot = WorkflowService.open(root).input_snapshot(
+                expected_revision=ExpectedRevision(blocked["revision"]),
+            )
+            fields: dict[str, JsonValue] = {
+                "repository_id": repository_id,
+                "session_id": "ses_objective123",
+                "message_id": "msg_objective123",
+                "request_text": request_text,
+                "input_fingerprint": snapshot.fingerprint,
+            }
+            before = CoreService.open(root).recover()
+
+            malformed = json.loads(execute(
+                root,
+                request(
+                    "request_scoped_objective",
+                    expected_revision=before.revision,
+                    **{**fields, "unexpected": True},
+                ),
+            ))
+            invalid_fingerprint = json.loads(execute(
+                root,
+                request(
+                    "request_scoped_objective",
+                    expected_revision=before.revision,
+                    **{**fields, "input_fingerprint": "A" * 64},
+                ),
+            ))
+            stale = json.loads(execute(
+                root,
+                request(
+                    "request_scoped_objective",
+                    expected_revision=before.revision - 1,
+                    **fields,
+                ),
+            ))
+            incomplete = json.loads(execute(
+                root,
+                request(
+                    "request_scoped_objective",
+                    expected_revision=before.revision,
+                    **fields,
+                ),
+            ))
+
+            self.assertEqual(malformed["error"]["code"], "INVALID_REQUEST")
+            self.assertEqual(invalid_fingerprint["error"]["code"], "INVALID_REQUEST")
+            self.assertEqual(stale["error"]["code"], "STALE_REVISION")
+            self.assertEqual(incomplete["error"]["code"], "WORKFLOW_ERROR")
+            self.assertIn(
+                "REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED",
+                incomplete["error"]["detail"],
+            )
+            self.assertNotIn("context", incomplete)
+            self.assertEqual(CoreService.open(root).recover(), before)
+
+    def test_request_scoped_objective_generic_request_does_not_create_criteria(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            initialized = json.loads(execute(root, request("init", expected_revision=0)))
+            repository_id = sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+            request_text = "Create a todo application with a form and persistent storage."
+            admitted = json.loads(execute(
+                root,
+                request(
+                    "accept_first_slice_session",
+                    expected_revision=initialized["result"]["revision"],
+                    repository_id=repository_id,
+                    session_id="ses_generic123",
+                    message_id="msg_generic123",
+                    request_text=request_text,
+                ),
+            ))
+            self.assertEqual(admitted["result"]["code"], "SESSION_SLICE_RECORDED")
+            self.assertEqual(
+                admitted["result"]["revision"],
+                initialized["result"]["revision"] + 1,
+            )
+            _, snapshot = WorkflowService.open(root).input_snapshot(
+                expected_revision=ExpectedRevision(admitted["result"]["revision"]),
+            )
+            before = CoreService.open(root).recover()
+
+            response = json.loads(execute(
+                root,
+                request(
+                    "request_scoped_objective",
+                    expected_revision=before.revision,
+                    repository_id=repository_id,
+                    session_id="ses_generic123",
+                    message_id="msg_generic123",
+                    request_text=request_text,
+                    input_fingerprint=snapshot.fingerprint,
+                ),
+            ))
+
+            self.assertTrue(
+                "error" in response
+                or response["result"]["code"] not in {
+                    "REQUEST_OBJECTIVE_VERIFIED",
+                    "REQUEST_OBJECTIVE_COMPLETE",
+                    "REQUEST_OBJECTIVE_ALREADY_COMPLETE",
+                }
+            )
+            state = CoreService.open(root).recover()
+            self.assertEqual(state.slice_criteria_heads, ())
+            self.assertEqual(state.slice_criteria_revisions, ())
+            self.assertEqual(state.revision, before.revision)
+
     def test_session_request_round_trips_with_separate_workspace_fingerprint(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
