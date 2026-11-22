@@ -503,28 +503,66 @@ def _matching_rows(
     return matches
 
 
+def _exact_task_rows(page: Any, task_texts: tuple[str, str]) -> None:
+    rows = page.locator("[data-evo-task]")
+    count = rows.count()
+    if count > _MAX_TASK_ROWS:
+        raise _not_verified("The task list exceeds the bounded row limit.")
+    observed = tuple(rows.nth(index).inner_text() for index in range(count))
+    if (
+        count != 2
+        or len(observed) != 2
+        or set(observed) != set(task_texts)
+        or any(not rows.nth(index).is_visible() for index in range(count))
+        or any(len(_matching_rows(page, text)) != 1 for text in task_texts)
+    ):
+        raise _not_verified("The task list did not retain exactly the two verified tasks.")
+
+
+def _task_checkbox(page: Any, task_text: str) -> Any:
+    matches = _matching_rows(page, task_text)
+    if len(matches) != 1:
+        raise _not_verified("A task has no unique visible row.")
+    checkbox = page.locator("[data-evo-task]").nth(matches[0]).locator(
+        'input[type="checkbox"][data-evo-action="complete-task"]'
+    )
+    if checkbox.count() != 1 or not checkbox.is_visible():
+        raise _not_verified("Each task needs its own visible native checkbox.")
+    return checkbox
+
+
 def _verify_in_context(context: Any, content: bytes, operations: tuple[str, ...]) -> None:
     violations = False
-    served_index = False
     page: Any | None = None
+    load_page: Any | None = None
+    served_page: Any | None = None
 
     def mark_violation() -> None:
         nonlocal violations
         violations = True
 
     def route_request(route: Any) -> None:
-        nonlocal served_index
+        nonlocal load_page, served_page
         request = route.request
+        target = load_page
+        try:
+            request_frame = request.frame
+            target_frame = None if target is None else target.main_frame
+            is_navigation = request.is_navigation_request()
+        except Exception:
+            request_frame = None
+            target_frame = None
+            is_navigation = False
         if (
-            not served_index
-            and page is not None
+            target is not None
+            and request_frame == target_frame
+            and is_navigation
             and request.url == _APP_URL
             and request.method == "GET"
             and request.resource_type == "document"
-            and request.is_navigation_request()
-            and request.frame == page.main_frame
         ):
-            served_index = True
+            load_page = None
+            served_page = target
             route.fulfill(
                 status=200,
                 body=content,
@@ -544,14 +582,10 @@ def _verify_in_context(context: Any, content: bytes, operations: tuple[str, ...]
     try:
         context.route("**/*", route_request)
         context.route_web_socket("**/*", reject_websocket)
-        page = context.new_page()
     except Exception as exc:
         raise _unavailable(
             "Required browser isolation controls are unavailable."
         ) from exc
-    if page is None:
-        raise _unavailable("An isolated browser page could not be created.")
-    active_page = page
 
     def observe_request(request: Any) -> None:
         if (
@@ -561,8 +595,8 @@ def _verify_in_context(context: Any, content: bytes, operations: tuple[str, ...]
         ):
             mark_violation()
 
-    def observe_navigation(frame: Any) -> None:
-        if page is not None and frame == page.main_frame and frame.url != _APP_URL:
+    def observe_navigation(owner: Any, frame: Any) -> None:
+        if frame != owner.main_frame or frame.url != _APP_URL:
             mark_violation()
 
     def observe_console(message: Any) -> None:
@@ -576,21 +610,52 @@ def _verify_in_context(context: Any, content: bytes, operations: tuple[str, ...]
         except Exception:
             pass
 
-    active_page.on("request", observe_request)
-    active_page.on("framenavigated", observe_navigation)
-    active_page.on("console", observe_console)
-    active_page.on("pageerror", lambda _error: mark_violation())
-    active_page.on("popup", observe_popup)
-    active_page.on("download", lambda _download: mark_violation())
-    active_page.set_default_timeout(5_000)
-    active_page.set_default_navigation_timeout(10_000)
+    def observe_page(active_page: Any) -> None:
+        active_page.on("request", observe_request)
+        active_page.on(
+            "framenavigated",
+            lambda frame, owner=active_page: observe_navigation(owner, frame),
+        )
+        active_page.on("console", observe_console)
+        active_page.on("pageerror", lambda _error: mark_violation())
+        active_page.on("popup", observe_popup)
+        active_page.on("download", lambda _download: mark_violation())
+        active_page.set_default_timeout(5_000)
+        active_page.set_default_navigation_timeout(10_000)
 
-    try:
-        response = active_page.goto(_APP_URL, wait_until="load")
-        if response is None or response.status != 200 or not served_index:
-            raise _not_verified("The exact local index document did not load.")
+    def load_exact_document() -> Any:
+        nonlocal page, load_page, served_page
+        if page is not None:
+            previous_page = page
+            page = None
+            load_page = None
+            previous_page.close()
         if violations:
             raise _not_verified("The page attempted behavior outside the local proof.")
+        try:
+            active_page = context.new_page()
+        except Exception as exc:
+            raise _unavailable("An isolated browser page could not be created.") from exc
+        if active_page is None:
+            raise _unavailable("An isolated browser page could not be created.")
+        page = active_page
+        observe_page(active_page)
+        served_page = None
+        load_page = active_page
+        response = active_page.goto(_APP_URL, wait_until="load")
+        if (
+            response is None
+            or response.status != 200
+            or served_page is not active_page
+            or load_page is not None
+        ):
+            raise _not_verified("The exact local index document did not load once.")
+        if violations:
+            raise _not_verified("The page attempted behavior outside the local proof.")
+        return active_page
+
+    try:
+        active_page = load_exact_document()
 
         task_input = active_page.locator('[data-evo-action="task-input"]')
         add_button = active_page.locator('[data-evo-action="add-task"]')
@@ -624,36 +689,28 @@ def _verify_in_context(context: Any, content: bytes, operations: tuple[str, ...]
             if len(_matching_rows(active_page, task_text)) != 1:
                 raise _not_verified("The add action did not create one visible task row.")
 
-        first_rows = _matching_rows(active_page, task_texts[0])
-        second_rows = _matching_rows(active_page, task_texts[1])
-        if (
-            len(first_rows) != 1
-            or len(second_rows) != 1
-            or first_rows[0] == second_rows[0]
-        ):
-            raise _not_verified("The two added tasks are not distinct visible rows.")
+        _exact_task_rows(active_page, task_texts)
+        active_page = load_exact_document()
+        _exact_task_rows(active_page, task_texts)
 
         if "complete" in operations:
-            first_row = active_page.locator("[data-evo-task]").nth(first_rows[0])
-            second_row = active_page.locator("[data-evo-task]").nth(second_rows[0])
-            first_checkbox = first_row.locator(
-                'input[type="checkbox"][data-evo-action="complete-task"]'
-            )
-            second_checkbox = second_row.locator(
-                'input[type="checkbox"][data-evo-action="complete-task"]'
-            )
+            first_checkbox = _task_checkbox(active_page, task_texts[0])
+            second_checkbox = _task_checkbox(active_page, task_texts[1])
             if (
-                first_checkbox.count() != 1
-                or second_checkbox.count() != 1
-                or not first_checkbox.is_visible()
-                or not second_checkbox.is_visible()
-                or first_checkbox.is_checked()
+                first_checkbox.is_checked()
                 or second_checkbox.is_checked()
             ):
                 raise _not_verified("Each task needs its own pending native checkbox.")
             first_checkbox.check()
             if not first_checkbox.is_checked() or second_checkbox.is_checked():
                 raise _not_verified("Completion did not affect only the selected task.")
+            active_page = load_exact_document()
+            _exact_task_rows(active_page, task_texts)
+            if (
+                not _task_checkbox(active_page, task_texts[0]).is_checked()
+                or _task_checkbox(active_page, task_texts[1]).is_checked()
+            ):
+                raise _not_verified("Completion state did not survive page replacement.")
 
         if violations:
             raise _not_verified("The page attempted behavior outside the local proof.")

@@ -52,6 +52,13 @@ REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST = sha256(
     b"core-static-heading-v1:strict-utf8:bounded-index.html:exact-single-h1"
 ).hexdigest()
 SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST = sha256(
+    b"core-personal-tasks-browser-v2:playwright-1.65.2:chromium:"
+    b"same-context-exact-page-replacement:durable-tasks-and-completion:"
+    b"REQUEST_SCOPED_PERSONAL_TASKS"
+).hexdigest()
+SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID = "core-personal-tasks-browser-v2"
+LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID = TASK_APP_TEST_KIND
+LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST = sha256(
     b"core-personal-tasks-browser-v1:playwright-1.65.2:chromium:REQUEST_SCOPED_PERSONAL_TASKS"
 ).hexdigest()
 
@@ -349,11 +356,26 @@ def request_objective_policy(
         for item in criteria.criteria
     ):
         return (
-            TASK_APP_TEST_KIND,
+            SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
             SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
             "REQUEST_SCOPED_PERSONAL_TASKS",
         )
     raise DomainError("request-objective criteria have no canonical admission policy")
+
+
+def _request_objective_policy_versions(
+    criteria: SliceCriteriaRevision,
+) -> tuple[tuple[str, str], ...]:
+    policy_id, current_digest, outcome_basis = request_objective_policy(criteria)
+    if outcome_basis == "REQUEST_SCOPED_PERSONAL_TASKS":
+        return tuple(dict.fromkeys((
+            (policy_id, current_digest),
+            (
+                LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
+                LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
+            ),
+        )))
+    return ((policy_id, current_digest),)
 
 
 def request_objective_completion_condition(
@@ -3491,19 +3513,45 @@ def validate_state(state: State) -> None:
         if (revision is None or revision.slice_agreement_ref != observation.slice_agreement_ref
                 or not any(item.id == observation.criterion_id for item in revision.criteria)):
             raise StateValidationError("R3 test evidence must target an accepted criterion revision")
-        if not any(
+        request_objective_test = revision.source == REQUEST_SCOPED_OBJECTIVE
+        request_policy: tuple[str, str, str] | None = None
+        request_policy_versions: tuple[tuple[str, str], ...] = ()
+        if request_objective_test:
+            try:
+                request_policy = request_objective_policy(revision)
+                request_policy_versions = _request_objective_policy_versions(revision)
+            except DomainError as error:
+                raise StateValidationError("request-objective criteria have no canonical policy") from error
+            expected_evidence_kind = (
+                TASK_APP_TEST_KIND
+                if request_policy[2] == "REQUEST_SCOPED_PERSONAL_TASKS"
+                else request_policy[0]
+            )
+            if (
+                observation.test_kind not in {
+                    policy_id for policy_id, _ in request_policy_versions
+                }
+                or not any(
+                    item.expected_evidence
+                    == f"{expected_evidence_kind}:{observation.test_target}"
+                    for item in revision.criteria
+                    if item.id == observation.criterion_id
+                )
+            ):
+                raise StateValidationError(
+                    "request-objective evidence descriptor differs from its canonical policy"
+                )
+        elif not any(
             item.expected_evidence == f"{observation.test_kind}:{observation.test_target}"
             for item in revision.criteria if item.id == observation.criterion_id
         ):
             raise StateValidationError("R3 test command differs from the accepted evidence contract")
-        request_objective_test = revision.source == REQUEST_SCOPED_OBJECTIVE
         if request_objective_test:
-            try:
-                expected_test_kind, _, _ = request_objective_policy(revision)
-            except DomainError as error:
-                raise StateValidationError("request-objective criteria have no canonical policy") from error
+            assert request_policy is not None
             if (
-                observation.test_kind != expected_test_kind
+                observation.test_kind not in {
+                    policy_id for policy_id, _ in request_policy_versions
+                }
                 or observation.test_target != OBJECTIVE_TEST_TARGET
             ):
                 raise StateValidationError("request-objective evidence descriptor is not canonical")
@@ -3570,18 +3618,21 @@ def validate_state(state: State) -> None:
         if observation.id != expected_id:
             raise StateValidationError("R3 test receipt identity does not match its recorded result")
         if request_objective_test:
-            try:
-                expected_admission_id, expected_admission_digest, _ = request_objective_policy(revision)
-            except DomainError as error:
-                raise StateValidationError("request-objective criteria have no canonical policy") from error
+            assert request_policy is not None
             if (
                 not has_r3b_provenance
                 or not is_sha256_digest(observation.input_fingerprint_before or "")
                 or observation.input_fingerprint_before != observation.input_fingerprint_after
                 or observation.input_policy_id != INPUT_POLICY_ID
                 or observation.input_policy_digest != INPUT_POLICY_DIGEST
-                or observation.admission_policy_id != expected_admission_id
-                or observation.admission_policy_digest != expected_admission_digest
+                or (
+                    observation.test_kind,
+                    observation.admission_policy_id,
+                    observation.admission_policy_digest,
+                ) not in tuple(
+                    (policy_id, policy_id, policy_digest)
+                    for policy_id, policy_digest in request_policy_versions
+                )
                 or observation.external_inputs
                 or observation.runtime_executable is not None
                 or observation.runtime_executable_sha256 is not None
@@ -3653,18 +3704,23 @@ def validate_state(state: State) -> None:
             criteria is not None and criteria.source == REQUEST_SCOPED_OBJECTIVE
         )
         request_policy: tuple[str, str, str] | None = None
+        request_policy_versions: tuple[tuple[str, str], ...] = ()
         if criteria is not None and criteria.source == REQUEST_SCOPED_OBJECTIVE:
             try:
                 request_policy = request_objective_policy(criteria)
+                request_policy_versions = _request_objective_policy_versions(criteria)
             except DomainError as error:
                 raise StateValidationError("request-objective criteria have no canonical policy") from error
+        request_admission_policy_valid = (
+            (outcome.admission_policy_id, outcome.admission_policy_digest)
+            in request_policy_versions
+            if request_policy is not None
+            else outcome.admission_policy_digest == TEST_ADMISSION_POLICY_DIGEST
+        )
         current_input_policy = (
             outcome.input_policy_id == INPUT_POLICY_ID
             and outcome.input_policy_digest == INPUT_POLICY_DIGEST
-            and outcome.admission_policy_digest == (
-                request_policy[1]
-                if request_policy is not None else TEST_ADMISSION_POLICY_DIGEST
-            )
+            and request_admission_policy_valid
         )
         legacy_input_policy = (
             outcome.input_policy_id == LEGACY_INPUT_POLICY_ID
@@ -3688,14 +3744,11 @@ def validate_state(state: State) -> None:
                 or request_objective_outcome and current_input_policy
             )
             or type(outcome.admission_policy_id) is not str
-            or outcome.admission_policy_id != (
-                request_policy[0]
-                if request_policy is not None else TEST_ADMISSION_POLICY_ID
-            )
-            or outcome.admission_policy_digest != (
-                request_policy[1]
-                if request_policy is not None else outcome.admission_policy_digest
-            )
+            or request_policy is not None
+            and (outcome.admission_policy_id, outcome.admission_policy_digest)
+            not in request_policy_versions
+            or request_policy is None
+            and outcome.admission_policy_id != TEST_ADMISSION_POLICY_ID
             or (
                 not request_objective_outcome
                 and outcome.admission_policy_digest != TEST_ADMISSION_POLICY_DIGEST
@@ -3734,7 +3787,7 @@ def validate_state(state: State) -> None:
                     receipt is None
                     or receipt.exit_code != 0
                     or receipt.criterion_id != criterion.id
-                    or receipt.test_kind != request_policy[0]
+                    or receipt.test_kind != outcome.admission_policy_id
                     or receipt.test_target != OBJECTIVE_TEST_TARGET
                     or receipt.slice_agreement_ref != outcome.slice_agreement_ref
                     or receipt.criteria_revision_id != outcome.criteria_revision_id

@@ -22,8 +22,7 @@ _COMPLETE_CONTROLS = """
 """
 
 
-def task_app(*, completion: bool = True, extra_script: str = "") -> bytes:
-    completion_setup = _COMPLETE_CONTROLS if completion else ""
+def memory_task_app() -> bytes:
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Tasks</title></head>
 <body>
@@ -41,8 +40,77 @@ def task_app(*, completion: bool = True, extra_script: str = "") -> bytes:
       const text = document.createElement("span");
       text.textContent = input.value;
       row.append(text);
-      {completion_setup}
+      {_COMPLETE_CONTROLS}
       document.querySelector("#tasks").append(row);
+      input.value = "";
+    }});
+  </script>
+</body></html>"""
+    return html.encode("utf-8")
+
+
+def persisted_task_app(
+    *,
+    completion: bool = True,
+    persist_completion: bool = True,
+    replace_saved_tasks: bool = False,
+    duplicate_on_reload: bool = False,
+    restore_script: str = "",
+    extra_script: str = "",
+) -> bytes:
+    completion_setup = ""
+    if completion:
+        completion_setup = """
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = task.completed;
+      checkbox.dataset.evoAction = "complete-task";
+      if (PERSIST_COMPLETION) {
+        checkbox.addEventListener("change", () => {
+          const next = savedTasks().map(item =>
+            item.text === task.text ? {...item, completed: checkbox.checked} : item);
+          localStorage.setItem(storageKey, JSON.stringify(next));
+        });
+      }
+      row.append(checkbox);
+""".replace("PERSIST_COMPLETION", str(persist_completion).lower())
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Tasks</title></head>
+<body>
+  <form id="task-form">
+    <input data-evo-action="task-input">
+    <button type="submit" data-evo-action="add-task">Add</button>
+  </form>
+  <ul id="tasks"></ul>
+  <script>
+    const storageKey = "evospec-test-tasks";
+    const savedTasks = () => JSON.parse(localStorage.getItem(storageKey) || "[]");
+    const list = document.querySelector("#tasks");
+    function appendTask(task) {{
+      const row = document.createElement("li");
+      row.dataset.evoTask = "";
+      const text = document.createElement("span");
+      text.textContent = task.text;
+      row.append(text);
+      {completion_setup}
+      list.append(row);
+      return row;
+    }}
+    const restored = savedTasks();
+    restored.forEach(appendTask);
+    {restore_script}
+    if ({str(duplicate_on_reload).lower()} && restored.length) {{
+      appendTask(restored[0]);
+    }}
+    document.querySelector("#task-form").addEventListener("submit", event => {{
+      event.preventDefault();
+      const input = document.querySelector('[data-evo-action="task-input"]');
+      const task = {{text: input.value, completed: false}};
+      const row = appendTask(task);
+      const next = {str(replace_saved_tasks).lower()}
+        ? [task]
+        : [...savedTasks(), task];
+      localStorage.setItem(storageKey, JSON.stringify(next));
       input.value = "";
       {extra_script}
     }});
@@ -192,22 +260,51 @@ class ProcessContainmentTests(unittest.TestCase):
     "set EVOSPEC_RUN_BROWSER_TESTS=1 on Windows with the browser extra and Chromium",
 )
 class RealBrowserObjectiveTests(unittest.TestCase):
+    def assert_not_verified(self, content: bytes, operations: tuple[str, ...]) -> None:
+        try:
+            digest = verify_personal_tasks(content, operations)
+        except BrowserObjectiveError as error:
+            self.assertEqual(error.code, "REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED")
+        else:
+            self.fail(f"Verifier returned positive proof digest {digest}")
+
+    def test_live_only_tasks_are_not_durable_acceptance(self) -> None:
+        self.assert_not_verified(memory_task_app(), ("create", "consult"))
+
+    def test_replacing_saved_tasks_loses_one_after_reload(self) -> None:
+        self.assert_not_verified(
+            persisted_task_app(replace_saved_tasks=True),
+            ("create", "consult"),
+        )
+
+    def test_duplicate_task_restored_after_reload_fails_closed(self) -> None:
+        self.assert_not_verified(
+            persisted_task_app(duplicate_on_reload=True),
+            ("create", "consult"),
+        )
+
+    def test_completion_must_survive_reload(self) -> None:
+        self.assert_not_verified(
+            persisted_task_app(persist_completion=False),
+            ("create", "consult", "complete"),
+        )
+
     def test_add_and_consult_proves_two_distinct_live_rows_and_exact_bytes(self) -> None:
-        content = task_app()
+        content = persisted_task_app()
         self.assertEqual(
             verify_personal_tasks(content, ("create", "consult")),
             hashlib.sha256(content).hexdigest(),
         )
 
     def test_explicit_completion_checks_only_one_native_checkbox(self) -> None:
-        content = task_app()
+        content = persisted_task_app()
         self.assertEqual(
             verify_personal_tasks(content, ("create", "consult", "complete")),
             hashlib.sha256(content).hexdigest(),
         )
 
     def test_completion_is_optional_unless_explicit(self) -> None:
-        content = task_app(completion=False)
+        content = persisted_task_app(completion=False)
         self.assertEqual(
             verify_personal_tasks(content, ("create", "consult")),
             hashlib.sha256(content).hexdigest(),
@@ -271,7 +368,7 @@ class RealBrowserObjectiveTests(unittest.TestCase):
         )
 
     def test_dropping_the_first_task_fails_consult_verification(self) -> None:
-        content = task_app(
+        content = persisted_task_app(
             extra_script=(
                 'const rows = document.querySelectorAll("[data-evo-task]"); '
                 "if (rows.length > 1) rows[0].remove();"
@@ -285,12 +382,11 @@ class RealBrowserObjectiveTests(unittest.TestCase):
         )
 
     def test_completion_that_checks_both_tasks_fails_closed(self) -> None:
-        content = task_app(
-            extra_script=(
-                'row.querySelector(\'input[type="checkbox"]\').addEventListener('
-                '"change", () => document.querySelectorAll('
-                '\'input[type="checkbox"]\').forEach(box => { box.checked = true; }));'
-            )
+        content = persisted_task_app(
+            restore_script=(
+                'list.addEventListener("change", () => list.querySelectorAll('
+                '`input[type="checkbox"]`).forEach(box => { box.checked = true; }));'
+            ),
         )
         with self.assertRaises(BrowserObjectiveError) as raised:
             verify_personal_tasks(content, ("create", "consult", "complete"))
@@ -300,18 +396,36 @@ class RealBrowserObjectiveTests(unittest.TestCase):
         )
 
     def test_external_fetch_attempt_fails_closed(self) -> None:
-        content = task_app(
+        content = persisted_task_app(
             extra_script='fetch("https://outside.invalid/task").catch(() => {});'
         )
-        with self.assertRaises(BrowserObjectiveError) as raised:
-            verify_personal_tasks(content, ("create", "consult"))
-        self.assertEqual(
-            raised.exception.code,
-            "REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED",
+        self.assert_not_verified(content, ("create", "consult"))
+
+    def test_same_document_navigation_attempt_fails_closed(self) -> None:
+        content = persisted_task_app(extra_script='location.hash = "after-add";')
+        self.assert_not_verified(content, ("create", "consult"))
+
+    def test_same_url_document_navigation_attempt_fails_closed(self) -> None:
+        content = persisted_task_app(extra_script="location.reload();")
+        self.assert_not_verified(content, ("create", "consult"))
+
+    def test_app_owned_frame_does_not_receive_a_document_load_credit(self) -> None:
+        content = persisted_task_app(
+            extra_script=(
+                'const frame = document.createElement("iframe"); '
+                "frame.src = location.href; document.body.append(frame);"
+            )
         )
+        self.assert_not_verified(content, ("create", "consult"))
+
+    def test_external_main_frame_navigation_attempt_fails_closed(self) -> None:
+        content = persisted_task_app(
+            extra_script='location.href = "https://outside.invalid/task";'
+        )
+        self.assert_not_verified(content, ("create", "consult"))
 
     def test_popup_attempt_fails_closed(self) -> None:
-        content = task_app(
+        content = persisted_task_app(
             extra_script='window.open("https://outside.invalid/task", "_blank");'
         )
         with self.assertRaises(BrowserObjectiveError) as raised:
@@ -322,7 +436,7 @@ class RealBrowserObjectiveTests(unittest.TestCase):
         )
 
     def test_download_attempt_fails_closed(self) -> None:
-        content = task_app(
+        content = persisted_task_app(
             extra_script=(
                 'const link = document.createElement("a"); '
                 'link.href = "data:text/plain,task"; link.download = "task.txt"; '

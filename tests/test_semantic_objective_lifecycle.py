@@ -13,7 +13,11 @@ from unittest.mock import call, patch
 
 from evospec.domain import (
     ExpectedRevision,
+    LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
+    LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
     OperationalState,
+    SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
+    SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
     request_objective_completion_condition,
     validate_state,
 )
@@ -37,6 +41,46 @@ EXPLICIT_COMPLETE_REQUEST = (
     "and mark them as completed."
 )
 APP = b"""<!doctype html><html><head><meta charset="utf-8"><title>Tasks</title></head>
+<body>
+  <form id="task-form">
+    <input data-evo-action="task-input">
+    <button type="submit" data-evo-action="add-task">Add</button>
+  </form>
+  <ul id="tasks"></ul>
+  <script>
+    const storageKey = "evospec-core-tasks";
+    const savedTasks = () => JSON.parse(localStorage.getItem(storageKey) || "[]");
+    const list = document.querySelector("#tasks");
+    function appendTask(task) {
+      const row = document.createElement("li");
+      row.dataset.evoTask = "";
+      const text = document.createElement("span");
+      text.textContent = task.text;
+      row.append(text);
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = task.completed;
+      checkbox.dataset.evoAction = "complete-task";
+      checkbox.addEventListener("change", () => {
+        const next = savedTasks().map(item =>
+          item.text === task.text ? {...item, completed: checkbox.checked} : item);
+        localStorage.setItem(storageKey, JSON.stringify(next));
+      });
+      row.append(checkbox);
+      list.append(row);
+    }
+    savedTasks().forEach(appendTask);
+    document.querySelector("#task-form").addEventListener("submit", event => {
+      event.preventDefault();
+      const input = document.querySelector('[data-evo-action="task-input"]');
+      const task = {text: input.value, completed: false};
+      appendTask(task);
+      localStorage.setItem(storageKey, JSON.stringify([...savedTasks(), task]));
+      input.value = "";
+    });
+  </script>
+</body></html>"""
+MEMORY_ONLY_APP = b"""<!doctype html><html><head><meta charset="utf-8"><title>Tasks</title></head>
 <body>
   <form id="task-form">
     <input data-evo-action="task-input">
@@ -203,7 +247,19 @@ class SemanticObjectiveLifecycleTests(_SemanticObjectiveFixture, unittest.TestCa
             )
             self.assertEqual(
                 {item.admission_policy_id for item in proofs},
-                {"core-personal-tasks-browser-v1"},
+                {SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID},
+            )
+            self.assertEqual(
+                {item.test_kind for item in proofs},
+                {SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID},
+            )
+            self.assertEqual(
+                {item.admission_policy_digest for item in proofs},
+                {SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST},
+            )
+            self.assertNotEqual(
+                SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
+                LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
             )
             self.assertTrue(all(
                 item.runtime_executable is None
@@ -371,6 +427,176 @@ class SemanticObjectiveLifecycleTests(_SemanticObjectiveFixture, unittest.TestCa
             self.assertEqual(closed_result.code, "REQUEST_OBJECTIVE_COMPLETE")
             self.assertEqual(browser.call_count, 2)
 
+    def test_v1_active_proof_requires_new_policy_reproof(self) -> None:
+        self._write_app()
+        with (
+            patch(
+                "evospec.domain.SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID",
+                LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
+            ),
+            patch(
+                "evospec.domain.SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST",
+                LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
+            ),
+            patch(
+                "evospec.services.verify_personal_tasks",
+                side_effect=lambda content, _operations: sha256(content).hexdigest(),
+            ),
+        ):
+            self.assertEqual(self._request().code, "REQUEST_OBJECTIVE_VERIFIED")
+
+        legacy_open = CoreService.open(self.root).recover()
+        validate_state(legacy_open)
+        self.assertEqual(self._schema(), SEMANTIC_REQUEST_OBJECTIVE_SCHEMA)
+        self.assertEqual(len(legacy_open.criterion_test_receipts), 2)
+        self.assertEqual(
+            {item.admission_policy_id for item in legacy_open.criterion_test_receipts},
+            {LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID},
+        )
+        self.assertEqual(
+            {item.admission_policy_digest for item in legacy_open.criterion_test_receipts},
+            {LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST},
+        )
+        self.assertFalse(legacy_open.feature_completion_receipts)
+
+        state, snapshot = self._snapshot()
+        status = self.workflow.request_scoped_objective_status(state, snapshot)
+        self.assertIsNotNone(status)
+        assert status is not None
+        self.assertEqual(status.status, "PENDING")
+        self.assertIn("REQUEST_OBJECTIVE_PROOF_STALE", status.blockers)
+        with patch(
+            "evospec.services.verify_personal_tasks",
+            side_effect=BrowserObjectiveError(
+                "REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED",
+                "legacy proof cannot replace current durability evidence",
+            ),
+        ):
+            with self.assertRaisesRegex(
+                WorkflowError, "REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED",
+            ):
+                self.workflow.request_scoped_objective(
+                    self.evidence,
+                    snapshot.fingerprint,
+                    expected_revision=ExpectedRevision(state.revision),
+                )
+        self.assertEqual(CoreService.open(self.root).recover(), legacy_open)
+
+        with patch(
+            "evospec.services.verify_personal_tasks",
+            side_effect=lambda content, _operations: sha256(content).hexdigest(),
+        ) as browser:
+            self.assertEqual(self._request().code, "REQUEST_OBJECTIVE_VERIFIED")
+            current_open = CoreService.open(self.root).recover()
+            browser.assert_called_once_with(APP, ("create", "consult"))
+            self.assertEqual(
+                current_open.criterion_test_receipts[:2],
+                legacy_open.criterion_test_receipts,
+            )
+            current_proofs = current_open.criterion_test_receipts[2:]
+            self.assertEqual(len(current_proofs), 2)
+            self.assertEqual(
+                {item.admission_policy_id for item in current_proofs},
+                {SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID},
+            )
+            self.assertEqual(
+                {item.admission_policy_digest for item in current_proofs},
+                {SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST},
+            )
+            current_outcome = current_open.slice_outcome_receipts[-1]
+            self.assertEqual(
+                current_outcome.evidence_receipt_ids,
+                tuple(item.id for item in current_proofs),
+            )
+            self.assertEqual(
+                current_outcome.admission_policy_id,
+                SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
+            )
+
+            self.assertEqual(self._request().code, "REQUEST_OBJECTIVE_COMPLETE")
+            browser.assert_called_once()
+
+        closed = CoreService.open(self.root).recover()
+        validate_state(closed)
+        self.assertEqual(self._schema(), SEMANTIC_REQUEST_OBJECTIVE_SCHEMA)
+        self.assertEqual(len(closed.feature_completion_receipts), 1)
+        self.assertEqual(
+            closed.feature_completion_receipts[0].slice_outcome_receipt_ids,
+            (current_open.slice_outcome_receipts[-1].id,),
+        )
+        closed_snapshot = self._snapshot()[1]
+        status = WorkflowService.open(self.root).request_scoped_objective_status(
+            closed, closed_snapshot,
+        )
+        self.assertIsNotNone(status)
+        assert status is not None
+        self.assertEqual(status.status, "COMPLETE")
+        with patch("evospec.services.verify_personal_tasks") as browser:
+            replay = WorkflowService.open(self.root).request_scoped_objective(
+                self.evidence,
+                closed_snapshot.fingerprint,
+                expected_revision=ExpectedRevision(closed.revision),
+            )
+            browser.assert_not_called()
+        self.assertEqual(replay.code, "REQUEST_OBJECTIVE_ALREADY_COMPLETE")
+        self.assertEqual(CoreService.open(self.root).recover(), closed)
+
+    def test_v1_terminal_closure_is_compatible_but_not_currently_qualified(self) -> None:
+        self._write_app()
+        with (
+            patch(
+                "evospec.domain.SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID",
+                LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID,
+            ),
+            patch(
+                "evospec.domain.SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST",
+                LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_DIGEST,
+            ),
+            patch(
+                "evospec.services.verify_personal_tasks",
+                side_effect=lambda content, _operations: sha256(content).hexdigest(),
+            ),
+        ):
+            self.assertEqual(self._request().code, "REQUEST_OBJECTIVE_VERIFIED")
+            self.assertEqual(self._request().code, "REQUEST_OBJECTIVE_COMPLETE")
+
+        legacy_closed = CoreService.open(self.root).recover()
+        validate_state(legacy_closed)
+        self.assertEqual(self._schema(), SEMANTIC_REQUEST_OBJECTIVE_SCHEMA)
+        self.assertEqual(len(legacy_closed.criterion_test_receipts), 2)
+        self.assertEqual(
+            {item.admission_policy_id for item in legacy_closed.criterion_test_receipts},
+            {LEGACY_SEMANTIC_REQUEST_OBJECTIVE_ADMISSION_POLICY_ID},
+        )
+        self.assertEqual(len(legacy_closed.feature_completion_receipts), 1)
+        self.assertEqual(len(legacy_closed.terminal_archives), 1)
+        self.assertEqual(
+            legacy_closed.terminal_archives[0].context.status.value,
+            "ACCEPTED",
+        )
+
+        recovered = CoreService.open(self.root).recover()
+        self.assertEqual(recovered, legacy_closed)
+        closed_snapshot = self._snapshot()[1]
+        status = WorkflowService.open(self.root).request_scoped_objective_status(
+            recovered, closed_snapshot,
+        )
+        self.assertIsNotNone(status)
+        assert status is not None
+        self.assertEqual(status.status, "BLOCKED")
+        self.assertIn("REQUEST_OBJECTIVE_PROOF_STALE", status.blockers)
+        with patch("evospec.services.verify_personal_tasks") as browser:
+            with self.assertRaisesRegex(
+                WorkflowError, "REQUEST_OBJECTIVE_PROOF_STALE",
+            ):
+                WorkflowService.open(self.root).request_scoped_objective(
+                    self.evidence,
+                    closed_snapshot.fingerprint,
+                    expected_revision=ExpectedRevision(recovered.revision),
+                )
+            browser.assert_not_called()
+        self.assertEqual(CoreService.open(self.root).recover(), legacy_closed)
+
 
 class ExplicitCompletionObjectiveTests(_SemanticObjectiveFixture, unittest.TestCase):
     request_statement = EXPLICIT_COMPLETE_REQUEST
@@ -532,6 +758,38 @@ _BROWSER_TESTS_ENABLED = os.environ.get("EVOSPEC_RUN_BROWSER_TESTS") == "1"
     "set EVOSPEC_RUN_BROWSER_TESTS=1 with the semantic-browser extra and Chromium",
 )
 class RealBrowserCoreLifecycleTests(_SemanticObjectiveFixture, unittest.TestCase):
+    def test_memory_only_app_is_rejected_without_recording_core_proof(self) -> None:
+        self._write_app(MEMORY_ONLY_APP)
+        state, snapshot = self._snapshot()
+        self.assertFalse(state.criterion_test_receipts)
+        self.assertFalse(state.slice_outcome_receipts)
+        self.assertFalse(state.feature_completion_receipts)
+
+        try:
+            result = self.workflow.request_scoped_objective(
+                self.evidence,
+                snapshot.fingerprint,
+                expected_revision=ExpectedRevision(state.revision),
+            )
+        except WorkflowError as error:
+            self.assertIn("REQUEST_OBJECTIVE_CONTENT_NOT_VERIFIED", str(error))
+        else:
+            observed = CoreService.open(self.root).recover()
+            self.fail(
+                "Core accepted a memory-only task app: "
+                f"code={result.code}, revision={state.revision}->{observed.revision}, "
+                f"criterion_receipts={len(observed.criterion_test_receipts)}, "
+                f"slice_outcome_receipts={len(observed.slice_outcome_receipts)}, "
+                f"feature_completion_receipts={len(observed.feature_completion_receipts)}"
+            )
+
+        rejected = CoreService.open(self.root).recover()
+        self.assertEqual(rejected, state)
+        self.assertFalse(rejected.criterion_test_receipts)
+        self.assertFalse(rejected.slice_outcome_receipts)
+        self.assertFalse(rejected.feature_completion_receipts)
+        self.assertEqual(self._schema(), SCHEMA)
+
     def test_real_browser_verifies_and_closes_the_core_objective(self) -> None:
         self._write_app()
         state, snapshot = self._snapshot()

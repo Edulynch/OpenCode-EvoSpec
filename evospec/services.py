@@ -170,6 +170,7 @@ from .request_scoped_objective import (
     OBJECTIVE_TEST_KIND,
     OBJECTIVE_TEST_TARGET,
     REQUEST_SCOPED_OBJECTIVE,
+    TASK_APP_TEST_KIND,
     TASK_APP_TEST_TARGET,
     PersonalTasksObjective,
     StaticHeadingObjective,
@@ -3298,6 +3299,9 @@ class CoreService:
             {item.id for item in expected_revision.criteria}
             if expected_revision is not None else set()
         )
+        expected_test_kinds = {expected_test_kind}
+        if isinstance(objective, PersonalTasksObjective):
+            expected_test_kinds.add(TASK_APP_TEST_KIND)
         if (
             len(state.slice_criteria_revisions) != len(objective_revisions)
             or len(objective_revisions) > 1
@@ -3331,7 +3335,7 @@ class CoreService:
         if any(
             item.criteria_revision_id not in {item.id for item in objective_revisions}
             or item.criterion_id not in expected_criterion_ids
-            or item.test_kind != expected_test_kind
+            or item.test_kind not in expected_test_kinds
             or item.test_target != expected_target
             for item in state.criterion_test_receipts
         ):
@@ -4715,6 +4719,17 @@ class CoreService:
             None if expected_request_criteria is None
             else request_objective_policy(expected_request_criteria)[0]
         )
+        expected_request_test_kinds = {expected_request_test_kind}
+        if (
+            expected_request_criteria is not None
+            and expected_request_criteria.criteria
+            and all(
+                item.expected_evidence
+                == f"{TASK_APP_TEST_KIND}:{TASK_APP_TEST_TARGET}"
+                for item in expected_request_criteria.criteria
+            )
+        ):
+            expected_request_test_kinds.add(TASK_APP_TEST_KIND)
         request_objective_path = (
             self.__persistence.request_objective_schema_ready()
             and current.r3_schema_upgrade is None
@@ -4740,7 +4755,7 @@ class CoreService:
             and all(
                 item.criteria_revision_id == current.slice_criteria_revisions[0].id
                 and item.slice_agreement_ref == slices[0].id
-                and item.test_kind == expected_request_test_kind
+                and item.test_kind in expected_request_test_kinds
                 and item.test_target == OBJECTIVE_TEST_TARGET
                 for item in current.criterion_test_receipts
             )
