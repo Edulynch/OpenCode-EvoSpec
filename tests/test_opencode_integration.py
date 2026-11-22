@@ -55,6 +55,7 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn('"evospec_context"', plugin)
         self.assertIn('"evospec_auto_readiness"', plugin)
         self.assertIn('"evospec_auto_contract"', plugin)
+        self.assertIn('"evospec_session_first_slice"', plugin)
         self.assertIn('{ codemode: false }', plugin)
         self.assertIn('"evospec_start"', plugin)
         self.assertIn('"evospec_assessed_start"', plugin)
@@ -166,7 +167,8 @@ const call = async (name, args) => {
 const started = JSON.parse((await call("evospec_start", {
   operation: "new", intent: "Create a simple task list"
 })).content)
-assert(started.code === "FIRST_SLICE_HANDOFF_REQUIRED", "fresh NEW returns E1 handoff, not legacy intake")
+assert(started.code === "SESSION_FIRST_SLICE_AVAILABLE", "fresh NEW offers host-bound session intake, not legacy work")
+assert(started.next_tool === "evospec_session_first_slice", "no TTY in default new Feature UX")
 assert(started.state === "NO_FEATURE_CREATED", "no premature work materialized")
 assert(!commands.some((cmd) => cmd.includes("new")), "fresh NEW must not run legacy CLI")
 const proposal = JSON.parse((await call("evospec_first_slice_handoff", {
@@ -210,6 +212,148 @@ const legacy = JSON.parse((await call("evospec_start", {
 })).content)
 assert(legacy.intake === "PROPOSED | 2", "explicit legacy intake remains usable")
 assert(commands.some((cmd) => cmd.includes("new")), "legacy intent still reaches the CLI")
+''',
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                ("bun", "run", str(runner)), cwd=root, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_session_first_slice_uses_admitted_message_not_model_text_and_host_permission(self) -> None:
+        # The model supplies only Core revision. The plugin selects the exact
+        # preceding admitted host message, never a model-proposed requirement.
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "plugin.ts").write_text(_resources()[PLUGIN], encoding="utf-8")
+            (root / "continuation.mjs").write_text(_resources()[CONTINUATION], encoding="utf-8")
+            runner = root / "session-intake.ts"
+            runner.write_text(
+                '''import plugin from "./plugin.ts"
+const definitions = [], requests = [], writes = []
+const assert = (test, message) => { if (!test) throw new Error(message) }
+// A real admitted prompt may have CRLF, blank lines, indentation, and
+// trailing whitespace. Its exact bytes must reach Core without rewrites.
+const text = [
+  "  Quiero una aplicación sencilla para mis tareas.",
+  "",
+  "- Agregar tareas nuevas.",
+  "- Marcar y desmarcar las terminadas.",
+  "",
+].join(String.fromCharCode(13, 10))
+const user = { type: "user", id: "msg_user0001", text, files: [] }
+const assistant = { type: "assistant", id: "msg_assistant0001" }
+let messages = [user, assistant]
+const canonical = { revision: 7, repository_id: "repo-xyz",
+  initialization_state: "INITIALIZED", e1_schema_ready: null,
+  lifecycle: null, feature_id: null, change_id: null,
+  feature_completion: null, completed_terminal: false,
+  pending_intake: false, side_work_active: false, stale: false,
+  legal_actions: ["new"], work_queue: { total: 0, complete: true },
+  slice_acceptance_inventory: { total: 0, complete: true },
+}
+const responseQueue = []
+let assertions = 0, deny = false, currentRoot = process.cwd()
+const runtime = {
+  tool: {
+    transform: async (fn) => fn({ add: (tool) => definitions.push(tool) }),
+    list: async () => definitions.map((tool) => ({ id: tool.name })),
+  },
+  session: {
+    get: async () => ({ location: { directory: currentRoot } }),
+    context: async () => messages,
+    hook: async () => {},
+  },
+  permission: {
+    assert: async (request) => {
+      assertions++
+      assert(request.action === "evospec_session_intake", "only bounded host permission")
+      assert(request.sessionID === "ses_test0001", "permission tied to executing session")
+      assert(request.source.messageID === assistant.id, "bind permission to actual assistant call")
+      assert(JSON.stringify(request.resources) === JSON.stringify([process.cwd()]), "root resource")
+      if (deny) throw new Error("HOST_DENIED")
+    },
+  },
+}
+await plugin.setup(runtime)
+Object.defineProperty(Bun, "spawn", { value(command, opts) {
+  assert(!command.includes("--project"), "no TTY CLI from native intake")
+  const request = opts.stdin?.text()
+  if (request) writes.push(request.then((content) => requests.push(JSON.parse(content))))
+  const value = responseQueue.shift()
+  assert(value !== undefined, "unexpected protocol request")
+  return { stdout: new Blob([JSON.stringify(value)]).stream(),
+    stderr: new Blob([""]).stream(), exited: Promise.resolve(0) }
+} })
+const invoke = async (ctx = {}) => {
+  const tool = definitions.find((item) => item.name === "evospec_session_first_slice")
+  assert(tool, "native intake tool must exist")
+  return tool.execute({ expected_revision: 7 }, {
+    sessionID: "ses_test0001", agent: "build", messageID: assistant.id,
+    id: "call_0001", signal: new AbortController().signal, ...ctx,
+  })
+}
+const idle = { context: canonical }
+responseQueue.push(idle, idle, { result: { code: "SESSION_SLICE_RECORDED" }, context: {
+  ...canonical, revision: 8,
+} })
+const accepted = JSON.parse((await invoke()).content)
+await Promise.all(writes)
+assert(accepted.result.code === "SESSION_SLICE_RECORDED", "Core recorded session request")
+assert(assertions === 1, "host checks permission once")
+assert(requests.length === 3, "read, revalidate, one Core mutation only")
+assert(requests[2].action === "accept_first_slice_session", "writer operation typed")
+assert(requests[2].request_text === text, "exact admitted text, not generated model title")
+assert(requests[2].session_id === "ses_test0001", "bind to current host session")
+assert(requests[2].message_id === user.id, "bind to the actual admitted user message")
+assert(requests[2].repository_id === "repo-xyz", "bind to canonical Core identity")
+
+// Generic raw requests may not reach the host-bound provenance writer.
+const raw = definitions.find((item) => item.name === "evospec")
+const blocked = JSON.parse((await raw.execute({ request: JSON.stringify({
+  action: "accept_first_slice_session", expected_revision: 7,
+}) }, { sessionID: "ses_test0001" })).content)
+assert(blocked.error.code === "DEDICATED_TOOL_REQUIRED", "no model-owned source via raw tool")
+
+// A missing assistant message or programmatic synthetic message fails before
+// host permission or Core mutation.
+// Control bytes still fail closed, without a new session approval.
+let rejected = false
+messages = [{ ...user, text: text + String.fromCharCode(0) }, assistant]
+responseQueue.push(idle)
+const checksBeforeInvalid = assertions
+try { await invoke() } catch (e) { rejected = String(e).includes("SESSION_REQUEST_SCOPE_INVALID") }
+assert(rejected, "NUL must be rejected even though CRLF is permitted")
+assert(assertions === checksBeforeInvalid, "invalid input must fail before host permission")
+messages = [user, assistant]
+rejected = false
+messages = [user, { type: "assistant", id: "msg_other0001" }]
+responseQueue.push(idle)
+try { await invoke() } catch (e) { rejected = String(e).includes("INPUT_PROVENANCE_UNAVAILABLE") }
+assert(rejected, "unknown assistant context is not an authenticated message")
+messages = [user, { type: "synthetic", id: "msg_synthetic0001" }, assistant]
+responseQueue.push(idle)
+rejected = false
+try { await invoke() } catch (e) { rejected = String(e).includes("INPUT_PROVENANCE_UNAVAILABLE") }
+assert(rejected, "synthetic hop must not become user intent")
+messages = [user, assistant]
+const beforeDeny = assertions
+deny = true
+responseQueue.push(idle)
+rejected = false
+try { await invoke() } catch (e) { rejected = String(e).includes("HOST_DENIED") }
+assert(rejected, "host deny must stop and propagate")
+assert(assertions === beforeDeny + 1, "one denied host check")
+deny = false
+// After an async host check the root must still be unchanged.
+runtime.permission.assert = async () => { currentRoot = process.cwd() + "/newroot" }
+responseQueue.push(idle)
+rejected = false
+try { await invoke() } catch (e) { rejected = String(e).includes("SESSION_REQUEST_ROOT_CHANGED") }
+assert(rejected, "root change during host admission fails closed")
+await Promise.all(writes)
+assert(requests.filter((item) => item.action === "accept_first_slice_session").length === 1,
+  "only successful admitted request may write")
 ''',
                 encoding="utf-8",
             )
@@ -613,9 +757,9 @@ const runtime = {
   },
 }
 await plugin.setup(runtime)
-assert(definitions.length === 32, "raw protocol tool and all typed helpers register")
+assert(definitions.length === 33, "raw protocol tool and all typed helpers register")
 const names = new Set(definitions.map((definition) => definition.name))
-for (const name of ["evospec", "evospec_start", "evospec_first_slice_handoff", "evospec_propose_file_edit", "evospec_auto_readiness", "evospec_auto_contract", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_criterion_test", "evospec_criterion_test_r3b", "evospec_accept_slice_outcome", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
+for (const name of ["evospec", "evospec_start", "evospec_first_slice_handoff", "evospec_session_first_slice", "evospec_propose_file_edit", "evospec_auto_readiness", "evospec_auto_contract", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_criterion_test", "evospec_criterion_test_r3b", "evospec_accept_slice_outcome", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
 const contextEntry = definitions.find((definition) => definition.name === "evospec_context")
 assert(contextEntry.options?.codemode === false, "canonical read-only context bypasses deferred Code Mode discovery")
 assert(definitions.filter((definition) => definition.options?.codemode === false).length === 1, "only canonical context is directly exposed")

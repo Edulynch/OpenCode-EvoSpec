@@ -2595,8 +2595,24 @@ def validate_state(state: State) -> None:
         for value in (agreement.title, agreement.statement, agreement.source,
                       agreement.source_reference, agreement.repository_id):
             _text(value, "agreement provenance")
-        if agreement.source != "INTERACTIVE_TERMINAL":
-            raise StateValidationError("agreement provenance must identify the interactive channel")
+        if agreement.source == "SESSION_REQUEST":
+            # A session message is not a human signature. Verify only the
+            # internal binding of recorded text to session/message identity;
+            # the OpenCode adapter must fetch the actual admitted message.
+            match = re.fullmatch(
+                r"session:(ses_[A-Za-z0-9_-]{3,128}):(msg_[A-Za-z0-9_-]{3,128}):([0-9a-f]{16})",
+                agreement.source_reference,
+            )
+            if (match is None or match.group(3) != sha256(agreement.statement.encode("utf-8")).hexdigest()[:16]):
+                raise StateValidationError("session request agreement has invalid message provenance")
+        elif agreement.source == "INTERACTIVE_TERMINAL":
+            # Legacy terminal receipts are cryptographically bound to their
+            # own canonical statement, not interchangeable with SESSION_REQUEST.
+            expected_ref = "tty:" + sha256(agreement.statement.encode("utf-8")).hexdigest()[:12]
+            if agreement.source_reference != expected_ref:
+                raise StateValidationError("terminal agreement reference does not match its statement")
+        else:
+            raise StateValidationError("agreement provenance must identify an available channel")
         if initialization is None or agreement.repository_id != initialization.repository_id:
             raise StateValidationError("agreement repository identity is not authoritative")
         if agreement.kind == "FEATURE" and any(
@@ -2607,6 +2623,23 @@ def validate_state(state: State) -> None:
             not agreement.task_id or not agreement.initial_task or not agreement.checkpoint
         ):
             raise StateValidationError("Slice agreement requires its initial Task and checkpoint")
+    # Both records must refer to the same admitted request. A model-proposed
+    # title is never independently authorized to widen its original meaning.
+    for agreement in state.agreements:
+        if agreement.source != "SESSION_REQUEST" or agreement.kind != "SLICE":
+            continue
+        owner = next((item for item in state.agreements if item.kind == "FEATURE"
+                      and item.feature_id == agreement.feature_id
+                      and item.change_id == agreement.change_id), None)
+        if (owner is None or owner.source != "SESSION_REQUEST"
+                or owner.source_reference != agreement.source_reference
+                or owner.statement != agreement.statement
+                # The exact source statement retains user formatting.
+                # Only display titles may trim outer whitespace; internal
+                # line breaks and the original source digest remain untouched.
+                or owner.title != agreement.statement.strip()
+                or agreement.title != agreement.statement.strip()):
+            raise StateValidationError("SESSION_REQUEST Slice must preserve exact original user scope")
     receipt = state.e1_schema_upgrade
     if receipt is not None:
         if type(receipt) is not E1SchemaUpgradeReceipt:

@@ -55,7 +55,7 @@ from .input_fingerprint import (
     InputSnapshot,
 )
 from .persistence import JsonValue, RecoveryError
-from .services import ServiceError, StaleRevisionError
+from .services import ServiceError, StaleRevisionError, SessionRequestEvidence
 from .workflow import (
     ClarificationAnswer,
     WorkflowError,
@@ -665,6 +665,16 @@ def _dispatch(
             )
         case "init":
             return workflow.init(expected_revision=parse_expected_revision(request))
+        case "accept_first_slice_session":
+            return workflow.accept_first_slice_session(
+                SessionRequestEvidence(
+                    session_id=parse_nonblank_string(request, "session_id"),
+                    message_id=parse_nonblank_string(request, "message_id"),
+                    statement=parse_nonblank_string(request, "request_text"),
+                    repository_id=parse_nonblank_string(request, "repository_id"),
+                ),
+                expected_revision=parse_expected_revision(request),
+            )
         case "new":
             return workflow.new(
                 parse_string(request, "intent"),
