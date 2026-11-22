@@ -1021,7 +1021,9 @@ class WorkflowService:
         try:
             saved = self.__core.propose_autonomy_expansion(state, delta)
         except ServiceError as error:
-            raise WorkflowError("autonomy expansion proposal was rejected by Core") from error
+            # Retain Core's bounded, user-actionable rejection reason. A generic
+            # "rejected" result made the host retry permission requests blindly.
+            raise WorkflowError(f"AUTONOMY_PROPOSAL_REJECTED: {error}") from error
         return self._result(
             "AUTONOMY_EXPANSION_PROPOSED",
             saved,
