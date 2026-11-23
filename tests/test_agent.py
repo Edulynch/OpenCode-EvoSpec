@@ -84,9 +84,12 @@ class AgentContextTests(unittest.TestCase):
         item = _slice_acceptance_inventory(parked_state).items[0]
         self.assertEqual(item.scope_status, "PARKED")
         self.assertEqual(item.historical_acceptance_status, "ACCEPTED_PREVIOUSLY")
-        self.assertEqual(item.historical_acceptance.receipt, receipt)
+        # Confirm the historical details exist before inspecting their receipts.
+        history = item.historical_acceptance
+        assert history is not None, "accepted history must include its supporting records"
+        self.assertEqual(history.receipt, receipt)
         self.assertEqual(
-            tuple(proof.id for proof in item.historical_acceptance.criterion_evidence),
+            tuple(proof.id for proof in history.criterion_evidence),
             receipt.evidence_receipt_ids,
         )
 
@@ -145,16 +148,19 @@ class AgentContextTests(unittest.TestCase):
             self.assertEqual(item.scope_status, "ACTIVE")
             self.assertEqual(item.criteria_revision, current_revision)
             self.assertEqual(item.historical_acceptance_status, "ACCEPTED_PREVIOUSLY")
-            self.assertEqual(item.historical_acceptance.receipt.id, receipt.id)
+        # Confirm the historical details exist before inspecting their receipts.
+        history = item.historical_acceptance
+        assert history is not None, "accepted history must include its supporting records"
+            self.assertEqual(history.receipt.id, receipt.id)
             self.assertEqual(
-                item.historical_acceptance.criteria_revision.id, prior_revision.id,
+                history.criteria_revision.id, prior_revision.id,
             )
             self.assertEqual(
-                tuple(proof.criterion_id for proof in item.historical_acceptance.criterion_evidence),
+                tuple(proof.criterion_id for proof in history.criterion_evidence),
                 tuple(criterion.id for criterion in prior_revision.criteria),
             )
             self.assertEqual(
-                tuple(proof.output_sha256 for proof in item.historical_acceptance.criterion_evidence),
+                tuple(proof.output_sha256 for proof in history.criterion_evidence),
                 ("a" * 64,) * len(prior_revision.criteria),
             )
 
