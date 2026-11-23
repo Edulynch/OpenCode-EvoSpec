@@ -7,7 +7,15 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from .agent import AcceptedSliceContext, AgentContext, HistoricalSliceAcceptance, SliceAcceptanceItem, WorkItemSummary, project_context
+from .agent import (
+    AcceptedSliceContext,
+    AgentContext,
+    HistoricalSliceAcceptance,
+    ProvisionalSliceInventory,
+    SliceAcceptanceItem,
+    WorkItemSummary,
+    project_context,
+)
 from .continuation_summary import ContinuationSummary, criterion_verification, project_continuation
 from .agent_protocol_schema import (
     ProtocolError,
@@ -335,6 +343,42 @@ def _slice_acceptance_inventory_json(context: AgentContext) -> dict[str, JsonVal
     }
 
 
+def _provisional_slice_inventory_json(
+    inventory: ProvisionalSliceInventory,
+) -> dict[str, JsonValue]:
+    return {
+        "source": inventory.source,
+        "availability": inventory.availability,
+        "total": inventory.total,
+        "complete": inventory.complete,
+        "truncated": inventory.truncated,
+        "items": [
+            {
+                "proposal_id": item.proposal_id,
+                "head": {
+                    "revision_id": item.head_revision_id,
+                    "revision": item.head_revision,
+                    "digest": item.head_digest,
+                },
+                "repository_id": item.repository_id,
+                "feature_id": item.feature_id,
+                "title": item.title,
+                "status": item.status,
+                "provenance": item.provenance,
+                "criteria": [
+                    {
+                        "id": criterion.id,
+                        "expected_result": criterion.expected_result,
+                        "expected_evidence": criterion.expected_evidence,
+                    }
+                    for criterion in item.criteria
+                ],
+            }
+            for item in inventory.items
+        ],
+    }
+
+
 def _continuation_json(summary: ContinuationSummary) -> dict[str, JsonValue]:
     accepted = summary.accepted_slice
     task_progress = summary.task_progress
@@ -440,6 +484,9 @@ def context_json(context: AgentContext) -> dict[str, JsonValue]:
             "e1_schema_ready": context.e1_schema_ready,
             "accepted_slice": _accepted_slice_json(context.accepted_slice),
             "slice_acceptance_inventory": _slice_acceptance_inventory_json(context),
+            "provisional_slice_inventory": _provisional_slice_inventory_json(
+                context.provisional_slice_inventory,
+            ),
             "feature_completion": None if context.feature_completion is None else {
                 "feature_id": context.feature_completion.feature_id,
                 "status": context.feature_completion.status,

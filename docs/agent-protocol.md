@@ -39,6 +39,44 @@ Start with `context` and treat the returned EvoSpec lifecycle fields as authorit
 
 Choose the next action from the returned `legal_actions`. Do not assume that an action is legal because it was legal in an earlier response. `context` is read-only and does not require `expected_revision`.
 
+### Provisional Slice inventory (experimental, read-only)
+
+The additive `provisional_slice_inventory` field projects only the current heads referenced by the same validated Core state used for the rest of `context`. It does not expose superseded revision history, reload State separately, or add a protocol action. Schema 15–21 initialized states have a known-empty inventory; an uninitialized root reports `availability: "UNINITIALIZED"` and `complete: false`. `UNAVAILABLE` is the default for a context object without an established projection; protocol recovery failures instead remain `WORKFLOW_ERROR` with no success context and are never converted to an empty inventory.
+
+```json
+{
+  "source": "CORE_PROVISIONAL_SLICE_HEADS",
+  "availability": "AVAILABLE",
+  "total": 1,
+  "complete": true,
+  "truncated": false,
+  "items": [
+    {
+      "proposal_id": "ps-<stable proposal identity>",
+      "head": {
+        "revision_id": "ps-<stable proposal identity>-r2",
+        "revision": 2,
+        "digest": "<current head digest>"
+      },
+      "repository_id": "<initialized repository identity>",
+      "feature_id": "<Feature identity>",
+      "title": "<proposal title>",
+      "status": "PROVISIONAL",
+      "provenance": "AGENT_SUGGESTION",
+      "criteria": [
+        {
+          "id": "c-1",
+          "expected_result": "<expected result>",
+          "expected_evidence": "<expected evidence>"
+        }
+      ]
+    }
+  ]
+}
+```
+
+At most 32 items are returned, ordered by `(feature_id, proposal_id)`; `total` counts every current head, and `truncated`/`complete` describe whether the full head set is visible. Each proposal is stored against a Feature, not a specific Change, so the item reports only its stored `feature_id`. Accepted agreement identities remain in the separate canonical `slice_acceptance_inventory`; the provisional item does not duplicate or infer a Change/Slice association. The item status is always `PROVISIONAL`; it is not an agreement, `AGREED` state, accepted Slice, or authority. `provenance` preserves the stored `AGENT_SUGGESTION` or `USER_EXPRESSED` kind; `USER_EXPRESSED` is attributable text metadata, not authenticated authorship or consent. D1 publication remains test-harness-only and is not enabled by this projection.
+
 ### SESSION_REQUEST recovery projection (experimental)
 
 For a Core-validated paired `SESSION_REQUEST` Feature/Slice, `accepted_slice` keeps its existing agreement references, Task fields, `source`, and `source_reference`, and adds only this compact original-request snapshot:

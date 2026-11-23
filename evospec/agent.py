@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
+from typing import Literal
 
-from .domain import AgreementRecord, AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, CriterionCoverageApproval, CriterionTestReceipt, ExpectedRevision, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, SliceCriteriaHead, SliceCriteriaRevision, SliceCriterion, SliceOutcomeReceipt, State, WorkItem, WorkingContext, is_sha256_digest
+from .domain import AgreementRecord, AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, CriterionCoverageApproval, CriterionTestReceipt, ExpectedRevision, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ProvisionalSliceCriterion, ProvisionalSliceHead, ProvisionalSliceRevision, ReviewInspection, SliceCriteriaHead, SliceCriteriaRevision, SliceCriterion, SliceOutcomeReceipt, State, WorkItem, WorkingContext, is_sha256_digest
 from .guidance import (
     ActionGuidance,
     MaterialDecisionEvidence,
@@ -25,6 +26,7 @@ MAX_EXTERNAL_SDD_EVIDENCE = 8
 MAX_WORK_ITEMS = 32
 MAX_WORK_RELATIONS = 64
 MAX_NEXT_CANDIDATES = MAX_WORK_ITEMS
+MAX_PROVISIONAL_SLICE_ITEMS = MAX_WORK_ITEMS
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +202,30 @@ class SliceAcceptanceInventory:
 
 
 @dataclass(frozen=True, slots=True)
+class ProvisionalSliceItem:
+    proposal_id: str
+    head_revision_id: str
+    head_revision: int
+    head_digest: str
+    repository_id: str
+    feature_id: str
+    title: str
+    provenance: str
+    criteria: tuple[ProvisionalSliceCriterion, ...]
+    status: Literal["PROVISIONAL"] = "PROVISIONAL"
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisionalSliceInventory:
+    source: str = "CORE_PROVISIONAL_SLICE_HEADS"
+    availability: Literal["AVAILABLE", "UNINITIALIZED", "UNAVAILABLE"] = "UNAVAILABLE"
+    total: int = 0
+    complete: bool = False
+    truncated: bool = False
+    items: tuple[ProvisionalSliceItem, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class FeatureCompletionSummary:
     """Core-owned closure/readiness displayed without granting execution rights."""
 
@@ -264,6 +290,7 @@ class AgentContext:
     slice_acceptance_inventory: SliceAcceptanceInventory = SliceAcceptanceInventory()
     feature_completion: FeatureCompletionSummary | None = None
     request_scoped_objective: RequestScopedObjectiveStatus | None = None
+    provisional_slice_inventory: ProvisionalSliceInventory = ProvisionalSliceInventory()
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +333,7 @@ def project_context(
         _slice_acceptance_inventory(state)
         if state.initialization is not None else SliceAcceptanceInventory()
     )
+    provisional_slice_inventory = _provisional_slice_inventory(state)
     active_accepted_slice = _accepted_slice_context(state)
     active_session_request = bool(
         active_accepted_slice is not None
@@ -386,6 +414,7 @@ def project_context(
               Outcome(OutcomeKind.STRUCTURAL_DEFECT, "repository authority initialization is required"),
               r3_schema_ready=inspection.state.r3_schema_upgrade is not None,
               r3b_schema_ready=inspection.state.r3b_schema_upgrade is not None,
+              provisional_slice_inventory=provisional_slice_inventory,
          )
     external_sdd_discovery = workflow.external_sdd_evidence()
     external_sdd_evidence = tuple(
@@ -447,6 +476,7 @@ def project_context(
                  slice_acceptance_inventory=slice_inventory,
                  feature_completion=completion,
                  request_scoped_objective=request_scoped_objective,
+                 provisional_slice_inventory=provisional_slice_inventory,
            )
     locks = tuple(lock for lock in inspection.locks if lock.active and lock.feature_id == context.feature_id)
     change = next((item for item in inspection.changes if item.id == context.change_id), None)
@@ -553,6 +583,7 @@ def project_context(
                 slice_acceptance_inventory=slice_inventory,
                 feature_completion=completion,
                 request_scoped_objective=request_scoped_objective,
+                provisional_slice_inventory=provisional_slice_inventory,
         )
 
 
@@ -676,6 +707,60 @@ def _slice_acceptance_inventory(state: State) -> SliceAcceptanceInventory:
         complete=structurally_resolved and not truncated,
         truncated=truncated,
         items=tuple(items),
+    )
+
+
+def _provisional_slice_inventory(state: State) -> ProvisionalSliceInventory:
+    """Project only validated current heads; older initialized schemas are known-empty."""
+    if state.initialization is None:
+        availability: Literal["UNINITIALIZED", "UNAVAILABLE"] = (
+            "UNAVAILABLE"
+            if state.provisional_slice_revisions or state.provisional_slice_heads
+            else "UNINITIALIZED"
+        )
+        return ProvisionalSliceInventory(availability=availability)
+
+    revisions_by_id = {
+        revision.revision_id: revision
+        for revision in state.provisional_slice_revisions
+    }
+    heads = sorted(
+        state.provisional_slice_heads,
+        key=lambda head: (
+            str(revisions_by_id[head.revision_id].feature_id),
+            head.proposal_id,
+        ),
+    )
+    total = len(heads)
+    selected = heads[:MAX_PROVISIONAL_SLICE_ITEMS]
+    items = tuple(
+        _provisional_slice_item(head, revisions_by_id[head.revision_id])
+        for head in selected
+    )
+    truncated = total > MAX_PROVISIONAL_SLICE_ITEMS
+    return ProvisionalSliceInventory(
+        availability="AVAILABLE",
+        total=total,
+        complete=not truncated,
+        truncated=truncated,
+        items=items,
+    )
+
+
+def _provisional_slice_item(
+    head: ProvisionalSliceHead,
+    revision: ProvisionalSliceRevision,
+) -> ProvisionalSliceItem:
+    return ProvisionalSliceItem(
+        head.proposal_id,
+        head.revision_id,
+        head.revision,
+        head.digest,
+        revision.repository_id,
+        str(revision.feature_id),
+        revision.title,
+        revision.provenance.kind,
+        revision.criteria,
     )
 
 

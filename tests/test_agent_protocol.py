@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import unittest
@@ -193,6 +194,10 @@ class AgentProtocolTests(unittest.TestCase):
             recovered = json.loads(execute(root, request("context")))["context"]
             reopened = json.loads(execute(root, request("context")))["context"]
             self.assertEqual(recovered["request_scoped_objective"]["status"], "COMPLETE")
+            self.assertEqual(
+                recovered["provisional_slice_inventory"]["availability"], "AVAILABLE",
+            )
+            self.assertEqual(recovered["provisional_slice_inventory"]["total"], 0)
             self.assertEqual(recovered["feature_completion"]["status"], "COMPLETE")
             self.assertIsNotNone(recovered["feature_completion"]["receipt_id"])
             self.assertEqual(reopened["slice_acceptance_inventory"], recovered["slice_acceptance_inventory"])
@@ -749,6 +754,114 @@ class AgentProtocolTests(unittest.TestCase):
             external_discovery.assert_not_called()
             capability_discovery.assert_not_called()
             self.assertEqual(CoreService.open(root).recover(), before)
+
+    def test_provisional_slice_context_is_additive_read_only_and_distinguishes_empty(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            uninitialized = json.loads(execute(root, request("context")))["context"]
+            self.assertEqual(uninitialized["provisional_slice_inventory"], {
+                "source": "CORE_PROVISIONAL_SLICE_HEADS",
+                "availability": "UNINITIALIZED",
+                "total": 0,
+                "complete": False,
+                "truncated": False,
+                "items": [],
+            })
+            self.assertFalse((root / ".evospec").exists())
+
+            initialized = json.loads(execute(root, request("init", expected_revision=0)))
+            state_path = root / ".evospec" / "state.json"
+            before = (state_path.read_bytes(), state_path.stat().st_mtime_ns)
+            state_before_context = CoreService.open(root).recover()
+            first = json.loads(execute(root, request("context")))["context"]
+            second = json.loads(execute(root, request("context")))["context"]
+            self.assertEqual(initialized["context"]["revision"], first["revision"])
+            self.assertEqual(first["provisional_slice_inventory"], {
+                "source": "CORE_PROVISIONAL_SLICE_HEADS",
+                "availability": "AVAILABLE",
+                "total": 0,
+                "complete": True,
+                "truncated": False,
+                "items": [],
+            })
+            self.assertEqual(first["provisional_slice_inventory"], second["provisional_slice_inventory"])
+            self.assertEqual(CoreService.open(root).recover(), state_before_context)
+            self.assertEqual(
+                (state_path.read_bytes(), state_path.stat().st_mtime_ns), before,
+            )
+
+        from tests.test_persistence import (
+            _ProvisionalSliceTestHarness,
+            _create_provisional_fixture,
+            _make_provisional_revision,
+        )
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = _create_provisional_fixture(root)
+            proposal = _make_provisional_revision(base, title="Protocol proposal")
+            committed = _ProvisionalSliceTestHarness(root).publish(base, proposal, None)
+            authority_root = root / ".evospec"
+
+            def authority_snapshot() -> dict[str, tuple[bytes, int]]:
+                return {
+                    path.relative_to(authority_root).as_posix(): (
+                        path.read_bytes(), path.stat().st_mtime_ns,
+                    )
+                    for path in authority_root.rglob("*")
+                    if path.is_file()
+                }
+
+            before_files = authority_snapshot()
+            first = json.loads(execute(root, request("context")))["context"]
+            second = json.loads(execute(root, request("context")))["context"]
+            projection = first["provisional_slice_inventory"]
+            self.assertEqual(first["revision"], committed.revision)
+            self.assertEqual(projection["availability"], "AVAILABLE")
+            self.assertEqual(projection["total"], 1)
+            self.assertEqual(set(projection["items"][0]), {
+                "proposal_id", "head", "repository_id", "feature_id", "title",
+                "status", "provenance", "criteria",
+            })
+            self.assertEqual(projection["items"][0]["proposal_id"], proposal.proposal_id)
+            self.assertEqual(projection, second["provisional_slice_inventory"])
+            self.assertEqual(CoreService.open(root).recover(), committed)
+            self.assertEqual(authority_snapshot(), before_files)
+
+    def test_provisional_slice_context_fails_closed_for_corrupt_and_cross_root_state(self) -> None:
+        from tests.test_persistence import (
+            _ProvisionalSliceTestHarness,
+            _create_provisional_fixture,
+            _make_provisional_revision,
+        )
+
+        with TemporaryDirectory() as source_temporary, TemporaryDirectory() as other_temporary:
+            root = Path(source_temporary)
+            other_root = Path(other_temporary)
+            base = _create_provisional_fixture(root)
+            proposal = _make_provisional_revision(base, title="Root-bound proposal")
+            _ProvisionalSliceTestHarness(root).publish(base, proposal, None)
+            shutil.copytree(root / ".evospec", other_root / ".evospec")
+            copied_state = other_root / ".evospec" / "state.json"
+            copied_before = copied_state.read_bytes()
+
+            wrong_root = json.loads(execute(other_root, request("context")))
+
+            self.assertEqual(wrong_root["error"]["code"], "WORKFLOW_ERROR")
+            self.assertNotIn("context", wrong_root)
+            self.assertEqual(copied_state.read_bytes(), copied_before)
+
+            state_path = root / ".evospec" / "state.json"
+            altered = json.loads(state_path.read_text(encoding="utf-8"))
+            altered["provisional_slice_heads"][0]["digest"] = "0" * 64
+            state_path.write_text(json.dumps(altered), encoding="utf-8")
+            corrupted_before = state_path.read_bytes()
+
+            corrupt_response = json.loads(execute(root, request("context")))
+
+            self.assertEqual(corrupt_response["error"]["code"], "WORKFLOW_ERROR")
+            self.assertNotIn("context", corrupt_response)
+            self.assertEqual(state_path.read_bytes(), corrupted_before)
 
     def test_context_serializes_the_fact_derived_outcome_and_legacy_intervention(self) -> None:
         with TemporaryDirectory() as temporary:
