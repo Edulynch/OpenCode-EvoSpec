@@ -138,6 +138,8 @@ function makeContext({
         criteria_status: projectedCriteriaRevision === null ? "NOT_RECORDED" : "RECORDED",
         criteria_revision: projectedCriteriaRevision,
         historical_receipt: false,
+        historical_acceptance_status: "NOT_RECORDED",
+        historical_acceptance: null,
       }],
     },
     criterion_verification: criterionVerification,
@@ -541,7 +543,7 @@ test("groups accepted Slices by canonical Feature identity and never evaluates i
   const parked = card("Parked Slice")
   assert.ok(parked?.textContent.includes("Agreed outcome: parked approved outcome"))
   assert.ok(parked?.textContent.includes("Parked — current acceptance not evaluated"))
-  assert.ok(parked?.textContent.includes("historical outcome receipt"))
+  assert.ok(parked?.textContent.includes("Historical acceptance evidence is unavailable"))
   assert.ok(parked?.textContent.includes("parked-only result"))
   assert.equal(parked?.textContent.includes("private parked evidence"), false)
   assert.ok(card("Blocked parked Slice")?.textContent.includes("Blocked (parked)"))
@@ -555,6 +557,151 @@ test("groups accepted Slices by canonical Feature identity and never evaluates i
   assert.ok(queued?.textContent.includes("Current acceptance not evaluated"))
   assert.ok(queued?.textContent.includes("queued-only result"))
   assert.ok(app.ids.get("active-slice-content").textContent.includes("Archived/history coverage is not exhaustive"))
+})
+
+test("historical acceptance shows its exact past basis without promoting current validity", async () => {
+  const attachHistory = (context, {
+    receiptId = "receipt-prior",
+    revisionId = "criteria-prior",
+    receiptSource = "CORE_OBJECTIVE_ACCEPTANCE",
+    criteriaSource = "INTERACTIVE_TERMINAL",
+    criteriaRows,
+    proofSourceRevision = 8,
+    proofRecordedRevision = 9,
+    outcomeSourceRevision = 10,
+    outcomeRecordedRevision = 11,
+  } = {}) => {
+    const item = context.slice_acceptance_inventory.items[0]
+    context.revision = Math.max(context.revision, outcomeRecordedRevision)
+    const criterion = {
+      id: "AC-prior",
+      expected_result: "The previously accepted result",
+      expected_evidence: "python-unittest:tests/test_prior.py",
+    }
+    const criteria = criteriaRows ?? [criterion]
+    const proofs = criteria.map((row, index) => ({
+      id: criteria.length === 1 ? "proof-prior" : `proof-prior-${index + 1}`,
+      slice_agreement_ref: item.slice_agreement_ref,
+      criteria_revision_id: revisionId,
+      criterion_id: row.id,
+      test_kind: "python-unittest",
+      test_target: "tests/test_prior.py",
+      exit_code: 0,
+      output_sha256: "a".repeat(64),
+      source_revision: proofSourceRevision,
+      recorded_revision: proofRecordedRevision,
+    }))
+    item.historical_acceptance_status = "ACCEPTED_PREVIOUSLY"
+    item.historical_acceptance = {
+      receipt: {
+        id: receiptId,
+        repository_id: context.repository_id,
+        slice_agreement_ref: item.slice_agreement_ref,
+        criteria_revision_id: revisionId,
+        evidence_receipt_ids: proofs.map((proof) => proof.id),
+        input_fingerprint: "b".repeat(64),
+        input_policy_id: "input-policy",
+        input_policy_digest: "c".repeat(64),
+        admission_policy_id: "admission-policy",
+        admission_policy_digest: "d".repeat(64),
+        relevant_drift_digest: "e".repeat(64),
+        basis: "ALL_CRITERIA_FRESH_SUPPORTED_TESTS",
+        source: receiptSource,
+        source_revision: outcomeSourceRevision,
+        recorded_revision: outcomeRecordedRevision,
+        coverage_contract_digest: null,
+      },
+      criteria_revision: {
+        id: revisionId,
+        slice_agreement_ref: item.slice_agreement_ref,
+        repository_id: context.repository_id,
+        outcome: "Past agreed outcome",
+        example: "Past example",
+        inclusions: [],
+        exclusions: [],
+        decisions: [],
+        criteria,
+        source: criteriaSource,
+        source_reference: "tty:prior",
+        previous_revision_id: null,
+        reason: null,
+        decision_statement: null,
+      },
+      criterion_evidence: proofs,
+    }
+    return item
+  }
+
+  const amended = makeContext({ outcome: "READY" })
+  const amendedItem = attachHistory(amended)
+  const amendedRevision = {
+    ...amendedItem.criteria_revision,
+    id: "criteria-current-amended",
+  }
+  amendedItem.criteria_revision = amendedRevision
+  amended.accepted_slice.criteria_revision = amendedRevision
+  const amendedApp = await loadedDashboard(amended)
+  const amendedCard = descendants(amendedApp.ids.get("active-slice-content")).find((element) =>
+    element.className === "acceptance-slice" && element.textContent.includes("Restore saved tasks")
+  )
+  assert.ok(amendedCard?.textContent.includes("Accepted previously — current validity not evaluated"))
+  assert.ok(amendedCard?.textContent.includes("The previously accepted result"))
+  assert.equal(amendedApp.ids.get("active-slice-status").textContent, "Ready for acceptance")
+  assert.notEqual(amendedApp.ids.get("active-slice-status").textContent, "Slice accepted")
+  const details = descendants(amendedCard).find((element) => element.tagName === "details")
+  assert.ok(details)
+  assert.ok(details.textContent.includes("receipt-prior"))
+  assert.ok(details.textContent.includes("proof-prior"))
+  assert.ok(details.textContent.includes("tests/test_prior.py"))
+  assert.ok(details.textContent.includes("a".repeat(64)))
+  const textOutsideDetails = (element) => element.tagName === "details"
+    ? ""
+    : element._textContent + element.children.map(textOutsideDetails).join("")
+  assert.equal(textOutsideDetails(amendedCard).includes("receipt-prior"), false)
+  assert.equal(textOutsideDetails(amendedCard).includes("proof-prior"), false)
+
+  const current = makeContext({ outcome: "CURRENT" })
+  const currentItem = attachHistory(current, {
+    receiptId: current.slice_outcome.latest_receipt_id,
+    revisionId: current.accepted_slice.criteria_revision.id,
+    receiptSource: "REQUEST_SCOPED_OBJECTIVE",
+    criteriaSource: "REQUEST_SCOPED_OBJECTIVE",
+    criteriaRows: current.slice_acceptance_inventory.items[0].criteria_revision.criteria,
+    proofSourceRevision: 11,
+    proofRecordedRevision: 12,
+    outcomeSourceRevision: 11,
+    outcomeRecordedRevision: 12,
+  })
+  currentItem.criteria_revision = currentItem.historical_acceptance.criteria_revision
+  current.accepted_slice.criteria_revision = currentItem.criteria_revision
+  const currentApp = await loadedDashboard(current)
+  assert.equal(currentApp.ids.get("active-slice-status").textContent, "Slice accepted")
+  assert.equal(currentApp.ids.get("active-slice-content").textContent.includes("Accepted previously"), false)
+
+  const mismatchedRequest = makeContext({ outcome: "READY" })
+  attachHistory(mismatchedRequest, {
+    receiptSource: "REQUEST_SCOPED_OBJECTIVE",
+    criteriaSource: "REQUEST_SCOPED_OBJECTIVE",
+    proofSourceRevision: 8,
+    proofRecordedRevision: 9,
+    outcomeSourceRevision: 10,
+    outcomeRecordedRevision: 11,
+  })
+  const mismatchedRequestApp = await loadedDashboard(mismatchedRequest)
+  assert.equal(mismatchedRequestApp.ids.get("active-slice-content").textContent.includes("Accepted previously"), false)
+  assert.ok(mismatchedRequestApp.ids.get("active-slice-content").textContent.includes("Historical acceptance evidence is unavailable"))
+
+  const unsupportedSource = makeContext({ outcome: "READY" })
+  attachHistory(unsupportedSource, { criteriaSource: "FUTURE_CRITERIA_SOURCE" })
+  const unsupportedSourceApp = await loadedDashboard(unsupportedSource)
+  assert.equal(unsupportedSourceApp.ids.get("active-slice-content").textContent.includes("Accepted previously"), false)
+  assert.ok(unsupportedSourceApp.ids.get("active-slice-content").textContent.includes("Historical acceptance evidence is unavailable"))
+
+  const inconsistent = makeContext({ outcome: "READY" })
+  attachHistory(inconsistent).historical_acceptance.receipt.repository_id = "another-repository"
+  const inconsistentApp = await loadedDashboard(inconsistent)
+  assert.equal(inconsistentApp.ids.get("active-slice-content").textContent.includes("Accepted previously"), false)
+  assert.ok(inconsistentApp.ids.get("active-slice-content").textContent.includes("Historical acceptance evidence is unavailable"))
 })
 
 test("inventory truncation, malformed associations, and unknown states fail closed visibly", async () => {

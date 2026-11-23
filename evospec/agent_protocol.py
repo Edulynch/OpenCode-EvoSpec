@@ -7,7 +7,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from .agent import AcceptedSliceContext, AgentContext, SliceAcceptanceItem, WorkItemSummary, project_context
+from .agent import AcceptedSliceContext, AgentContext, HistoricalSliceAcceptance, SliceAcceptanceItem, WorkItemSummary, project_context
 from .continuation_summary import ContinuationSummary, criterion_verification, project_continuation
 from .agent_protocol_schema import (
     ProtocolError,
@@ -42,7 +42,7 @@ from .agent_protocol_schema import (
     parse_work_relation_kind,
     validate_action_request,
 )
-from .domain import AssessmentOperation, AutonomyEnvelope, AutonomyEnvelopeDelta, CriterionCoverageApproval, SliceCriteriaRevision, SliceOutcomeReceipt
+from .domain import AssessmentOperation, AutonomyEnvelope, AutonomyEnvelopeDelta, CriterionCoverageApproval, CriterionTestReceipt, SliceCriteriaRevision, SliceOutcomeReceipt
 from .input_fingerprint import (
     COVERAGE_CONTRACT_VERSION,
     INPUT_FINGERPRINT_VERSION,
@@ -290,6 +290,36 @@ def _slice_acceptance_item_json(item: SliceAcceptanceItem) -> dict[str, JsonValu
         "criteria_status": item.criteria_status,
         "criteria_revision": _criteria_revision_json(item.criteria_revision),
         "historical_receipt": item.historical_receipt,
+        "historical_acceptance_status": item.historical_acceptance_status,
+        "historical_acceptance": (
+            None if item.historical_acceptance is None
+            else _historical_slice_acceptance_json(item.historical_acceptance)
+        ),
+    }
+
+
+def _historical_slice_acceptance_json(
+    acceptance: HistoricalSliceAcceptance,
+) -> dict[str, JsonValue]:
+    return {
+        "receipt": _slice_outcome_receipt_json(acceptance.receipt),
+        "criteria_revision": _criteria_revision_json(acceptance.criteria_revision),
+        "criterion_evidence": [
+            {
+                "id": proof.id,
+                "slice_agreement_ref": proof.slice_agreement_ref,
+                "criteria_revision_id": proof.criteria_revision_id,
+                "criterion_id": proof.criterion_id,
+                "test_kind": proof.test_kind,
+                "test_target": proof.test_target,
+                "exit_code": proof.exit_code,
+                "output_sha256": proof.output_sha256,
+                "source_revision": proof.source_revision,
+                "recorded_revision": proof.recorded_revision,
+            }
+            for proof in acceptance.criterion_evidence
+            if isinstance(proof, CriterionTestReceipt)
+        ],
     }
 
 

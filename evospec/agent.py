@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 
-from .domain import AgreementRecord, AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, CriterionCoverageApproval, CriterionTestReceipt, ExpectedRevision, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, SliceCriteriaHead, SliceCriteriaRevision, SliceCriterion, SliceOutcomeReceipt, State, WorkItem, WorkingContext
+from .domain import AgreementRecord, AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, CriterionCoverageApproval, CriterionTestReceipt, ExpectedRevision, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ReviewInspection, SliceCriteriaHead, SliceCriteriaRevision, SliceCriterion, SliceOutcomeReceipt, State, WorkItem, WorkingContext, is_sha256_digest
 from .guidance import (
     ActionGuidance,
     MaterialDecisionEvidence,
@@ -159,6 +159,15 @@ class WorkQueueSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class HistoricalSliceAcceptance:
+    """One exact past Slice outcome and the criterion receipts that support it."""
+
+    receipt: SliceOutcomeReceipt
+    criteria_revision: SliceCriteriaRevision
+    criterion_evidence: tuple[CriterionTestReceipt, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SliceAcceptanceItem:
     """One canonical Slice agreement, kept distinct from evaluation evidence."""
 
@@ -174,6 +183,8 @@ class SliceAcceptanceItem:
     criteria_status: str
     criteria_revision: SliceCriteriaRevision | None
     historical_receipt: bool
+    historical_acceptance_status: str = "NOT_RECORDED"
+    historical_acceptance: HistoricalSliceAcceptance | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -848,6 +859,9 @@ def _slice_acceptance_item(
         and receipt.criteria_revision_id in valid_revision_ids
         for receipt in state.slice_outcome_receipts
     )
+    historical_acceptance, historical_acceptance_status = _historical_slice_acceptance(
+        state, record, repository_id, unique,
+    )
     authority_valid = association_valid and context_valid and criteria_status != "UNAVAILABLE"
     item = SliceAcceptanceItem(
         record.id,
@@ -862,8 +876,206 @@ def _slice_acceptance_item(
         criteria_status,
         criteria_revision,
         historical_receipt,
+        historical_acceptance_status,
+        historical_acceptance,
     )
     return item, authority_valid
+
+
+def _historical_slice_acceptance(
+    state: State,
+    record: AgreementRecord,
+    repository_id: str | None,
+    unique: bool,
+) -> tuple[HistoricalSliceAcceptance | None, str]:
+    receipts = state.slice_outcome_receipts
+    if not isinstance(receipts, tuple):
+        return None, "UNAVAILABLE"
+    candidates = tuple(
+        receipt for receipt in receipts
+        if getattr(receipt, "slice_agreement_ref", None) == record.id
+    )
+    if not candidates:
+        return None, "NOT_RECORDED"
+    if (
+        not unique or repository_id is None or record.repository_id != repository_id
+        or not isinstance(state.slice_criteria_revisions, tuple)
+        or not isinstance(state.criterion_test_receipts, tuple)
+    ):
+        return None, "UNAVAILABLE"
+
+    valid: list[HistoricalSliceAcceptance] = []
+    failure: str | None = None
+    for receipt in candidates:
+        if (
+            not isinstance(receipt, SliceOutcomeReceipt)
+            or not isinstance(receipt.id, str) or not receipt.id
+            or sum(
+                getattr(other, "id", None) == receipt.id
+                for other in receipts
+            ) != 1
+            or receipt.repository_id != repository_id
+            or receipt.slice_agreement_ref != record.id
+            or not isinstance(receipt.criteria_revision_id, str)
+            or not receipt.criteria_revision_id
+            or type(receipt.source_revision) is not int
+            or type(receipt.recorded_revision) is not int
+            or receipt.source_revision < 0
+            or receipt.recorded_revision != receipt.source_revision + 1
+            or receipt.recorded_revision > state.revision
+            or any(
+                not isinstance(value, str) or not value.strip()
+                for value in (
+                    receipt.input_fingerprint, receipt.input_policy_id,
+                    receipt.input_policy_digest, receipt.admission_policy_id,
+                    receipt.admission_policy_digest, receipt.relevant_drift_digest,
+                    receipt.basis, receipt.source,
+                )
+            )
+            or not is_sha256_digest(receipt.input_fingerprint)
+            or not is_sha256_digest(receipt.input_policy_digest)
+            or not is_sha256_digest(receipt.admission_policy_digest)
+            or not is_sha256_digest(receipt.relevant_drift_digest)
+            or (
+                receipt.coverage_contract_digest is not None
+                and not is_sha256_digest(receipt.coverage_contract_digest)
+            )
+        ):
+            failure = "UNAVAILABLE"
+            continue
+
+        revisions = tuple(
+            revision for revision in state.slice_criteria_revisions
+            if getattr(revision, "id", None) == receipt.criteria_revision_id
+        )
+        if (
+            len(revisions) != 1
+            or not isinstance(revisions[0], SliceCriteriaRevision)
+            or revisions[0].repository_id != repository_id
+            or revisions[0].slice_agreement_ref != record.id
+            or not isinstance(revisions[0].criteria, tuple)
+            or not revisions[0].criteria
+        ):
+            failure = "UNAVAILABLE"
+            continue
+        revision = revisions[0]
+        request_scoped = revision.source == REQUEST_SCOPED_OBJECTIVE
+        if (
+            revision.source not in (
+                "INTERACTIVE_TERMINAL",
+                "INTERACTIVE_TERMINAL_DECISION",
+                REQUEST_SCOPED_OBJECTIVE,
+            )
+            or receipt.source != (
+                REQUEST_SCOPED_OBJECTIVE if request_scoped else "CORE_OBJECTIVE_ACCEPTANCE"
+            )
+        ):
+            failure = "UNAVAILABLE"
+            continue
+        criteria = revision.criteria
+        if (
+            any(
+                not isinstance(criterion, SliceCriterion)
+                or not isinstance(criterion.id, str) or not criterion.id.strip()
+                or not isinstance(criterion.expected_result, str) or not criterion.expected_result.strip()
+                or not isinstance(criterion.expected_evidence, str) or not criterion.expected_evidence.strip()
+                for criterion in criteria
+            )
+            or len({criterion.id for criterion in criteria if isinstance(criterion, SliceCriterion)})
+            != len(criteria)
+        ):
+            failure = "UNAVAILABLE"
+            continue
+
+        evidence_ids = receipt.evidence_receipt_ids
+        if (
+            not isinstance(evidence_ids, tuple)
+            or not evidence_ids
+            or len(evidence_ids) != len(criteria)
+            or any(not isinstance(identity, str) or not identity for identity in evidence_ids)
+            or len(evidence_ids) != len(set(evidence_ids))
+        ):
+            failure = failure or "PARTIAL"
+            continue
+        selected: list[CriterionTestReceipt] = []
+        missing = False
+        inconsistent = False
+        for identity in evidence_ids:
+            matches = tuple(
+                proof for proof in state.criterion_test_receipts
+                if getattr(proof, "id", None) == identity
+            )
+            if len(matches) != 1 or not isinstance(matches[0], CriterionTestReceipt):
+                missing = True
+                break
+            proof = matches[0]
+            if (
+                proof.slice_agreement_ref != record.id
+                or proof.criteria_revision_id != revision.id
+                or not isinstance(proof.criterion_id, str) or not proof.criterion_id
+                or type(proof.exit_code) is not int or proof.exit_code != 0
+                or not isinstance(proof.test_kind, str) or not proof.test_kind.strip()
+                or not isinstance(proof.test_target, str) or not proof.test_target.strip()
+                or not is_sha256_digest(proof.output_sha256)
+                or proof.input_fingerprint_before != receipt.input_fingerprint
+                or proof.input_fingerprint_after != receipt.input_fingerprint
+                or proof.input_policy_id != receipt.input_policy_id
+                or proof.input_policy_digest != receipt.input_policy_digest
+                or proof.admission_policy_id != receipt.admission_policy_id
+                or proof.admission_policy_digest != receipt.admission_policy_digest
+                or type(proof.source_revision) is not int
+                or proof.source_revision < 0
+                or type(proof.recorded_revision) is not int
+                or proof.recorded_revision != proof.source_revision + 1
+                or proof.recorded_revision > state.revision
+                or (
+                    request_scoped
+                    and (
+                        proof.source_revision != receipt.source_revision
+                        or proof.recorded_revision != receipt.recorded_revision
+                    )
+                )
+                or (
+                    not request_scoped
+                    and proof.recorded_revision > receipt.source_revision
+                )
+            ):
+                inconsistent = True
+                break
+            selected.append(proof)
+        if missing:
+            failure = failure or "PARTIAL"
+            continue
+        if inconsistent:
+            failure = "UNAVAILABLE"
+            continue
+
+        by_criterion = {proof.criterion_id: proof for proof in selected}
+        criterion_ids = tuple(criterion.id for criterion in criteria)
+        if (
+            len(by_criterion) != len(selected)
+            or set(by_criterion) != set(criterion_ids)
+        ):
+            failure = "UNAVAILABLE"
+            continue
+        valid.append(HistoricalSliceAcceptance(
+            receipt,
+            revision,
+            tuple(by_criterion[criterion_id] for criterion_id in criterion_ids),
+        ))
+
+    if failure is not None:
+        return None, failure
+    if not valid:
+        return None, "NOT_RECORDED"
+    latest_revision = max(item.receipt.recorded_revision for item in valid)
+    latest = tuple(
+        item for item in valid
+        if item.receipt.recorded_revision == latest_revision
+    )
+    if len(latest) != 1:
+        return None, "UNAVAILABLE"
+    return latest[0], "ACCEPTED_PREVIOUSLY"
 
 
 def _accepted_slice_context(state: State) -> AcceptedSliceContext | None:
