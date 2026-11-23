@@ -56,6 +56,34 @@ State is persisted locally with atomic publication operations. Recovery reads th
 
 Side work preserves the primary context. When side work ends, Core restores the saved primary context through a validated operation. A failed publication leaves the prior authoritative state in place. Paused work resumes only through the stored valid state and phase. Terminal work is reported, not reopened automatically.
 
+### Provisional Slice format (experimental fixture support)
+
+Schema 22 is a dedicated, experimental persistence format for provisional future-Slice proposals. It leaves the ordinary `SCHEMA = 15` default and schema 15–21 layouts unchanged. Canonical immutable revisions live under `.evospec/records/provisional-slices/`; exact State references and one current head per proposal are the sole authority. Recovery checks canonical IDs and digests, root and existing Feature-agreement binding, provenance shape, and a contiguous linear history. Unreferenced files are inert. The production package retains this model, serialization, validation, recovery, and ordinary-writer rejection, but has no D1 publication operation.
+
+The write orchestration exists only in `_ProvisionalSliceTestHarness` in `tests/test_persistence.py`. It writes isolated test fixtures and reuses the production lock, recovery and validation logic, generic immutable-record publisher, and atomic state replacement primitive. It is not an enabled product operation: the production package exposes no private or public D1 publisher and there is no service, CLI, protocol, agent, host, or UI route. The test harness publishes no AgreementRecord, accepted criteria, Task, checkpoint, verification, or acceptance state. `USER_EXPRESSED` retains exact attributable text and a digest; its shape does not authenticate a host message or establish consent, acceptance, or human presence. Agent suggestions remain distinct.
+
+Executed for this P1/P2 change: `python -m unittest tests.test_persistence tests.test_persistence_atomic` passed all 56 tests, covering canonical encoding, strict provenance and reference validation, CAS/replay/conflict and supersession behavior, recovery, atomic record/state publication and retry, ordinary schema-22 writer rejection, and source-runtime API absence. `tests/installed_runtime_smoke.py` now checks that test modules are absent from wheels and that the installed Python, persistence, service, workflow, CLI, and protocol namespaces expose no D1 publisher; that wheel automation has not been run for this change. The prior Push run [45160802302](https://github.com/Edulynch/OpenCode-EvoSpec/actions/runs/45160802302) and PR run [45162507781](https://github.com/Edulynch/OpenCode-EvoSpec/actions/runs/45162507781) succeeded for the audited base SHA `4fba43c670c8adacfe87e065d9ebf276c3cdef8e`; they predate and do not verify this change. Production activation is intentionally absent; exact-baseline mutation, G1–G3, browser behavior, the built-wheel smoke, independent Nox gates, and broader schema 16–21 fixture coverage remain unverified.
+
+For a disposable fixture, use the platform's temporary directory and the ordinary accepted-Feature test fixture before adding only a D1 proposal:
+
+```python
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from tests.test_persistence import _ProvisionalSliceTestHarness, _create_provisional_fixture, _make_provisional_revision
+from evospec.persistence import PROVISIONAL_SLICE_SCHEMA, StateStore
+
+with TemporaryDirectory(prefix="evospec-d1-") as path:
+    root = Path(path)
+    base = _create_provisional_fixture(root)
+    revision = _make_provisional_revision(base)
+    d1 = _ProvisionalSliceTestHarness(root).publish(base, revision, None)
+    state_path = root / ".evospec" / "state.json"
+    assert StateStore(root).load_state() == d1
+    assert __import__("json").loads(state_path.read_text(encoding="utf-8"))["schema"] == PROVISIONAL_SLICE_SCHEMA
+```
+
+The fixture's ordinary acceptance is synthetic test setup, not evidence of real human consent; the test-only publisher only preserves it. A production writer route should reject schema 22 before any mutation; the focused regression asserts an ordinary Core writer fails closed with unchanged bytes. This is not an independently run exact-baseline mutator or a product activation test.
+
 ## Provider neutral protocol
 
 `evospec.agent` projects authoritative context into a bounded provider neutral shape. The related JSON protocol carries context, legal actions, structured intent, progress, review, verification, and convergence requests through WorkflowService. It returns the current revision and reports stale revision errors so an agent can reload before trying again.

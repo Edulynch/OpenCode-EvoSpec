@@ -401,6 +401,59 @@ class SliceCriteriaHead:
 
 
 @dataclass(frozen=True, slots=True)
+class ProvisionalSliceCriterion:
+    id: str
+    expected_result: str
+    expected_evidence: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisionalSliceSourceReference:
+    session_id: str
+    message_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisionalSliceProvenance:
+    kind: str
+    source_reference: ProvisionalSliceSourceReference | None = None
+    expression: str | None = None
+    expression_sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisionalSliceRevision:
+    proposal_id: str
+    revision_id: str
+    revision: int
+    repository_id: str
+    feature_id: FeatureId
+    title: str
+    outcome: str
+    example: str | None
+    inclusions: tuple[str, ...]
+    exclusions: tuple[str, ...]
+    considerations: tuple[str, ...]
+    open_questions: tuple[str, ...]
+    criteria: tuple[ProvisionalSliceCriterion, ...]
+    provenance: ProvisionalSliceProvenance
+    previous_revision_id: str | None
+    digest: str
+
+    @property
+    def id(self) -> str:
+        return self.revision_id
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisionalSliceHead:
+    proposal_id: str
+    revision_id: str
+    revision: int
+    digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class CoverageInput:
     """One explicit root file or directory-presence dependency declaration."""
 
@@ -1549,6 +1602,8 @@ class State:
     criterion_coverage_approvals: tuple[CriterionCoverageApproval, ...] = ()
     feature_completion_receipts: tuple[FeatureCompletionReceipt, ...] = ()
     feature_reopen_receipts: tuple[FeatureReopenReceipt, ...] = ()
+    provisional_slice_revisions: tuple[ProvisionalSliceRevision, ...] = ()
+    provisional_slice_heads: tuple[ProvisionalSliceHead, ...] = ()
 
 
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -3271,6 +3326,14 @@ def validate_state(state: State) -> None:
             revision = revision_index.get(revision.previous_revision_id) if revision.previous_revision_id else None
     if reachable != set(revision_index):
         raise StateValidationError("Slice criteria history must be reachable from Core-owned heads")
+    if type(state.provisional_slice_revisions) is not tuple or type(state.provisional_slice_heads) is not tuple:
+        raise StateValidationError("provisional Slice authority must be immutable tuples")
+    if any(type(item) is not ProvisionalSliceRevision for item in state.provisional_slice_revisions):
+        raise StateValidationError("provisional Slice revision shape is invalid")
+    if any(type(item) is not ProvisionalSliceHead for item in state.provisional_slice_heads):
+        raise StateValidationError("provisional Slice head shape is invalid")
+    _unique((item.revision_id for item in state.provisional_slice_revisions), "provisional Slice revision")
+    _unique((item.proposal_id for item in state.provisional_slice_heads), "provisional Slice head")
     receipt = state.r3_schema_upgrade
     if receipt is not None:
         if type(receipt) is not R3SchemaUpgradeReceipt or state.initialization is None:

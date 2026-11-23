@@ -111,6 +111,8 @@ def _audit_wheel(wheel: Path, checkout: Path, expected_version: str) -> None:
     missing = _package_files(checkout) - contents
     if missing:
         raise AssertionError(f"wheel omitted: {sorted(missing)}")
+    if any(name.startswith("tests/") for name in contents):
+        raise AssertionError("wheel unexpectedly includes test-only modules")
     metadata_lines = set(metadata_text.splitlines())
     if "Name: evospec" not in metadata_lines or f"Version: {expected_version}" not in metadata_lines:
         raise AssertionError("wheel metadata does not match project metadata")
@@ -146,6 +148,31 @@ def _exercise_wheel(wheel: Path, context: RuntimeContext) -> None:
     )
     if Path(module.stdout.strip()).resolve().is_relative_to(context.checkout):
         raise AssertionError("installed runtime imported from the source checkout")
+    _ = subprocess.run(
+        (
+            str(python),
+            "-c",
+            "import evospec\n"
+            "import evospec.agent_protocol as protocol\n"
+            "import evospec.cli as cli\n"
+            "import evospec.persistence as persistence\n"
+            "import evospec.services as services\n"
+            "import evospec.workflow as workflow\n"
+            "assert not hasattr(evospec, 'publish_provisional_slice')\n"
+            "assert not hasattr(persistence, 'publish_provisional_slice')\n"
+            "assert not hasattr(persistence.StateStore, 'publish_provisional_slice')\n"
+            "assert not hasattr(persistence._StateStore, 'publish_provisional_slice')\n"
+            "assert not hasattr(services.CoreService, 'publish_provisional_slice')\n"
+            "assert not hasattr(workflow.WorkflowService, 'publish_provisional_slice')\n"
+            "assert not hasattr(protocol, 'publish_provisional_slice')\n"
+            "assert not hasattr(cli, 'publish_provisional_slice')\n",
+        ),
+        capture_output=True,
+        check=True,
+        cwd=workspace,
+        env=context.environment,
+        text=True,
+    )
     version = subprocess.run(
         (str(scripts / f"evospec{executable_suffix}"), "--version"),
         capture_output=True,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -63,6 +64,11 @@ from .domain import (
     IntakeId,
     IntentAssessment,
     MaterialDecision,
+    ProvisionalSliceCriterion,
+    ProvisionalSliceHead,
+    ProvisionalSliceProvenance,
+    ProvisionalSliceRevision,
+    ProvisionalSliceSourceReference,
     MaterialClarification,
     RepositoryPath,
     RepositoryInitialization,
@@ -132,6 +138,7 @@ FEATURE_COMPLETION_SCHEMA: Final = 18
 FEATURE_CYCLE_SCHEMA: Final = 19
 REQUEST_OBJECTIVE_SCHEMA: Final = 20
 SEMANTIC_REQUEST_OBJECTIVE_SCHEMA: Final = 21
+PROVISIONAL_SLICE_SCHEMA: Final = 22
 LEGACY_WRITE_SCHEMA: Final = 13
 E1_TASK_PROGRESS_SCHEMA: Final = 14
 INTEGRATION_REGISTRY_SCHEMA: Final = 1
@@ -188,6 +195,7 @@ STATE_FIELDS_V18: Final = STATE_FIELDS_V17 | frozenset(("feature_completion_rece
 STATE_FIELDS_V19: Final = STATE_FIELDS_V18 | frozenset(("feature_reopen_receipts",))
 STATE_FIELDS_V20: Final = STATE_FIELDS_V19
 STATE_FIELDS_V21: Final = STATE_FIELDS_V20
+STATE_FIELDS_V22: Final = STATE_FIELDS_V21 | frozenset(("provisional_slice_refs", "provisional_slice_heads"))
 CONTEXT_FIELDS: Final = frozenset(
     (
         "feature_id",
@@ -874,6 +882,278 @@ def _slice_criteria_from_json(value: JsonValue) -> SliceCriteriaRevision:
     )
 
 
+_PROVISIONAL_SLICE_FIELDS: Final = frozenset((
+    "proposal_id", "revision_id", "revision", "repository_id", "feature_id",
+    "title", "outcome", "example", "inclusions", "exclusions",
+    "considerations", "open_questions", "criteria", "provenance",
+    "previous_revision_id", "digest",
+))
+_PROVISIONAL_SLICE_GENESIS_FIELDS: Final = (
+    "repository_id", "feature_id", "title", "outcome", "example",
+    "inclusions", "exclusions", "considerations", "open_questions",
+    "criteria", "provenance",
+)
+_PROVISIONAL_SLICE_CRITERION_FIELDS: Final = frozenset((
+    "id", "expected_result", "expected_evidence",
+))
+
+
+def _provisional_slice_provenance_to_json(
+    provenance: ProvisionalSliceProvenance,
+) -> JsonValue:
+    if provenance.kind == "AGENT_SUGGESTION":
+        return {"kind": "AGENT_SUGGESTION"}
+    source = provenance.source_reference
+    if provenance.kind == "USER_EXPRESSED" and source is not None:
+        return {
+            "kind": "USER_EXPRESSED",
+            "source_reference": {
+                "session_id": source.session_id,
+                "message_id": source.message_id,
+            },
+            "expression": provenance.expression,
+            "expression_sha256": provenance.expression_sha256,
+        }
+    raise DecodeError("provisional Slice provenance shape is invalid")
+
+
+def _provisional_slice_payload(revision: ProvisionalSliceRevision) -> dict[str, JsonValue]:
+    return {
+        "proposal_id": revision.proposal_id,
+        "revision_id": revision.revision_id,
+        "revision": revision.revision,
+        "repository_id": revision.repository_id,
+        "feature_id": str(revision.feature_id),
+        "title": revision.title,
+        "outcome": revision.outcome,
+        "example": revision.example,
+        "inclusions": list(revision.inclusions),
+        "exclusions": list(revision.exclusions),
+        "considerations": list(revision.considerations),
+        "open_questions": list(revision.open_questions),
+        "criteria": [
+            {
+                "id": item.id,
+                "expected_result": item.expected_result,
+                "expected_evidence": item.expected_evidence,
+            }
+            for item in revision.criteria
+        ],
+        "provenance": _provisional_slice_provenance_to_json(revision.provenance),
+        "previous_revision_id": revision.previous_revision_id,
+    }
+
+
+def _provisional_slice_genesis_id(revision: ProvisionalSliceRevision) -> str:
+    payload = _provisional_slice_payload(revision)
+    genesis = {name: payload[name] for name in _PROVISIONAL_SLICE_GENESIS_FIELDS}
+    return "ps-" + sha256(encode_json(genesis)).hexdigest()
+
+
+def _provisional_slice_digest(revision: ProvisionalSliceRevision) -> str:
+    return sha256(encode_json(_provisional_slice_payload(revision))).hexdigest()
+
+
+def _provisional_slice_to_json(revision: ProvisionalSliceRevision) -> JsonValue:
+    return {**_provisional_slice_payload(revision), "digest": revision.digest}
+
+
+def _provisional_nonblank(value: JsonValue, label: str) -> str:
+    text = _string(value, label)
+    if not text.strip():
+        raise DecodeError(f"{label} must not be blank")
+    return text
+
+
+def _provisional_slice_provenance_from_json(value: JsonValue) -> ProvisionalSliceProvenance:
+    if not isinstance(value, dict):
+        raise DecodeError("provisional Slice provenance must be an object")
+    kind = _string(value.get("kind"), "provisional Slice provenance kind")
+    if kind == "AGENT_SUGGESTION":
+        raw = _object(value, frozenset(("kind",)), "agent suggestion provenance")
+        return ProvisionalSliceProvenance(_string(raw["kind"], "provenance kind"))
+    if kind != "USER_EXPRESSED":
+        raise DecodeError("provisional Slice provenance kind is invalid")
+    raw = _object(
+        value,
+        frozenset(("kind", "source_reference", "expression", "expression_sha256")),
+        "user expression provenance",
+    )
+    source = _object(
+        raw["source_reference"],
+        frozenset(("session_id", "message_id")),
+        "user expression source reference",
+    )
+    session_id = _provisional_nonblank(source["session_id"], "expression session id")
+    message_id = _provisional_nonblank(source["message_id"], "expression message id")
+    expression = _provisional_nonblank(raw["expression"], "user expression")
+    expression_sha256 = _string(raw["expression_sha256"], "expression SHA-256")
+    if (
+        re.fullmatch(r"ses_[A-Za-z0-9_-]{3,128}", session_id) is None
+        or re.fullmatch(r"msg_[A-Za-z0-9_-]{3,128}", message_id) is None
+        or not is_sha256_digest(expression_sha256)
+        or expression_sha256 != sha256(expression.encode("utf-8")).hexdigest()
+    ):
+        raise DecodeError("user expression provenance is invalid")
+    return ProvisionalSliceProvenance(
+        "USER_EXPRESSED",
+        ProvisionalSliceSourceReference(session_id, message_id),
+        expression,
+        expression_sha256,
+    )
+
+
+def _provisional_slice_from_json(value: JsonValue) -> ProvisionalSliceRevision:
+    raw = _object(value, _PROVISIONAL_SLICE_FIELDS, "provisional Slice revision")
+    proposal_id = _string(raw["proposal_id"], "provisional Slice proposal id")
+    revision_id = _string(raw["revision_id"], "provisional Slice revision id")
+    revision_number = _integer(raw["revision"], "provisional Slice revision")
+    repository_id = _provisional_nonblank(raw["repository_id"], "provisional Slice repository")
+    feature_id = _provisional_nonblank(raw["feature_id"], "provisional Slice Feature")
+    title = _provisional_nonblank(raw["title"], "provisional Slice title")
+    outcome = _provisional_nonblank(raw["outcome"], "provisional Slice outcome")
+    example = (
+        None if raw["example"] is None
+        else _provisional_nonblank(raw["example"], "provisional Slice example")
+    )
+    arrays = tuple(
+        tuple(
+            _provisional_nonblank(item, f"provisional Slice {label}")
+            for item in _array(raw[label], f"provisional Slice {label}")
+        )
+        for label in ("inclusions", "exclusions", "considerations", "open_questions")
+    )
+    criteria = tuple(
+        ProvisionalSliceCriterion(
+            _provisional_nonblank(item["id"], "provisional criterion id"),
+            _provisional_nonblank(item["expected_result"], "provisional criterion result"),
+            _provisional_nonblank(item["expected_evidence"], "provisional criterion evidence"),
+        )
+        for entry in _array(raw["criteria"], "provisional Slice criteria")
+        for item in (
+            _object(entry, _PROVISIONAL_SLICE_CRITERION_FIELDS, "provisional Slice criterion"),
+        )
+    )
+    provenance = _provisional_slice_provenance_from_json(raw["provenance"])
+    previous_revision_id = _optional_string(
+        raw["previous_revision_id"], "previous provisional Slice revision",
+    )
+    digest = _string(raw["digest"], "provisional Slice digest")
+    record = ProvisionalSliceRevision(
+        proposal_id,
+        revision_id,
+        revision_number,
+        repository_id,
+        FeatureId(feature_id),
+        title,
+        outcome,
+        example,
+        arrays[0],
+        arrays[1],
+        arrays[2],
+        arrays[3],
+        criteria,
+        provenance,
+        previous_revision_id,
+        digest,
+    )
+    _validate_provisional_slice_record(record)
+    return record
+
+
+def _validate_provisional_slice_record(revision: ProvisionalSliceRevision) -> None:
+    if type(revision) is not ProvisionalSliceRevision:
+        raise DecodeError("provisional Slice revision is invalid")
+    if any(type(value) is not str for value in (
+        revision.proposal_id, revision.revision_id, revision.repository_id,
+        revision.feature_id, revision.title, revision.outcome, revision.digest,
+    )):
+        raise DecodeError("provisional Slice revision strings are invalid")
+    if revision.example is not None and type(revision.example) is not str:
+        raise DecodeError("provisional Slice example is invalid")
+    if (
+        revision.previous_revision_id is not None
+        and type(revision.previous_revision_id) is not str
+    ):
+        raise DecodeError("provisional Slice predecessor is invalid")
+    if type(revision.provenance) is not ProvisionalSliceProvenance:
+        raise DecodeError("provisional Slice provenance is invalid")
+    if _provisional_slice_provenance_from_json(
+        _provisional_slice_provenance_to_json(revision.provenance)
+    ) != revision.provenance:
+        raise DecodeError("provisional Slice provenance is invalid")
+    if type(revision.revision) is not int or revision.revision < 1:
+        raise DecodeError("provisional Slice revision number is invalid")
+    if any(type(values) is not tuple for values in (
+        revision.inclusions, revision.exclusions, revision.considerations,
+        revision.open_questions, revision.criteria,
+    )):
+        raise DecodeError("provisional Slice arrays are invalid")
+    if any(
+        type(value) is not str or not value.strip()
+        for values in (
+            revision.inclusions, revision.exclusions, revision.considerations,
+            revision.open_questions,
+        )
+        for value in values
+    ):
+        raise DecodeError("provisional Slice scope text is invalid")
+    if any(type(item) is not ProvisionalSliceCriterion for item in revision.criteria):
+        raise DecodeError("provisional Slice criterion shape is invalid")
+    if any(
+        any(type(value) is not str or not value.strip() for value in (
+            item.id, item.expected_result, item.expected_evidence,
+        ))
+        or re.fullmatch(r"c-[1-9][0-9]*", item.id) is None
+        for item in revision.criteria
+    ):
+        raise DecodeError("provisional Slice criterion is invalid")
+    if (
+        re.fullmatch(r"ps-[0-9a-f]{64}", revision.proposal_id) is None
+        or revision.revision_id != f"{revision.proposal_id}-r{revision.revision}"
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", revision.feature_id) is None
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", revision.repository_id) is None
+        or any(type(value) is not str or not value.strip() for value in (
+            revision.repository_id, revision.feature_id, revision.title, revision.outcome,
+        ))
+        or (revision.example is not None and not revision.example.strip())
+        or len({item.id for item in revision.criteria}) != len(revision.criteria)
+        or (revision.revision == 1 and revision.previous_revision_id is not None)
+        or (revision.revision > 1 and (
+            not revision.previous_revision_id
+            or re.fullmatch(
+                r"ps-[0-9a-f]{64}-r[1-9][0-9]*",
+                revision.previous_revision_id,
+            ) is None
+        ))
+        or not is_sha256_digest(revision.digest)
+        or revision.digest != _provisional_slice_digest(revision)
+    ):
+        raise DecodeError("provisional Slice revision is invalid")
+    if revision.revision == 1 and revision.proposal_id != _provisional_slice_genesis_id(revision):
+        raise DecodeError("provisional Slice genesis identity is invalid")
+
+
+def _provisional_slice_head_from_json(value: JsonValue) -> ProvisionalSliceHead:
+    raw = _object(
+        value,
+        frozenset(("proposal_id", "revision_id", "revision", "digest")),
+        "provisional Slice head",
+    )
+    proposal_id = _string(raw["proposal_id"], "provisional Slice head proposal")
+    revision_id = _string(raw["revision_id"], "provisional Slice head revision id")
+    revision = _integer(raw["revision"], "provisional Slice head revision")
+    digest = _string(raw["digest"], "provisional Slice head digest")
+    if (
+        type(revision) is not int or revision < 1
+        or re.fullmatch(r"ps-[0-9a-f]{64}", proposal_id) is None
+        or revision_id != f"{proposal_id}-r{revision}"
+        or not is_sha256_digest(digest)
+    ):
+        raise DecodeError("provisional Slice head is invalid")
+    return ProvisionalSliceHead(proposal_id, revision_id, revision, digest)
+
+
 _E1_UPGRADE_FIELDS: Final = frozenset((
     "source_revision", "converted_revision", "source_sha256", "statement",
     "source", "source_reference", "repository_id", "feature_agreement_ref", "slice_agreement_ref",
@@ -1558,6 +1838,166 @@ def _load_references(
     return tuple(loaded)
 
 
+def _load_provisional_slice_revisions(
+    root: Path, value: JsonValue,
+) -> tuple[ProvisionalSliceRevision, ...]:
+    references = _references_from_json(value, "provisional_slice_refs")
+    identities = tuple(identity for identity, _ in references)
+    if identities != tuple(sorted(identities)) or len(identities) != len(set(identities)):
+        raise DecodeError("provisional Slice references must be unique and sorted")
+    revisions: list[ProvisionalSliceRevision] = []
+    for identity, path in references:
+        expected = RepositoryPath(f"records/provisional-slices/{identity}.json")
+        if path != expected:
+            raise DecodeError("provisional Slice record path does not match revision identity")
+        revision = _provisional_slice_from_json(_read_json(_artifact_path(root, path.value)))
+        if revision.revision_id != identity:
+            raise DecodeError("provisional Slice record identity mismatch")
+        revisions.append(revision)
+    return tuple(revisions)
+
+
+def _load_provisional_slice_heads(value: JsonValue) -> tuple[ProvisionalSliceHead, ...]:
+    heads = tuple(
+        _provisional_slice_head_from_json(entry)
+        for entry in _array(value, "provisional Slice heads")
+    )
+    proposals = tuple(item.proposal_id for item in heads)
+    if proposals != tuple(sorted(proposals)) or len(proposals) != len(set(proposals)):
+        raise DecodeError("provisional Slice heads must be unique and sorted")
+    return heads
+
+
+def _validate_provisional_slice_authority(root: Path, state: State) -> None:
+    revisions = state.provisional_slice_revisions
+    heads = state.provisional_slice_heads
+    if not revisions and not heads:
+        return
+    if bool(revisions) != bool(heads):
+        raise DecodeError("provisional Slice revisions and heads must be paired")
+    resolved_root = _resolved_root(root)
+    initialization = state.initialization
+    repository_id = sha256(str(resolved_root).encode("utf-8")).hexdigest()[:16]
+    if initialization is None or initialization.repository_id != repository_id:
+        raise DecodeError("provisional Slice repository identity does not match this root")
+    features = {item.id: item for item in state.features}
+    revisions_by_proposal: dict[str, list[ProvisionalSliceRevision]] = {}
+    for revision in revisions:
+        _validate_provisional_slice_record(revision)
+        if revision.repository_id != repository_id:
+            raise DecodeError("provisional Slice record belongs to a different repository")
+        feature = features.get(revision.feature_id)
+        feature_agreements = tuple(
+            item for item in state.agreements
+            if item.kind == "FEATURE" and item.feature_id == revision.feature_id
+        )
+        slice_agreements = tuple(
+            item for item in state.agreements
+            if item.kind == "SLICE" and item.feature_id == revision.feature_id
+        )
+        feature_changes = tuple(item.change_id for item in feature_agreements)
+        slice_changes = tuple(item.change_id for item in slice_agreements)
+        agreement_contexts = tuple(
+            context for context in (state.active_context, state.preserved_primary_context)
+            if context is not None
+        ) + tuple(
+            context for item in state.work_items
+            for context in (item.context, item.preserved_primary_context)
+            if context is not None
+        ) + tuple(archive.context for archive in state.terminal_archives)
+        context_pairs = {
+            (context.feature_id, context.change_id, context.feature_agreement_ref, context.slice_agreement_ref)
+            for context in agreement_contexts
+            if context.feature_agreement_ref is not None and context.slice_agreement_ref is not None
+        }
+        if (
+            feature is None
+            or not feature_agreements
+            or len(feature_changes) != len(set(feature_changes))
+            or len(slice_changes) != len(set(slice_changes))
+            or set(feature_changes) != set(slice_changes)
+            or any(
+                item.repository_id != repository_id or item.title != feature.title
+                for item in feature_agreements
+            )
+            or any(item.repository_id != repository_id for item in slice_agreements)
+            or any(
+                feature_agreement.source != slice_agreement.source
+                or feature_agreement.statement != slice_agreement.statement
+                or feature_agreement.source_reference != slice_agreement.source_reference
+                or (
+                    revision.feature_id,
+                    feature_agreement.change_id,
+                    feature_agreement.id,
+                    slice_agreement.id,
+                ) not in context_pairs
+                for feature_agreement in feature_agreements
+                for slice_agreement in slice_agreements
+                if slice_agreement.change_id == feature_agreement.change_id
+            )
+        ):
+            raise DecodeError("provisional Slice Feature lacks canonical accepted Feature/Change pairs")
+        revisions_by_proposal.setdefault(revision.proposal_id, []).append(revision)
+    heads_by_proposal = {item.proposal_id: item for item in heads}
+    if set(heads_by_proposal) != set(revisions_by_proposal):
+        raise DecodeError("provisional Slice records must be reachable from exactly one head")
+    for proposal_id, proposal_revisions in revisions_by_proposal.items():
+        ordered = sorted(proposal_revisions, key=lambda item: item.revision)
+        first = ordered[0]
+        previous_id: str | None = None
+        used_criteria: set[str] = set()
+        maximum_criterion = 0
+        for expected_revision, revision in enumerate(ordered, start=1):
+            if (
+                revision.revision != expected_revision
+                or revision.proposal_id != proposal_id
+                or revision.repository_id != first.repository_id
+                or revision.feature_id != first.feature_id
+                or revision.previous_revision_id != previous_id
+            ):
+                raise DecodeError("provisional Slice history is not one contiguous linear chain")
+            criterion_numbers: list[int] = []
+            for item in revision.criteria:
+                match = re.fullmatch(r"c-([1-9][0-9]*)", item.id)
+                if match is None:
+                    raise DecodeError("provisional Slice criterion identities are not canonical")
+                criterion_numbers.append(int(match.group(1)))
+            if criterion_numbers != sorted(criterion_numbers):
+                raise DecodeError("provisional Slice criterion identities are not canonical")
+            current_ids = {item.id for item in revision.criteria}
+            previous_ids = (
+                set() if expected_revision == 1
+                else {item.id for item in ordered[expected_revision - 2].criteria}
+            )
+            new_numbers = [
+                number for number, item in zip(criterion_numbers, revision.criteria)
+                if item.id not in used_criteria
+            ]
+            if expected_revision == 1:
+                if criterion_numbers != list(range(1, len(criterion_numbers) + 1)):
+                    raise DecodeError("provisional Slice genesis criteria must start at c-1")
+            else:
+                if any(item.id in used_criteria and item.id not in previous_ids for item in revision.criteria):
+                    raise DecodeError("removed provisional Slice criteria cannot be resurrected")
+                if new_numbers != list(range(
+                    maximum_criterion + 1,
+                    maximum_criterion + len(new_numbers) + 1,
+                )):
+                    raise DecodeError("new provisional Slice criteria must use never-used next IDs")
+            used_criteria.update(current_ids)
+            if criterion_numbers:
+                maximum_criterion = max(maximum_criterion, max(criterion_numbers))
+            previous_id = revision.revision_id
+        head = heads_by_proposal[proposal_id]
+        final = ordered[-1]
+        if (
+            head.revision_id != final.revision_id
+            or head.revision != final.revision
+            or head.digest != final.digest
+        ):
+            raise DecodeError("provisional Slice head does not match the final immutable revision")
+
+
 def _archive_from_json(value: JsonValue, schema: int) -> TerminalArchive:
     fields = frozenset(("context", "parent_feature_id"))
     raw = _object(
@@ -1806,7 +2246,7 @@ def _criterion_test_from_json(value: JsonValue, schema: int) -> CriterionTestRec
     )
     raw = _object(value, allowed, "R3 criterion test")
     def optional_r3_string(key: str, label: str) -> str | None:
-        if key not in raw or schema in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA) and raw[key] is None:
+        if key not in raw or schema in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA) and raw[key] is None:
             return None
         return _string(raw[key], label)
 
@@ -2007,9 +2447,11 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                     decoded.pop(field)
         if schema in (9, 10):
             raw = _object(decoded, STATE_FIELDS_V10, "state")
-        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA):
+        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA):
             decoded_fields = set(decoded)
-            if schema == REQUEST_OBJECTIVE_SCHEMA and decoded_fields == set(STATE_FIELDS_V20):
+            if schema == PROVISIONAL_SLICE_SCHEMA and decoded_fields == set(STATE_FIELDS_V22):
+                raw = _object(decoded, STATE_FIELDS_V22, "state")
+            elif schema == REQUEST_OBJECTIVE_SCHEMA and decoded_fields == set(STATE_FIELDS_V20):
                 raw = _object(decoded, STATE_FIELDS_V20, "state")
             elif schema == SEMANTIC_REQUEST_OBJECTIVE_SCHEMA and decoded_fields == set(STATE_FIELDS_V21):
                 raw = _object(decoded, STATE_FIELDS_V21, "state")
@@ -2094,7 +2536,7 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 legacy_fields,
                 "state",
             )
-        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA):
+        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA):
             raise DecodeError("unknown state schema")
         (
             initialization, deferred, intake, selection, recovery, selection_history,
@@ -2197,8 +2639,16 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 _feature_reopen_from_json(item)
                 for item in _array(raw["feature_reopen_receipts"], "Feature reopening receipts")
             ) if schema >= FEATURE_CYCLE_SCHEMA else (),
+            provisional_slice_revisions=(
+                _load_provisional_slice_revisions(root, raw["provisional_slice_refs"])
+                if schema == PROVISIONAL_SLICE_SCHEMA else ()
+            ),
+            provisional_slice_heads=(
+                _load_provisional_slice_heads(raw["provisional_slice_heads"])
+                if schema == PROVISIONAL_SLICE_SCHEMA else ()
+            ),
         )
-        if schema >= R3B_SCHEMA and schema not in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA) and state.r3b_schema_upgrade is None:
+        if schema >= R3B_SCHEMA and schema not in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA) and state.r3b_schema_upgrade is None:
             raise DecodeError("schema 17 requires an explicit R3-B conversion receipt")
         if schema == FEATURE_CYCLE_SCHEMA and not state.feature_reopen_receipts:
             raise DecodeError("schema 19 requires explicit Feature reopening authority")
@@ -2217,7 +2667,12 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 or not any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_outcome_receipts)
             ):
                 raise DecodeError(f"schema {schema} requires its canonical request-objective proof")
+        elif schema == PROVISIONAL_SLICE_SCHEMA and has_request_objective:
+            if _request_objective_schema_for_state(state) is None:
+                raise DecodeError("schema 22 cannot weaken existing request-objective proof")
         validate_state(state)
+        if schema == PROVISIONAL_SLICE_SCHEMA:
+            _validate_provisional_slice_authority(root, state)
         _validate_capability_selection_authority(state, schema)
         contexts = tuple(
             context
@@ -2728,18 +3183,43 @@ def _request_objective_schema_for_state(state: State) -> int | None:
 
 def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
     """Preserve each accepted layout until a scoped authority decision changes it."""
-    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA):
+    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA):
         raise ValueError("unsupported state writer schema")
     if schema < SCHEMA and (state.slice_criteria_revisions or state.slice_criteria_heads):
         raise ValueError("Slice criteria cannot be silently downgraded")
+    if schema != PROVISIONAL_SLICE_SCHEMA and (
+        state.provisional_slice_revisions or state.provisional_slice_heads
+    ):
+        raise ValueError("provisional Slice authority cannot be silently downgraded")
     if (
         schema >= R3B_SCHEMA
-        and schema not in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA)
+        and schema not in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA)
         and state.r3b_schema_upgrade is None
     ):
         raise ValueError("schema 17 requires its separate human-approved conversion receipt")
     if schema == FEATURE_CYCLE_SCHEMA and not state.feature_reopen_receipts:
         raise ValueError("schema 19 requires a human reopening receipt")
+    if schema == PROVISIONAL_SLICE_SCHEMA:
+        value_d1: dict[str, JsonValue] = {
+            "provisional_slice_refs": [
+                {
+                    "id": item.revision_id,
+                    "path": f"records/provisional-slices/{item.revision_id}.json",
+                }
+                for item in sorted(state.provisional_slice_revisions, key=lambda item: item.revision_id)
+            ],
+            "provisional_slice_heads": [
+                {
+                    "proposal_id": item.proposal_id,
+                    "revision_id": item.revision_id,
+                    "revision": item.revision,
+                    "digest": item.digest,
+                }
+                for item in sorted(state.provisional_slice_heads, key=lambda item: item.proposal_id)
+            ],
+        }
+    else:
+        value_d1 = {}
     if schema in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA) and (
         _request_objective_schema_for_state(state) != schema
         or not any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_criteria_revisions)
@@ -2803,6 +3283,7 @@ def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
             "work_relations": [_work_relation_to_json(item) for item in state.work_relations],
     }
     value.update(_extensions_to_json(state))
+    value.update(value_d1)
     if schema < SCHEMA:
         # Earlier schemas have no criterion ledger; an empty slot is not authority.
         value.pop("slice_criteria_refs")
@@ -3012,12 +3493,12 @@ class _StateStore:
             expected_id = sha256(str(self.__root).encode("utf-8")).hexdigest()[:16]
             if state.initialization is None or state.initialization.repository_id != expected_id:
                 raise RecoveryError("accepted Slice state belongs to a different repository root")
-        return state, (schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA) if state.agreements else None)
+        return state, (schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA) if state.agreements else None)
 
     def e1_schema_ready(self) -> bool:
         """Legacy state remains readable but cannot silently enter the E1 writer path."""
         raw = _read_json(_artifact_path(self.__root, "state.json"))
-        return isinstance(raw, dict) and raw.get("schema") in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA)
+        return isinstance(raw, dict) and raw.get("schema") in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA)
 
     def r3_schema_ready(self) -> bool:
         """Schema 15 stays readable; it never becomes an R3 writer without consent."""
@@ -3588,6 +4069,8 @@ class _StateStore:
         if not isinstance(raw, dict) or type(raw.get("schema")) is not int:
             raise AtomicFailure("persisted schema authority is invalid")
         source_schema = raw["schema"]
+        if source_schema == PROVISIONAL_SLICE_SCHEMA:
+            raise AtomicFailure("D1_PROVISIONAL_SCHEMA_READ_ONLY: ordinary writers are disabled")
         if allow_request_objective:
             if source_schema == SCHEMA:
                 if (
