@@ -182,10 +182,48 @@ class AgentProtocolTests(unittest.TestCase):
                 verified["result"]["revision"] + 1,
             )
 
+            state_path = root / ".evospec" / "state.json"
+            artifact_path = root / "index.html"
+            state_before = CoreService.open(root).recover()
+            state_bytes_before = state_path.read_bytes()
+            state_mtime_before = state_path.stat().st_mtime_ns
+            artifact_bytes_before = artifact_path.read_bytes()
+            artifact_mtime_before = artifact_path.stat().st_mtime_ns
+
             recovered = json.loads(execute(root, request("context")))["context"]
+            reopened = json.loads(execute(root, request("context")))["context"]
             self.assertEqual(recovered["request_scoped_objective"]["status"], "COMPLETE")
             self.assertEqual(recovered["feature_completion"]["status"], "COMPLETE")
             self.assertIsNotNone(recovered["feature_completion"]["receipt_id"])
+            self.assertEqual(reopened["slice_acceptance_inventory"], recovered["slice_acceptance_inventory"])
+            self.assertEqual(
+                recovered["slice_acceptance_inventory"]["history_scope"],
+                "AGREEMENT_RECORDS_ONLY_NONEXHAUSTIVE",
+            )
+            historical_item = recovered["slice_acceptance_inventory"]["items"][0]
+            self.assertEqual(historical_item["scope_status"], "HISTORICAL")
+            self.assertEqual(historical_item["historical_acceptance_status"], "ACCEPTED_PREVIOUSLY")
+            historical = historical_item["historical_acceptance"]
+            receipt = historical["receipt"]
+            self.assertEqual(receipt["repository_id"], recovered["repository_id"])
+            self.assertEqual(receipt["slice_agreement_ref"], historical_item["slice_agreement_ref"])
+            self.assertEqual(
+                receipt["criteria_revision_id"],
+                historical["criteria_revision"]["id"],
+            )
+            self.assertEqual(
+                {proof["id"] for proof in historical["criterion_evidence"]},
+                set(receipt["evidence_receipt_ids"]),
+            )
+            state_after = CoreService.open(root).recover()
+            self.assertEqual(state_after, state_before)
+            self.assertEqual(state_after.revision, recovered["revision"])
+            self.assertEqual(state_path.relative_to(root).as_posix(), ".evospec/state.json")
+            self.assertEqual(state_path.read_bytes(), state_bytes_before)
+            self.assertEqual(state_path.stat().st_mtime_ns, state_mtime_before)
+            self.assertEqual(artifact_path.relative_to(root).as_posix(), "index.html")
+            self.assertEqual(artifact_path.read_bytes(), artifact_bytes_before)
+            self.assertEqual(artifact_path.stat().st_mtime_ns, artifact_mtime_before)
             self.assertEqual(
                 recovered["input_snapshot"]["fingerprint"],
                 snapshot.fingerprint,

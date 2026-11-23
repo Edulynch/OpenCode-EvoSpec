@@ -16,6 +16,7 @@ from evospec.domain import (
     CapabilityState,
     Change,
     ChangeId,
+    CriterionTestReceipt,
     Decision,
     DecisionId,
     ExpectedRevision,
@@ -52,6 +53,142 @@ from tests.test_workflow_assurance import established_change_assessment
 
 
 class AgentContextTests(unittest.TestCase):
+    def test_ordinary_r3b_historical_acceptance_accepts_earlier_canonical_proofs(self) -> None:
+        from tests.test_e1_r3b_slice_auto_acceptance import R3BSliceOutcomeTests
+
+        fixture = R3BSliceOutcomeTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        fixture.upgrade_r3b()
+        fixture.record_both()
+
+        accepted_response = fixture.send(fixture.accept_request())
+        self.assertEqual(accepted_response["result"]["code"], "SLICE_OUTCOME_ACCEPTED")
+        accepted_state = CoreService.open(fixture.root).recover()
+        receipt = accepted_state.slice_outcome_receipts[-1]
+        proofs = tuple(
+            next(item for item in accepted_state.criterion_test_receipts if item.id == proof_id)
+            for proof_id in receipt.evidence_receipt_ids
+        )
+        self.assertEqual(receipt.source, "CORE_OBJECTIVE_ACCEPTANCE")
+        self.assertTrue(any(
+            proof.source_revision != receipt.source_revision
+            or proof.recorded_revision != receipt.recorded_revision
+            for proof in proofs
+        ))
+        self.assertTrue(all(proof.recorded_revision <= receipt.source_revision for proof in proofs))
+        self.assertTrue(all(proof.recorded_revision < receipt.recorded_revision for proof in proofs))
+        fixture.workflow.park("deferred for later")
+
+        parked_state = CoreService.open(fixture.root).recover()
+        item = _slice_acceptance_inventory(parked_state).items[0]
+        self.assertEqual(item.scope_status, "PARKED")
+        self.assertEqual(item.historical_acceptance_status, "ACCEPTED_PREVIOUSLY")
+        self.assertEqual(item.historical_acceptance.receipt, receipt)
+        self.assertEqual(
+            tuple(proof.id for proof in item.historical_acceptance.criterion_evidence),
+            receipt.evidence_receipt_ids,
+        )
+
+    def test_historical_slice_acceptance_requires_exact_receipt_and_criterion_evidence(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = WorkflowService.open(root)
+            initial = workflow.init()
+            criteria = _spec()
+            statement = slice_acceptance_statement(FEATURE, SLICE, TASK, CHECKPOINT, criteria)
+            workflow.accept_first_slice(
+                FEATURE, SLICE, TASK, CHECKPOINT, _provenance(statement),
+                expected_revision=ExpectedRevision(initial.revision), criteria=criteria,
+            )
+            state = CoreService.open(root).recover()
+            _, accepted = state.agreements
+            prior_revision = state.slice_criteria_revisions[0]
+            current_revision = replace(
+                prior_revision,
+                id="criteria-amended",
+                outcome="A revised outcome",
+                previous_revision_id=prior_revision.id,
+            )
+            proofs = tuple(
+                CriterionTestReceipt(
+                    f"proof-{criterion.id}", accepted.id, prior_revision.id, criterion.id,
+                    "python-unittest", f"tests/{criterion.id}.py", 0, "a" * 64, 2, 3,
+                    "b" * 64, "b" * 64, "input-policy", "c" * 64,
+                    "admission-policy", "d" * 64,
+                )
+                for criterion in prior_revision.criteria
+            )
+            receipt = SliceOutcomeReceipt(
+                "receipt-prior", accepted.repository_id, accepted.id, prior_revision.id,
+                tuple(proof.id for proof in proofs), "b" * 64, "input-policy", "c" * 64,
+                "admission-policy", "d" * 64, "e" * 64,
+                "ALL_CRITERIA_FRESH_SUPPORTED_TESTS", "CORE_OBJECTIVE_ACCEPTANCE", 3, 4,
+            )
+
+            def inventory(
+                outcome: SliceOutcomeReceipt | None = receipt,
+                evidence: tuple[CriterionTestReceipt, ...] = proofs,
+                revisions: tuple[SliceCriteriaRevision, ...] = (prior_revision, current_revision),
+            ):
+                fixture = replace(
+                    state,
+                    revision=max(state.revision, 4),
+                    slice_criteria_revisions=revisions,
+                    slice_criteria_heads=(SliceCriteriaHead(accepted.id, current_revision.id),),
+                    slice_outcome_receipts=() if outcome is None else (outcome,),
+                    criterion_test_receipts=evidence,
+                )
+                return _slice_acceptance_inventory(fixture).items[0]
+
+            item = inventory()
+            self.assertEqual(item.scope_status, "ACTIVE")
+            self.assertEqual(item.criteria_revision, current_revision)
+            self.assertEqual(item.historical_acceptance_status, "ACCEPTED_PREVIOUSLY")
+            self.assertEqual(item.historical_acceptance.receipt.id, receipt.id)
+            self.assertEqual(
+                item.historical_acceptance.criteria_revision.id, prior_revision.id,
+            )
+            self.assertEqual(
+                tuple(proof.criterion_id for proof in item.historical_acceptance.criterion_evidence),
+                tuple(criterion.id for criterion in prior_revision.criteria),
+            )
+            self.assertEqual(
+                tuple(proof.output_sha256 for proof in item.historical_acceptance.criterion_evidence),
+                ("a" * 64,) * len(prior_revision.criteria),
+            )
+
+            self.assertEqual(
+                inventory(replace(receipt, repository_id="another-repository"))
+                .historical_acceptance_status,
+                "UNAVAILABLE",
+            )
+            self.assertEqual(
+                inventory(replace(receipt, criteria_revision_id="missing-revision"))
+                .historical_acceptance_status,
+                "UNAVAILABLE",
+            )
+            self.assertEqual(
+                inventory(replace(receipt, slice_agreement_ref="another-slice"))
+                .historical_acceptance_status,
+                "NOT_RECORDED",
+            )
+            self.assertEqual(
+                inventory(evidence=proofs[:-1]).historical_acceptance_status,
+                "PARTIAL",
+            )
+            self.assertEqual(
+                inventory(evidence=(
+                    replace(proofs[0], criteria_revision_id="another-revision"),
+                    *proofs[1:],
+                )).historical_acceptance_status,
+                "UNAVAILABLE",
+            )
+            self.assertEqual(
+                inventory(None).historical_acceptance_status,
+                "NOT_RECORDED",
+            )
+
     def test_slice_acceptance_inventory_uses_exact_agreements_heads_and_provenance(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -414,6 +414,171 @@
     return ["Acceptance status unavailable", "waiting", "The canonical acceptance receipt is unavailable or belongs to another Slice or criteria revision."];
   }
 
+  function historicalAcceptanceBasis(item, context) {
+    const acceptance = objectValue(item.historical_acceptance);
+    const receipt = objectValue(acceptance.receipt);
+    const revision = objectValue(acceptance.criteria_revision);
+    const criteria = arrayValue(revision.criteria).map(objectValue);
+    const evidence = arrayValue(acceptance.criterion_evidence).map(objectValue);
+    const evidenceIds = arrayValue(receipt.evidence_receipt_ids);
+    const criterionIds = criteria.map((criterion) => criterion.id);
+    const requestScoped = revision.source === "REQUEST_SCOPED_OBJECTIVE";
+    if (
+      !Number.isSafeInteger(context.revision) || context.revision < 0
+      || typeof context.repository_id !== "string" || !context.repository_id.trim()
+      || typeof item.slice_agreement_ref !== "string" || !item.slice_agreement_ref
+      || typeof receipt.id !== "string" || !receipt.id
+      || receipt.repository_id !== context.repository_id
+      || receipt.slice_agreement_ref !== item.slice_agreement_ref
+      || typeof revision.id !== "string" || !revision.id
+      || revision.id !== receipt.criteria_revision_id
+      || revision.repository_id !== context.repository_id
+      || revision.slice_agreement_ref !== item.slice_agreement_ref
+      || !["INTERACTIVE_TERMINAL", "INTERACTIVE_TERMINAL_DECISION", "REQUEST_SCOPED_OBJECTIVE"].includes(revision.source)
+      || receipt.source !== (requestScoped ? "REQUEST_SCOPED_OBJECTIVE" : "CORE_OBJECTIVE_ACCEPTANCE")
+      || criteria.length === 0 || evidence.length !== criteria.length
+      || evidenceIds.length !== evidence.length
+      || new Set(evidenceIds).size !== evidenceIds.length
+      || new Set(criterionIds).size !== criterionIds.length
+      || evidence.some((proof) =>
+        typeof proof.id !== "string" || !proof.id
+        || !evidenceIds.includes(proof.id)
+        || proof.slice_agreement_ref !== item.slice_agreement_ref
+        || proof.criteria_revision_id !== revision.id
+        || typeof proof.criterion_id !== "string"
+        || !criterionIds.includes(proof.criterion_id)
+        || proof.exit_code !== 0
+        || typeof proof.test_kind !== "string" || !proof.test_kind.trim()
+        || typeof proof.test_target !== "string" || !proof.test_target.trim()
+        || typeof proof.output_sha256 !== "string"
+        || !/^[0-9a-f]{64}$/.test(proof.output_sha256)
+        || !Number.isSafeInteger(proof.source_revision) || proof.source_revision < 0
+        || !Number.isSafeInteger(proof.recorded_revision)
+        || proof.recorded_revision !== proof.source_revision + 1
+        || proof.recorded_revision > context.revision
+        || (requestScoped
+          ? proof.source_revision !== receipt.source_revision
+            || proof.recorded_revision !== receipt.recorded_revision
+          : proof.recorded_revision > receipt.source_revision)
+      )
+      || new Set(evidence.map((proof) => proof.id)).size !== evidence.length
+      || new Set(evidence.map((proof) => proof.criterion_id)).size !== criterionIds.length
+      || criterionIds.some((id) => evidence.filter((proof) => proof.criterion_id === id).length !== 1)
+      || evidenceIds.some((id) => evidence.filter((proof) => proof.id === id).length !== 1)
+      || !Number.isSafeInteger(receipt.source_revision) || receipt.source_revision < 0
+      || !Number.isSafeInteger(receipt.recorded_revision)
+      || receipt.recorded_revision !== receipt.source_revision + 1
+      || receipt.recorded_revision > context.revision
+      || typeof receipt.input_fingerprint !== "string" || !/^[0-9a-f]{64}$/.test(receipt.input_fingerprint)
+      || typeof receipt.input_policy_id !== "string" || !receipt.input_policy_id.trim()
+      || typeof receipt.input_policy_digest !== "string" || !/^[0-9a-f]{64}$/.test(receipt.input_policy_digest)
+      || typeof receipt.admission_policy_id !== "string" || !receipt.admission_policy_id.trim()
+      || typeof receipt.admission_policy_digest !== "string" || !/^[0-9a-f]{64}$/.test(receipt.admission_policy_digest)
+      || typeof receipt.relevant_drift_digest !== "string" || !/^[0-9a-f]{64}$/.test(receipt.relevant_drift_digest)
+      || typeof receipt.basis !== "string" || !receipt.basis.trim()
+      || typeof receipt.source !== "string" || !receipt.source.trim()
+      || (receipt.coverage_contract_digest !== null
+        && (typeof receipt.coverage_contract_digest !== "string"
+          || !/^[0-9a-f]{64}$/.test(receipt.coverage_contract_digest)))
+      || typeof revision.outcome !== "string" || !revision.outcome.trim()
+      || typeof revision.example !== "string" || !revision.example.trim()
+      || typeof revision.source !== "string" || !revision.source.trim()
+      || typeof revision.source_reference !== "string" || !revision.source_reference.trim()
+      || criteria.some((criterion) =>
+        typeof criterion.id !== "string" || !criterion.id
+        || typeof criterion.expected_result !== "string" || !criterion.expected_result.trim()
+        || typeof criterion.expected_evidence !== "string" || !criterion.expected_evidence.trim()
+      )
+    ) return null;
+    return { receipt, revision, criteria, evidence };
+  }
+
+  function appendHistoricalAcceptance(slice, item, isActive, context) {
+    const status = item.historical_acceptance_status;
+    if (status === "NOT_RECORDED" && item.historical_receipt !== true) return;
+    if (status !== "ACCEPTED_PREVIOUSLY") {
+      slice.append(create(
+        "p",
+        "acceptance-history-unavailable",
+        status === "PARTIAL"
+          ? "Historical acceptance evidence is partial; no prior acceptance is inferred."
+          : "Historical acceptance evidence is unavailable; no prior acceptance is inferred.",
+      ));
+      return;
+    }
+    const basis = historicalAcceptanceBasis(item, context);
+    if (!basis) {
+      slice.append(create(
+        "p",
+        "acceptance-history-unavailable",
+        "Historical acceptance evidence is unavailable; no prior acceptance is inferred.",
+      ));
+      return;
+    }
+    const currentOutcome = objectValue(context.slice_outcome);
+    if (
+      isActive && String(currentOutcome.status || "").toUpperCase() === "CURRENT"
+      && currentOutcome.latest_receipt_id === basis.receipt.id
+    ) return;
+
+    const statusLabel = create(
+      "span",
+      "status-label",
+      "Accepted previously — current validity not evaluated",
+    );
+    statusLabel.dataset.status = "waiting";
+    acceptanceStatuses.push(statusLabel);
+    slice.append(create("p", "eyebrow", "Historical outcome"), statusLabel);
+    slice.append(create(
+      "h5",
+      "active-slice-criteria-heading",
+      "Previously accepted criteria (current validity not evaluated)",
+    ));
+    const list = create("ul", "acceptance-history-criteria");
+    list.setAttribute("aria-label", `${item.slice_title} previously accepted criteria`);
+    basis.criteria.forEach((criterion) => {
+      const row = create("li", "active-slice-criterion");
+      const acceptedPreviously = create("span", "status-label", "Accepted previously");
+      acceptedPreviously.dataset.status = "waiting";
+      acceptanceStatuses.push(acceptedPreviously);
+      row.append(
+        create("span", "active-slice-criterion-result", criterion.expected_result.trim()),
+        acceptedPreviously,
+      );
+      list.append(row);
+    });
+    slice.append(list);
+
+    const details = create("details", "acceptance-history-details");
+    details.append(create("summary", "", "Technical provenance"));
+    details.append(
+      create("p", "", `Repository: ${basis.receipt.repository_id}`),
+      create("p", "", `Slice agreement: ${basis.receipt.slice_agreement_ref}`),
+      create("p", "", `Outcome receipt: ${basis.receipt.id}`),
+      create("p", "", `Criteria revision: ${basis.revision.id}`),
+      create("p", "", `Previously agreed outcome: ${basis.revision.outcome}`),
+      create("p", "", `Criteria source: ${textValue(basis.revision.source)}`),
+      create("p", "", `Criteria source reference: ${textValue(basis.revision.source_reference)}`),
+      create("p", "", `Outcome basis: ${basis.receipt.basis}`),
+      create("p", "", `Outcome source: ${basis.receipt.source}`),
+      create("p", "", `Source revision: ${basis.receipt.source_revision}`),
+      create("p", "", `Recorded revision: ${basis.receipt.recorded_revision}`),
+      create("p", "", `Input fingerprint: ${basis.receipt.input_fingerprint}`),
+      create("p", "", `Input policy: ${basis.receipt.input_policy_id} (${basis.receipt.input_policy_digest})`),
+      create("p", "", `Admission policy: ${basis.receipt.admission_policy_id} (${basis.receipt.admission_policy_digest})`),
+      create("p", "", `Relevant drift digest: ${basis.receipt.relevant_drift_digest}`),
+    );
+    if (basis.receipt.coverage_contract_digest !== null) {
+      details.append(create("p", "", `Coverage contract digest: ${basis.receipt.coverage_contract_digest}`));
+    }
+    basis.evidence.forEach((proof) => details.append(create(
+      "p",
+      "",
+      `${proof.criterion_id}: ${basis.criteria.find((criterion) => criterion.id === proof.criterion_id).expected_evidence}; ${proof.test_kind}:${proof.test_target}; receipt ${proof.id}; exit ${proof.exit_code}; SHA-256 ${proof.output_sha256}`,
+    )));
+    slice.append(details);
+  }
+
   function appendAcceptanceSlice(container, item, isActive, context) {
     const slice = create("section", "acceptance-slice");
     slice.append(create("h4", "acceptance-slice-title", item.slice_title));
@@ -450,9 +615,6 @@
     acceptanceStatus.dataset.status = acceptance[1];
     acceptanceStatuses.push(acceptanceStatus);
     slice.append(acceptanceStatus);
-    if (!isActive && item.historical_receipt === true) {
-      slice.append(create("p", "acceptance-history-note", "A historical outcome receipt is recorded for this Slice and its criteria; it is not current acceptance."));
-    }
     if (item.criteria_status === "NOT_RECORDED") {
       slice.append(create("p", "empty-state", "Acceptance criteria are not recorded for this Slice."));
     } else if (item.criteria_status !== "RECORDED") {
@@ -489,6 +651,7 @@
         slice.append(list);
       }
     }
+    appendHistoricalAcceptance(slice, item, isActive, context);
     container.append(slice);
   }
 
