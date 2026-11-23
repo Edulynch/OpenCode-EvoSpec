@@ -1956,10 +1956,12 @@ def _validate_provisional_slice_authority(root: Path, state: State) -> None:
                 or revision.previous_revision_id != previous_id
             ):
                 raise DecodeError("provisional Slice history is not one contiguous linear chain")
-            criterion_numbers = [
-                int(re.fullmatch(r"c-([1-9][0-9]*)", item.id).group(1))
-                for item in revision.criteria
-            ]
+            criterion_numbers: list[int] = []
+            for item in revision.criteria:
+                match = re.fullmatch(r"c-([1-9][0-9]*)", item.id)
+                if match is None:
+                    raise DecodeError("provisional Slice criterion identities are not canonical")
+                criterion_numbers.append(int(match.group(1)))
             if criterion_numbers != sorted(criterion_numbers):
                 raise DecodeError("provisional Slice criterion identities are not canonical")
             current_ids = {item.id for item in revision.criteria}
@@ -3198,7 +3200,7 @@ def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
     if schema == FEATURE_CYCLE_SCHEMA and not state.feature_reopen_receipts:
         raise ValueError("schema 19 requires a human reopening receipt")
     if schema == PROVISIONAL_SLICE_SCHEMA:
-        value_d1 = {
+        value_d1: dict[str, JsonValue] = {
             "provisional_slice_refs": [
                 {
                     "id": item.revision_id,

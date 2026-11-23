@@ -56,6 +56,7 @@ from evospec.persistence import (
     SCHEMA,
     AtomicFailure,
     DecodeError,
+    JsonValue,
     RecoveryError,
     StateStore,
     _StateStore,
@@ -1143,12 +1144,13 @@ class PersistenceTests(unittest.TestCase):
 
 
 class ProvisionalSlicePersistenceTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = TemporaryDirectory(prefix="evospec-d1-")
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.temporary: TemporaryDirectory[str] = TemporaryDirectory(prefix="evospec-d1-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-        self.base = _create_provisional_fixture(self.root)
-        self.store = _StateStore(self.root)
+        self.root: Path = Path(self.temporary.name)
+        self.base: State = _create_provisional_fixture(self.root)
+        self.store: _StateStore = _StateStore(self.root)
 
     def _publish_first(
         self, provenance: ProvisionalSliceProvenance | None = None,
@@ -1233,36 +1235,45 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
             sha256(expression.encode("utf-8")).hexdigest(),
         )
         revision, _ = self._publish_first(provenance)
-        raw = _provisional_slice_to_json(revision)
+        raw_value = _provisional_slice_to_json(revision)
+        assert isinstance(raw_value, dict)
+        raw: dict[str, JsonValue] = raw_value
+        provenance_value = raw["provenance"]
+        assert isinstance(provenance_value, dict)
         self.assertEqual(raw["provenance"], _provisional_provenance_json(provenance))
         self.assertEqual(_provisional_slice_from_json(raw), revision)
 
         bad_expression = dict(raw)
-        bad_expression["provenance"] = dict(raw["provenance"])
-        bad_expression["provenance"]["expression"] += " "
+        bad_expression_provenance = dict(provenance_value)
+        expression_value = bad_expression_provenance["expression"]
+        assert isinstance(expression_value, str)
+        bad_expression_provenance["expression"] = expression_value + " "
+        bad_expression["provenance"] = bad_expression_provenance
         with self.assertRaises(DecodeError):
             _provisional_slice_from_json(bad_expression)
 
         extra_provenance = dict(raw)
-        extra_provenance["provenance"] = {**raw["provenance"], "accepted": True}
+        extra_provenance["provenance"] = {**provenance_value, "accepted": True}
         with self.assertRaises(DecodeError):
             _provisional_slice_from_json(extra_provenance)
 
         bad_source = dict(raw)
         bad_source["provenance"] = {
-            **raw["provenance"],
+            **provenance_value,
             "source_reference": {"session_id": "not-a-session", "message_id": "msg_test_123"},
         }
         with self.assertRaises(DecodeError):
             _provisional_slice_from_json(bad_source)
 
-        extra_record_field = {**raw, "status": "ACCEPTED"}
+        extra_record_field: dict[str, JsonValue] = {**raw, "status": "ACCEPTED"}
         with self.assertRaises(DecodeError):
             _provisional_slice_from_json(extra_record_field)
 
     def test_malformed_revision_shapes_and_boolean_revision_fail_closed(self) -> None:
-        raw = _provisional_slice_to_json(_make_provisional_revision(self.base))
-        malformed = (
+        raw_value = _provisional_slice_to_json(_make_provisional_revision(self.base))
+        assert isinstance(raw_value, dict)
+        raw: dict[str, JsonValue] = raw_value
+        malformed: tuple[dict[str, JsonValue], ...] = (
             {**raw, "revision": True},
             {**raw, "title": "   "},
             {**raw, "criteria": [{"id": "c-01", "expected_result": "x", "expected_evidence": "y"}]},
@@ -1489,7 +1500,7 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
         })
 
         active = state.active_context
-        self.assertIsNotNone(active)
+        assert active is not None
         other_feature_ref = next(
             item.id for item in state.agreements
             if item.kind == "FEATURE" and item.id != active.feature_agreement_ref
@@ -1535,7 +1546,8 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
             self.root / ".evospec" / "records" / "provisional-slices"
             / f"{revision.revision_id}.json"
         )
-        bad_record = dict(original_record)
+        assert isinstance(original_record, dict)
+        bad_record: dict[str, JsonValue] = dict(original_record)
         bad_record["outcome"] = "tampered without a matching digest"
         record_path.write_bytes(encode_json(bad_record))
         with self.assertRaises(RecoveryError):
