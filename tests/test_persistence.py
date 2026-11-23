@@ -5,7 +5,7 @@ import unittest
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, cast
 from unittest.mock import patch
 
 from evospec.domain import (
@@ -38,6 +38,7 @@ from evospec.domain import (
     ReviewResult,
     State,
     StateValidationError,
+    DomainError,
     VerificationEvidence,
     WorkRelation,
     WorkRelationKind,
@@ -51,16 +52,26 @@ from evospec.lifecycle import (
     is_valid_pair,
 )
 from evospec.persistence import (
+    FEATURE_COMPLETION_SCHEMA,
+    FEATURE_CYCLE_SCHEMA,
     PROVISIONAL_SLICE_SCHEMA,
+    REQUEST_OBJECTIVE_SCHEMA,
+    R3B_SCHEMA,
+    R3_SCHEMA,
+    SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
     LEGACY_WRITE_SCHEMA,
     SCHEMA,
     AtomicFailure,
     DecodeError,
+    FileOperations,
     JsonValue,
     RecoveryError,
     StateStore,
     _StateStore,
+    _atomic_replace,
+    _artifact_path,
     _state_bytes,
+    _state_publish_lock,
     _lock_release_from_json,
     _agreement_to_json,
     decode_json,
@@ -68,7 +79,10 @@ from evospec.persistence import (
     load_integration_providers,
     _provisional_slice_from_json,
     _provisional_slice_to_json,
+    _recover_state_with_schema,
+    _resolved_root,
     _validate_provisional_slice_authority,
+    _validate_provisional_slice_record,
     save_integration_providers,
 )
 from evospec.services import (
@@ -293,6 +307,109 @@ def _create_two_slice_fixture(root: Path, base: State) -> State:
         criteria=criteria,
     )
     return CoreService.open(root).recover()
+
+
+class _ProvisionalSliceTestHarness:
+    """Test-only D1 publisher using the production persistence primitives."""
+
+    def __init__(self, root: Path, operations: FileOperations | None = None) -> None:
+        self.root = _resolved_root(root)
+        self.operations = FileOperations() if operations is None else operations
+        self.immutable_writer = _StateStore(self.root, self.operations)
+
+    def publish(
+        self,
+        expected_state: State,
+        revision: ProvisionalSliceRevision,
+        expected_head: ProvisionalSliceHead | None,
+    ) -> State:
+        with _state_publish_lock(self.root):
+            current, schema = _recover_state_with_schema(self.root)
+            if expected_state != current:
+                raise AtomicFailure("provisional Slice State revision is stale")
+            if schema not in (
+                SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA,
+                FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA,
+                SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA,
+            ):
+                raise AtomicFailure("provisional Slice requires schema 15–22 authority")
+            try:
+                _validate_provisional_slice_record(revision)
+            except (DecodeError, DomainError) as error:
+                raise AtomicFailure("provisional Slice candidate is invalid") from error
+            heads = {item.proposal_id: item for item in current.provisional_slice_heads}
+            current_head = heads.get(revision.proposal_id)
+            if current_head != expected_head:
+                raise AtomicFailure("provisional Slice head revision or digest is stale")
+            current_record = next(
+                (
+                    item for item in current.provisional_slice_revisions
+                    if item.revision_id == revision.revision_id
+                ),
+                None,
+            )
+            if current_head is not None and (
+                current_head.revision_id == revision.revision_id
+                and current_head.digest == revision.digest
+                and current_record == revision
+            ):
+                return current
+            if current_record is not None:
+                raise AtomicFailure("immutable provisional Slice revision conflicts")
+            expected_revision = 1 if current_head is None else current_head.revision + 1
+            expected_previous = None if current_head is None else current_head.revision_id
+            if (
+                revision.revision != expected_revision
+                or revision.previous_revision_id != expected_previous
+            ):
+                raise AtomicFailure("provisional Slice append does not match its current head")
+            candidate_head = ProvisionalSliceHead(
+                revision.proposal_id, revision.revision_id, revision.revision, revision.digest,
+            )
+            candidate = replace(
+                current,
+                revision=current.revision + 1,
+                provisional_slice_revisions=tuple(sorted(
+                    current.provisional_slice_revisions + (revision,),
+                    key=lambda item: item.revision_id,
+                )),
+                provisional_slice_heads=tuple(sorted(
+                    (
+                        item for item in current.provisional_slice_heads
+                        if item.proposal_id != revision.proposal_id
+                    ),
+                    key=lambda item: item.proposal_id,
+                )) + (candidate_head,),
+            )
+            candidate = replace(
+                candidate,
+                provisional_slice_heads=tuple(sorted(
+                    candidate.provisional_slice_heads,
+                    key=lambda item: item.proposal_id,
+                )),
+            )
+            try:
+                validate_state(candidate)
+                _validate_provisional_slice_authority(self.root, candidate)
+            except (DecodeError, DomainError, StateValidationError) as error:
+                raise AtomicFailure("provisional Slice candidate is invalid") from error
+            record_bytes = encode_json(_provisional_slice_to_json(revision))
+            publish_immutable = cast(
+                Callable[..., None],
+                getattr(self.immutable_writer, "_StateStore__publish_immutable"),
+            )
+            publish_immutable(
+                f"records/provisional-slices/{revision.revision_id}.json",
+                record_bytes,
+                strict_directory=True,
+            )
+            _atomic_replace(
+                _artifact_path(self.root, "state.json"),
+                _state_bytes(candidate, PROVISIONAL_SLICE_SCHEMA),
+                self.operations,
+                strict_directory=True,
+            )
+            return candidate
 
 
 class PersistenceTests(unittest.TestCase):
@@ -1150,13 +1267,13 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root: Path = Path(self.temporary.name)
         self.base: State = _create_provisional_fixture(self.root)
-        self.store: _StateStore = _StateStore(self.root)
+        self.store = _ProvisionalSliceTestHarness(self.root)
 
     def _publish_first(
         self, provenance: ProvisionalSliceProvenance | None = None,
     ) -> tuple[ProvisionalSliceRevision, State]:
         revision = _make_provisional_revision(self.base, provenance=provenance)
-        return revision, self.store.publish_provisional_slice(self.base, revision, None)
+        return revision, self.store.publish(self.base, revision, None)
 
     def _snapshot(self) -> dict[Path, bytes]:
         directory = self.root / ".evospec"
@@ -1186,7 +1303,7 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
         self.assertEqual(state_path.read_bytes(), before_read)
 
         revision = _make_provisional_revision(self.base)
-        saved = self.store.publish_provisional_slice(self.base, revision, None)
+        saved = self.store.publish(self.base, revision, None)
         encoded = json.loads(state_path.read_bytes())
         self.assertEqual(encoded["schema"], PROVISIONAL_SLICE_SCHEMA)
         self.assertEqual(
@@ -1223,8 +1340,31 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
         self.assertEqual(saved, StateStore(self.root).load_state())
         self.assertEqual(saved.agreements, self.base.agreements)
         self.assertEqual(saved.active_context, self.base.active_context)
+        self.assertFalse(hasattr(_StateStore(self.root), "publish_provisional_slice"))
         self.assertFalse(hasattr(StateStore(self.root), "publish_provisional_slice"))
         self.assertEqual(json.loads(record_bytes)["provenance"], {"kind": "AGENT_SUGGESTION"})
+
+    def test_d1_publisher_is_absent_from_runtime_api_namespaces(self) -> None:
+        import evospec
+        import evospec.agent_protocol as protocol
+        import evospec.cli as cli
+        import evospec.persistence as persistence
+        import evospec.services as services
+        import evospec.workflow as workflow
+
+        surfaces = (
+            evospec,
+            persistence,
+            persistence.StateStore,
+            persistence._StateStore,
+            services.CoreService,
+            workflow.WorkflowService,
+            protocol,
+            cli,
+        )
+        for surface in surfaces:
+            with self.subTest(surface=surface):
+                self.assertFalse(hasattr(surface, "publish_provisional_slice"))
 
     def test_user_expression_is_exact_attributable_data_not_acceptance(self) -> None:
         expression = "  I would like this future Slice considered.  "
@@ -1292,7 +1432,7 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
             _make_provisional_revision(self.base, feature_id="missing-feature"),
         ):
             with self.subTest(revision=revision.feature_id), self.assertRaises(AtomicFailure):
-                self.store.publish_provisional_slice(self.base, revision, None)
+                self.store.publish(self.base, revision, None)
             self.assertEqual(self._snapshot(), before)
 
         with TemporaryDirectory(prefix="evospec-d1-unagreed-") as temporary:
@@ -1311,7 +1451,7 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
                 for path in (root / ".evospec").rglob("*") if path.is_file()
             }
             with self.assertRaises(AtomicFailure):
-                _StateStore(root).publish_provisional_slice(
+                _ProvisionalSliceTestHarness(root).publish(
                     state, _make_provisional_revision(state), None,
                 )
             self.assertEqual(
@@ -1324,7 +1464,7 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
 
     def test_multiple_accepted_slices_for_one_feature_publish_and_recover(self) -> None:
         root, state = self._create_two_slice_state("evospec-d1-multi-")
-        store = _StateStore(root)
+        store = _ProvisionalSliceTestHarness(root)
         recovery = StateStore(root)
         feature_agreements = tuple(
             item for item in state.agreements
@@ -1366,7 +1506,7 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
             ))
 
         revision = _make_provisional_revision(state)
-        saved = store.publish_provisional_slice(state, revision, None)
+        saved = store.publish(state, revision, None)
         self.assertEqual(saved, recovery.load_state())
         self.assertEqual(saved.agreements, state.agreements)
 
@@ -1452,7 +1592,7 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
                 }
                 revision = _make_provisional_revision(persisted)
                 with self.assertRaises(AtomicFailure):
-                    _StateStore(root).publish_provisional_slice(persisted, revision, None)
+                    _ProvisionalSliceTestHarness(root).publish(persisted, revision, None)
                 self.assertEqual(before, {
                     path.relative_to(authority_root): path.read_bytes()
                     for path in authority_root.rglob("*") if path.is_file()
@@ -1565,9 +1705,9 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
 
     def test_recovery_rejects_chain_gaps_nonfinal_heads_and_unreachable_refs(self) -> None:
         first = _make_provisional_revision(self.base)
-        state1 = self.store.publish_provisional_slice(self.base, first, None)
+        state1 = self.store.publish(self.base, first, None)
         second = _make_provisional_revision(state1, previous=first, outcome="Revision two")
-        state2 = self.store.publish_provisional_slice(
+        state2 = self.store.publish(
             state1, second, state1.provisional_slice_heads[0],
         )
         state_path = self.root / ".evospec" / "state.json"
@@ -1604,10 +1744,10 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
 
     def test_replay_is_noop_and_stale_state_or_head_cannot_publish(self) -> None:
         first = _make_provisional_revision(self.base)
-        state1 = self.store.publish_provisional_slice(self.base, first, None)
+        state1 = self.store.publish(self.base, first, None)
         snapshot = self._snapshot()
         head1 = state1.provisional_slice_heads[0]
-        replay = self.store.publish_provisional_slice(state1, first, head1)
+        replay = self.store.publish(state1, first, head1)
         self.assertEqual(replay, state1)
         self.assertEqual(self._snapshot(), snapshot)
 
@@ -1621,18 +1761,18 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
             ),
         )
         with self.assertRaises(AtomicFailure):
-            self.store.publish_provisional_slice(state1, second, None)
+            self.store.publish(state1, second, None)
         self.assertEqual(self._snapshot(), snapshot)
-        state2 = self.store.publish_provisional_slice(state1, second, head1)
+        state2 = self.store.publish(state1, second, head1)
         snapshot2 = self._snapshot()
         with self.assertRaises(AtomicFailure):
-            self.store.publish_provisional_slice(state1, first, head1)
+            self.store.publish(state1, first, head1)
         self.assertEqual(self._snapshot(), snapshot2)
 
         head2 = state2.provisional_slice_heads[0]
         third = _make_provisional_revision(state2, previous=second, outcome="Another outcome")
         with self.assertRaises(AtomicFailure):
-            self.store.publish_provisional_slice(
+            self.store.publish(
                 state2, third, replace(head2, digest="0" * 64),
             )
         self.assertEqual(self._snapshot(), snapshot2)
@@ -1642,7 +1782,7 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
             previous=second,
             criteria=(ProvisionalSliceCriterion("c-2", "Keep c-2", "Evidence"),),
         )
-        state3 = self.store.publish_provisional_slice(state2, removed, head2)
+        state3 = self.store.publish(state2, removed, head2)
         resurrected = _make_provisional_revision(
             state3,
             previous=removed,
@@ -1653,14 +1793,14 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
         )
         snapshot3 = self._snapshot()
         with self.assertRaises(AtomicFailure):
-            self.store.publish_provisional_slice(
+            self.store.publish(
                 state3, resurrected, state3.provisional_slice_heads[0],
             )
         self.assertEqual(self._snapshot(), snapshot3)
 
     def test_ordinary_core_writer_rejects_schema22_before_any_effect(self) -> None:
         revision = _make_provisional_revision(self.base)
-        saved = self.store.publish_provisional_slice(self.base, revision, None)
+        saved = self.store.publish(self.base, revision, None)
         if saved.active_context is None:
             self.fail("fixture must have an active Core context")
         before = self._snapshot()

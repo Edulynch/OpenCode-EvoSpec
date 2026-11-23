@@ -20,7 +20,6 @@ from evospec.persistence import (
     BinaryFile,
     FileOperations,
     StateStore,
-    _StateStore,
     _provisional_slice_to_json,
     encode_json,
 )
@@ -32,7 +31,11 @@ from tests.test_services_state import (
     convergence_assessment,
     implementation_context,
 )
-from tests.test_persistence import _create_provisional_fixture, _make_provisional_revision
+from tests.test_persistence import (
+    _ProvisionalSliceTestHarness,
+    _create_provisional_fixture,
+    _make_provisional_revision,
+)
 
 
 class FailingReplace(FileOperations):
@@ -268,7 +271,7 @@ class AtomicPersistenceTests(unittest.TestCase):
             )
 
             with self.assertRaises(AtomicFailure):
-                _StateStore(root, FailSecondReplace()).publish_provisional_slice(
+                _ProvisionalSliceTestHarness(root, FailSecondReplace()).publish(
                     base, revision, None,
                 )
 
@@ -277,7 +280,7 @@ class AtomicPersistenceTests(unittest.TestCase):
             self.assertEqual(StateStore(root).load_state(), base)
             self.assertEqual(StateStore(root).load_state().provisional_slice_revisions, ())
 
-            retried = _StateStore(root).publish_provisional_slice(base, revision, None)
+            retried = _ProvisionalSliceTestHarness(root).publish(base, revision, None)
             self.assertEqual(retried.provisional_slice_revisions, (revision,))
             self.assertEqual(StateStore(root).load_state(), retried)
 
@@ -285,9 +288,9 @@ class AtomicPersistenceTests(unittest.TestCase):
         with TemporaryDirectory(prefix="evospec-d1-conflict-") as temporary:
             root = Path(temporary)
             base = _create_provisional_fixture(root)
-            store = _StateStore(root)
+            store = _ProvisionalSliceTestHarness(root)
             first = _make_provisional_revision(base)
-            state1 = store.publish_provisional_slice(base, first, None)
+            state1 = store.publish(base, first, None)
             head1 = state1.provisional_slice_heads[0]
             candidate = _make_provisional_revision(
                 state1, previous=first, outcome="candidate content",
@@ -305,7 +308,7 @@ class AtomicPersistenceTests(unittest.TestCase):
             before_state = state_path.read_bytes()
 
             with self.assertRaises(AtomicFailure):
-                store.publish_provisional_slice(state1, candidate, head1)
+                store.publish(state1, candidate, head1)
 
             self.assertEqual(state_path.read_bytes(), before_state)
             self.assertEqual(StateStore(root).load_state(), state1)
