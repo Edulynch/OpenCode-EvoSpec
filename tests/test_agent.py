@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 
 from evospec.agent import _slice_acceptance_inventory, project_context
@@ -35,6 +36,9 @@ from evospec.domain import (
     VerificationEvidence,
     OperationalState,
     ParkedWork,
+    ProvisionalSliceCriterion,
+    ProvisionalSliceProvenance,
+    ProvisionalSliceSourceReference,
     SliceCriteriaHead,
     SliceCriteriaRevision,
     SliceCriterion,
@@ -44,7 +48,7 @@ from evospec.domain import (
 )
 from evospec.lifecycle import Classification, LifecycleState, Phase, ReviewVerdict
 from evospec.persistence import JsonValue
-from evospec.services import CoreService, slice_acceptance_statement
+from evospec.services import CoreService, SliceCriteriaSpec, slice_acceptance_statement
 from evospec.workflow import ClarificationAnswer, WorkflowService
 from tests._tempdir import TemporaryDirectory
 from tests.test_e1_r1d1_slice_criteria import CHECKPOINT, FEATURE, SLICE, TASK, _provenance, _spec
@@ -53,6 +57,211 @@ from tests.test_workflow_assurance import established_change_assessment
 
 
 class AgentContextTests(unittest.TestCase):
+    def test_provisional_slice_inventory_projects_current_heads_and_provenance(self) -> None:
+        from tests.test_persistence import (
+            _ProvisionalSliceTestHarness,
+            _create_provisional_fixture,
+            _create_two_slice_fixture,
+            _make_provisional_revision,
+        )
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = _create_provisional_fixture(root, criteria=SliceCriteriaSpec(
+                "Base accepted outcome",
+                "Base accepted example",
+                ("Base inclusion",),
+                ("Base exclusion",),
+                ("Base decision",),
+                (SliceCriterion(
+                    "AC-1", "Base result", "python-unittest:tests.test_r5a_fixture",
+                ),),
+            ))
+            accepted = _create_two_slice_fixture(root, base)
+            publisher = _ProvisionalSliceTestHarness(root)
+            legacy_projection = project_context(WorkflowService.open(root)).provisional_slice_inventory
+            self.assertEqual(legacy_projection.availability, "AVAILABLE")
+            self.assertEqual(legacy_projection.total, 0)
+            self.assertTrue(legacy_projection.complete)
+
+            suggested = _make_provisional_revision(
+                accepted,
+                title="Agent suggestion",
+                criteria=(
+                    ProvisionalSliceCriterion("c-1", "First result", "First evidence"),
+                    ProvisionalSliceCriterion("c-2", "Second result", "Second evidence"),
+                ),
+            )
+            state = publisher.publish(accepted, suggested, None)
+            expression = "Consider this later Slice."
+            expressed = _make_provisional_revision(
+                state,
+                title="User-expressed proposal",
+                provenance=ProvisionalSliceProvenance(
+                    "USER_EXPRESSED",
+                    ProvisionalSliceSourceReference("ses_d2_test123", "msg_d2_test123"),
+                    expression,
+                    sha256(expression.encode("utf-8")).hexdigest(),
+                ),
+            )
+            state = publisher.publish(state, expressed, None)
+            suggested_revision = _make_provisional_revision(
+                state,
+                previous=suggested,
+                title="Agent suggestion revised",
+                criteria=(
+                    ProvisionalSliceCriterion("c-1", "Updated first result", "Updated evidence"),
+                    ProvisionalSliceCriterion("c-2", "Second result", "Second evidence"),
+                ),
+            )
+            suggested_head = next(
+                item for item in state.provisional_slice_heads
+                if item.proposal_id == suggested.proposal_id
+            )
+            state = publisher.publish(state, suggested_revision, suggested_head)
+            before = CoreService.open(root).recover()
+            authority_root = root / ".evospec"
+
+            def authority_snapshot() -> dict[str, tuple[bytes, int]]:
+                return {
+                    path.relative_to(authority_root).as_posix(): (
+                        path.read_bytes(), path.stat().st_mtime_ns,
+                    )
+                    for path in authority_root.rglob("*")
+                    if path.is_file()
+                }
+
+            files_before = authority_snapshot()
+            workflow = WorkflowService.open(root)
+            context = project_context(workflow)
+            repeated = project_context(workflow)
+
+            inventory = context.provisional_slice_inventory
+            self.assertEqual(inventory.availability, "AVAILABLE")
+            self.assertEqual(inventory.total, 2)
+            self.assertTrue(inventory.complete)
+            self.assertFalse(inventory.truncated)
+            self.assertEqual(inventory, repeated.provisional_slice_inventory)
+            self.assertEqual(len(inventory.items), len({
+                item.proposal_id for item in inventory.items
+            }))
+            self.assertEqual(
+                [item.proposal_id for item in inventory.items],
+                sorted(item.proposal_id for item in inventory.items),
+            )
+            items = {item.proposal_id: item for item in inventory.items}
+            self.assertEqual(set(items), {suggested.proposal_id, expressed.proposal_id})
+            suggested_item = items[suggested.proposal_id]
+            self.assertEqual(suggested_item.head_revision_id, suggested_revision.revision_id)
+            self.assertEqual(suggested_item.head_revision, suggested_revision.revision)
+            self.assertEqual(suggested_item.head_digest, suggested_revision.digest)
+            self.assertEqual(suggested_item.title, "Agent suggestion revised")
+            self.assertEqual(suggested_item.status, "PROVISIONAL")
+            self.assertEqual(suggested_item.provenance, "AGENT_SUGGESTION")
+            self.assertEqual(suggested_item.criteria, suggested_revision.criteria)
+            self.assertEqual(len(suggested_item.criteria), 2)
+            self.assertEqual(
+                {item.head_revision_id for item in inventory.items},
+                {item.revision_id for item in state.provisional_slice_heads},
+            )
+            self.assertNotIn(suggested.revision_id, {
+                item.head_revision_id for item in inventory.items
+            })
+            assert state.initialization is not None, "the fixture state must be initialized"
+            self.assertEqual(
+                (suggested_item.repository_id, suggested_item.feature_id),
+                (state.initialization.repository_id, str(suggested_revision.feature_id)),
+            )
+            self.assertEqual(items[expressed.proposal_id].provenance, "USER_EXPRESSED")
+            expressed_item = items[expressed.proposal_id]
+            self.assertEqual(expressed_item.status, "PROVISIONAL")
+            accepted_slices = tuple(
+                agreement for agreement in state.agreements
+                if agreement.kind == "SLICE"
+            )
+            self.assertEqual(len(accepted_slices), 2)
+            self.assertEqual(
+                len({item.change_id for item in accepted_slices}), 2,
+            )
+            self.assertEqual(
+                {item.slice_agreement_ref for item in context.slice_acceptance_inventory.items},
+                {item.id for item in accepted_slices},
+            )
+            self.assertEqual(context.slice_acceptance_inventory.total, 2)
+
+            serialized = context_json(context)["provisional_slice_inventory"]
+            self.assertIsInstance(serialized, dict)
+            if not isinstance(serialized, dict):
+                self.fail("provisional Slice inventory must serialize as an object")
+            self.assertEqual(serialized["availability"], "AVAILABLE")
+            serialized_items = serialized["items"]
+            self.assertIsInstance(serialized_items, list)
+            if not isinstance(serialized_items, list):
+                self.fail("provisional Slice items must serialize as an array")
+            serialized_suggested = next(
+                item for item in serialized_items
+                if isinstance(item, dict) and item.get("proposal_id") == suggested.proposal_id
+            )
+            self.assertEqual(set(serialized_suggested), {
+                "proposal_id", "head", "repository_id", "feature_id", "title",
+                "status", "provenance", "criteria",
+            })
+            self.assertEqual(serialized_suggested["status"], "PROVISIONAL")
+            self.assertEqual(serialized_suggested["provenance"], "AGENT_SUGGESTION")
+            self.assertEqual(serialized_suggested["head"], {
+                "revision_id": suggested_revision.revision_id,
+                "revision": suggested_revision.revision,
+                "digest": suggested_revision.digest,
+            })
+            self.assertEqual(
+                serialized_suggested["criteria"],
+                [
+                    {"id": item.id, "expected_result": item.expected_result,
+                     "expected_evidence": item.expected_evidence}
+                    for item in suggested_revision.criteria
+                ],
+            )
+            self.assertEqual(CoreService.open(root).recover(), before)
+            self.assertEqual(authority_snapshot(), files_before)
+
+    def test_provisional_slice_inventory_is_bounded_with_stable_order(self) -> None:
+        from tests.test_persistence import (
+            _ProvisionalSliceTestHarness,
+            _create_provisional_fixture,
+            _make_provisional_revision,
+        )
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = _create_provisional_fixture(root)
+            publisher = _ProvisionalSliceTestHarness(root)
+            for index in range(33):
+                proposal = _make_provisional_revision(
+                    state, title=f"Bounded proposal {index:02d}",
+                )
+                state = publisher.publish(state, proposal, None)
+
+            inventory = project_context(WorkflowService.open(root)).provisional_slice_inventory
+
+            ordered = sorted(
+                state.provisional_slice_heads,
+                key=lambda head: (
+                    str(next(
+                        item.feature_id for item in state.provisional_slice_revisions
+                        if item.revision_id == head.revision_id
+                    )),
+                    head.proposal_id,
+                ),
+            )
+            self.assertEqual(inventory.total, 33)
+            self.assertEqual(len(inventory.items), 32)
+            self.assertFalse(inventory.complete)
+            self.assertTrue(inventory.truncated)
+            self.assertEqual(
+                [item.proposal_id for item in inventory.items],
+                [item.proposal_id for item in ordered[:32]],
+            )
+
     def test_ordinary_r3b_historical_acceptance_accepts_earlier_canonical_proofs(self) -> None:
         from tests.test_e1_r3b_slice_auto_acceptance import R3BSliceOutcomeTests
 
