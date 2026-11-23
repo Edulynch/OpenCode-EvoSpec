@@ -148,9 +148,9 @@ class AgentContextTests(unittest.TestCase):
             self.assertEqual(item.scope_status, "ACTIVE")
             self.assertEqual(item.criteria_revision, current_revision)
             self.assertEqual(item.historical_acceptance_status, "ACCEPTED_PREVIOUSLY")
-        # Confirm the historical details exist before inspecting their receipts.
-        history = item.historical_acceptance
-        assert history is not None, "accepted history must include its supporting records"
+            # Confirm the historical details exist before inspecting their receipts.
+            history = item.historical_acceptance
+            assert history is not None, "accepted history must include its supporting records"
             self.assertEqual(history.receipt.id, receipt.id)
             self.assertEqual(
                 history.criteria_revision.id, prior_revision.id,
