@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -16,7 +17,10 @@ from evospec.domain import (
     CapabilityState,
     Change,
     ChangeId,
+    CoverageInput,
+    CriterionCoverageDeclaration,
     Drift,
+    ExpectedRevision,
     ExperimentOutcome,
     Feature,
     FeatureId,
@@ -25,12 +29,19 @@ from evospec.domain import (
     Observation,
     ObservationId,
     PendingDiscoveryRecovery,
+    ProvisionalSliceCriterion,
+    ProvisionalSliceHead,
+    ProvisionalSliceProvenance,
+    ProvisionalSliceRevision,
+    ProvisionalSliceSourceReference,
     RepositoryPath,
     ReviewResult,
     State,
+    StateValidationError,
     VerificationEvidence,
     WorkRelation,
     WorkRelationKind,
+    validate_state,
 )
 from evospec.lifecycle import (
     Classification,
@@ -40,17 +51,33 @@ from evospec.lifecycle import (
     is_valid_pair,
 )
 from evospec.persistence import (
+    PROVISIONAL_SLICE_SCHEMA,
     LEGACY_WRITE_SCHEMA,
     SCHEMA,
+    AtomicFailure,
     DecodeError,
     RecoveryError,
     StateStore,
+    _StateStore,
+    _state_bytes,
     _lock_release_from_json,
+    _agreement_to_json,
     decode_json,
+    encode_json,
     load_integration_providers,
+    _provisional_slice_from_json,
+    _provisional_slice_to_json,
+    _validate_provisional_slice_authority,
     save_integration_providers,
 )
-from evospec.services import CoreService, ServiceError
+from evospec.services import (
+    CoreService,
+    ServiceError,
+    SliceCriteriaSpec,
+    UserAcceptance,
+    next_slice_acceptance_statement,
+    slice_acceptance_statement,
+)
 from evospec.workflow import WorkflowService
 from tests._tempdir import TemporaryDirectory
 from tests.test_services_state import (
@@ -79,6 +106,192 @@ def _legacy_before_e1(value: dict[str, Any]) -> dict[str, Any]:
 
     remove_context_fields(value)
     return value
+
+
+def _canonical_json(value: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _provisional_provenance_json(provenance: ProvisionalSliceProvenance) -> dict[str, Any]:
+    if provenance.kind == "AGENT_SUGGESTION":
+        return {"kind": "AGENT_SUGGESTION"}
+    assert provenance.source_reference is not None
+    return {
+        "kind": "USER_EXPRESSED",
+        "source_reference": {
+            "session_id": provenance.source_reference.session_id,
+            "message_id": provenance.source_reference.message_id,
+        },
+        "expression": provenance.expression,
+        "expression_sha256": provenance.expression_sha256,
+    }
+
+
+def _make_provisional_revision(
+    state: State,
+    *,
+    previous: ProvisionalSliceRevision | None = None,
+    repository_id: str | None = None,
+    feature_id: str | None = None,
+    title: str = "Provisional future Slice",
+    outcome: str = "The future Slice is clearly described",
+    example: str | None = None,
+    inclusions: tuple[str, ...] = ("Describe bounded future work",),
+    exclusions: tuple[str, ...] = (),
+    considerations: tuple[str, ...] = (),
+    open_questions: tuple[str, ...] = (),
+    criteria: tuple[ProvisionalSliceCriterion, ...] | None = None,
+    provenance: ProvisionalSliceProvenance | None = None,
+) -> ProvisionalSliceRevision:
+    if state.initialization is None:
+        raise AssertionError("fixture state must be initialized")
+    number = 1 if previous is None else previous.revision + 1
+    repository = state.initialization.repository_id if repository_id is None else repository_id
+    feature = str(state.features[0].id) if feature_id is None else feature_id
+    selected_criteria = (
+        (ProvisionalSliceCriterion("c-1", "It is bounded", "An observable result"),)
+        if criteria is None else criteria
+    )
+    selected_provenance = (
+        ProvisionalSliceProvenance("AGENT_SUGGESTION")
+        if provenance is None else provenance
+    )
+    provenance_json = _provisional_provenance_json(selected_provenance)
+    genesis = {
+        "repository_id": repository,
+        "feature_id": feature,
+        "title": title,
+        "outcome": outcome,
+        "example": example,
+        "inclusions": list(inclusions),
+        "exclusions": list(exclusions),
+        "considerations": list(considerations),
+        "open_questions": list(open_questions),
+        "criteria": [
+            {
+                "id": item.id,
+                "expected_result": item.expected_result,
+                "expected_evidence": item.expected_evidence,
+            }
+            for item in selected_criteria
+        ],
+        "provenance": provenance_json,
+    }
+    proposal_id = (
+        previous.proposal_id
+        if previous is not None
+        else "ps-" + sha256(_canonical_json(genesis)).hexdigest()
+    )
+    revision_id = f"{proposal_id}-r{number}"
+    value = {
+        "proposal_id": proposal_id,
+        "revision_id": revision_id,
+        "revision": number,
+        **genesis,
+        "previous_revision_id": None if previous is None else previous.revision_id,
+    }
+    digest = sha256(_canonical_json(value)).hexdigest()
+    return ProvisionalSliceRevision(
+        proposal_id,
+        revision_id,
+        number,
+        repository,
+        FeatureId(feature),
+        title,
+        outcome,
+        example,
+        inclusions,
+        exclusions,
+        considerations,
+        open_questions,
+        selected_criteria,
+        selected_provenance,
+        None if previous is None else previous.revision_id,
+        digest,
+    )
+
+
+def _create_provisional_fixture(
+    root: Path, criteria: SliceCriteriaSpec | None = None,
+) -> State:
+    """Use the project’s ordinary accepted Feature fixture; D1 only reads it."""
+    workflow = WorkflowService.open(root)
+    initial = workflow.init()
+    feature = "D1 fixture Feature"
+    slice_title = "Existing fixture Slice"
+    task = "Existing fixture Task"
+    checkpoint = "Existing fixture checkpoint"
+    statement = slice_acceptance_statement(feature, slice_title, task, checkpoint, criteria)
+    acceptance = UserAcceptance(
+        statement,
+        f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}",
+    )
+    workflow.accept_first_slice(
+        feature,
+        slice_title,
+        task,
+        checkpoint,
+        acceptance,
+        expected_revision=ExpectedRevision(initial.revision),
+        criteria=criteria,
+    )
+    return CoreService.open(root).recover()
+
+
+def _create_two_slice_fixture(root: Path, base: State) -> State:
+    """Use Core's accepted-pair route for synthetic multi-Slice authority."""
+    workflow = WorkflowService.open(root)
+    current = CoreService.open(root).recover()
+    r3 = workflow.r3_upgrade_agreement(expected_revision=ExpectedRevision(current.revision))
+    upgraded = workflow.upgrade_r3_schema(
+        UserAcceptance(r3, f"tty:{sha256(r3.encode('utf-8')).hexdigest()[:12]}"),
+        expected_revision=ExpectedRevision(current.revision),
+    )
+    known_input = root / "tests" / "test_r5a_fixture.py"
+    known_input.parent.mkdir()
+    known_input.write_text("# synthetic R3-B coverage input\n", encoding="utf-8")
+    declarations = (
+        CriterionCoverageDeclaration(
+            "AC-1", "python-unittest", "tests.test_r5a_fixture",
+            (CoverageInput("root-file", "tests/test_r5a_fixture.py"),),
+        ),
+    )
+    r3b = workflow.r3b_upgrade_agreement(
+        declarations, expected_revision=ExpectedRevision(upgraded.revision),
+    )
+    workflow.upgrade_r3b_schema(
+        UserAcceptance(r3b, f"tty:{sha256(r3b.encode('utf-8')).hexdigest()[:12]}"),
+        declarations, expected_revision=ExpectedRevision(upgraded.revision),
+    )
+    workflow.park("Fixture has another accepted Slice")
+    current = CoreService.open(root).recover()
+    from tests.test_e1_r5a_next_slice import spec
+
+    criteria = spec("The second accepted Slice is independently bounded")
+    feature = base.features[0]
+    feature_id = str(feature.id)
+    slice_title = "Second fixture Slice"
+    initial_task = "Second fixture Task"
+    checkpoint = "Second fixture checkpoint"
+    statement = next_slice_acceptance_statement(
+        feature_id, feature.title, slice_title, initial_task, checkpoint, criteria,
+    )
+    workflow.accept_next_slice(
+        feature_id, slice_title, initial_task, checkpoint,
+        UserAcceptance(statement, f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"),
+        expected_revision=ExpectedRevision(current.revision),
+        criteria=criteria,
+    )
+    return CoreService.open(root).recover()
 
 
 class PersistenceTests(unittest.TestCase):
@@ -777,6 +990,16 @@ class PersistenceTests(unittest.TestCase):
             self.assertFalse(hasattr(store, "write_immutable"))
             self.assertFalse(hasattr(store, "publish_living_spec"))
 
+    def test_schema_22_is_provisional_only_and_keeps_default_at_15(self) -> None:
+        empty = State(0, None)
+
+        self.assertEqual(SCHEMA, 15)
+        self.assertEqual(json.loads(_state_bytes(empty))["schema"], 15)
+        provisional = json.loads(_state_bytes(empty, 22))
+        self.assertEqual(provisional["schema"], 22)
+        self.assertEqual(provisional["provisional_slice_refs"], [])
+        self.assertEqual(provisional["provisional_slice_heads"], [])
+
     def test_referenced_record_requires_exact_schema(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -917,3 +1140,529 @@ class PersistenceTests(unittest.TestCase):
 
                 with self.assertRaises(RecoveryError):
                     CoreService.open(root).recover()
+
+
+class ProvisionalSlicePersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = TemporaryDirectory(prefix="evospec-d1-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.base = _create_provisional_fixture(self.root)
+        self.store = _StateStore(self.root)
+
+    def _publish_first(
+        self, provenance: ProvisionalSliceProvenance | None = None,
+    ) -> tuple[ProvisionalSliceRevision, State]:
+        revision = _make_provisional_revision(self.base, provenance=provenance)
+        return revision, self.store.publish_provisional_slice(self.base, revision, None)
+
+    def _snapshot(self) -> dict[Path, bytes]:
+        directory = self.root / ".evospec"
+        return {
+            path.relative_to(directory): path.read_bytes()
+            for path in directory.rglob("*")
+            if path.is_file()
+        }
+
+    def _create_two_slice_state(self, prefix: str) -> tuple[Path, State]:
+        from tests.test_e1_r5a_next_slice import spec
+
+        temporary = TemporaryDirectory(prefix=prefix)
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        base = _create_provisional_fixture(
+            root, criteria=spec("The first accepted Slice has human-approved criteria"),
+        )
+        return root, _create_two_slice_fixture(root, base)
+
+    def test_schema22_roundtrips_canonical_records_without_changing_the_default(self) -> None:
+        state_path = self.root / ".evospec" / "state.json"
+        before_read = state_path.read_bytes()
+        self.assertEqual(SCHEMA, 15)
+        self.assertEqual(json.loads(_state_bytes(self.base))["schema"], 15)
+        self.assertEqual(StateStore(self.root).load_state(), self.base)
+        self.assertEqual(state_path.read_bytes(), before_read)
+
+        revision = _make_provisional_revision(self.base)
+        saved = self.store.publish_provisional_slice(self.base, revision, None)
+        encoded = json.loads(state_path.read_bytes())
+        self.assertEqual(encoded["schema"], PROVISIONAL_SLICE_SCHEMA)
+        self.assertEqual(
+            encoded["provisional_slice_refs"],
+            [{
+                "id": revision.revision_id,
+                "path": f"records/provisional-slices/{revision.revision_id}.json",
+            }],
+        )
+        self.assertEqual(
+            encoded["provisional_slice_heads"],
+            [{
+                "proposal_id": revision.proposal_id,
+                "revision_id": revision.revision_id,
+                "revision": 1,
+                "digest": revision.digest,
+            }],
+        )
+        record_path = (
+            self.root / ".evospec" / "records" / "provisional-slices"
+            / f"{revision.revision_id}.json"
+        )
+        record_bytes = record_path.read_bytes()
+        self.assertEqual(encode_json(json.loads(record_bytes)), record_bytes)
+        self.assertEqual(
+            set(json.loads(record_bytes)),
+            {
+                "proposal_id", "revision_id", "revision", "repository_id",
+                "feature_id", "title", "outcome", "example", "inclusions",
+                "exclusions", "considerations", "open_questions", "criteria",
+                "provenance", "previous_revision_id", "digest",
+            },
+        )
+        self.assertEqual(saved, StateStore(self.root).load_state())
+        self.assertEqual(saved.agreements, self.base.agreements)
+        self.assertEqual(saved.active_context, self.base.active_context)
+        self.assertFalse(hasattr(StateStore(self.root), "publish_provisional_slice"))
+        self.assertEqual(json.loads(record_bytes)["provenance"], {"kind": "AGENT_SUGGESTION"})
+
+    def test_user_expression_is_exact_attributable_data_not_acceptance(self) -> None:
+        expression = "  I would like this future Slice considered.  "
+        provenance = ProvisionalSliceProvenance(
+            "USER_EXPRESSED",
+            ProvisionalSliceSourceReference("ses_test_123", "msg_test_123"),
+            expression,
+            sha256(expression.encode("utf-8")).hexdigest(),
+        )
+        revision, _ = self._publish_first(provenance)
+        raw = _provisional_slice_to_json(revision)
+        self.assertEqual(raw["provenance"], _provisional_provenance_json(provenance))
+        self.assertEqual(_provisional_slice_from_json(raw), revision)
+
+        bad_expression = dict(raw)
+        bad_expression["provenance"] = dict(raw["provenance"])
+        bad_expression["provenance"]["expression"] += " "
+        with self.assertRaises(DecodeError):
+            _provisional_slice_from_json(bad_expression)
+
+        extra_provenance = dict(raw)
+        extra_provenance["provenance"] = {**raw["provenance"], "accepted": True}
+        with self.assertRaises(DecodeError):
+            _provisional_slice_from_json(extra_provenance)
+
+        bad_source = dict(raw)
+        bad_source["provenance"] = {
+            **raw["provenance"],
+            "source_reference": {"session_id": "not-a-session", "message_id": "msg_test_123"},
+        }
+        with self.assertRaises(DecodeError):
+            _provisional_slice_from_json(bad_source)
+
+        extra_record_field = {**raw, "status": "ACCEPTED"}
+        with self.assertRaises(DecodeError):
+            _provisional_slice_from_json(extra_record_field)
+
+    def test_malformed_revision_shapes_and_boolean_revision_fail_closed(self) -> None:
+        raw = _provisional_slice_to_json(_make_provisional_revision(self.base))
+        malformed = (
+            {**raw, "revision": True},
+            {**raw, "title": "   "},
+            {**raw, "criteria": [{"id": "c-01", "expected_result": "x", "expected_evidence": "y"}]},
+            {**raw, "criteria": [{"id": "c-1", "expected_result": "", "expected_evidence": "y"}]},
+            {**raw, "digest": "0" * 64},
+            {**raw, "previous_revision_id": "wrong"},
+        )
+        for value in malformed:
+            with self.subTest(value=value), self.assertRaises(DecodeError):
+                _provisional_slice_from_json(value)
+
+    def test_wrong_root_feature_and_missing_feature_agreement_write_nothing(self) -> None:
+        before = self._snapshot()
+        for revision in (
+            _make_provisional_revision(self.base, repository_id="0000000000000000"),
+            _make_provisional_revision(self.base, feature_id="missing-feature"),
+        ):
+            with self.subTest(revision=revision.feature_id), self.assertRaises(AtomicFailure):
+                self.store.publish_provisional_slice(self.base, revision, None)
+            self.assertEqual(self._snapshot(), before)
+
+        with TemporaryDirectory(prefix="evospec-d1-unagreed-") as temporary:
+            root = Path(temporary)
+            workflow = WorkflowService.open(root)
+            workflow.init()
+            state = CoreService.open(root).recover()
+            core = CoreService.open(root)
+            feature = Feature(FeatureId("unagreed-feature"), "Unagreed Feature", None)
+            state = core.record_feature(state, feature)
+            state = core.record_change(
+                state, Change(ChangeId("unagreed-change"), feature.id, "Fixture change"),
+            )
+            before_unagreed = {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*") if path.is_file()
+            }
+            with self.assertRaises(AtomicFailure):
+                _StateStore(root).publish_provisional_slice(
+                    state, _make_provisional_revision(state), None,
+                )
+            self.assertEqual(
+                before_unagreed,
+                {
+                    path.relative_to(root / ".evospec"): path.read_bytes()
+                    for path in (root / ".evospec").rglob("*") if path.is_file()
+                },
+            )
+
+    def test_multiple_accepted_slices_for_one_feature_publish_and_recover(self) -> None:
+        root, state = self._create_two_slice_state("evospec-d1-multi-")
+        store = _StateStore(root)
+        recovery = StateStore(root)
+        feature_agreements = tuple(
+            item for item in state.agreements
+            if item.kind == "FEATURE" and item.feature_id == state.features[0].id
+        )
+        slice_agreements = tuple(
+            item for item in state.agreements
+            if item.kind == "SLICE" and item.feature_id == state.features[0].id
+        )
+        self.assertEqual(len(feature_agreements), 2)
+        self.assertEqual(len(slice_agreements), 2)
+        self.assertEqual(len({item.change_id for item in feature_agreements}), 2)
+
+        contexts = tuple(
+            context for context in (state.active_context, state.preserved_primary_context)
+            if context is not None
+        ) + tuple(
+            context for item in state.work_items
+            for context in (item.context, item.preserved_primary_context)
+            if context is not None
+        ) + tuple(archive.context for archive in state.terminal_archives)
+        for feature_agreement in feature_agreements:
+            matching_slices = tuple(
+                item for item in slice_agreements
+                if item.change_id == feature_agreement.change_id
+            )
+            self.assertEqual(len(matching_slices), 1)
+            slice_agreement = matching_slices[0]
+            self.assertEqual(
+                (feature_agreement.source, feature_agreement.statement, feature_agreement.source_reference),
+                (slice_agreement.source, slice_agreement.statement, slice_agreement.source_reference),
+            )
+            self.assertTrue(any(
+                context.feature_id == feature_agreement.feature_id
+                and context.change_id == feature_agreement.change_id
+                and context.feature_agreement_ref == feature_agreement.id
+                and context.slice_agreement_ref == slice_agreement.id
+                for context in contexts
+            ))
+
+        revision = _make_provisional_revision(state)
+        saved = store.publish_provisional_slice(state, revision, None)
+        self.assertEqual(saved, recovery.load_state())
+        self.assertEqual(saved.agreements, state.agreements)
+
+    def test_feature_association_rejects_mismatched_provenance_without_writing(self) -> None:
+        for mismatch in ("statement", "source"):
+            with self.subTest(mismatch=mismatch):
+                root, state = self._create_two_slice_state(f"evospec-d1-provenance-{mismatch}-")
+                feature_agreement = tuple(
+                    item for item in state.agreements if item.kind == "FEATURE"
+                )[-1]
+                slice_agreement = next(
+                    item for item in state.agreements
+                    if item.kind == "SLICE" and item.change_id == feature_agreement.change_id
+                )
+                if mismatch == "statement":
+                    statement = f"{slice_agreement.statement} (different terminal statement)"
+                    mismatched = replace(
+                        slice_agreement,
+                        statement=statement,
+                        source_reference=f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}",
+                    )
+                else:
+                    reference = (
+                        f"session:ses_test_123:msg_test_123:"
+                        f"{sha256(feature_agreement.statement.encode('utf-8')).hexdigest()[:16]}"
+                    )
+                    mismatched = replace(
+                        feature_agreement, source="SESSION_REQUEST", source_reference=reference,
+                    )
+                candidate = replace(
+                    state,
+                    agreements=tuple(
+                        mismatched if item.id == mismatched.id else item
+                        for item in state.agreements
+                    ),
+                    slice_criteria_revisions=tuple(
+                        item for item in state.slice_criteria_revisions
+                        if item.slice_agreement_ref != slice_agreement.id
+                    ),
+                    slice_criteria_heads=tuple(
+                        item for item in state.slice_criteria_heads
+                        if item.slice_agreement_ref != slice_agreement.id
+                    ),
+                )
+                validate_state(candidate)
+                paired_feature = next(
+                    item for item in candidate.agreements
+                    if item.kind == "FEATURE" and item.change_id == feature_agreement.change_id
+                )
+                paired_slice = next(
+                    item for item in candidate.agreements
+                    if item.kind == "SLICE" and item.change_id == feature_agreement.change_id
+                )
+                self.assertNotEqual(
+                    (paired_feature.source, paired_feature.statement, paired_feature.source_reference),
+                    (paired_slice.source, paired_slice.statement, paired_slice.source_reference),
+                )
+                for agreement in (paired_feature, paired_slice):
+                    if agreement.source == "INTERACTIVE_TERMINAL":
+                        self.assertEqual(
+                            agreement.source_reference,
+                            f"tty:{sha256(agreement.statement.encode('utf-8')).hexdigest()[:12]}",
+                        )
+                    else:
+                        self.assertEqual(
+                            agreement.source_reference,
+                            f"session:ses_test_123:msg_test_123:"
+                            f"{sha256(agreement.statement.encode('utf-8')).hexdigest()[:16]}",
+                        )
+
+                state_path = root / ".evospec" / "state.json"
+                agreement_path = (
+                    root / ".evospec" / "records" / "agreements" / f"{mismatched.id}.json"
+                )
+                agreement_path.write_bytes(encode_json(_agreement_to_json(mismatched)))
+                state_path.write_bytes(_state_bytes(candidate, PROVISIONAL_SLICE_SCHEMA))
+                persisted = StateStore(root).load_state()
+                self.assertEqual(persisted, candidate)
+                authority_root = root / ".evospec"
+                before = {
+                    path.relative_to(authority_root): path.read_bytes()
+                    for path in authority_root.rglob("*") if path.is_file()
+                }
+                revision = _make_provisional_revision(persisted)
+                with self.assertRaises(AtomicFailure):
+                    _StateStore(root).publish_provisional_slice(persisted, revision, None)
+                self.assertEqual(before, {
+                    path.relative_to(authority_root): path.read_bytes()
+                    for path in authority_root.rglob("*") if path.is_file()
+                })
+
+    def test_feature_association_rejects_duplicate_logical_pairs_and_crossed_refs(self) -> None:
+        root, state = self._create_two_slice_state("evospec-d1-invalid-association-")
+        revision = _make_provisional_revision(state)
+        head = ProvisionalSliceHead(
+            revision.proposal_id, revision.revision_id, revision.revision, revision.digest,
+        )
+        proposal_state = replace(
+            state, provisional_slice_revisions=(revision,), provisional_slice_heads=(head,),
+        )
+        before = {
+            path.relative_to(root / ".evospec"): path.read_bytes()
+            for path in (root / ".evospec").rglob("*") if path.is_file()
+        }
+
+        accepted_feature = next(item for item in state.agreements if item.kind == "FEATURE")
+        duplicate_feature = replace(accepted_feature, id="agreement-feature-duplicate")
+        duplicate = replace(
+            proposal_state, agreements=proposal_state.agreements + (duplicate_feature,),
+        )
+        with self.assertRaises(DecodeError):
+            _validate_provisional_slice_authority(root, duplicate)
+        self.assertEqual(before, {
+            path.relative_to(root / ".evospec"): path.read_bytes()
+            for path in (root / ".evospec").rglob("*") if path.is_file()
+        })
+
+        invalid_provenance = replace(
+            state,
+            agreements=tuple(
+                replace(item, source_reference="tty:invalid")
+                if item.id == accepted_feature.id else item
+                for item in state.agreements
+            ),
+        )
+        with self.assertRaises(StateValidationError):
+            validate_state(invalid_provenance)
+        self.assertEqual(before, {
+            path.relative_to(root / ".evospec"): path.read_bytes()
+            for path in (root / ".evospec").rglob("*") if path.is_file()
+        })
+
+        active = state.active_context
+        self.assertIsNotNone(active)
+        other_feature_ref = next(
+            item.id for item in state.agreements
+            if item.kind == "FEATURE" and item.id != active.feature_agreement_ref
+        )
+        crossed = replace(
+            proposal_state,
+            active_context=replace(active, feature_agreement_ref=other_feature_ref),
+        )
+        with self.assertRaises(DecodeError):
+            _validate_provisional_slice_authority(root, crossed)
+        self.assertEqual(before, {
+            path.relative_to(root / ".evospec"): path.read_bytes()
+            for path in (root / ".evospec").rglob("*") if path.is_file()
+        })
+
+    def test_recovery_rejects_bad_refs_digest_head_and_wrong_root(self) -> None:
+        revision, saved = self._publish_first()
+        state_path = self.root / ".evospec" / "state.json"
+        original_state = state_path.read_bytes()
+        original_record = _provisional_slice_to_json(revision)
+
+        corruptions = (
+            lambda value: value["provisional_slice_refs"][0].update(path="records/other.json"),
+            lambda value: value["provisional_slice_refs"].append(
+                dict(value["provisional_slice_refs"][0])
+            ),
+            lambda value: value["provisional_slice_heads"].append(
+                dict(value["provisional_slice_heads"][0])
+            ),
+            lambda value: value["provisional_slice_heads"][0].update(digest="0" * 64),
+            lambda value: value.update(unexpected=True),
+        )
+        for corrupt in corruptions:
+            with self.subTest(corrupt=corrupt):
+                state_value = json.loads(original_state)
+                corrupt(state_value)
+                state_path.write_text(json.dumps(state_value), encoding="utf-8")
+                with self.assertRaises(RecoveryError):
+                    StateStore(self.root).load_state()
+                state_path.write_bytes(original_state)
+
+        record_path = (
+            self.root / ".evospec" / "records" / "provisional-slices"
+            / f"{revision.revision_id}.json"
+        )
+        bad_record = dict(original_record)
+        bad_record["outcome"] = "tampered without a matching digest"
+        record_path.write_bytes(encode_json(bad_record))
+        with self.assertRaises(RecoveryError):
+            StateStore(self.root).load_state()
+        record_path.write_bytes(encode_json(original_record))
+        self.assertEqual(StateStore(self.root).load_state(), saved)
+
+        with TemporaryDirectory(prefix="evospec-d1-wrong-root-") as temporary:
+            wrong_root = Path(temporary)
+            import shutil
+
+            shutil.copytree(self.root / ".evospec", wrong_root / ".evospec")
+            with self.assertRaises(RecoveryError):
+                StateStore(wrong_root).load_state()
+
+    def test_recovery_rejects_chain_gaps_nonfinal_heads_and_unreachable_refs(self) -> None:
+        first = _make_provisional_revision(self.base)
+        state1 = self.store.publish_provisional_slice(self.base, first, None)
+        second = _make_provisional_revision(state1, previous=first, outcome="Revision two")
+        state2 = self.store.publish_provisional_slice(
+            state1, second, state1.provisional_slice_heads[0],
+        )
+        state_path = self.root / ".evospec" / "state.json"
+        original_state = state_path.read_bytes()
+        second_proposal = _make_provisional_revision(self.base, title="Separate proposal")
+        second_record = (
+            self.root / ".evospec" / "records" / "provisional-slices"
+            / f"{second_proposal.revision_id}.json"
+        )
+        second_record.write_bytes(encode_json(_provisional_slice_to_json(second_proposal)))
+
+        corruptions = (
+            lambda value: value["provisional_slice_refs"].pop(0),
+            lambda value: value["provisional_slice_heads"][0].update(
+                revision_id=first.revision_id,
+                revision=first.revision,
+                digest=first.digest,
+            ),
+            lambda value: value["provisional_slice_refs"].append({
+                "id": second_proposal.revision_id,
+                "path": f"records/provisional-slices/{second_proposal.revision_id}.json",
+            }),
+        )
+        for corrupt in corruptions:
+            with self.subTest(corrupt=corrupt):
+                state_value = json.loads(original_state)
+                corrupt(state_value)
+                state_value["provisional_slice_refs"].sort(key=lambda item: item["id"])
+                state_path.write_text(json.dumps(state_value), encoding="utf-8")
+                with self.assertRaises(RecoveryError):
+                    StateStore(self.root).load_state()
+                state_path.write_bytes(original_state)
+        self.assertEqual(StateStore(self.root).load_state(), state2)
+
+    def test_replay_is_noop_and_stale_state_or_head_cannot_publish(self) -> None:
+        first = _make_provisional_revision(self.base)
+        state1 = self.store.publish_provisional_slice(self.base, first, None)
+        snapshot = self._snapshot()
+        head1 = state1.provisional_slice_heads[0]
+        replay = self.store.publish_provisional_slice(state1, first, head1)
+        self.assertEqual(replay, state1)
+        self.assertEqual(self._snapshot(), snapshot)
+
+        second = _make_provisional_revision(
+            state1,
+            previous=first,
+            title="Revised provisional future Slice",
+            criteria=(
+                ProvisionalSliceCriterion("c-1", "Still bounded", "Observable result"),
+                ProvisionalSliceCriterion("c-2", "New limit stated", "Limit is present"),
+            ),
+        )
+        with self.assertRaises(AtomicFailure):
+            self.store.publish_provisional_slice(state1, second, None)
+        self.assertEqual(self._snapshot(), snapshot)
+        state2 = self.store.publish_provisional_slice(state1, second, head1)
+        snapshot2 = self._snapshot()
+        with self.assertRaises(AtomicFailure):
+            self.store.publish_provisional_slice(state1, first, head1)
+        self.assertEqual(self._snapshot(), snapshot2)
+
+        head2 = state2.provisional_slice_heads[0]
+        third = _make_provisional_revision(state2, previous=second, outcome="Another outcome")
+        with self.assertRaises(AtomicFailure):
+            self.store.publish_provisional_slice(
+                state2, third, replace(head2, digest="0" * 64),
+            )
+        self.assertEqual(self._snapshot(), snapshot2)
+
+        removed = _make_provisional_revision(
+            state2,
+            previous=second,
+            criteria=(ProvisionalSliceCriterion("c-2", "Keep c-2", "Evidence"),),
+        )
+        state3 = self.store.publish_provisional_slice(state2, removed, head2)
+        resurrected = _make_provisional_revision(
+            state3,
+            previous=removed,
+            criteria=(
+                ProvisionalSliceCriterion("c-1", "Resurrected", "Evidence"),
+                ProvisionalSliceCriterion("c-2", "Keep c-2", "Evidence"),
+            ),
+        )
+        snapshot3 = self._snapshot()
+        with self.assertRaises(AtomicFailure):
+            self.store.publish_provisional_slice(
+                state3, resurrected, state3.provisional_slice_heads[0],
+            )
+        self.assertEqual(self._snapshot(), snapshot3)
+
+    def test_ordinary_core_writer_rejects_schema22_before_any_effect(self) -> None:
+        revision = _make_provisional_revision(self.base)
+        saved = self.store.publish_provisional_slice(self.base, revision, None)
+        if saved.active_context is None:
+            self.fail("fixture must have an active Core context")
+        before = self._snapshot()
+        core = CoreService.open(self.root)
+        with self.assertRaises(ServiceError) as raised:
+            core.record_safety_facts(
+                saved,
+                True,
+                replace(
+                    saved.active_context.safety_facts,
+                    unresolved_decision_details=("ordinary writer probe",),
+                ),
+            )
+        self.assertIsInstance(raised.exception.__cause__, AtomicFailure)
+        self.assertIn("D1_PROVISIONAL_SCHEMA_READ_ONLY", str(raised.exception.__cause__))
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(StateStore(self.root).load_state(), saved)

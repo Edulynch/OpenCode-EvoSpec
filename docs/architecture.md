@@ -56,6 +56,34 @@ State is persisted locally with atomic publication operations. Recovery reads th
 
 Side work preserves the primary context. When side work ends, Core restores the saved primary context through a validated operation. A failed publication leaves the prior authoritative state in place. Paused work resumes only through the stored valid state and phase. Terminal work is reported, not reopened automatically.
 
+### Provisional Slice format (experimental fixture support)
+
+Schema 22 is a dedicated, experimental persistence format for provisional future-Slice proposals. It leaves the ordinary `SCHEMA = 15` default and schema 15–21 layouts unchanged. Canonical immutable revisions live under `.evospec/records/provisional-slices/`; exact State references and one current head per proposal are the sole authority. Recovery checks canonical IDs and digests, root and existing Feature-agreement binding, provenance shape, and a contiguous linear history. Unreferenced files are inert.
+
+This is fixture-only persistence support, not an enabled product operation: there is no service, CLI, agent, host, or UI route, and `StateStore` remains read-only. The private persistence test seam publishes no AgreementRecord, accepted criteria, Task, checkpoint, verification, or acceptance state. `USER_EXPRESSED` retains exact attributable text and a digest; its shape does not authenticate a host message or establish consent, acceptance, or human presence. Agent suggestions remain distinct.
+
+The focused schema-22 regression tests were run after a test-first RED. They cover canonical encoding, strict provenance and reference validation, CAS/replay/conflict behavior, recovery, and an ordinary Core writer rejection. This does not qualify production activation, independently run the exact baseline mutator, or repeat G1–G3. The independent Nox baseline gate and Vera review remain pending; broader schema 16–21 fixture coverage is not claimed by this focused run.
+
+For the independent baseline gate, create a disposable root beneath the runtime-approved temporary directory, then use the project’s ordinary accepted-Feature test fixture before adding only a D1 proposal:
+
+```python
+from pathlib import Path
+from tests._tempdir import TemporaryDirectory
+from tests.test_persistence import _create_provisional_fixture, _make_provisional_revision
+from evospec.persistence import PROVISIONAL_SLICE_SCHEMA, StateStore, _StateStore
+
+with TemporaryDirectory(dir=r"C:\Users\eduma\AppData\Local\Temp\opencode") as path:
+    root = Path(path)
+    base = _create_provisional_fixture(root)
+    revision = _make_provisional_revision(base)
+    d1 = _StateStore(root).publish_provisional_slice(base, revision, None)
+    state_path = root / ".evospec" / "state.json"
+    assert StateStore(root).load_state() == d1
+    assert __import__("json").loads(state_path.read_text(encoding="utf-8"))["schema"] == PROVISIONAL_SLICE_SCHEMA
+```
+
+The fixture’s ordinary acceptance is synthetic test setup, not evidence of real human consent; the D1 publisher only preserves it. Run the exact-baseline ordinary writer route against this same `root` (for example, a `CoreService.record_safety_facts` mutation from its recovered active context), and compare `state.json` bytes and the `.evospec` file snapshot before and after. The baseline reader in this checkout predates schema 22; its expected fail-closed result is `RecoveryError` during recovery, before any write. Record the actual exception and unchanged snapshot; do not count this recipe as an executed or passing baseline gate.
+
 ## Provider neutral protocol
 
 `evospec.agent` projects authoritative context into a bounded provider neutral shape. The related JSON protocol carries context, legal actions, structured intent, progress, review, verification, and convergence requests through WorkflowService. It returns the current revision and reports stale revision errors so an agent can reload before trying again.

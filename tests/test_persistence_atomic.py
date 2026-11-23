@@ -15,7 +15,15 @@ from evospec.domain import (
     VerificationEvidence,
 )
 from evospec.lifecycle import LifecycleState, Phase, ReviewVerdict
-from evospec.persistence import BinaryFile, FileOperations, StateStore
+from evospec.persistence import (
+    AtomicFailure,
+    BinaryFile,
+    FileOperations,
+    StateStore,
+    _StateStore,
+    _provisional_slice_to_json,
+    encode_json,
+)
 from evospec.services import CoreService, ServiceError
 from evospec.workflow import WorkflowService
 from tests._tempdir import TemporaryDirectory
@@ -24,6 +32,7 @@ from tests.test_services_state import (
     convergence_assessment,
     implementation_context,
 )
+from tests.test_persistence import _create_provisional_fixture, _make_provisional_revision
 
 
 class FailingReplace(FileOperations):
@@ -245,6 +254,61 @@ class AtomicPersistenceTests(unittest.TestCase):
 
             retried = stable_service.record_change(state, change)
             self.assertEqual(retried.changes[0].id, ChangeId("orphan-change"))
+
+    def test_provisional_record_orphan_is_inert_when_state_replace_fails(self) -> None:
+        with TemporaryDirectory(prefix="evospec-d1-atomic-") as temporary:
+            root = Path(temporary)
+            base = _create_provisional_fixture(root)
+            state_path = root / ".evospec" / "state.json"
+            before_state = state_path.read_bytes()
+            revision = _make_provisional_revision(base)
+            record_path = (
+                root / ".evospec" / "records" / "provisional-slices"
+                / f"{revision.revision_id}.json"
+            )
+
+            with self.assertRaises(AtomicFailure):
+                _StateStore(root, FailSecondReplace()).publish_provisional_slice(
+                    base, revision, None,
+                )
+
+            self.assertEqual(state_path.read_bytes(), before_state)
+            self.assertTrue(record_path.is_file())
+            self.assertEqual(StateStore(root).load_state(), base)
+            self.assertEqual(StateStore(root).load_state().provisional_slice_revisions, ())
+
+            retried = _StateStore(root).publish_provisional_slice(base, revision, None)
+            self.assertEqual(retried.provisional_slice_revisions, (revision,))
+            self.assertEqual(StateStore(root).load_state(), retried)
+
+    def test_provisional_immutable_id_conflict_leaves_current_head_unchanged(self) -> None:
+        with TemporaryDirectory(prefix="evospec-d1-conflict-") as temporary:
+            root = Path(temporary)
+            base = _create_provisional_fixture(root)
+            store = _StateStore(root)
+            first = _make_provisional_revision(base)
+            state1 = store.publish_provisional_slice(base, first, None)
+            head1 = state1.provisional_slice_heads[0]
+            candidate = _make_provisional_revision(
+                state1, previous=first, outcome="candidate content",
+            )
+            conflict = _make_provisional_revision(
+                state1, previous=first, outcome="different immutable content",
+            )
+            conflict_path = (
+                root / ".evospec" / "records" / "provisional-slices"
+                / f"{candidate.revision_id}.json"
+            )
+            conflict_path.parent.mkdir(parents=True, exist_ok=True)
+            conflict_path.write_bytes(encode_json(_provisional_slice_to_json(conflict)))
+            state_path = root / ".evospec" / "state.json"
+            before_state = state_path.read_bytes()
+
+            with self.assertRaises(AtomicFailure):
+                store.publish_provisional_slice(state1, candidate, head1)
+
+            self.assertEqual(state_path.read_bytes(), before_state)
+            self.assertEqual(StateStore(root).load_state(), state1)
 
     def test_living_spec_written_before_failed_state_commit_is_non_authoritative(self) -> None:
         with TemporaryDirectory() as temporary:
