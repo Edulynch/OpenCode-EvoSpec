@@ -47,6 +47,9 @@ from .domain import (
     ExperimentOutcome,
     Feature,
     FeatureId,
+    D4_PROVISIONAL_SLICE_ACTIVATION_MARKER,
+    SESSION_REQUEST_CHECKPOINT,
+    SESSION_REQUEST_TASK,
     GitCommitRewrite,
     GitHistoryRewritePolicy,
     IrreversibleAuthorization,
@@ -64,6 +67,7 @@ from .domain import (
     IntakeId,
     IntentAssessment,
     MaterialDecision,
+    ProvisionalSliceActivation,
     ProvisionalSliceCriterion,
     ProvisionalSliceHead,
     ProvisionalSliceProvenance,
@@ -139,6 +143,7 @@ FEATURE_CYCLE_SCHEMA: Final = 19
 REQUEST_OBJECTIVE_SCHEMA: Final = 20
 SEMANTIC_REQUEST_OBJECTIVE_SCHEMA: Final = 21
 PROVISIONAL_SLICE_SCHEMA: Final = 22
+D4_PROVISIONAL_SLICE_SCHEMA: Final = 23
 LEGACY_WRITE_SCHEMA: Final = 13
 E1_TASK_PROGRESS_SCHEMA: Final = 14
 INTEGRATION_REGISTRY_SCHEMA: Final = 1
@@ -196,6 +201,7 @@ STATE_FIELDS_V19: Final = STATE_FIELDS_V18 | frozenset(("feature_reopen_receipts
 STATE_FIELDS_V20: Final = STATE_FIELDS_V19
 STATE_FIELDS_V21: Final = STATE_FIELDS_V20
 STATE_FIELDS_V22: Final = STATE_FIELDS_V21 | frozenset(("provisional_slice_refs", "provisional_slice_heads"))
+STATE_FIELDS_V23: Final = STATE_FIELDS_V22 | frozenset(("provisional_slice_activation",))
 CONTEXT_FIELDS: Final = frozenset(
     (
         "feature_id",
@@ -1003,7 +1009,9 @@ def _provisional_slice_provenance_from_json(value: JsonValue) -> ProvisionalSlic
     )
 
 
-def _provisional_slice_from_json(value: JsonValue) -> ProvisionalSliceRevision:
+def _provisional_slice_from_json(
+    value: JsonValue, *, schema: int = PROVISIONAL_SLICE_SCHEMA,
+) -> ProvisionalSliceRevision:
     raw = _object(value, _PROVISIONAL_SLICE_FIELDS, "provisional Slice revision")
     proposal_id = _string(raw["proposal_id"], "provisional Slice proposal id")
     revision_id = _string(raw["revision_id"], "provisional Slice revision id")
@@ -1057,11 +1065,13 @@ def _provisional_slice_from_json(value: JsonValue) -> ProvisionalSliceRevision:
         previous_revision_id,
         digest,
     )
-    _validate_provisional_slice_record(record)
+    _validate_provisional_slice_record(record, bounded=schema >= D4_PROVISIONAL_SLICE_SCHEMA)
     return record
 
 
-def _validate_provisional_slice_record(revision: ProvisionalSliceRevision) -> None:
+def _validate_provisional_slice_record(
+    revision: ProvisionalSliceRevision, *, bounded: bool = False,
+) -> None:
     if type(revision) is not ProvisionalSliceRevision:
         raise DecodeError("provisional Slice revision is invalid")
     if any(type(value) is not str for value in (
@@ -1132,6 +1142,27 @@ def _validate_provisional_slice_record(revision: ProvisionalSliceRevision) -> No
         raise DecodeError("provisional Slice revision is invalid")
     if revision.revision == 1 and revision.proposal_id != _provisional_slice_genesis_id(revision):
         raise DecodeError("provisional Slice genesis identity is invalid")
+    if bounded:
+        texts = (
+            revision.repository_id, str(revision.feature_id), revision.title,
+            revision.outcome, *( () if revision.example is None else (revision.example,) ),
+            *revision.inclusions, *revision.exclusions, *revision.considerations,
+            *revision.open_questions,
+            *(value for item in revision.criteria for value in (
+                item.id, item.expected_result, item.expected_evidence,
+            )),
+        )
+        if (
+            revision.provenance.kind != "AGENT_SUGGESTION"
+            or any(len(value.encode("utf-8")) > 2048 for value in texts)
+            or any(len(values) > 16 for values in (
+                revision.inclusions, revision.exclusions,
+                revision.considerations, revision.open_questions,
+                revision.criteria,
+            ))
+            or len(encode_json(_provisional_slice_to_json(revision))) > 64 * 1024
+        ):
+            raise DecodeError("D4 provisional Slice payload exceeds its fixed bounds")
 
 
 def _provisional_slice_head_from_json(value: JsonValue) -> ProvisionalSliceHead:
@@ -1152,6 +1183,46 @@ def _provisional_slice_head_from_json(value: JsonValue) -> ProvisionalSliceHead:
     ):
         raise DecodeError("provisional Slice head is invalid")
     return ProvisionalSliceHead(proposal_id, revision_id, revision, digest)
+
+
+_PROVISIONAL_SLICE_ACTIVATION_FIELDS: Final = frozenset((
+    "marker", "source_schema", "source_revision", "source_sha256",
+    "repository_id", "feature_id", "feature_agreement_ref",
+    "slice_agreement_ref", "recorded_revision",
+))
+
+
+def _provisional_slice_activation_to_json(
+    activation: ProvisionalSliceActivation | None,
+) -> JsonValue:
+    if activation is None:
+        return None
+    return {
+        "marker": activation.marker,
+        "source_schema": activation.source_schema,
+        "source_revision": activation.source_revision,
+        "source_sha256": activation.source_sha256,
+        "repository_id": activation.repository_id,
+        "feature_id": str(activation.feature_id),
+        "feature_agreement_ref": activation.feature_agreement_ref,
+        "slice_agreement_ref": activation.slice_agreement_ref,
+        "recorded_revision": activation.recorded_revision,
+    }
+
+
+def _provisional_slice_activation_from_json(value: JsonValue) -> ProvisionalSliceActivation:
+    raw = _object(value, _PROVISIONAL_SLICE_ACTIVATION_FIELDS, "D4 activation")
+    return ProvisionalSliceActivation(
+        _string(raw["marker"], "D4 activation marker"),
+        _integer(raw["source_schema"], "D4 source schema"),
+        _integer(raw["source_revision"], "D4 source revision"),
+        _string(raw["source_sha256"], "D4 source SHA-256"),
+        _string(raw["repository_id"], "D4 repository"),
+        FeatureId(_string(raw["feature_id"], "D4 Feature")),
+        _string(raw["feature_agreement_ref"], "D4 Feature agreement"),
+        _string(raw["slice_agreement_ref"], "D4 Slice agreement"),
+        _integer(raw["recorded_revision"], "D4 activation revision"),
+    )
 
 
 _E1_UPGRADE_FIELDS: Final = frozenset((
@@ -1839,9 +1910,11 @@ def _load_references(
 
 
 def _load_provisional_slice_revisions(
-    root: Path, value: JsonValue,
+    root: Path, value: JsonValue, *, schema: int = PROVISIONAL_SLICE_SCHEMA,
 ) -> tuple[ProvisionalSliceRevision, ...]:
     references = _references_from_json(value, "provisional_slice_refs")
+    if schema >= D4_PROVISIONAL_SLICE_SCHEMA and len(references) > 32 * 32:
+        raise DecodeError("D4 provisional Slice project revision limit is exceeded")
     identities = tuple(identity for identity, _ in references)
     if identities != tuple(sorted(identities)) or len(identities) != len(set(identities)):
         raise DecodeError("provisional Slice references must be unique and sorted")
@@ -1850,17 +1923,24 @@ def _load_provisional_slice_revisions(
         expected = RepositoryPath(f"records/provisional-slices/{identity}.json")
         if path != expected:
             raise DecodeError("provisional Slice record path does not match revision identity")
-        revision = _provisional_slice_from_json(_read_json(_artifact_path(root, path.value)))
+        revision = _provisional_slice_from_json(
+            _read_json(_artifact_path(root, path.value)), schema=schema,
+        )
         if revision.revision_id != identity:
             raise DecodeError("provisional Slice record identity mismatch")
         revisions.append(revision)
     return tuple(revisions)
 
 
-def _load_provisional_slice_heads(value: JsonValue) -> tuple[ProvisionalSliceHead, ...]:
+def _load_provisional_slice_heads(
+    value: JsonValue, *, schema: int = PROVISIONAL_SLICE_SCHEMA,
+) -> tuple[ProvisionalSliceHead, ...]:
+    entries = _array(value, "provisional Slice heads")
+    if schema >= D4_PROVISIONAL_SLICE_SCHEMA and len(entries) > 32:
+        raise DecodeError("D4 provisional Slice project head limit is exceeded")
     heads = tuple(
         _provisional_slice_head_from_json(entry)
-        for entry in _array(value, "provisional Slice heads")
+        for entry in entries
     )
     proposals = tuple(item.proposal_id for item in heads)
     if proposals != tuple(sorted(proposals)) or len(proposals) != len(set(proposals)):
@@ -1868,22 +1948,65 @@ def _load_provisional_slice_heads(value: JsonValue) -> tuple[ProvisionalSliceHea
     return heads
 
 
-def _validate_provisional_slice_authority(root: Path, state: State) -> None:
+def _validate_provisional_slice_authority(
+    root: Path, state: State, *, schema: int = PROVISIONAL_SLICE_SCHEMA,
+) -> None:
     revisions = state.provisional_slice_revisions
     heads = state.provisional_slice_heads
-    if not revisions and not heads:
-        return
     if bool(revisions) != bool(heads):
         raise DecodeError("provisional Slice revisions and heads must be paired")
+    if schema >= D4_PROVISIONAL_SLICE_SCHEMA:
+        activation = state.provisional_slice_activation
+        if (
+            activation is None
+            or activation.marker != D4_PROVISIONAL_SLICE_ACTIVATION_MARKER
+            or activation.source_schema != 15
+            or activation.source_revision != 2
+            or activation.recorded_revision != 3
+            or activation.recorded_revision > state.revision
+            or len(state.features) != 1
+            or len(state.changes) != 1
+            or len(state.agreements) != 2
+            or state.features[0].id != activation.feature_id
+            or state.changes[0].feature_id != activation.feature_id
+            or state.agreements[0].id != activation.feature_agreement_ref
+            or state.agreements[1].id != activation.slice_agreement_ref
+            or state.agreements[0].kind != "FEATURE"
+            or state.agreements[1].kind != "SLICE"
+            or state.agreements[0].feature_id != activation.feature_id
+            or state.agreements[1].feature_id != activation.feature_id
+            or state.agreements[0].change_id != state.agreements[1].change_id
+            or state.changes[0].id != state.agreements[0].change_id
+            or state.r3_schema_upgrade is not None
+            or state.r3b_schema_upgrade is not None
+            or state.e1_schema_upgrade is not None
+            or state.slice_criteria_revisions
+            or state.slice_criteria_heads
+            or state.criterion_test_receipts
+            or state.slice_outcome_receipts
+            or state.criterion_coverage_approvals
+            or state.feature_completion_receipts
+            or state.feature_reopen_receipts
+            or state.terminal_archives
+            or state.work_items
+        ):
+            raise DecodeError("schema 23 requires the exact D4 initial-session activation lane")
+        if len(revisions) > 32 or len(heads) > 32:
+            raise DecodeError("D4 provisional Slice project limits are exceeded")
     resolved_root = _resolved_root(root)
     initialization = state.initialization
     repository_id = sha256(str(resolved_root).encode("utf-8")).hexdigest()[:16]
     if initialization is None or initialization.repository_id != repository_id:
-        raise DecodeError("provisional Slice repository identity does not match this root")
+        if schema >= D4_PROVISIONAL_SLICE_SCHEMA or revisions or heads:
+            raise DecodeError("provisional Slice repository identity does not match this root")
+    if not revisions and not heads:
+        return
     features = {item.id: item for item in state.features}
     revisions_by_proposal: dict[str, list[ProvisionalSliceRevision]] = {}
     for revision in revisions:
-        _validate_provisional_slice_record(revision)
+        _validate_provisional_slice_record(
+            revision, bounded=schema >= D4_PROVISIONAL_SLICE_SCHEMA,
+        )
         if revision.repository_id != repository_id:
             raise DecodeError("provisional Slice record belongs to a different repository")
         feature = features.get(revision.feature_id)
@@ -1943,6 +2066,8 @@ def _validate_provisional_slice_authority(root: Path, state: State) -> None:
         raise DecodeError("provisional Slice records must be reachable from exactly one head")
     for proposal_id, proposal_revisions in revisions_by_proposal.items():
         ordered = sorted(proposal_revisions, key=lambda item: item.revision)
+        if schema >= D4_PROVISIONAL_SLICE_SCHEMA and len(ordered) > 32:
+            raise DecodeError("D4 provisional Slice history limit is exceeded")
         first = ordered[0]
         previous_id: str | None = None
         used_criteria: set[str] = set()
@@ -1996,6 +2121,181 @@ def _validate_provisional_slice_authority(root: Path, state: State) -> None:
             or head.digest != final.digest
         ):
             raise DecodeError("provisional Slice head does not match the final immutable revision")
+
+
+def _d4_initial_session_request(
+    root: Path, state: State,
+) -> tuple[AgreementRecord, AgreementRecord]:
+    """Revalidate the one untouched schema-15 Core admission D4 can opt into."""
+    if (
+        state.revision != 2
+        or state.initialization is None
+        or state.initialization.repository_id
+        != sha256(str(_resolved_root(root)).encode("utf-8")).hexdigest()[:16]
+        or len(state.features) != 1
+        or len(state.changes) != 1
+        or len(state.agreements) != 2
+        or state.active_context is None
+        or state.preserved_primary_context is not None
+        or state.work_items
+        or state.work_relations
+        or state.terminal_archives
+        or state.completed_side_contexts
+        or state.publications
+        or state.publication_history
+        or state.decisions
+        or state.observations
+        or state.drifts
+        or state.locks
+        or state.lock_revisions
+        or state.lock_releases
+        or state.lock_authorizations
+        or state.pending_intake is not None
+        or state.deferred_side_request is not None
+        or state.pending_capability_selection is not None
+        or state.capability_selection_history
+        or state.pending_discovery_recovery is not None
+        or state.irreversible_authorizations
+        or state.pending_autonomy_expansion is not None
+        or state.autonomy_expansion_history
+        or state.e1_schema_upgrade is not None
+        or state.r3_schema_upgrade is not None
+        or state.r3b_schema_upgrade is not None
+        or state.slice_criteria_revisions
+        or state.slice_criteria_heads
+        or state.criterion_test_receipts
+        or state.slice_outcome_receipts
+        or state.criterion_coverage_approvals
+        or state.feature_completion_receipts
+        or state.feature_reopen_receipts
+        or state.provisional_slice_revisions
+        or state.provisional_slice_heads
+        or state.provisional_slice_activation is not None
+    ):
+        raise DecodeError("D4 activation requires the untouched initial schema-15 session request")
+    feature_agreement, slice_agreement = state.agreements
+    feature = state.features[0]
+    change = state.changes[0]
+    context = state.active_context
+    reference_match = re.fullmatch(
+        r"session:(ses_[A-Za-z0-9_-]{3,128}):(msg_[A-Za-z0-9_-]{3,128}):([0-9a-f]{16})",
+        slice_agreement.source_reference,
+    )
+    if reference_match is None:
+        raise DecodeError("D4 activation requires canonical SESSION_REQUEST provenance")
+    expected_source_digest = sha256(slice_agreement.statement.encode("utf-8")).hexdigest()[:16]
+    repository_id = state.initialization.repository_id
+    expected_digest = sha256(json.dumps([
+        repository_id,
+        slice_agreement.statement,
+        slice_agreement.statement,
+        SESSION_REQUEST_TASK,
+        SESSION_REQUEST_CHECKPOINT,
+        slice_agreement.statement,
+        slice_agreement.source_reference,
+    ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+    if (
+        reference_match.group(3) != expected_source_digest
+        or feature_agreement.kind != "FEATURE"
+        or slice_agreement.kind != "SLICE"
+        or feature_agreement.id != f"agreement-feature-{expected_digest}"
+        or slice_agreement.id != f"agreement-slice-{expected_digest}"
+        or feature_agreement.feature_id != f"feature-{expected_digest}"
+        or slice_agreement.feature_id != feature_agreement.feature_id
+        or feature_agreement.change_id != f"change-{expected_digest}"
+        or slice_agreement.change_id != feature_agreement.change_id
+        or feature_agreement.source != "SESSION_REQUEST"
+        or slice_agreement.source != "SESSION_REQUEST"
+        or feature_agreement.source_reference != slice_agreement.source_reference
+        or feature_agreement.statement != slice_agreement.statement
+        or feature_agreement.repository_id != repository_id
+        or slice_agreement.repository_id != repository_id
+        or feature_agreement.title != slice_agreement.statement.strip()
+        or slice_agreement.title != slice_agreement.statement.strip()
+        or slice_agreement.task_id != f"task-{expected_digest}"
+        or slice_agreement.initial_task != SESSION_REQUEST_TASK
+        or slice_agreement.checkpoint != SESSION_REQUEST_CHECKPOINT
+        or feature.id != feature_agreement.feature_id
+        or feature.title != feature_agreement.title
+        or str(feature.living_spec_id) != f"spec-{expected_digest}"
+        or change.id != feature_agreement.change_id
+        or change.feature_id != feature.id
+        or change.intent != slice_agreement.statement.strip()
+        or change.classification is not Classification.FEATURE
+        or context.feature_id != feature.id
+        or context.change_id != change.id
+        or context.feature_agreement_ref != feature_agreement.id
+        or context.slice_agreement_ref != slice_agreement.id
+        or context.focus != slice_agreement.title
+        or context.current_work != SESSION_REQUEST_TASK
+        or context.task_progress is not None
+        or context.status is not LifecycleState.PROPOSED
+        or context.phase is not Phase.RESEARCH
+    ):
+        raise DecodeError("D4 activation does not match Core's initial SESSION_REQUEST acceptance")
+    return feature_agreement, slice_agreement
+
+
+def _new_d4_provisional_slice_revision(
+    repository_id: str,
+    feature_id: str,
+    expected_head: ProvisionalSliceHead | None,
+    title: str,
+    outcome: str,
+    example: str | None,
+    inclusions: tuple[str, ...],
+    exclusions: tuple[str, ...],
+    considerations: tuple[str, ...],
+    open_questions: tuple[str, ...],
+    criteria: tuple[ProvisionalSliceCriterion, ...],
+) -> ProvisionalSliceRevision:
+    provenance = ProvisionalSliceProvenance("AGENT_SUGGESTION")
+    genesis: dict[str, JsonValue] = {
+        "repository_id": repository_id,
+        "feature_id": feature_id,
+        "title": title,
+        "outcome": outcome,
+        "example": example,
+        "inclusions": list(inclusions),
+        "exclusions": list(exclusions),
+        "considerations": list(considerations),
+        "open_questions": list(open_questions),
+        "criteria": [
+            {
+                "id": item.id,
+                "expected_result": item.expected_result,
+                "expected_evidence": item.expected_evidence,
+            }
+            for item in criteria
+        ],
+        "provenance": _provisional_slice_provenance_to_json(provenance),
+    }
+    proposal_id = (
+        "ps-" + sha256(encode_json(genesis)).hexdigest()
+        if expected_head is None else expected_head.proposal_id
+    )
+    number = 1 if expected_head is None else expected_head.revision + 1
+    revision = ProvisionalSliceRevision(
+        proposal_id,
+        f"{proposal_id}-r{number}",
+        number,
+        repository_id,
+        FeatureId(feature_id),
+        title,
+        outcome,
+        example,
+        inclusions,
+        exclusions,
+        considerations,
+        open_questions,
+        criteria,
+        provenance,
+        None if expected_head is None else expected_head.revision_id,
+        "",
+    )
+    revision = replace(revision, digest=_provisional_slice_digest(revision))
+    _validate_provisional_slice_record(revision, bounded=True)
+    return revision
 
 
 def _archive_from_json(value: JsonValue, schema: int) -> TerminalArchive:
@@ -2246,7 +2546,10 @@ def _criterion_test_from_json(value: JsonValue, schema: int) -> CriterionTestRec
     )
     raw = _object(value, allowed, "R3 criterion test")
     def optional_r3_string(key: str, label: str) -> str | None:
-        if key not in raw or schema in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA) and raw[key] is None:
+        if key not in raw or schema in (
+            REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
+            PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA,
+        ) and raw[key] is None:
             return None
         return _string(raw[key], label)
 
@@ -2447,9 +2750,11 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                     decoded.pop(field)
         if schema in (9, 10):
             raw = _object(decoded, STATE_FIELDS_V10, "state")
-        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA):
+        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA):
             decoded_fields = set(decoded)
-            if schema == PROVISIONAL_SLICE_SCHEMA and decoded_fields == set(STATE_FIELDS_V22):
+            if schema == D4_PROVISIONAL_SLICE_SCHEMA and decoded_fields == set(STATE_FIELDS_V23):
+                raw = _object(decoded, STATE_FIELDS_V23, "state")
+            elif schema == PROVISIONAL_SLICE_SCHEMA and decoded_fields == set(STATE_FIELDS_V22):
                 raw = _object(decoded, STATE_FIELDS_V22, "state")
             elif schema == REQUEST_OBJECTIVE_SCHEMA and decoded_fields == set(STATE_FIELDS_V20):
                 raw = _object(decoded, STATE_FIELDS_V20, "state")
@@ -2536,7 +2841,7 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 legacy_fields,
                 "state",
             )
-        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA):
+        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA):
             raise DecodeError("unknown state schema")
         (
             initialization, deferred, intake, selection, recovery, selection_history,
@@ -2640,15 +2945,22 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 for item in _array(raw["feature_reopen_receipts"], "Feature reopening receipts")
             ) if schema >= FEATURE_CYCLE_SCHEMA else (),
             provisional_slice_revisions=(
-                _load_provisional_slice_revisions(root, raw["provisional_slice_refs"])
-                if schema == PROVISIONAL_SLICE_SCHEMA else ()
+                _load_provisional_slice_revisions(root, raw["provisional_slice_refs"], schema=schema)
+                if schema in (PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA) else ()
             ),
             provisional_slice_heads=(
-                _load_provisional_slice_heads(raw["provisional_slice_heads"])
-                if schema == PROVISIONAL_SLICE_SCHEMA else ()
+                _load_provisional_slice_heads(raw["provisional_slice_heads"], schema=schema)
+                if schema in (PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA) else ()
+            ),
+            provisional_slice_activation=(
+                _provisional_slice_activation_from_json(raw["provisional_slice_activation"])
+                if schema == D4_PROVISIONAL_SLICE_SCHEMA else None
             ),
         )
-        if schema >= R3B_SCHEMA and schema not in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA) and state.r3b_schema_upgrade is None:
+        if schema >= R3B_SCHEMA and schema not in (
+            REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
+            PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA,
+        ) and state.r3b_schema_upgrade is None:
             raise DecodeError("schema 17 requires an explicit R3-B conversion receipt")
         if schema == FEATURE_CYCLE_SCHEMA and not state.feature_reopen_receipts:
             raise DecodeError("schema 19 requires explicit Feature reopening authority")
@@ -2667,12 +2979,12 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 or not any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_outcome_receipts)
             ):
                 raise DecodeError(f"schema {schema} requires its canonical request-objective proof")
-        elif schema == PROVISIONAL_SLICE_SCHEMA and has_request_objective:
+        elif schema in (PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA) and has_request_objective:
             if _request_objective_schema_for_state(state) is None:
                 raise DecodeError("schema 22 cannot weaken existing request-objective proof")
         validate_state(state)
-        if schema == PROVISIONAL_SLICE_SCHEMA:
-            _validate_provisional_slice_authority(root, state)
+        if schema in (PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA):
+            _validate_provisional_slice_authority(root, state, schema=schema)
         _validate_capability_selection_authority(state, schema)
         contexts = tuple(
             context
@@ -3183,23 +3495,30 @@ def _request_objective_schema_for_state(state: State) -> int | None:
 
 def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
     """Preserve each accepted layout until a scoped authority decision changes it."""
-    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA):
+    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA):
         raise ValueError("unsupported state writer schema")
     if schema < SCHEMA and (state.slice_criteria_revisions or state.slice_criteria_heads):
         raise ValueError("Slice criteria cannot be silently downgraded")
-    if schema != PROVISIONAL_SLICE_SCHEMA and (
+    if schema < D4_PROVISIONAL_SLICE_SCHEMA and state.provisional_slice_activation is not None:
+        raise ValueError("D4 provisional Slice activation cannot be silently downgraded")
+    if schema == D4_PROVISIONAL_SLICE_SCHEMA and state.provisional_slice_activation is None:
+        raise ValueError("schema 23 requires the D4 provisional Slice activation marker")
+    if schema < PROVISIONAL_SLICE_SCHEMA and (
         state.provisional_slice_revisions or state.provisional_slice_heads
     ):
         raise ValueError("provisional Slice authority cannot be silently downgraded")
     if (
         schema >= R3B_SCHEMA
-        and schema not in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA)
+        and schema not in (
+            REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
+            PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA,
+        )
         and state.r3b_schema_upgrade is None
     ):
         raise ValueError("schema 17 requires its separate human-approved conversion receipt")
     if schema == FEATURE_CYCLE_SCHEMA and not state.feature_reopen_receipts:
         raise ValueError("schema 19 requires a human reopening receipt")
-    if schema == PROVISIONAL_SLICE_SCHEMA:
+    if schema >= PROVISIONAL_SLICE_SCHEMA:
         value_d1: dict[str, JsonValue] = {
             "provisional_slice_refs": [
                 {
@@ -3218,6 +3537,10 @@ def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
                 for item in sorted(state.provisional_slice_heads, key=lambda item: item.proposal_id)
             ],
         }
+        if schema >= D4_PROVISIONAL_SLICE_SCHEMA:
+            value_d1["provisional_slice_activation"] = _provisional_slice_activation_to_json(
+                state.provisional_slice_activation,
+            )
     else:
         value_d1 = {}
     if schema in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA) and (
@@ -3483,22 +3806,216 @@ class _StateStore:
         self.__operations = FileOperations() if operations is None else operations
 
     def recover(self) -> State:
-        state, _ = self.recover_snapshot()
+        state, _, _ = self.recover_snapshot()
         return state
 
-    def recover_snapshot(self) -> tuple[State, bool | None]:
-        """Pair the accepted E1 schema gate with the state that was actually decoded."""
+    def recover_snapshot(self) -> tuple[State, bool | None, int | None]:
+        """Pair write readiness and the persisted schema with one recovered State."""
         state, schema = _recover_state_with_schema(self.__root)
         if state.agreements:
             expected_id = sha256(str(self.__root).encode("utf-8")).hexdigest()[:16]
             if state.initialization is None or state.initialization.repository_id != expected_id:
                 raise RecoveryError("accepted Slice state belongs to a different repository root")
-        return state, (schema in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA) if state.agreements else None)
+        ready_schemas = (
+            E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA,
+            FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA,
+            REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
+            D4_PROVISIONAL_SLICE_SCHEMA,
+        )
+        return state, (schema in ready_schemas if state.agreements else None), schema
 
     def e1_schema_ready(self) -> bool:
         """Legacy state remains readable but cannot silently enter the E1 writer path."""
         raw = _read_json(_artifact_path(self.__root, "state.json"))
-        return isinstance(raw, dict) and raw.get("schema") in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA)
+        return isinstance(raw, dict) and raw.get("schema") in (
+            E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA,
+            FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA,
+            REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
+            D4_PROVISIONAL_SLICE_SCHEMA,
+        )
+
+    def activate_provisional_slice_writes(
+        self, state: State, repository_id: str, feature_id: str,
+    ) -> State:
+        """Enable only the revision-bound initial schema-15 session-request lane."""
+        with _state_publish_lock(self.__root):
+            current, schema = _recover_state_with_schema(self.__root)
+            if state != current:
+                raise AtomicFailure("D4 activation source State is stale")
+            if current.provisional_slice_activation is not None:
+                activation = current.provisional_slice_activation
+                if (
+                    schema == D4_PROVISIONAL_SLICE_SCHEMA
+                    and activation.repository_id == repository_id
+                    and str(activation.feature_id) == feature_id
+                ):
+                    return current
+                raise AtomicFailure("D4 activation authority already differs")
+            if schema != SCHEMA:
+                raise AtomicFailure("D4 activation requires exact schema-15 source authority")
+            try:
+                feature_agreement, slice_agreement = _d4_initial_session_request(
+                    self.__root, current,
+                )
+            except DecodeError as error:
+                raise AtomicFailure("D4 activation source is not eligible") from error
+            if (
+                repository_id != feature_agreement.repository_id
+                or feature_id != str(feature_agreement.feature_id)
+                or slice_agreement.feature_id != feature_id
+            ):
+                raise AtomicFailure("D4 activation repository or Feature identity is incorrect")
+            source_path = _artifact_path(self.__root, "state.json")
+            source_digest = sha256(source_path.read_bytes()).hexdigest()
+            activation = ProvisionalSliceActivation(
+                D4_PROVISIONAL_SLICE_ACTIVATION_MARKER,
+                SCHEMA,
+                current.revision,
+                source_digest,
+                repository_id,
+                FeatureId(feature_id),
+                feature_agreement.id,
+                slice_agreement.id,
+                current.revision + 1,
+            )
+            candidate = replace(
+                current,
+                revision=current.revision + 1,
+                provisional_slice_activation=activation,
+            )
+            try:
+                validate_state(candidate)
+                _validate_provisional_slice_authority(
+                    self.__root, candidate, schema=D4_PROVISIONAL_SLICE_SCHEMA,
+                )
+            except (StateValidationError, DecodeError, DomainError) as error:
+                raise AtomicFailure("D4 activation candidate is invalid") from error
+            self.__publish_state_locked(
+                candidate,
+                strict_directory=True,
+                allow_d4_activation=True,
+                expected_current=current,
+            )
+            return candidate
+
+    def publish_d4_provisional_slice(
+        self,
+        state: State,
+        repository_id: str,
+        feature_id: str,
+        expected_head: ProvisionalSliceHead | None,
+        title: str,
+        outcome: str,
+        example: str | None,
+        inclusions: tuple[str, ...],
+        exclusions: tuple[str, ...],
+        considerations: tuple[str, ...],
+        open_questions: tuple[str, ...],
+        criteria: tuple[ProvisionalSliceCriterion, ...],
+    ) -> State:
+        """Publish one bounded AGENT_SUGGESTION and its current head under one CAS."""
+        with _state_publish_lock(self.__root):
+            current, schema = _recover_state_with_schema(self.__root)
+            if state != current:
+                raise AtomicFailure("D4 provisional Slice State revision is stale")
+            if schema != D4_PROVISIONAL_SLICE_SCHEMA:
+                raise AtomicFailure("D4 provisional Slice activation is required")
+            activation = current.provisional_slice_activation
+            if (
+                activation is None
+                or repository_id != activation.repository_id
+                or feature_id != str(activation.feature_id)
+            ):
+                raise AtomicFailure("D4 proposal repository or Feature differs from activation")
+            if expected_head is not None and type(expected_head) is not ProvisionalSliceHead:
+                raise AtomicFailure("D4 expected head must be the exact Core head or null")
+            try:
+                revision = _new_d4_provisional_slice_revision(
+                    repository_id, feature_id, expected_head, title, outcome, example,
+                    inclusions, exclusions, considerations, open_questions, criteria,
+                )
+            except (DecodeError, DomainError, AttributeError, TypeError) as error:
+                raise AtomicFailure("D4 provisional Slice payload is invalid") from error
+            heads = {item.proposal_id: item for item in current.provisional_slice_heads}
+            current_head = heads.get(revision.proposal_id)
+            revisions_by_id = {
+                item.revision_id: item for item in current.provisional_slice_revisions
+            }
+            if expected_head is None:
+                if (
+                    current_head is not None
+                    and current_head.revision_id == revision.revision_id
+                    and revisions_by_id.get(revision.revision_id) == revision
+                ):
+                    return current
+                if current_head is not None:
+                    raise AtomicFailure("D4 create expected a null current head")
+                if len(current.provisional_slice_heads) >= 32:
+                    raise AtomicFailure("D4 provisional Slice project head limit is exceeded")
+            else:
+                prior_revision = revisions_by_id.get(expected_head.revision_id)
+                expected_recorded_head = (
+                    None if prior_revision is None
+                    else ProvisionalSliceHead(
+                        prior_revision.proposal_id, prior_revision.revision_id,
+                        prior_revision.revision, prior_revision.digest,
+                    )
+                )
+                if expected_recorded_head != expected_head:
+                    raise AtomicFailure("D4 expected head is not a recorded immutable revision")
+                if current_head != expected_head:
+                    if (
+                        current_head is not None
+                        and current_head.revision_id == revision.revision_id
+                        and revisions_by_id.get(revision.revision_id) == revision
+                    ):
+                        return current
+                    raise AtomicFailure("D4 expected provisional Slice head is stale")
+                if expected_head.revision >= 32:
+                    raise AtomicFailure("D4 provisional Slice revision limit is exceeded")
+            if any(item.revision_id == revision.revision_id for item in current.provisional_slice_revisions):
+                raise AtomicFailure("D4 immutable provisional Slice revision conflicts")
+            candidate_head = ProvisionalSliceHead(
+                revision.proposal_id, revision.revision_id, revision.revision, revision.digest,
+            )
+            candidate_heads = tuple(sorted(
+                tuple(
+                    item for item in current.provisional_slice_heads
+                    if item.proposal_id != revision.proposal_id
+                ) + (candidate_head,),
+                key=lambda item: item.proposal_id,
+            ))
+            candidate = replace(
+                current,
+                revision=current.revision + 1,
+                provisional_slice_revisions=tuple(sorted(
+                    current.provisional_slice_revisions + (revision,),
+                    key=lambda item: item.revision_id,
+                )),
+                provisional_slice_heads=candidate_heads,
+            )
+            try:
+                validate_state(candidate)
+                _validate_provisional_slice_authority(
+                    self.__root, candidate, schema=D4_PROVISIONAL_SLICE_SCHEMA,
+                )
+            except (StateValidationError, DecodeError, DomainError) as error:
+                raise AtomicFailure("D4 provisional Slice candidate is invalid") from error
+            record_bytes = encode_json(_provisional_slice_to_json(revision))
+            if len(record_bytes) > 64 * 1024:
+                raise AtomicFailure("D4 provisional Slice payload exceeds 64 KiB")
+            self.__publish_immutable(
+                f"records/provisional-slices/{revision.revision_id}.json",
+                record_bytes,
+                strict_directory=True,
+            )
+            self.__publish_state_locked(
+                candidate,
+                strict_directory=True,
+                allow_d4_provisional_slice=True,
+                expected_current=current,
+            )
+            return candidate
 
     def r3_schema_ready(self) -> bool:
         """Schema 15 stays readable; it never becomes an R3 writer without consent."""
@@ -3684,6 +4201,7 @@ class _StateStore:
     def transact_e1(
         self, expected_revision: int, transform: Callable[[State], State], *,
         upgrade: bool = False, source_digest: str | None = None,
+        allow_d4_task_progress: bool = False,
     ) -> State:
         """Validate and publish one E1 operation entirely under the state writer lock."""
         with _state_publish_lock(self.__root):
@@ -3692,13 +4210,38 @@ class _StateStore:
                 raise AtomicFailure("E1 expected revision is stale")
             if upgrade and (source_digest is None or self.state_source_sha256() != source_digest):
                 raise AtomicFailure("E1 conversion source identity changed after human approval")
-            source_schema = self.__writer_schema_locked(current, allow_e1_upgrade=upgrade)
-            if source_schema not in (E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA):
+            source_schema = self.__writer_schema_locked(
+                current, allow_e1_upgrade=upgrade,
+                allow_d4_task_progress=allow_d4_task_progress,
+            )
+            if source_schema not in (
+                E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA,
+                FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA,
+                REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
+                *((D4_PROVISIONAL_SLICE_SCHEMA,) if allow_d4_task_progress else ()),
+            ):
                 raise AtomicFailure("E1_TASK_PROGRESS_REQUIRES_SCHEMA_14")
             candidate = transform(current)
             if candidate.revision != current.revision + 1:
                 raise AtomicFailure("E1 operation must publish exactly one revision")
-            self.__publish_state_locked(candidate, strict_directory=True, allow_e1_upgrade=upgrade)
+            if source_schema == D4_PROVISIONAL_SLICE_SCHEMA:
+                if (
+                    not allow_d4_task_progress
+                    or replace(candidate, revision=current.revision, active_context=current.active_context) != current
+                ):
+                    raise AtomicFailure("D4 Task progress must preserve all accepted authority")
+                try:
+                    validate_state(candidate)
+                    _validate_provisional_slice_authority(
+                        self.__root, candidate, schema=D4_PROVISIONAL_SLICE_SCHEMA,
+                    )
+                except (StateValidationError, DecodeError) as error:
+                    raise AtomicFailure("D4 Task progress candidate is invalid") from error
+            self.__publish_state_locked(
+                candidate, strict_directory=True, allow_e1_upgrade=upgrade,
+                allow_d4_task_progress=allow_d4_task_progress,
+                expected_current=current,
+            )
             return candidate
 
     def transact_r3(
@@ -4057,7 +4600,8 @@ class _StateStore:
         self, current: State, *, allow_e1_upgrade: bool = False, allow_criteria_upgrade: bool = False,
         allow_r3_upgrade: bool = False, allow_r3b_upgrade: bool = False,
         allow_feature_completion: bool = False, allow_feature_reopening: bool = False,
-        allow_request_objective: bool = False,
+        allow_request_objective: bool = False, allow_d4_activation: bool = False,
+        allow_d4_task_progress: bool = False, allow_d4_provisional_slice: bool = False,
     ) -> int:
         """Choose the output version from persisted authority, never caller input."""
         state_path = _artifact_path(self.__root, "state.json")
@@ -4071,6 +4615,16 @@ class _StateStore:
         source_schema = raw["schema"]
         if source_schema == PROVISIONAL_SLICE_SCHEMA:
             raise AtomicFailure("D1_PROVISIONAL_SCHEMA_READ_ONLY: ordinary writers are disabled")
+        if allow_d4_activation:
+            if source_schema != SCHEMA:
+                raise AtomicFailure("D4 activation requires exact schema-15 source authority")
+            return D4_PROVISIONAL_SLICE_SCHEMA
+        if source_schema == D4_PROVISIONAL_SLICE_SCHEMA:
+            if current.provisional_slice_activation is None:
+                raise AtomicFailure("D4 schema 23 is missing its activation authority")
+            if allow_d4_task_progress or allow_d4_provisional_slice:
+                return D4_PROVISIONAL_SLICE_SCHEMA
+            raise AtomicFailure("D4 schema 23 permits only its supported Core writers")
         if allow_request_objective:
             if source_schema == SCHEMA:
                 if (
@@ -4150,9 +4704,13 @@ class _StateStore:
         allow_criteria_upgrade: bool = False, allow_r3_upgrade: bool = False,
         allow_r3b_upgrade: bool = False, allow_next_slice: bool = False,
         allow_feature_completion: bool = False, allow_feature_reopening: bool = False,
-        allow_request_objective: bool = False,
+        allow_request_objective: bool = False, allow_d4_activation: bool = False,
+        allow_d4_task_progress: bool = False, allow_d4_provisional_slice: bool = False,
+        expected_current: State | None = None,
     ) -> None:
         current = self.__check_state_revision(state)
+        if expected_current is not None and current != expected_current:
+            raise AtomicFailure("State authority changed before scoped publication")
         output_schema = self.__writer_schema_locked(
             current, allow_e1_upgrade=allow_e1_upgrade,
             allow_criteria_upgrade=allow_criteria_upgrade, allow_r3_upgrade=allow_r3_upgrade,
@@ -4160,7 +4718,46 @@ class _StateStore:
             allow_feature_completion=allow_feature_completion,
             allow_feature_reopening=allow_feature_reopening,
             allow_request_objective=allow_request_objective,
+            allow_d4_activation=allow_d4_activation,
+            allow_d4_task_progress=allow_d4_task_progress,
+            allow_d4_provisional_slice=allow_d4_provisional_slice,
         )
+        if allow_d4_activation and (
+            current.provisional_slice_activation is not None
+            or state.provisional_slice_activation is None
+            or replace(
+                state, revision=current.revision,
+                provisional_slice_activation=current.provisional_slice_activation,
+            ) != current
+        ):
+            raise AtomicFailure("D4 activation may add only its immutable marker")
+        if allow_d4_task_progress and output_schema == D4_PROVISIONAL_SLICE_SCHEMA and (
+            replace(state, revision=current.revision, active_context=current.active_context) != current
+        ):
+            raise AtomicFailure("D4 Task progress may change only active Task context")
+        if allow_d4_provisional_slice and (
+            output_schema != D4_PROVISIONAL_SLICE_SCHEMA
+            or replace(
+                state,
+                revision=current.revision,
+                provisional_slice_revisions=current.provisional_slice_revisions,
+                provisional_slice_heads=current.provisional_slice_heads,
+            ) != current
+        ):
+            raise AtomicFailure("D4 proposal may change only its immutable history and current head")
+        if (
+            current.provisional_slice_activation != state.provisional_slice_activation
+            and not allow_d4_activation
+        ):
+            raise AtomicFailure("D4 activation marker is immutable")
+        if (
+            (
+                state.provisional_slice_revisions != current.provisional_slice_revisions
+                or state.provisional_slice_heads != current.provisional_slice_heads
+            )
+            and not allow_d4_provisional_slice
+        ):
+            raise AtomicFailure("provisional Slice history requires its Core writer")
         if current.agreements and state.agreements != current.agreements and not (
             allow_next_slice and state.agreements[:len(current.agreements)] == current.agreements
             and len(state.agreements) == len(current.agreements) + 2

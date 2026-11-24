@@ -54,6 +54,11 @@ from .domain import (
     ExperimentOutcome,
     Feature,
     FeatureId,
+    ProvisionalSliceActivation,
+    ProvisionalSliceCriterion,
+    ProvisionalSliceHead,
+    SESSION_REQUEST_CHECKPOINT,
+    SESSION_REQUEST_TASK,
     LivingSpecId,
     LivingSpecPublication,
     LockAssessment,
@@ -209,12 +214,6 @@ class UserAcceptance:
     statement: str
     source_reference: str
     source: str = "INTERACTIVE_TERMINAL"
-
-
-# Session requests describe a user-supplied outcome; they do not prove that
-# the sender is a physically authenticated person or grant host permissions.
-SESSION_REQUEST_TASK = "Implementar únicamente el resultado expresado en la petición"
-SESSION_REQUEST_CHECKPOINT = "Comprobar el resultado observable expresado en la petición"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2292,6 +2291,98 @@ class CoreService:
             SESSION_REQUEST_TASK, SESSION_REQUEST_CHECKPOINT, evidence,
         )
 
+    def activate_provisional_slice_writes(
+        self, state: State, repository_id: str, feature_id: str,
+    ) -> State:
+        """Explicitly opt into D4 without presenting session provenance as human approval."""
+        current = _authoritative_state(self.__persistence, state)
+        if (
+            type(repository_id) is not str
+            or type(feature_id) is not str
+            or current.initialization is None
+            or repository_id != current.initialization.repository_id
+            or repository_id != sha256(str(self.__repository_root).encode("utf-8")).hexdigest()[:16]
+            or not feature_id
+            or feature_id != feature_id.strip()
+        ):
+            raise ServiceError("D4 activation repository or Feature identity is invalid")
+        try:
+            return self.__persistence.activate_provisional_slice_writes(
+                current, repository_id, feature_id,
+            )
+        except AtomicFailure as error:
+            raise ServiceError("D4 provisional Slice activation was rejected") from error
+
+    def propose_provisional_slice(
+        self,
+        state: State,
+        repository_id: str,
+        feature_id: str,
+        expected_head: ProvisionalSliceHead | None,
+        title: str,
+        outcome: str,
+        example: str | None,
+        inclusions: tuple[str, ...],
+        exclusions: tuple[str, ...],
+        considerations: tuple[str, ...],
+        open_questions: tuple[str, ...],
+        criteria: tuple[ProvisionalSliceCriterion, ...],
+    ) -> State:
+        """Record only a bounded agent suggestion; never accept or promote it."""
+        current = _authoritative_state(self.__persistence, state)
+        activation = current.provisional_slice_activation
+        if (
+            type(repository_id) is not str
+            or type(feature_id) is not str
+            or activation is None
+            or repository_id != activation.repository_id
+            or feature_id != str(activation.feature_id)
+            or repository_id != sha256(str(self.__repository_root).encode("utf-8")).hexdigest()[:16]
+        ):
+            raise ServiceError("D4 proposal differs from current repository or Feature authority")
+
+        def bounded_text(value: object, label: str, *, optional: bool = False) -> None:
+            if optional and value is None:
+                return
+            if type(value) is not str or not value.strip():
+                raise ServiceError(f"D4 {label} must be nonblank text")
+            try:
+                if len(value.encode("utf-8")) > 2048:
+                    raise ServiceError(f"D4 {label} exceeds 2 KiB")
+            except UnicodeEncodeError as error:
+                raise ServiceError(f"D4 {label} is not valid UTF-8") from error
+
+        bounded_text(title, "title")
+        bounded_text(outcome, "outcome")
+        bounded_text(example, "example", optional=True)
+        arrays = (
+            (inclusions, "inclusions"),
+            (exclusions, "exclusions"),
+            (considerations, "considerations"),
+            (open_questions, "open questions"),
+        )
+        for values, label in arrays:
+            if type(values) is not tuple or len(values) > 16:
+                raise ServiceError(f"D4 {label} must contain at most 16 immutable items")
+            for value in values:
+                bounded_text(value, label)
+        if type(criteria) is not tuple or len(criteria) > 16:
+            raise ServiceError("D4 criteria must contain at most 16 immutable items")
+        for criterion in criteria:
+            if type(criterion) is not ProvisionalSliceCriterion:
+                raise ServiceError("D4 criteria must use the exact Core criterion shape")
+            bounded_text(criterion.id, "criterion id")
+            bounded_text(criterion.expected_result, "criterion result")
+            bounded_text(criterion.expected_evidence, "criterion evidence")
+        try:
+            return self.__persistence.publish_d4_provisional_slice(
+                current, repository_id, feature_id, expected_head, title, outcome,
+                example, inclusions, exclusions, considerations, open_questions,
+                criteria,
+            )
+        except AtomicFailure as error:
+            raise ServiceError("D4 provisional Slice proposal was rejected") from error
+
     def accept_next_slice(
         self, state: State, feature_id: str, slice_title: str, initial_task: str,
         checkpoint: str, acceptance: UserAcceptance, criteria: SliceCriteriaSpec,
@@ -2549,7 +2640,9 @@ class CoreService:
             return _prepare_state_publication(replace(locked, active_context=updated), locked.revision)
 
         try:
-            return self.__persistence.transact_e1(current.revision, record)
+            return self.__persistence.transact_e1(
+                current.revision, record, allow_d4_task_progress=True,
+            )
         except AtomicFailure as error:
             self.__raise_e1_publication_error(current.revision, error)
 
@@ -6318,8 +6411,12 @@ class CoreService:
         return saved
 
     def inspect_review(self) -> ReviewInspection:
-        state, e1_schema_ready = self.__persistence.recover_snapshot()
-        return replace(inspect(state), e1_schema_ready=e1_schema_ready)
+        state, e1_schema_ready, persisted_schema = self.__persistence.recover_snapshot()
+        return replace(
+            inspect(state),
+            e1_schema_ready=e1_schema_ready,
+            persisted_schema=persisted_schema,
+        )
 
     def lock_gate(self, state: State) -> str | None:
         return _lock_gate(_authoritative_state(self.__persistence, state))

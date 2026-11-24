@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import unittest
 from dataclasses import replace
 from hashlib import sha256
@@ -51,6 +52,7 @@ from evospec.lifecycle import (
     ReviewVerdict,
     is_valid_pair,
 )
+from evospec.guidance import allowed_actions
 from evospec.persistence import (
     FEATURE_COMPLETION_SCHEMA,
     FEATURE_CYCLE_SCHEMA,
@@ -87,13 +89,14 @@ from evospec.persistence import (
 )
 from evospec.services import (
     CoreService,
+    SessionRequestEvidence,
     ServiceError,
     SliceCriteriaSpec,
     UserAcceptance,
     next_slice_acceptance_statement,
     slice_acceptance_statement,
 )
-from evospec.workflow import WorkflowService
+from evospec.workflow import WorkflowError, WorkflowService
 from tests._tempdir import TemporaryDirectory
 from tests.test_services_state import (
     advance_context,
@@ -410,6 +413,72 @@ class _ProvisionalSliceTestHarness:
                 strict_directory=True,
             )
             return candidate
+
+
+class _FailSecondProvisionalReplace(FileOperations):
+    """Leave an immutable proposal orphan when its State pointer replace fails."""
+
+    def __init__(self) -> None:
+        self.replacements = 0
+
+    def replace(self, source: Path, target: Path) -> None:
+        self.replacements += 1
+        if self.replacements == 2:
+            raise OSError("injected provisional State replacement failure")
+        super().replace(source, target)
+
+
+def _create_d4_session_request_fixture(root: Path) -> tuple[WorkflowService, State]:
+    workflow = WorkflowService.open(root)
+    initialized = workflow.init()
+    repository_id = sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+    workflow.accept_first_slice_session(
+        SessionRequestEvidence(
+            "ses_d4fixture123",
+            "msg_d4fixture123",
+            "Implement only the bounded request.",
+            repository_id,
+        ),
+        expected_revision=ExpectedRevision(initialized.revision),
+    )
+    return workflow, CoreService.open(root).recover()
+
+
+def _d4_competing_proposal_worker(
+    root: str,
+    repository_id: str,
+    feature_id: str,
+    expected_revision: int,
+    title: str,
+    barrier: Any,
+    outcomes: Any,
+) -> None:
+    path = Path(root)
+    state = CoreService.open(path).recover()
+    barrier.wait(timeout=20)
+    if state.revision != expected_revision:
+        outcomes.put(("unexpected_revision", state.revision))
+        return
+    try:
+        saved = _StateStore(path).publish_d4_provisional_slice(
+            state,
+            repository_id,
+            feature_id,
+            None,
+            title,
+            f"Bounded outcome for {title}",
+            None,
+            ("A bounded inclusion",),
+            (),
+            (),
+            (),
+            (ProvisionalSliceCriterion("c-1", "A visible result", "A test"),),
+        )
+    except AtomicFailure as error:
+        outcome = "stale" if "stale" in str(error).lower() else "rejected"
+        outcomes.put((outcome, str(error)))
+    else:
+        outcomes.put(("committed", saved.revision))
 
 
 class PersistenceTests(unittest.TestCase):
@@ -1344,6 +1413,30 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
         self.assertFalse(hasattr(StateStore(self.root), "publish_provisional_slice"))
         self.assertEqual(json.loads(record_bytes)["provenance"], {"kind": "AGENT_SUGGESTION"})
 
+    def test_schema22_guidance_keeps_reads_and_blocks_writes(self) -> None:
+        _, saved = self._publish_first()
+        inspection = CoreService.open(self.root).inspect_review()
+        self.assertEqual(inspection.persisted_schema, 22)
+        self.assertEqual(
+            set(allowed_actions(inspection)),
+            {"context", "list_work", "next_work"},
+        )
+        before = self._snapshot()
+        workflow = WorkflowService.open(self.root)
+        self.assertEqual(
+            workflow.list_work("all", expected_revision=ExpectedRevision(saved.revision)).revision,
+            saved.revision,
+        )
+        self.assertEqual(
+            workflow.next_work(expected_revision=ExpectedRevision(saved.revision)).revision,
+            saved.revision,
+        )
+        self.assertEqual(
+            workflow.reject(expected_revision=ExpectedRevision(saved.revision)).code,
+            "D1_PROVISIONAL_SCHEMA_READ_ONLY",
+        )
+        self.assertEqual(self._snapshot(), before)
+
     def test_d1_publisher_is_absent_from_runtime_api_namespaces(self) -> None:
         import evospec
         import evospec.agent_protocol as protocol
@@ -1818,3 +1911,243 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
         self.assertIn("D1_PROVISIONAL_SCHEMA_READ_ONLY", str(raised.exception.__cause__))
         self.assertEqual(self._snapshot(), before)
         self.assertEqual(StateStore(self.root).load_state(), saved)
+        with self.assertRaises(ServiceError):
+            CoreService.open(self.root).activate_provisional_slice_writes(
+                saved,
+                saved.initialization.repository_id if saved.initialization else "",
+                str(saved.features[0].id),
+            )
+        self.assertEqual(self._snapshot(), before)
+
+    def test_d4_schema23_activation_is_bound_to_the_exact_initial_session_request(self) -> None:
+        with TemporaryDirectory(prefix="evospec-d4-activation-") as temporary:
+            root = Path(temporary)
+            workflow, source = _create_d4_session_request_fixture(root)
+            self.assertEqual(json.loads((root / ".evospec" / "state.json").read_bytes())["schema"], 15)
+            before = {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*") if path.is_file()
+            }
+            assert source.initialization is not None
+            feature_id = str(source.features[0].id)
+
+            with self.assertRaises(WorkflowError):
+                workflow.activate_provisional_slice_writes(
+                    source.initialization.repository_id,
+                    "feature-not-the-initial-request",
+                    expected_revision=ExpectedRevision(source.revision),
+                )
+            self.assertEqual(before, {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*") if path.is_file()
+            })
+
+            source_bytes = (root / ".evospec" / "state.json").read_bytes()
+            enabled = workflow.activate_provisional_slice_writes(
+                source.initialization.repository_id,
+                feature_id,
+                expected_revision=ExpectedRevision(source.revision),
+            )
+            state = CoreService.open(root).recover()
+            self.assertEqual(enabled.code, "PROVISIONAL_SLICE_WRITES_ACTIVATED")
+            self.assertEqual(state.revision, source.revision + 1)
+            self.assertEqual(state.provisional_slice_revisions, ())
+            self.assertEqual(state.provisional_slice_heads, ())
+            self.assertEqual(
+                json.loads((root / ".evospec" / "state.json").read_bytes())["schema"],
+                23,
+            )
+            marker = state.provisional_slice_activation
+            self.assertIsNotNone(marker)
+            assert marker is not None
+            self.assertEqual(marker.marker, "D4_SCHEMA15_AUTO_FIRST")
+            self.assertEqual(marker.source_schema, 15)
+            self.assertEqual(marker.source_revision, source.revision)
+            self.assertEqual(marker.source_sha256, sha256(source_bytes).hexdigest())
+            self.assertEqual(marker.repository_id, source.initialization.repository_id)
+            self.assertEqual(marker.feature_id, source.features[0].id)
+            self.assertEqual(marker.recorded_revision, state.revision)
+            self.assertEqual(StateStore(root).load_state(), state)
+
+    def test_d4_core_proposals_create_supersede_replay_and_preserve_immutable_history(self) -> None:
+        with TemporaryDirectory(prefix="evospec-d4-proposals-") as temporary:
+            root = Path(temporary)
+            workflow, source = _create_d4_session_request_fixture(root)
+            assert source.initialization is not None
+            repository_id = source.initialization.repository_id
+            feature_id = str(source.features[0].id)
+            enabled = workflow.activate_provisional_slice_writes(
+                repository_id, feature_id,
+                expected_revision=ExpectedRevision(source.revision),
+            )
+            current = CoreService.open(root).recover()
+
+            def propose(
+                state: State,
+                expected_head: ProvisionalSliceHead | None,
+                *,
+                outcome: str = "Bounded proposed outcome",
+            ):
+                return workflow.propose_provisional_slice(
+                    repository_id,
+                    feature_id,
+                    expected_head,
+                    "Suggested next Slice",
+                    outcome,
+                    None,
+                    ("Keep scope bounded",),
+                    ("No acceptance is implied",),
+                    (),
+                    ("Confirm the final UI choice",),
+                    (ProvisionalSliceCriterion("c-1", "A bounded result", "A visible check"),),
+                    expected_revision=ExpectedRevision(state.revision),
+                )
+
+            first_result = propose(current, None)
+            first = CoreService.open(root).recover()
+            head1 = first.provisional_slice_heads[0]
+            revision1 = next(item for item in first.provisional_slice_revisions if item.revision_id == head1.revision_id)
+            record_path = root / ".evospec" / "records" / "provisional-slices" / f"{head1.revision_id}.json"
+            original_record = record_path.read_bytes()
+            self.assertEqual(first_result.code, "PROVISIONAL_SLICE_PROPOSED")
+            self.assertEqual(first.revision, enabled.revision + 1)
+            self.assertEqual(revision1.provenance, ProvisionalSliceProvenance("AGENT_SUGGESTION"))
+
+            replay_result = propose(first, None)
+            replay = CoreService.open(root).recover()
+            self.assertEqual(replay_result.revision, first.revision)
+            self.assertEqual(replay, first)
+
+            revised_result = propose(first, head1, outcome="Clarified bounded outcome")
+            revised = CoreService.open(root).recover()
+            head2 = revised.provisional_slice_heads[0]
+            self.assertEqual(revised_result.revision, first.revision + 1)
+            self.assertEqual(head2.proposal_id, head1.proposal_id)
+            self.assertEqual(head2.revision, 2)
+            self.assertEqual(head2.revision_id, f"{head1.proposal_id}-r2")
+            self.assertEqual(record_path.read_bytes(), original_record)
+            self.assertEqual(
+                {item.revision_id for item in revised.provisional_slice_revisions},
+                {head1.revision_id, head2.revision_id},
+            )
+            self.assertEqual(StateStore(root).load_state(), revised)
+
+    def test_d4_provisional_slice_publication_cas_is_process_safe(self) -> None:
+        with TemporaryDirectory(prefix="evospec-d4-process-cas-") as temporary:
+            root = Path(temporary)
+            workflow, source = _create_d4_session_request_fixture(root)
+            assert source.initialization is not None
+            repository_id = source.initialization.repository_id
+            feature_id = str(source.features[0].id)
+            workflow.activate_provisional_slice_writes(
+                repository_id,
+                feature_id,
+                expected_revision=ExpectedRevision(source.revision),
+            )
+            baseline = CoreService.open(root).recover()
+            context = multiprocessing.get_context("spawn")
+            barrier = context.Barrier(2)
+            outcomes = context.Queue()
+            processes = [
+                context.Process(
+                    target=_d4_competing_proposal_worker,
+                    args=(
+                        str(root),
+                        repository_id,
+                        feature_id,
+                        baseline.revision,
+                        title,
+                        barrier,
+                        outcomes,
+                    ),
+                )
+                for title in ("Concurrent proposal A", "Concurrent proposal B")
+            ]
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(25)
+            lingering = [process for process in processes if process.is_alive()]
+            for process in lingering:
+                process.terminate()
+                process.join()
+            self.assertFalse(lingering, "D4 CAS workers did not finish")
+            self.assertEqual([process.exitcode for process in processes], [0, 0])
+            results = [outcomes.get(timeout=5) for _ in processes]
+            outcomes.close()
+            outcomes.join_thread()
+
+            self.assertEqual(
+                sorted(result[0] for result in results),
+                ["committed", "stale"],
+            )
+            saved = CoreService.open(root).recover()
+            self.assertEqual(saved.revision, baseline.revision + 1)
+            self.assertEqual(len(saved.provisional_slice_heads), 1)
+            self.assertEqual(len(saved.provisional_slice_revisions), 1)
+            record_paths = tuple(
+                (root / ".evospec" / "records" / "provisional-slices").glob("*.json")
+            )
+            self.assertEqual(len(record_paths), 1)
+
+    def test_d4_proposal_validation_is_bounded_and_failed_state_commit_recovers_safely(self) -> None:
+        with TemporaryDirectory(prefix="evospec-d4-failure-") as temporary:
+            root = Path(temporary)
+            workflow, source = _create_d4_session_request_fixture(root)
+            assert source.initialization is not None
+            repository_id = source.initialization.repository_id
+            feature_id = str(source.features[0].id)
+            workflow.activate_provisional_slice_writes(
+                repository_id, feature_id,
+                expected_revision=ExpectedRevision(source.revision),
+            )
+            enabled = CoreService.open(root).recover()
+
+            with self.assertRaises(WorkflowError):
+                workflow.propose_provisional_slice(
+                    repository_id, feature_id, None, "é" * 1025,
+                    "Outcome", None, (), (), (), (), (),
+                    expected_revision=ExpectedRevision(enabled.revision),
+                )
+            self.assertEqual(CoreService.open(root).recover(), enabled)
+
+            failing_core = CoreService.open(root, _FailSecondProvisionalReplace())
+            with self.assertRaises(ServiceError):
+                failing_core.propose_provisional_slice(
+                    enabled,
+                    repository_id,
+                    feature_id,
+                    None,
+                    "Orphaned suggestion",
+                    "Bounded outcome",
+                    None,
+                    ("A bounded scope",),
+                    (),
+                    (),
+                    (),
+                    (ProvisionalSliceCriterion("c-1", "Result", "Evidence"),),
+                )
+            after_failure = CoreService.open(root).recover()
+            self.assertEqual(after_failure, enabled)
+            state_path = root / ".evospec" / "state.json"
+            self.assertEqual(json.loads(state_path.read_bytes())["provisional_slice_refs"], [])
+            orphan_paths = tuple((root / ".evospec" / "records" / "provisional-slices").glob("*.json"))
+            self.assertEqual(len(orphan_paths), 1)
+
+            recovered = CoreService.open(root).propose_provisional_slice(
+                after_failure,
+                repository_id,
+                feature_id,
+                None,
+                "Orphaned suggestion",
+                "Bounded outcome",
+                None,
+                ("A bounded scope",),
+                (),
+                (),
+                (),
+                (ProvisionalSliceCriterion("c-1", "Result", "Evidence"),),
+            )
+            self.assertEqual(recovered.revision, enabled.revision + 1)
+            self.assertEqual(len(recovered.provisional_slice_revisions), 1)
+            self.assertEqual(StateStore(root).load_state(), recovered)

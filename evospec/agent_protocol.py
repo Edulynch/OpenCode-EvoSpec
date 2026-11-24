@@ -36,6 +36,9 @@ from .agent_protocol_schema import (
     parse_lock_assessments,
     parse_nonblank_string,
     parse_nonblank_strings,
+    parse_provisional_slice_criteria,
+    parse_provisional_slice_head,
+    parse_provisional_slice_texts,
     parse_input_fingerprint,
     parse_input_snapshot,
     parse_narrowed_autonomy_envelope,
@@ -80,8 +83,9 @@ from .workflow import (
 
 def encode_success(
     result: WorkflowResult, context: AgentContext, *, include_continuation: bool = False,
+    persisted_schema: int | None = None,
 ) -> str:
-    payload = context_json(context)
+    payload = context_json(context, persisted_schema=persisted_schema)
     if include_continuation:
         payload["continuation"] = _continuation_json(project_continuation(context))
     return _encode({"result": _result_json(result), "context": payload})
@@ -465,7 +469,9 @@ def _continuation_json(summary: ContinuationSummary) -> dict[str, JsonValue]:
     }
 
 
-def context_json(context: AgentContext) -> dict[str, JsonValue]:
+def context_json(
+    context: AgentContext, *, persisted_schema: int | None = None,
+) -> dict[str, JsonValue]:
     """Return the stable JSON-safe representation of an agent context."""
     payload: dict[str, JsonValue] = {"revision": context.revision, "repository_id": context.repository_id, "initialization_state": context.initialization_state,
             "r3_schema_ready": context.r3_schema_ready,
@@ -482,6 +488,16 @@ def context_json(context: AgentContext) -> dict[str, JsonValue]:
                 "coverage_contract": R3B_COVERAGE_CONTRACT,
             },
             "e1_schema_ready": context.e1_schema_ready,
+            "provisional_slice_schema": persisted_schema,
+            "provisional_slice_read_ready": (
+                context.provisional_slice_inventory.availability == "AVAILABLE"
+            ),
+            "provisional_slice_activation_available": (
+                "activate_provisional_slice_writes" in context.legal_actions
+            ),
+            "provisional_slice_write_ready": (
+                "propose_provisional_slice" in context.legal_actions
+            ),
             "accepted_slice": _accepted_slice_json(context.accepted_slice),
             "slice_acceptance_inventory": _slice_acceptance_inventory_json(context),
             "provisional_slice_inventory": _provisional_slice_inventory_json(
@@ -713,9 +729,14 @@ def execute(root: Path, payload: str) -> str:
             return encode_success(
                 workflow.status(inspection.state), project_context(workflow, inspection),
                 include_continuation=True,
+                persisted_schema=inspection.persisted_schema,
             )
         result = _dispatch(workflow, request)
-        return encode_success(result, project_context(workflow))
+        inspection = workflow.inspect_locks()
+        return encode_success(
+            result, project_context(workflow, inspection),
+            persisted_schema=inspection.persisted_schema,
+        )
     except ProtocolError as error:
         return encode_error("INVALID_REQUEST", str(error))
     except StaleRevisionError as error:
@@ -750,7 +771,7 @@ def _execute_autonomy_evaluation(
                 "authorization": evaluation.authorization.value,
                 "reason": evaluation.reason,
             },
-            "context": context_json(context),
+            "context": context_json(context, persisted_schema=inspection.persisted_schema),
         }
     )
 
@@ -866,6 +887,27 @@ def _dispatch(
                 parse_nonblank_string(request, "checkpoint"),
                 parse_nonblank_string(request, "statement"),
                 parse_nonblank_strings(request, "evidence_refs"),
+                expected_revision=parse_expected_revision(request),
+            )
+        case "activate_provisional_slice_writes":
+            return workflow.activate_provisional_slice_writes(
+                parse_nonblank_string(request, "repository_id"),
+                parse_nonblank_string(request, "feature_id"),
+                expected_revision=parse_expected_revision(request),
+            )
+        case "propose_provisional_slice":
+            return workflow.propose_provisional_slice(
+                parse_nonblank_string(request, "repository_id"),
+                parse_nonblank_string(request, "feature_id"),
+                parse_provisional_slice_head(request),
+                parse_nonblank_string(request, "title"),
+                parse_nonblank_string(request, "outcome"),
+                parse_optional_string(request, "example"),
+                parse_provisional_slice_texts(request, "inclusions"),
+                parse_provisional_slice_texts(request, "exclusions"),
+                parse_provisional_slice_texts(request, "considerations"),
+                parse_provisional_slice_texts(request, "open_questions"),
+                parse_provisional_slice_criteria(request),
                 expected_revision=parse_expected_revision(request),
             )
         case "criterion_test_result":

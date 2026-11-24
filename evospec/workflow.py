@@ -52,6 +52,8 @@ from .domain import (
     LockRelease,
     Observation,
     ObservationId,
+    ProvisionalSliceCriterion,
+    ProvisionalSliceHead,
     RepositoryInitialization,
     RepositoryPath,
     ReviewEvidence,
@@ -77,7 +79,6 @@ from .domain import (
     WorkId,
     WorkRelation,
     WorkRelationKind,
-    inspect,
     validate_assessment_authority,
     validate_convergence_assessment_authority,
 )
@@ -220,6 +221,71 @@ class WorkflowService:
         return self._result(
             "SESSION_SLICE_RECORDED", saved,
             "session request persisted with provenance and bounded single-file work; criteria not yet accepted",
+        )
+
+    def activate_provisional_slice_writes(
+        self, repository_id: str, feature_id: str, *,
+        expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        """Record the exact D4 schema-15 opt-in, not a human acceptance or permission."""
+        state = self._mutation_state(expected_revision)
+        guidance = for_action(
+            self._inspection_for_state(state), Action.ACTIVATE_PROVISIONAL_SLICE_WRITES,
+        )
+        if not guidance.allowed:
+            return self._result(
+                guidance.reason_code or "LIFECYCLE_UNAVAILABLE", state, guidance.message,
+            )
+        already_active = state.provisional_slice_activation is not None
+        try:
+            saved = self.__core.activate_provisional_slice_writes(
+                state, repository_id, feature_id,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        return self._result(
+            "PROVISIONAL_SLICE_WRITES_ALREADY_ACTIVE" if already_active
+            else "PROVISIONAL_SLICE_WRITES_ACTIVATED",
+            saved,
+            "D4 provisional Slice suggestions enabled by exact initial SESSION_REQUEST lineage",
+        )
+
+    def propose_provisional_slice(
+        self,
+        repository_id: str,
+        feature_id: str,
+        expected_head: ProvisionalSliceHead | None,
+        title: str,
+        outcome: str,
+        example: str | None,
+        inclusions: tuple[str, ...],
+        exclusions: tuple[str, ...],
+        considerations: tuple[str, ...],
+        open_questions: tuple[str, ...],
+        criteria: tuple[ProvisionalSliceCriterion, ...],
+        *,
+        expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        """Record one Core-validated agent suggestion without accepting the Slice."""
+        state = self._mutation_state(expected_revision)
+        guidance = for_action(
+            self._inspection_for_state(state), Action.PROPOSE_PROVISIONAL_SLICE,
+        )
+        if not guidance.allowed:
+            return self._result(
+                guidance.reason_code or "LIFECYCLE_UNAVAILABLE", state, guidance.message,
+            )
+        try:
+            saved = self.__core.propose_provisional_slice(
+                state, repository_id, feature_id, expected_head, title, outcome,
+                example, inclusions, exclusions, considerations, open_questions,
+                criteria,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        return self._result(
+            "PROVISIONAL_SLICE_PROPOSED", saved,
+            "bounded provisional Slice suggestion persisted; accepted authority was not changed",
         )
 
     def request_scoped_objective_status(
@@ -1199,7 +1265,7 @@ class WorkflowService:
     def activate_work(self, work_id: str, *, expected_revision: ExpectedRevision) -> WorkflowResult:
         state = self._queue_state(expected_revision)
         guidance = for_action(
-            inspect(state),
+            self._inspection_for_state(state),
             Action.ACTIVATE_WORK,
             queue_activation_available=self.__core.next_actionable(state).code in ("SELECTED", "AMBIGUOUS"),
         )
@@ -2254,7 +2320,7 @@ class WorkflowService:
     ) -> WorkflowResult | None:
         """Apply canonical intake guidance after compound facade routes are considered."""
         action = Action.NEW if operation is IntakeOperation.NEW else Action.CHANGE
-        guidance = for_action(inspect(state), action)
+        guidance = for_action(self._inspection_for_state(state), action)
         if guidance.allowed and state.pending_capability_selection is not None:
             return self._result(
                 "PENDING_CAPABILITY_SELECTION",
@@ -2280,12 +2346,21 @@ class WorkflowService:
     ) -> tuple[State, WorkflowResult | None]:
         """Bind revision authority, then return pure guidance before any Core mutation."""
         state = self._mutation_state(expected_revision)
-        guidance = for_action(inspect(state), action)
+        guidance = for_action(self._inspection_for_state(state), action)
         if guidance.allowed:
             return state, None
         return state, self._result(
             guidance.reason_code or "LIFECYCLE_UNAVAILABLE", state, guidance.message
         )
+
+    def _inspection_for_state(self, state: State) -> ReviewInspection:
+        """Bind persisted-schema guidance to the exact State selected for preflight."""
+        inspection = self.__core.inspect_review()
+        if inspection.state != state:
+            if inspection.state.revision != state.revision:
+                raise StaleRevisionError(state.revision, inspection.state.revision)
+            raise WorkflowError("State changed during preflight without a revision advance")
+        return inspection
 
     def _result(self, code: str, state: State, message: str, questions: tuple[ClarificationQuestion, ...] = ()) -> WorkflowResult:
         context = state.active_context
