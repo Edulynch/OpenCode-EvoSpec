@@ -153,6 +153,8 @@ class DashboardTests(unittest.TestCase):
         node = shutil.which("node")
         if node is None:
             self.skipTest("Node.js is required for the dependency-free dashboard UI regressions")
+        from tests.test_persistence import _ProvisionalSliceTestHarness, _make_provisional_revision
+
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             workflow = WorkflowService.open(root)
@@ -163,15 +165,23 @@ class DashboardTests(unittest.TestCase):
                 FEATURE, SLICE, TASK, CHECKPOINT, _provenance(statement),
                 expected_revision=ExpectedRevision(initial.revision), criteria=criteria,
             )
+            state = CoreService.open(root).recover()
+            proposal = _make_provisional_revision(state, title="Read-only dashboard proposal")
+            saved = _ProvisionalSliceTestHarness(root).publish(state, proposal, None)
             before = self._files(root)
             server, thread, base = self._start_server(root)
             try:
-                with urlopen(f"{base}/api/context") as response:
-                    self.assertEqual(response.status, 200)
-                    context = json.loads(response.read())
+                contexts = []
+                for _ in range(3):
+                    with urlopen(f"{base}/api/context") as response:
+                        self.assertEqual(response.status, 200)
+                        contexts.append(json.loads(response.read()))
+                context = contexts[0]
             finally:
                 self._stop_server(server, thread)
             self.assertEqual(self._files(root), before)
+            self.assertEqual(CoreService.open(root).recover(), saved)
+            self.assertTrue(all(snapshot == context for snapshot in contexts))
             accepted = context["accepted_slice"]
             self.assertEqual(accepted["feature_title"], FEATURE)
             self.assertEqual(accepted["slice_title"], SLICE)
@@ -189,6 +199,15 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(inventory["history_scope"], "AGREEMENT_RECORDS_ONLY_NONEXHAUSTIVE")
             self.assertEqual(inventory["items"][0]["slice_agreement_ref"], accepted["slice_agreement_ref"])
             self.assertEqual(inventory["items"][0]["criteria_revision"]["id"], accepted["criteria_revision"]["id"])
+            provisional = context["provisional_slice_inventory"]
+            self.assertEqual(provisional["source"], "CORE_PROVISIONAL_SLICE_HEADS")
+            self.assertEqual(provisional["availability"], "AVAILABLE")
+            self.assertEqual(provisional["total"], 1)
+            self.assertTrue(provisional["complete"])
+            self.assertFalse(provisional["truncated"])
+            self.assertEqual(provisional["items"][0]["proposal_id"], proposal.proposal_id)
+            self.assertEqual(provisional["items"][0]["head"]["revision_id"], proposal.revision_id)
+            self.assertEqual(provisional["items"][0]["title"], "Read-only dashboard proposal")
             environment = os.environ.copy()
             environment["EVOSPEC_DASHBOARD_ACCEPTANCE_CONTEXT"] = json.dumps(context, separators=(",", ":"))
             completed = subprocess.run(
@@ -525,6 +544,18 @@ class DashboardTests(unittest.TestCase):
       require(document.querySelector('#load-status').textContent.trim() === "Live", "a connected event stream must use the simple Live status");
     });
 
+    check("proposals remain visibly provisional and separate from agreements", () => {
+      const panel = document.querySelector(".provisional-slice-panel");
+      const proposal = document.querySelector(".provisional-slice");
+      require(panel && proposal, "the read-only proposal panel and current head must render");
+      require(panel.textContent.includes("Provisional proposals"), "proposal content must have a distinct heading");
+      require(panel.textContent.includes("User-expressed — not approval"), "user expression must not imply approval");
+      require(proposal.querySelector(".status-label")?.textContent.trim() === "Provisional", "proposal status must remain provisional");
+      require(proposal.textContent.includes("The proposed result is visible"), "proposal expected results must be readable");
+      require(!document.querySelector(".acceptance-slice .provisional-slice"), "proposals must not be rendered as agreed Slices");
+      require(!proposal.querySelector("button, input, a, [role=checkbox]"), "proposals must not offer an acceptance action");
+    });
+
     const previousFetchCount = window.__dashboardTest.fetchCalls.length;
     click(document.querySelector("#refresh-context"));
     await sleep(20);
@@ -662,6 +693,7 @@ class DashboardTests(unittest.TestCase):
             "total": 6,
             "relations": [],
         }
+        proposal_id = "ps-" + "b" * 64
         linked: dict[str, object] = {
             "revision": 101,
             "repository_id": "repository-dashboard-fixture",
@@ -674,6 +706,31 @@ class DashboardTests(unittest.TestCase):
                 "truncated": False,
                 "history_scope": "AGREEMENT_RECORDS_ONLY_NONEXHAUSTIVE",
                 "items": [],
+            },
+            "provisional_slice_inventory": {
+                "source": "CORE_PROVISIONAL_SLICE_HEADS",
+                "availability": "AVAILABLE",
+                "total": 1,
+                "complete": True,
+                "truncated": False,
+                "items": [{
+                    "proposal_id": proposal_id,
+                    "repository_id": "repository-dashboard-fixture",
+                    "feature_id": "feature-provisional-unmatched",
+                    "title": "Read-only provisional dashboard proposal",
+                    "status": "PROVISIONAL",
+                    "provenance": "USER_EXPRESSED",
+                    "head": {
+                        "revision_id": f"{proposal_id}-r1",
+                        "revision": 1,
+                        "digest": "a" * 64,
+                    },
+                    "criteria": [{
+                        "id": "c-1",
+                        "expected_result": "The proposed result is visible",
+                        "expected_evidence": "private-browser-proposal-evidence",
+                    }],
+                }],
             },
             "accepted_capabilities": capabilities,
             "accepted_capabilities_complete": True,

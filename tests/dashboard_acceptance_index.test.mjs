@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import test from "node:test"
 import { readFile } from "node:fs/promises"
 import { runInNewContext } from "node:vm"
@@ -163,6 +164,47 @@ function makeResponse(context, ok = true) {
   return { ok, status: ok ? 200 : 500, json: async () => context }
 }
 
+const formattedProposalId = (seed) => `ps-${createHash("sha256").update(seed).digest("hex")}`
+
+function makeProvisionalItem({
+  proposalId = formattedProposalId("proposal-private"),
+  featureId = "feature-1",
+  repositoryId = "private-repository-id",
+  title = "Future Slice",
+  provenance = "AGENT_SUGGESTION",
+  expectedResult = "The proposed result is visible",
+  headRevision = 1,
+} = {}) {
+  return {
+    proposal_id: proposalId,
+    repository_id: repositoryId,
+    feature_id: featureId,
+    title,
+    status: "PROVISIONAL",
+    provenance,
+    head: { revision_id: `${proposalId}-r${headRevision}`, revision: headRevision, digest: "a".repeat(64) },
+    criteria: [{
+      id: "c-1",
+      expected_result: expectedResult,
+      expected_evidence: "private-proposal-evidence",
+    }],
+  }
+}
+
+function makeProvisionalInventory(items = [], overrides = {}) {
+  const total = overrides.total ?? items.length
+  const truncated = overrides.truncated ?? false
+  return {
+    source: "CORE_PROVISIONAL_SLICE_HEADS",
+    availability: "AVAILABLE",
+    total,
+    complete: !truncated,
+    truncated,
+    items,
+    ...overrides,
+  }
+}
+
 function makeDashboard(fetcher) {
   const ids = new Map([
     "load-status", "project-summary", "refresh-context", "current-work-section", "current-work-title",
@@ -298,6 +340,13 @@ test("renders Feature, active Slice, and current criteria from the canonical GET
   assert.ok(content.includes(accepted.feature_title))
   assert.ok(content.includes(accepted.slice_title))
   assert.ok(content.includes(`Agreed outcome: ${accepted.criteria_revision.outcome}`))
+  const provisional = context.provisional_slice_inventory
+  assert.equal(provisional?.source, "CORE_PROVISIONAL_SLICE_HEADS")
+  assert.equal(provisional?.availability, "AVAILABLE")
+  assert.ok(provisional.items.length > 0)
+  assert.ok(content.includes("Provisional proposals"))
+  assert.ok(content.includes(provisional.items[0].title))
+  assert.ok(content.includes("Provisional"))
   assert.deepEqual(criterionRows(app).map(rowResult), accepted.criteria_revision.criteria.map((criterion) => criterion.expected_result))
   assert.equal(criterionRows(app).length, accepted.criteria_revision.criteria.length)
   assert.deepEqual(criterionRows(app).map(rowStatus), accepted.criteria_revision.criteria.map(() => "Pending verification"))
@@ -771,7 +820,17 @@ test("repository identity changes discard stale responses and stale errors befor
   const latest = new Promise((resolve) => { resolveLatest = resolve })
   const initial = makeContext({ revision: 19, featureTitle: "Prior root", outcome: "CURRENT" })
   const current = makeContext({ revision: 2, featureTitle: "New root", sliceTitle: "New-root Slice", outcome: "READY" })
+  initial.provisional_slice_inventory = makeProvisionalInventory([
+    makeProvisionalItem({ proposalId: formattedProposalId("prior-root-proposal"), title: "Prior-root proposal" }),
+  ])
   current.repository_id = "repository-new"
+  current.provisional_slice_inventory = makeProvisionalInventory([
+    makeProvisionalItem({
+      proposalId: formattedProposalId("new-root-proposal"),
+      repositoryId: "repository-new",
+      title: "New-root proposal",
+    }),
+  ])
   const app = makeDashboard((_url, _options, requestNumber) => {
     if (requestNumber === 1) return Promise.resolve(makeResponse(initial))
     if (requestNumber === 2) return staleError
@@ -784,6 +843,7 @@ test("repository identity changes discard stale responses and stale errors befor
   await waitFor(() => app.fetchCalls.length === 2)
   source.emit("revision", { data: JSON.stringify({ repository_id: "repository-new", revision: 2 }) })
   assert.equal(app.ids.get("active-slice-status").textContent, "Updating")
+  assert.equal(app.ids.get("active-slice-content").textContent.includes("Prior-root proposal"), false)
   resolveStaleError(makeResponse({}, false))
   await waitFor(() => app.fetchCalls.length === 3)
   assert.equal(app.ids.get("active-slice-status").textContent, "Updating")
@@ -792,6 +852,7 @@ test("repository identity changes discard stale responses and stale errors befor
   await waitFor(() => app.ids.get("active-slice-status").textContent === "Ready for acceptance")
   const content = app.ids.get("active-slice-content").textContent
   assert.ok(content.includes("New root"))
+  assert.ok(content.includes("New-root proposal"))
   assert.equal(content.includes("Prior root"), false)
 })
 
@@ -869,4 +930,198 @@ test("manual refresh and revision events make only read-only GET requests", asyn
   await waitFor(() => app.ids.get("active-slice-status").textContent === "Slice accepted")
   assert.ok(app.fetchCalls.every((call) => call.url === "/api/context" && call.options.method === undefined))
   assert.ok(app.fetchCalls.every((call) => call.options.headers.Accept === "application/json"))
+})
+
+test("provisional heads are safe, distinct from agreements, and associated only by canonical identity", async () => {
+  const context = makeContext({ outcome: "READY" })
+  context.provisional_slice_inventory = makeProvisionalInventory([
+    makeProvisionalItem({
+      proposalId: formattedProposalId("proposal-agent-private"),
+      title: "<img src=x onerror=alert(1)>",
+      expectedResult: "<script>alert(1)</script>",
+    }),
+    makeProvisionalItem({
+      proposalId: formattedProposalId("proposal-user-private"),
+      title: "<img src=x onerror=alert(1)>",
+      provenance: "USER_EXPRESSED",
+    }),
+    makeProvisionalItem({
+      proposalId: formattedProposalId("proposal-unmatched-private"),
+      featureId: "feature-without-agreement",
+      title: "Unmatched proposal",
+    }),
+    makeProvisionalItem({
+      proposalId: formattedProposalId("proposal-foreign-private"),
+      repositoryId: "another-repository",
+      title: "Foreign proposal",
+    }),
+  ])
+  const app = await loadedDashboard(context)
+  const content = app.ids.get("active-slice-content")
+  const panel = descendants(content).find((element) => element.className.split(/\s+/).includes("provisional-slice-panel"))
+  const proposals = descendants(content).filter((element) => element.className === "provisional-slice")
+  const groups = descendants(content).filter((element) => element.className.split(/\s+/).includes("provisional-feature-group"))
+
+  assert.ok(panel)
+  assert.equal(proposals.length, 3, "duplicate titles remain separate and foreign-root proposals are omitted")
+  assert.equal(groups.length, 2, "matched and unmatched proposal groups remain separate")
+  assert.ok(groups.some((group) => group.textContent.includes("Personal task list")))
+  assert.ok(groups.some((group) => group.textContent.includes("Unmatched Feature proposals")))
+  assert.equal(proposals.filter((proposal) => proposal.textContent.includes("<img src=x onerror=alert(1)>")).length, 2)
+  assert.ok(proposals[0].textContent.includes("<script>alert(1)</script>"))
+  assert.equal(descendants(panel).some((element) => ["img", "script"].includes(element.tagName)), false)
+  assert.equal(panel.textContent.includes("private-proposal-evidence"), false)
+  assert.equal(panel.textContent.includes(context.provisional_slice_inventory.items[0].proposal_id), false)
+  assert.equal(panel.textContent.includes(context.provisional_slice_inventory.items[0].head.revision_id), false)
+  assert.equal(panel.textContent.includes("a".repeat(64)), false)
+  assert.ok(panel.textContent.includes("Suggested by agent"))
+  assert.ok(panel.textContent.includes("User-expressed — not approval"))
+  assert.ok(descendants(panel).filter((element) => element.className === "status-label").every((status) => status.textContent === "Provisional"))
+  assert.equal(descendants(content).filter((element) => element.className === "acceptance-slice").length, 1)
+  assert.equal(app.ids.get("active-slice-status").textContent, "Ready for acceptance")
+})
+
+test("invalid proposal IDs and mismatched head revision IDs are omitted without hiding agreements", async () => {
+  const context = makeContext({ outcome: "READY" })
+  const invalidProposalId = makeProvisionalItem({
+    proposalId: "ps-not-a-canonical-id",
+    title: "Invalid proposal ID",
+  })
+  const mismatchedHead = makeProvisionalItem({
+    proposalId: formattedProposalId("mismatched-head"),
+    headRevision: 2,
+    title: "Mismatched head revision",
+  })
+  mismatchedHead.head.revision_id = `${mismatchedHead.proposal_id}-r3`
+  const terminalLineTerminator = makeProvisionalItem({
+    proposalId: `${formattedProposalId("terminal-line-terminator")}\n`,
+    title: "Trailing LF proposal ID",
+  })
+  const currentHead = makeProvisionalItem({
+    proposalId: formattedProposalId("canonical-current-head"),
+    headRevision: 2,
+    title: "Canonical current head",
+  })
+  context.provisional_slice_inventory = makeProvisionalInventory([
+    invalidProposalId,
+    mismatchedHead,
+    terminalLineTerminator,
+    currentHead,
+  ])
+
+  const app = await loadedDashboard(context)
+  const content = app.ids.get("active-slice-content")
+  const proposals = descendants(content).filter((element) => element.className === "provisional-slice")
+  assert.deepEqual(proposals.map((proposal) => proposal.textContent).filter((text) => text.includes("Canonical current head")).length, 1)
+  assert.equal(proposals.length, 1)
+  assert.ok(content.textContent.includes("Some provisional proposals were foreign or malformed"))
+  assert.equal(content.textContent.includes("Invalid proposal ID"), false)
+  assert.equal(content.textContent.includes("Mismatched head revision"), false)
+  assert.equal(content.textContent.includes("Trailing LF proposal ID"), false)
+  assert.equal(content.textContent.includes("Saved tasks reappear after reopening"), true)
+  assert.equal(descendants(content).filter((element) => element.className === "acceptance-slice").length, 1)
+  assert.equal(app.ids.get("active-slice-status").textContent, "Ready for acceptance")
+})
+
+test("provisional availability, legacy, truncation, and malformed entries remain explicit", async () => {
+  const legacy = makeContext()
+  delete legacy.provisional_slice_inventory
+  assert.ok((await loadedDashboard(legacy)).ids.get("active-slice-content").textContent.includes("older context schema"))
+
+  const empty = makeContext()
+  empty.provisional_slice_inventory = makeProvisionalInventory()
+  assert.ok((await loadedDashboard(empty)).ids.get("active-slice-content").textContent.includes("No provisional proposals"))
+
+  for (const [availability, message] of [
+    ["UNINITIALIZED", "not initialized"],
+    ["UNAVAILABLE", "unavailable"],
+  ]) {
+    const context = makeContext()
+    context.provisional_slice_inventory = {
+      source: "CORE_PROVISIONAL_SLICE_HEADS",
+      availability,
+      total: 0,
+      complete: false,
+      truncated: false,
+      items: [],
+    }
+    assert.ok((await loadedDashboard(context)).ids.get("active-slice-content").textContent.toLowerCase().includes(message))
+  }
+
+  const partial = makeContext()
+  const valid = makeProvisionalItem({ proposalId: formattedProposalId("valid-partial") })
+  const malformed = makeProvisionalItem({ proposalId: formattedProposalId("malformed-partial") })
+  malformed.head.digest = "not-a-digest"
+  partial.provisional_slice_inventory = makeProvisionalInventory([valid, malformed])
+  const partialApp = await loadedDashboard(partial)
+  assert.equal(descendants(partialApp.ids.get("active-slice-content")).filter((element) => element.className === "provisional-slice").length, 1)
+  assert.ok(partialApp.ids.get("active-slice-content").textContent.includes("Some provisional proposals were foreign or malformed"))
+  assert.ok(partialApp.ids.get("active-slice-content").textContent.includes("Ready for acceptance"))
+
+  const truncated = makeContext()
+  const items = Array.from({ length: 32 }, (_, index) => makeProvisionalItem({
+    proposalId: formattedProposalId(`proposal-${index}`),
+    title: `Proposal ${index}`,
+  }))
+  truncated.provisional_slice_inventory = makeProvisionalInventory(items, {
+    total: 33,
+    complete: false,
+    truncated: true,
+  })
+  const truncatedApp = await loadedDashboard(truncated)
+  assert.equal(descendants(truncatedApp.ids.get("active-slice-content")).filter((element) => element.className === "provisional-slice").length, 32)
+  assert.ok(truncatedApp.ids.get("active-slice-content").textContent.includes("truncated"))
+
+  const malformedEnvelope = makeContext()
+  malformedEnvelope.provisional_slice_inventory = makeProvisionalInventory([valid], { source: "UNKNOWN" })
+  const malformedApp = await loadedDashboard(malformedEnvelope)
+  assert.equal(descendants(malformedApp.ids.get("active-slice-content")).some((element) => element.className === "provisional-slice"), false)
+  assert.ok(malformedApp.ids.get("active-slice-content").textContent.includes("not available in a recognized Core projection"))
+})
+
+test("SSE revision drops stale provisional heads before refetch, and request errors do not retain them", async () => {
+  let resolveStale
+  let resolveLatest
+  let rejectRefresh
+  const stale = new Promise((resolve) => { resolveStale = resolve })
+  const latest = new Promise((resolve) => { resolveLatest = resolve })
+  const failedRefresh = new Promise((_resolve, reject) => { rejectRefresh = reject })
+  const initial = makeContext({ revision: 19 })
+  initial.provisional_slice_inventory = makeProvisionalInventory([
+    makeProvisionalItem({ proposalId: formattedProposalId("old-proposal"), title: "Old proposal" }),
+  ])
+  const staleContext = makeContext({ revision: 20 })
+  staleContext.provisional_slice_inventory = makeProvisionalInventory([
+    makeProvisionalItem({ proposalId: formattedProposalId("stale-proposal"), title: "Stale proposal" }),
+  ])
+  const current = makeContext({ revision: 21 })
+  current.provisional_slice_inventory = makeProvisionalInventory([
+    makeProvisionalItem({ proposalId: formattedProposalId("current-proposal"), title: "Current proposal" }),
+  ])
+  const app = makeDashboard((_url, _options, requestNumber) => {
+    if (requestNumber === 1) return Promise.resolve(makeResponse(initial))
+    if (requestNumber === 2) return stale
+    if (requestNumber === 3) return latest
+    if (requestNumber === 4) return failedRefresh
+    throw new Error("unexpected extra context request")
+  })
+  await waitFor(() => app.ids.get("active-slice-content").textContent.includes("Old proposal"))
+  const source = app.sources[0]
+  source.emit("open")
+  await waitFor(() => app.fetchCalls.length === 2)
+  source.emit("revision", { data: JSON.stringify({ revision: 21 }) })
+  assert.equal(app.ids.get("active-slice-content").textContent.includes("Old proposal"), false)
+  assert.equal(app.ids.get("active-slice-content").textContent.includes("stale-proposal"), false)
+
+  resolveStale(makeResponse(staleContext))
+  await waitFor(() => app.fetchCalls.length === 3)
+  assert.equal(app.ids.get("active-slice-content").textContent.includes("Stale proposal"), false)
+  resolveLatest(makeResponse(current))
+  await waitFor(() => app.ids.get("active-slice-content").textContent.includes("Current proposal"))
+
+  app.ids.get("refresh-context").click()
+  await waitFor(() => app.fetchCalls.length === 4)
+  rejectRefresh(new Error("context unavailable"))
+  await waitFor(() => app.ids.get("active-slice-status").textContent === "Status unavailable")
+  assert.equal(app.ids.get("active-slice-content").textContent.includes("Current proposal"), false)
 })

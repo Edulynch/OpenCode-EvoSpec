@@ -21,6 +21,8 @@
   let displayedRepositoryId;
   let signaledRevision = null;
   let signaledRepositoryId;
+  let provisionalSlicePanel;
+  let acceptanceFeatureTitles = new Map();
   const objectValue = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const arrayValue = (value) => Array.isArray(value) ? value : [];
   const textValue = (value, fallback = "Not available") => value === null || value === undefined || value === "" ? fallback : String(value);
@@ -384,6 +386,7 @@
         group.items.forEach((item) => appendAcceptanceSlice(article, item, item === activeItem, context));
         elements.activeSliceContent.append(article);
       });
+    groups.forEach((group, key) => acceptanceFeatureTitles.set(key, group.title));
     if (unassociated.length) {
       const article = create("article", "acceptance-unassociated");
       article.append(create("h3", "", "Unassociated Slice records"));
@@ -656,8 +659,191 @@
   }
 
   function renderAcceptanceIndex(context) {
+    provisionalSlicePanel = undefined;
+    acceptanceFeatureTitles = new Map();
     acceptanceStatuses = [];
     acceptanceInventory(context);
+  }
+
+  function provisionalInventoryMessage(message) {
+    provisionalSlicePanel.append(create("p", "empty-state", message));
+  }
+
+  function renderProvisionalItem(container, item) {
+    const proposal = create("article", "provisional-slice");
+    proposal.append(create("h4", "provisional-slice-title", item.title.trim()));
+    const status = create("span", "status-label", "Provisional");
+    status.dataset.status = "waiting";
+    proposal.append(status);
+    const provenance = item.provenance === "USER_EXPRESSED"
+      ? "User-expressed — not approval"
+      : "Suggested by agent";
+    proposal.append(create("p", "provisional-slice-provenance", provenance));
+    proposal.append(create("h5", "provisional-criteria-heading", "Expected results"));
+    const results = create("ul");
+    item.criteria.forEach((criterion) => results.append(
+      create("li", "provisional-criterion-result", criterion.expected_result.trim())
+    ));
+    proposal.append(results);
+    container.append(proposal);
+  }
+
+  function renderProvisionalInventory(context) {
+    provisionalSlicePanel = create("section", "active-slice-section provisional-slice-panel");
+    provisionalSlicePanel.append(create("h3", "provisional-slice-heading", "Provisional proposals"));
+    provisionalSlicePanel.append(create(
+      "p",
+      "active-slice-note",
+      "Read-only proposals are not agreed Slices and do not change acceptance.",
+    ));
+    elements.activeSliceContent.append(provisionalSlicePanel);
+
+    if (context.dashboard_error) {
+      provisionalInventoryMessage("Proposals could not be loaded with the project context.");
+      return;
+    }
+    if (!Object.prototype.hasOwnProperty.call(context, "provisional_slice_inventory")) {
+      provisionalInventoryMessage("Proposals are not exposed by this older context schema.");
+      return;
+    }
+
+    const inventory = objectValue(context.provisional_slice_inventory);
+    const unavailable = () => provisionalInventoryMessage(
+      "The provisional proposal inventory is not available in a recognized Core projection.",
+    );
+    if (
+      inventory.source !== "CORE_PROVISIONAL_SLICE_HEADS"
+      || !["AVAILABLE", "UNINITIALIZED", "UNAVAILABLE"].includes(inventory.availability)
+      || !Number.isSafeInteger(inventory.total) || inventory.total < 0
+      || typeof inventory.complete !== "boolean"
+      || typeof inventory.truncated !== "boolean"
+      || !Array.isArray(inventory.items)
+      || inventory.items.length > 32
+      || inventory.items.length > inventory.total
+    ) {
+      unavailable();
+      return;
+    }
+    if (inventory.availability !== "AVAILABLE") {
+      if (
+        inventory.total !== 0 || inventory.complete !== false
+        || inventory.truncated !== false || inventory.items.length !== 0
+      ) {
+        unavailable();
+        return;
+      }
+      provisionalInventoryMessage(
+        inventory.availability === "UNINITIALIZED"
+          ? "Provisional proposal storage is not initialized."
+          : "Provisional proposals are unavailable; no proposal head is inferred.",
+      );
+      return;
+    }
+
+    const truncated = inventory.total > 32;
+    if (
+      inventory.truncated !== truncated
+      || inventory.complete === truncated
+      || inventory.items.length !== Math.min(inventory.total, 32)
+    ) {
+      unavailable();
+      return;
+    }
+    if (!inventory.items.length) {
+      provisionalInventoryMessage("No provisional proposals are recorded.");
+      return;
+    }
+    const repositoryId = context.repository_id;
+    if (typeof repositoryId !== "string" || !repositoryId.trim()) {
+      provisionalInventoryMessage("Repository identity is unavailable; provisional proposals are hidden.");
+      return;
+    }
+
+    const proposals = [];
+    const proposalIds = new Set();
+    let omitted = false;
+    inventory.items.forEach((value) => {
+      const item = objectValue(value);
+      const head = objectValue(item.head);
+      const criteria = Array.isArray(item.criteria) ? item.criteria.map(objectValue) : [];
+      const criterionIds = criteria.map((criterion) => criterion.id);
+      const valid = typeof item.proposal_id === "string" && item.proposal_id.trim()
+        && /^ps-[0-9a-f]{64}$/.test(item.proposal_id)
+        && item.repository_id === repositoryId
+        && typeof item.feature_id === "string" && item.feature_id.trim()
+        && typeof item.title === "string" && item.title.trim()
+        && item.status === "PROVISIONAL"
+        && ["AGENT_SUGGESTION", "USER_EXPRESSED"].includes(item.provenance)
+        && typeof head.revision_id === "string" && head.revision_id.trim()
+        && Number.isSafeInteger(head.revision) && head.revision >= 1
+        && head.revision_id === `${item.proposal_id}-r${head.revision}`
+        && typeof head.digest === "string" && /^[0-9a-f]{64}$/.test(head.digest)
+        && criteria.length > 0
+        && criteria.every((criterion) =>
+          typeof criterion.id === "string" && criterion.id.trim()
+          && typeof criterion.expected_result === "string" && criterion.expected_result.trim()
+          && typeof criterion.expected_evidence === "string" && criterion.expected_evidence.trim()
+        )
+        && new Set(criterionIds).size === criterionIds.length
+        && !proposalIds.has(item.proposal_id);
+      if (!valid) {
+        omitted = true;
+        return;
+      }
+      proposalIds.add(item.proposal_id);
+      proposals.push({ ...item, criteria });
+    });
+
+    if (inventory.truncated) {
+      provisionalInventoryMessage("This proposal inventory is truncated; additional current heads are not shown.");
+    }
+    if (omitted) {
+      provisionalInventoryMessage("Some provisional proposals were foreign or malformed and could not be displayed.");
+    }
+    const matched = new Map();
+    const unmatched = [];
+    proposals.forEach((item) => {
+      const key = `${item.repository_id}\u0000${item.feature_id}`;
+      const featureTitle = acceptanceFeatureTitles.get(key);
+      if (!featureTitle) {
+        unmatched.push(item);
+        return;
+      }
+      if (!matched.has(key)) matched.set(key, { title: featureTitle, items: [] });
+      matched.get(key).items.push(item);
+    });
+    matched.forEach((group) => {
+      const article = create("article", "acceptance-feature-group provisional-feature-group");
+      article.append(create("p", "eyebrow", "Proposals for agreed Feature"));
+      article.append(create("h4", "acceptance-feature-title provisional-feature-title", group.title));
+      group.items.forEach((item) => renderProvisionalItem(article, item));
+      provisionalSlicePanel.append(article);
+    });
+    if (unmatched.length) {
+      const article = create("article", "acceptance-feature-group provisional-feature-group");
+      article.append(create("p", "eyebrow", "Unmatched Feature proposals"));
+      article.append(create(
+        "p",
+        "active-slice-note",
+        "No canonical Feature association is available; proposals are not matched by title.",
+      ));
+      unmatched.forEach((item) => renderProvisionalItem(article, item));
+      provisionalSlicePanel.append(article);
+    }
+    if (!proposals.length && !omitted) {
+      provisionalInventoryMessage("No valid provisional proposals are available.");
+    }
+  }
+
+  function hideProvisionalSliceHeads() {
+    if (!provisionalSlicePanel) return;
+    const panel = provisionalSlicePanel;
+    provisionalSlicePanel = undefined;
+    panel.replaceChildren(create(
+      "p",
+      "empty-state",
+      "Provisional proposal heads are hidden while the current project context is being checked.",
+    ));
   }
 
   function markAcceptanceUpdating() {
@@ -668,6 +854,7 @@
       status.textContent = "Updating";
       status.dataset.status = "waiting";
     });
+    hideProvisionalSliceHeads();
   }
 
   function blockedRecords(queue) {
@@ -789,6 +976,7 @@
     const capabilities = arrayValue(context.accepted_capabilities).map(objectValue);
     renderHeader(context);
     renderAcceptanceIndex(context);
+    renderProvisionalInventory(context);
     renderCurrentWork(queue, progress, capabilities);
     renderBlocked(queue, capabilities);
     renderFeatures(context);
@@ -874,9 +1062,11 @@
             signaledRevision = Math.max(signaledRevision === null ? revision : signaledRevision, revision);
           }
           if (displayedRevision !== undefined && displayedRevision !== null) markAcceptanceUpdating();
+          else hideProvisionalSliceHeads();
         }
       } catch {
         // A malformed revision event still triggers a canonical refetch.
+        hideProvisionalSliceHeads();
       }
       loadContext();
     });
