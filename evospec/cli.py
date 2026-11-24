@@ -183,6 +183,24 @@ def _parser() -> _ArgumentParser:
     next_slice.add_argument("--checkpoint", required=True, help="Initial verification checkpoint")
     next_slice.add_argument("--criteria-file", required=True, help="Complete JSON mini-spec for human acceptance")
     next_slice.add_argument("--expected-revision", required=True, type=int)
+    adopt_slice = commands.add_parser(
+        "adopt-provisional-slice",
+        help="Accept one exact current D5 proposal using an interactive terminal confirmation",
+    )
+    adopt_slice.add_argument("--feature-id", required=True, help="Exact identity of the accepted Feature")
+    adopt_slice.add_argument("--proposal-id", required=True, help="Exact current provisional proposal identity")
+    adopt_slice.add_argument("--revision-id", required=True, help="Exact current proposal revision identity")
+    adopt_slice.add_argument("--proposal-revision", required=True, type=int, help="Exact current proposal revision number")
+    adopt_slice.add_argument("--proposal-digest", required=True, help="Exact digest of the current proposal revision")
+    adopt_slice.add_argument("--slice", required=True, help="Final accepted Slice title")
+    adopt_slice.add_argument("--task", required=True, help="Initial Task for the adopted Slice")
+    adopt_slice.add_argument("--checkpoint", required=True, help="Initial pending verification checkpoint")
+    adopt_slice.add_argument("--criteria-file", required=True, help="Complete final Scope and criteria JSON mini-spec")
+    adopt_slice.add_argument(
+        "--question-answer", action="append", default=[],
+        metavar="QUESTION=ANSWER", help="Answer one exact proposal question; repeat for each question",
+    )
+    adopt_slice.add_argument("--expected-revision", required=True, type=int, help="Exact expected Core State revision")
     complete = commands.add_parser("complete-feature")
     complete.add_argument("--feature-id", required=True, help="Exact accepted primary Feature identity")
     complete.add_argument("--condition", required=True, help="Human-owned Feature completion condition")
@@ -272,7 +290,8 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
             return 2
         return 0
     if arguments.command in (
-        "accept-slice", "accept-next-slice", "revise-slice-criteria", "upgrade-e1-schema",
+        "accept-slice", "accept-next-slice", "adopt-provisional-slice",
+        "revise-slice-criteria", "upgrade-e1-schema",
         "upgrade-r3-schema", "upgrade-r3-outcome-schema", "renew-r3b-coverage",
         "complete-feature", "reopen-feature",
     ):
@@ -343,6 +362,38 @@ def main(argv: Sequence[str] | None = None, output: TextIO | None = None) -> int
         if arguments.expected_revision < 0:
             print("ERROR expected revision must be nonnegative", file=target)
             return 2
+        if arguments.command == "adopt-provisional-slice":
+            if target is not sys.stdout:
+                print("ERROR D5 approval must use the interactive terminal output", file=target)
+                return 2
+            try:
+                criteria = _load_criteria_spec(arguments.criteria_file)
+                question_answers = tuple(
+                    _provisional_question_answer(value)
+                    for value in arguments.question_answer
+                )
+                repository_id = project_context(workflow).repository_id
+                if repository_id is None:
+                    raise WorkflowError("D5 adoption requires an initialized repository identity")
+                result = workflow.adopt_provisional_slice(
+                    repository_id,
+                    arguments.feature_id,
+                    arguments.proposal_id,
+                    arguments.revision_id,
+                    arguments.proposal_revision,
+                    arguments.proposal_digest,
+                    arguments.slice,
+                    arguments.task,
+                    arguments.checkpoint,
+                    criteria,
+                    question_answers,
+                    expected_revision=ExpectedRevision(arguments.expected_revision),
+                )
+            except (ValueError, ServiceError, RecoveryError, WorkflowError) as error:
+                print(f"ERROR {error}", file=target)
+                return 2
+            _render(result, target)
+            return 0
         coverage = None
         try:
             if arguments.command == "accept-slice":
@@ -524,6 +575,13 @@ def _answer(value: str) -> ClarificationAnswer:
     if not separator or not question or not answer:
         raise WorkflowError("clarify answers must use QUESTION=ANSWER")
     return ClarificationAnswer(question, answer)
+
+
+def _provisional_question_answer(value: str) -> tuple[str, str]:
+    question, separator, answer = value.partition("=")
+    if not separator or not question.strip() or not answer.strip():
+        raise ValueError("proposal question answers must use nonempty QUESTION=ANSWER")
+    return question, answer
 
 
 def _render(result: WorkflowResult, output: TextIO) -> None:

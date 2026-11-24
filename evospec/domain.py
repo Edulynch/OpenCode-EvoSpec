@@ -453,6 +453,138 @@ class ProvisionalSliceHead:
     digest: str
 
 
+@dataclass(frozen=True, slots=True)
+class ProvisionalSliceAdoption:
+    """Immutable D5 mapping from one suggested head to one accepted Slice."""
+
+    id: str
+    repository_id: str
+    feature_id: FeatureId
+    proposal_id: str
+    proposal_revision_id: str
+    proposal_revision: int
+    proposal_digest: str
+    source_schema: int
+    source_revision: int
+    source_state_sha256: str
+    statement: str
+    source: str
+    source_reference: str
+    feature_agreement_ref: str
+    slice_agreement_ref: str
+    change_id: ChangeId
+    criteria_revision_id: str
+    task_id: str
+    slice_title: str
+    initial_task: str
+    checkpoint: str
+    outcome: str
+    example: str
+    inclusions: tuple[str, ...]
+    exclusions: tuple[str, ...]
+    decisions: tuple[str, ...]
+    criteria: tuple[SliceCriterion, ...]
+    question_answers: tuple[tuple[str, str], ...]
+    recorded_revision: int
+
+
+def provisional_slice_adoption_statement_text(
+    *,
+    repository_id: str,
+    feature_id: str,
+    source_revision: int,
+    source_state_sha256: str,
+    proposal: ProvisionalSliceRevision,
+    slice_title: str,
+    initial_task: str,
+    checkpoint: str,
+    outcome: str,
+    example: str,
+    inclusions: tuple[str, ...],
+    exclusions: tuple[str, ...],
+    decisions: tuple[str, ...],
+    criteria: tuple[SliceCriterion, ...],
+    question_answers: tuple[tuple[str, str], ...],
+) -> str:
+    """Render the exact bounded human decision for one selected D4 head."""
+    accepted_spec = {
+        "slice_title": slice_title,
+        "initial_task": initial_task,
+        "checkpoint": checkpoint,
+        "outcome": outcome,
+        "example": example,
+        "inclusions": list(inclusions),
+        "exclusions": list(exclusions),
+        "decisions": list(decisions),
+        "proposal_criteria_mapping": [
+            {
+                "proposal_criterion_id": source.id,
+                "accepted_criterion_id": accepted.id,
+                "expected_result": accepted.expected_result,
+                "expected_evidence": accepted.expected_evidence,
+            }
+            for source, accepted in zip(proposal.criteria, criteria, strict=True)
+        ],
+        "material_question_answers": [
+            {"question": question, "answer": answer}
+            for question, answer in question_answers
+        ],
+    }
+    mini_spec = json.dumps(
+        accepted_spec, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return "\n".join((
+        "EvoSpec D5: explicit interactive acceptance of one provisional AGENT_SUGGESTION head",
+        f"Repository: {repository_id}",
+        f"Feature: {feature_id}",
+        f"Current proposal head: {proposal.proposal_id} / {proposal.revision_id} / revision {proposal.revision}",
+        f"Current proposal digest: {proposal.digest}",
+        f"Expected State revision: {source_revision}",
+        f"Expected State SHA-256: {source_state_sha256}",
+        "The selected suggestion is not itself acceptance; every other head and all history remain unchanged.",
+        f"Accepted mini-spec: {mini_spec}",
+        "Validation: nonblank bounded text; 1–32 inclusions, exclusions, decisions and criteria; "
+        "unique stable criterion IDs; each text field at most 2 KiB; canonical mini-spec at most 32 KiB.",
+        "Every selected material question is answered explicitly; accepted criteria map one-to-one "
+        "to the exact retained proposal criteria.",
+        "This creates one actionable Task only. It does not verify criteria, accept a Slice outcome, "
+        "complete the Feature, or publish Product Truth.",
+        "Schema 23 to 24 occurs only with this accepted mapping; no general migration or downgrade is authorized.",
+    ))
+
+
+def provisional_slice_adoption_identity_digest(
+    *,
+    repository_id: str,
+    feature_id: str,
+    proposal_id: str,
+    proposal_revision_id: str,
+    proposal_revision: int,
+    proposal_digest: str,
+    source_revision: int,
+    source_state_sha256: str,
+    statement: str,
+    source_reference: str,
+) -> str:
+    """Derive stable accepted-record IDs from the complete consent binding."""
+    return sha256(json.dumps(
+        [
+            repository_id,
+            feature_id,
+            proposal_id,
+            proposal_revision_id,
+            proposal_revision,
+            proposal_digest,
+            source_revision,
+            source_state_sha256,
+            statement,
+            source_reference,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()[:16]
+
+
 SESSION_REQUEST_TASK = "Implementar únicamente el resultado expresado en la petición"
 SESSION_REQUEST_CHECKPOINT = "Comprobar el resultado observable expresado en la petición"
 D4_PROVISIONAL_SLICE_ACTIVATION_MARKER = "D4_SCHEMA15_AUTO_FIRST"
@@ -1625,6 +1757,7 @@ class State:
     provisional_slice_revisions: tuple[ProvisionalSliceRevision, ...] = ()
     provisional_slice_heads: tuple[ProvisionalSliceHead, ...] = ()
     provisional_slice_activation: ProvisionalSliceActivation | None = None
+    provisional_slice_adoptions: tuple[ProvisionalSliceAdoption, ...] = ()
 
 
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -2830,12 +2963,24 @@ def _validate_d4_provisional_slice_state(state: State) -> None:
         raise StateValidationError("provisional Slice revision shape is invalid")
     if any(type(item) is not ProvisionalSliceHead for item in state.provisional_slice_heads):
         raise StateValidationError("provisional Slice head shape is invalid")
+    if type(state.provisional_slice_adoptions) is not tuple or any(
+        type(item) is not ProvisionalSliceAdoption
+        for item in state.provisional_slice_adoptions
+    ):
+        raise StateValidationError("D5 provisional Slice adoptions must be immutable typed records")
     _unique((item.revision_id for item in state.provisional_slice_revisions), "provisional Slice revision")
     _unique((item.proposal_id for item in state.provisional_slice_heads), "provisional Slice head")
+    _unique((item.id for item in state.provisional_slice_adoptions), "D5 provisional Slice adoption")
     activation = state.provisional_slice_activation
     if activation is not None:
         _validate_d4_activation_metadata(state, activation)
-        _validate_d4_activation_source(state, activation)
+        _validate_d4_activation_source(
+            state, activation, adopted=bool(state.provisional_slice_adoptions),
+        )
+    if state.provisional_slice_adoptions:
+        if len(state.provisional_slice_adoptions) != 1:
+            raise StateValidationError("D5 permits exactly one provisional Slice adoption")
+        _validate_d5_provisional_slice_adoption(state, state.provisional_slice_adoptions[0])
 
 
 def _validate_d4_activation_metadata(
@@ -2868,7 +3013,7 @@ def _validate_d4_activation_metadata(
 
 
 def _validate_d4_activation_source(
-    state: State, activation: ProvisionalSliceActivation,
+    state: State, activation: ProvisionalSliceActivation, *, adopted: bool = False,
 ) -> None:
     feature_agreement = next(
         (item for item in state.agreements if item.id == activation.feature_agreement_ref),
@@ -2886,7 +3031,7 @@ def _validate_d4_activation_source(
         )
     )
     if (
-        len(state.agreements) != 2
+        len(state.agreements) != (4 if adopted else 2)
         or feature_agreement is None or feature_agreement.kind != "FEATURE"
         or slice_agreement is None or slice_agreement.kind != "SLICE"
         or feature_agreement.feature_id != activation.feature_id
@@ -2909,6 +3054,240 @@ def _validate_d4_activation_source(
         or slice_agreement.checkpoint != SESSION_REQUEST_CHECKPOINT
     ):
         raise StateValidationError("D4 activation is not bound to the initial session-request Feature")
+
+
+def _validate_d5_provisional_slice_adoption(
+    state: State, adoption: ProvisionalSliceAdoption,
+) -> None:
+    """Tie one accepted D4 head to its exact immutable consent and Task records."""
+    revisions = {item.revision_id: item for item in state.provisional_slice_revisions}
+    proposal = revisions.get(adoption.proposal_revision_id)
+    head = next(
+        (item for item in state.provisional_slice_heads if item.proposal_id == adoption.proposal_id),
+        None,
+    )
+    activation = state.provisional_slice_activation
+    if (
+        activation is None
+        or proposal is None
+        or head is None
+        or proposal.provenance.kind != "AGENT_SUGGESTION"
+        or proposal.proposal_id != adoption.proposal_id
+        or proposal.revision != adoption.proposal_revision
+        or proposal.digest != adoption.proposal_digest
+        or head.revision_id != proposal.revision_id
+        or head.revision != proposal.revision
+        or head.digest != proposal.digest
+        or adoption.repository_id != activation.repository_id
+        or adoption.feature_id != activation.feature_id
+        or adoption.source_schema != 23
+        or type(adoption.source_revision) is not int
+        or adoption.source_revision < activation.recorded_revision
+        or adoption.recorded_revision != adoption.source_revision + 1
+        or adoption.recorded_revision > state.revision
+        or not is_sha256_digest(adoption.source_state_sha256)
+        or adoption.source != "INTERACTIVE_TERMINAL"
+        or type(adoption.statement) is not str
+    ):
+        raise StateValidationError("D5 adoption does not bind the exact current provisional head")
+    if (
+        type(adoption.question_answers) is not tuple
+        or any(
+            type(item) is not tuple or len(item) != 2
+            or any(type(value) is not str or not value.strip() for value in item)
+            for item in adoption.question_answers
+        )
+        or len(adoption.question_answers) != len(proposal.open_questions)
+        or tuple(item[0] for item in adoption.question_answers) != proposal.open_questions
+        or type(adoption.criteria) is not tuple
+        or len(adoption.criteria) != len(proposal.criteria)
+        or any(type(item) is not SliceCriterion for item in adoption.criteria)
+        or tuple(
+            (item.id, item.expected_result, item.expected_evidence)
+            for item in adoption.criteria
+        ) != tuple(
+            (item.id, item.expected_result, item.expected_evidence)
+            for item in proposal.criteria
+        )
+    ):
+        raise StateValidationError("D5 adoption questions or criteria do not map to the selected suggestion")
+    if any(
+        type(values) is not tuple
+        for values in (adoption.inclusions, adoption.exclusions, adoption.decisions)
+    ):
+        raise StateValidationError("D5 accepted scope must use immutable tuples")
+    text_values = (
+        adoption.slice_title, adoption.initial_task, adoption.checkpoint,
+        adoption.outcome, adoption.example, *adoption.inclusions,
+        *adoption.exclusions, *adoption.decisions,
+        *(pair[1] for pair in adoption.question_answers),
+        *(value for item in adoption.criteria
+          for value in (item.id, item.expected_result, item.expected_evidence)),
+    )
+    if (
+        any(
+            type(value) is not str
+            or not value.strip()
+            or value != value.strip()
+            or len(value.encode("utf-8")) > 2048
+            for value in text_values
+        )
+        or type(adoption.inclusions) is not tuple
+        or type(adoption.exclusions) is not tuple
+        or type(adoption.decisions) is not tuple
+        or not adoption.inclusions
+        or not adoption.exclusions
+        or not adoption.decisions
+        or not adoption.criteria
+    ):
+        raise StateValidationError("D5 accepted mini-spec is not normalized or bounded")
+    try:
+        if any(
+            len(question.encode("utf-8")) > 2048
+            for question, _ in adoption.question_answers
+        ):
+            raise StateValidationError("D5 proposal question exceeds 2 KiB")
+    except UnicodeEncodeError as error:
+        raise StateValidationError("D5 proposal question is not valid UTF-8") from error
+    expected_statement = provisional_slice_adoption_statement_text(
+        repository_id=adoption.repository_id,
+        feature_id=str(adoption.feature_id),
+        source_revision=adoption.source_revision,
+        source_state_sha256=adoption.source_state_sha256,
+        proposal=proposal,
+        slice_title=adoption.slice_title,
+        initial_task=adoption.initial_task,
+        checkpoint=adoption.checkpoint,
+        outcome=adoption.outcome,
+        example=adoption.example,
+        inclusions=adoption.inclusions,
+        exclusions=adoption.exclusions,
+        decisions=adoption.decisions,
+        criteria=adoption.criteria,
+        question_answers=adoption.question_answers,
+    )
+    if (
+        adoption.statement != expected_statement
+        or adoption.source_reference != (
+            "tty:" + sha256(adoption.statement.encode("utf-8")).hexdigest()[:12]
+        )
+        or adoption.id != "d5-adoption-" + sha256(adoption.statement.encode("utf-8")).hexdigest()
+    ):
+        raise StateValidationError("D5 acceptance statement does not match its exact adopted specification")
+    identity_digest = provisional_slice_adoption_identity_digest(
+        repository_id=adoption.repository_id,
+        feature_id=str(adoption.feature_id),
+        proposal_id=adoption.proposal_id,
+        proposal_revision_id=adoption.proposal_revision_id,
+        proposal_revision=adoption.proposal_revision,
+        proposal_digest=adoption.proposal_digest,
+        source_revision=adoption.source_revision,
+        source_state_sha256=adoption.source_state_sha256,
+        statement=adoption.statement,
+        source_reference=adoption.source_reference,
+    )
+    if (
+        adoption.feature_agreement_ref != f"agreement-feature-{identity_digest}"
+        or adoption.slice_agreement_ref != f"agreement-slice-{identity_digest}"
+        or adoption.change_id != f"change-{identity_digest}"
+        or adoption.criteria_revision_id != f"slice-criteria-{identity_digest}-1"
+        or adoption.task_id != f"task-{identity_digest}"
+    ):
+        raise StateValidationError("D5 accepted identities do not match the consent binding")
+    original_feature = next(
+        (item for item in state.agreements if item.id == activation.feature_agreement_ref),
+        None,
+    )
+    original_slice = next(
+        (item for item in state.agreements if item.id == activation.slice_agreement_ref),
+        None,
+    )
+    feature_agreement = next(
+        (item for item in state.agreements if item.id == adoption.feature_agreement_ref),
+        None,
+    )
+    slice_agreement = next(
+        (item for item in state.agreements if item.id == adoption.slice_agreement_ref),
+        None,
+    )
+    feature = next((item for item in state.features if item.id == adoption.feature_id), None)
+    change = next((item for item in state.changes if item.id == adoption.change_id), None)
+    criteria_revision = next(
+        (item for item in state.slice_criteria_revisions if item.id == adoption.criteria_revision_id),
+        None,
+    )
+    if (
+        original_feature is None
+        or original_slice is None
+        or feature is None
+        or change is None
+        or feature_agreement is None
+        or slice_agreement is None
+        or criteria_revision is None
+        or len(state.features) != 1
+        or len(state.changes) != 2
+        or len(state.agreements) != 4
+        or state.agreements[:2] != (original_feature, original_slice)
+        or state.agreements[2:] != (feature_agreement, slice_agreement)
+        or state.changes[0].id != original_feature.change_id
+        or change.feature_id != feature.id
+        or change.intent != adoption.slice_title
+        or change.classification is not Classification.FEATURE
+        or feature_agreement.kind != "FEATURE"
+        or feature_agreement.feature_id != feature.id
+        or feature_agreement.change_id != change.id
+        or feature_agreement.title != feature.title
+        or feature_agreement.statement != adoption.statement
+        or feature_agreement.source != adoption.source
+        or feature_agreement.source_reference != adoption.source_reference
+        or feature_agreement.repository_id != adoption.repository_id
+        or any(value is not None for value in (
+            feature_agreement.task_id,
+            feature_agreement.initial_task,
+            feature_agreement.checkpoint,
+        ))
+        or slice_agreement.kind != "SLICE"
+        or slice_agreement.feature_id != feature.id
+        or slice_agreement.change_id != change.id
+        or slice_agreement.title != adoption.slice_title
+        or slice_agreement.statement != adoption.statement
+        or slice_agreement.source != adoption.source
+        or slice_agreement.source_reference != adoption.source_reference
+        or slice_agreement.repository_id != adoption.repository_id
+        or slice_agreement.task_id != adoption.task_id
+        or slice_agreement.initial_task != adoption.initial_task
+        or slice_agreement.checkpoint != adoption.checkpoint
+        or any(
+            context.current_work != adoption.initial_task
+            or context.focus != adoption.slice_title
+            for context in (
+                state.active_context,
+                *(item.context for item in state.terminal_archives),
+            )
+            if context is not None and context.slice_agreement_ref == adoption.slice_agreement_ref
+        )
+        or criteria_revision.slice_agreement_ref != slice_agreement.id
+        or criteria_revision.repository_id != adoption.repository_id
+        or criteria_revision.outcome != adoption.outcome
+        or criteria_revision.example != adoption.example
+        or criteria_revision.inclusions != adoption.inclusions
+        or criteria_revision.exclusions != adoption.exclusions
+        or criteria_revision.decisions != adoption.decisions
+        or criteria_revision.criteria != adoption.criteria
+        or criteria_revision.source != adoption.source
+        or criteria_revision.source_reference != adoption.source_reference
+        or criteria_revision.previous_revision_id is not None
+        or criteria_revision.reason is not None
+        or criteria_revision.decision_statement is not None
+        or state.slice_criteria_revisions != (criteria_revision,)
+        or state.slice_criteria_heads != (SliceCriteriaHead(slice_agreement.id, criteria_revision.id),)
+        or state.criterion_test_receipts
+        or state.slice_outcome_receipts
+        or state.criterion_coverage_approvals
+        or state.feature_completion_receipts
+        or state.feature_reopen_receipts
+    ):
+        raise StateValidationError("D5 adoption records are inconsistent with accepted Core authority")
 
 
 def validate_state(state: State) -> None:
@@ -3381,6 +3760,24 @@ def validate_state(state: State) -> None:
                      and item.change_id == agreement.change_id),
                     None,
                 )
+                adoption = next(
+                    (
+                        item for item in state.provisional_slice_adoptions
+                        if item.slice_agreement_ref == agreement.id
+                    ),
+                    None,
+                )
+                if adoption is not None:
+                    if (
+                        owning_feature is None
+                        or revision.id != adoption.criteria_revision_id
+                        or revision.source_reference != adoption.source_reference
+                        or agreement.statement != adoption.statement
+                        or owning_feature.statement != adoption.statement
+                        or owning_feature.source_reference != adoption.source_reference
+                    ):
+                        raise StateValidationError("D5 criteria must match their exact accepted adoption")
+                    continue
                 first_statement = (
                     f"Acepto Feature: {owning_feature.title if owning_feature is not None else ''}; "
                     f"Slice: {agreement.title}; Task: {agreement.initial_task}; "

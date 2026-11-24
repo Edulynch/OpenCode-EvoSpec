@@ -219,6 +219,107 @@ class DashboardTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
+    def test_d5_adopted_slice_get_projection_is_agreed_pending_and_read_only(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is required for the dependency-free dashboard UI regressions")
+        from tests.test_d5_proposal_adoption import D5ProposalAdoptionTests, _simulated_tty_adoption
+
+        with TemporaryDirectory(prefix="evospec-d5-dashboard-") as temporary:
+            root = Path(temporary)
+            fixture = D5ProposalAdoptionTests()
+            workflow, fixture_context = fixture._workspace(root)
+            before = fixture_context["state"]
+            values = fixture._adoption_inputs(fixture_context)
+            statement = fixture._agreement(workflow, before, fixture_context, values)
+            _, shown_statement, output = _simulated_tty_adoption(
+                workflow,
+                fixture_context["repository_id"],
+                fixture_context["feature_id"],
+                values,
+                before.revision,
+            )
+            self.assertEqual(shown_statement, statement)
+            self.assertIn(statement, output)
+            adopted = CoreService.open(root).recover()
+            adoption = adopted.provisional_slice_adoptions[0]
+            before_get = self._files(root)
+            server, thread, base = self._start_server(root)
+            try:
+                with urlopen(f"{base}/api/context") as response:
+                    self.assertEqual(response.status, 200)
+                    context = json.loads(response.read())
+            finally:
+                self._stop_server(server, thread)
+
+            self.assertEqual(self._files(root), before_get)
+            self.assertEqual(CoreService.open(root).recover(), adopted)
+            accepted = context["accepted_slice"]
+            self.assertEqual(accepted["slice_agreement_ref"], adoption.slice_agreement_ref)
+            self.assertEqual(accepted["slice_title"], adoption.slice_title)
+            inventory = context["slice_acceptance_inventory"]
+            self.assertEqual(inventory["source"], "CORE_AGREEMENTS")
+            self.assertEqual(inventory["total"], 2)
+            adopted_items = [
+                item for item in inventory["items"]
+                if item["slice_agreement_ref"] == adoption.slice_agreement_ref
+            ]
+            self.assertEqual(len(adopted_items), 1)
+            self.assertEqual(adopted_items[0]["authority_status"], "CANONICAL")
+            self.assertEqual(adopted_items[0]["scope_status"], "ACTIVE")
+            self.assertEqual(adopted_items[0]["criteria_status"], "RECORDED")
+            self.assertEqual(
+                adopted_items[0]["criteria_revision"]["id"],
+                adoption.criteria_revision_id,
+            )
+            self.assertEqual(
+                {item["slice_agreement_ref"] for item in inventory["items"]},
+                {item.id for item in before.agreements if item.kind == "SLICE"}
+                | {adoption.slice_agreement_ref},
+            )
+            criteria_ids = {
+                item["id"] for item in accepted["criteria_revision"]["criteria"]
+            }
+            verifications = [
+                item for item in context["criterion_verification"]
+                if item["criteria_revision_id"] == adoption.criteria_revision_id
+            ]
+            self.assertEqual(
+                {item["criterion_id"] for item in verifications},
+                criteria_ids,
+            )
+            self.assertTrue(all(item["status"] == "UNVERIFIED" for item in verifications))
+            outcome = context["slice_outcome"]
+            self.assertTrue(outcome is None or outcome["status"] != "CURRENT")
+
+            provisional = context["provisional_slice_inventory"]
+            self.assertEqual(provisional["source"], "CORE_PROVISIONAL_SLICE_HEADS")
+            self.assertEqual(provisional["availability"], "AVAILABLE")
+            self.assertEqual(provisional["total"], 1)
+            self.assertTrue(provisional["complete"])
+            self.assertFalse(provisional["truncated"])
+            self.assertEqual(
+                [item["proposal_id"] for item in provisional["items"]],
+                [fixture_context["other_head"].proposal_id],
+            )
+            self.assertNotIn(
+                adoption.proposal_id,
+                [item["proposal_id"] for item in provisional["items"]],
+            )
+
+            environment = os.environ.copy()
+            environment.pop("EVOSPEC_DASHBOARD_ACCEPTANCE_CONTEXT", None)
+            environment["EVOSPEC_D5_DASHBOARD_CONTEXT"] = json.dumps(
+                context, separators=(",", ":"),
+            )
+            completed = subprocess.run(
+                (node, "--test", str(Path(__file__).with_name("dashboard_acceptance_index.test.mjs"))),
+                cwd=Path(__file__).resolve().parents[1], env=environment, capture_output=True,
+                text=True, timeout=30, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertEqual(self._files(root), before_get)
+
     def test_schema23_dashboard_reads_only_the_current_core_head(self) -> None:
         with TemporaryDirectory(prefix="evospec-d4-dashboard-") as temporary:
             root = Path(temporary)

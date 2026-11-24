@@ -370,6 +370,69 @@ test("renders Feature, active Slice, and current criteria from the canonical GET
   assert.ok(technicalRevision?.textContent.includes("ACTIVE_CONTEXT"), "technical provenance remains inspectable")
 })
 
+test("D5 adoption appears once as agreed with pending criteria while another head stays provisional", async (t) => {
+  const serialized = process.env.EVOSPEC_D5_DASHBOARD_CONTEXT
+  if (!serialized) {
+    t.skip("Python D5 dashboard wrapper supplies a canonical GET /api/context snapshot")
+    return
+  }
+  const context = JSON.parse(serialized)
+  const accepted = context.accepted_slice
+  const inventory = context.slice_acceptance_inventory
+  const adoptedItems = inventory.items.filter(
+    (item) => item.slice_agreement_ref === accepted.slice_agreement_ref
+  )
+  assert.equal(adoptedItems.length, 1)
+  assert.equal(adoptedItems[0].authority_status, "CANONICAL")
+  assert.equal(adoptedItems[0].criteria_status, "RECORDED")
+  assert.notEqual(context.slice_outcome?.status, "CURRENT")
+
+  const app = await loadedDashboard(context)
+  const content = app.ids.get("active-slice-content")
+  const adoptedCards = descendants(content).filter((element) =>
+    element.className === "acceptance-slice"
+    && descendants(element).some((child) =>
+      child.className === "acceptance-slice-title"
+      && child.textContent === accepted.slice_title
+    )
+  )
+  assert.equal(adoptedCards.length, 1)
+  const agreementStatus = descendants(adoptedCards[0]).find(
+    (element) => element.className.split(/\s+/).includes("agreement-status")
+  )
+  assert.equal(agreementStatus?.textContent, "Agreed")
+  const criteriaRowsForAdoption = descendants(adoptedCards[0]).filter(
+    (element) => element.className === "active-slice-criterion"
+  )
+  assert.ok(criteriaRowsForAdoption.length > 0)
+  assert.deepEqual(
+    criteriaRowsForAdoption.map(rowStatus),
+    accepted.criteria_revision.criteria.map(() => "Pending verification")
+  )
+  assert.equal(
+    descendants(adoptedCards[0]).some(
+      (element) => element.className.split(/\s+/).includes("status-label") && element.textContent === "Slice accepted"
+    ),
+    false
+  )
+
+  const provisional = context.provisional_slice_inventory
+  assert.equal(provisional.total, 1)
+  assert.equal(provisional.items.length, 1)
+  const proposalCards = descendants(content).filter((element) => element.className === "provisional-slice")
+  assert.equal(proposalCards.length, 1)
+  assert.ok(proposalCards[0].textContent.includes(provisional.items[0].title))
+  assert.ok(proposalCards[0].textContent.includes("Provisional"))
+  assert.equal(
+    descendants(proposalCards[0]).some((element) =>
+      ["button", "input", "a"].includes(element.tagName.toLowerCase())
+    ),
+    false
+  )
+  assert.equal(app.fetchCalls.length, 1)
+  assert.equal(app.fetchCalls[0].url, "/api/context")
+})
+
 test("READY and completed Tasks never become Slice acceptance", async () => {
   const context = makeContext({ outcome: "READY" })
   const app = await loadedDashboard(context)
