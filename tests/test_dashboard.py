@@ -12,13 +12,15 @@ import tempfile
 import threading
 import time
 import unittest
+from hashlib import sha256
 from html import unescape
 from importlib.resources import files
 from pathlib import Path
-from typing import BinaryIO, Callable, NamedTuple, cast
+from typing import Any, BinaryIO, Callable, NamedTuple, cast
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from evospec.agent_protocol import execute
 from evospec.dashboard import DEFAULT_HOST, DashboardServer, create_server
 from evospec.domain import ExpectedRevision
 from evospec.services import CoreService, slice_acceptance_statement
@@ -216,6 +218,150 @@ class DashboardTests(unittest.TestCase):
                 text=True, timeout=30, check=False,
             )
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+    def test_schema23_dashboard_reads_only_the_current_core_head(self) -> None:
+        with TemporaryDirectory(prefix="evospec-d4-dashboard-") as temporary:
+            root = Path(temporary)
+
+            def run(action: str, **values: object) -> dict[str, Any]:
+                payload = json.dumps({"action": action, **values}, ensure_ascii=False)
+                return json.loads(execute(root, payload))
+
+            initialized = run("init", expected_revision=0)
+            repository_id = sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+            admitted = run(
+                "accept_first_slice_session",
+                expected_revision=initialized["result"]["revision"],
+                repository_id=repository_id,
+                session_id="ses_d4dashboard123",
+                message_id="msg_d4dashboard123",
+                request_text="Implement this bounded dashboard request.",
+            )
+            feature_id = admitted["context"]["feature_id"]
+            activated = run(
+                "activate_provisional_slice_writes",
+                expected_revision=admitted["result"]["revision"],
+                repository_id=repository_id,
+                feature_id=feature_id,
+            )
+            first = run(
+                "propose_provisional_slice",
+                expected_revision=activated["result"]["revision"],
+                repository_id=repository_id,
+                feature_id=feature_id,
+                expected_head=None,
+                title="Dashboard proposal",
+                outcome="The first provisional outcome",
+                example=None,
+                inclusions=["A narrow boundary"],
+                exclusions=[],
+                considerations=[],
+                open_questions=[],
+                criteria=[{
+                    "id": "c-1",
+                    "expected_result": "An observable outcome",
+                    "expected_evidence": "A visible check",
+                }],
+            )
+            first_item = first["context"]["provisional_slice_inventory"]["items"][0]
+            superseded = run(
+                "propose_provisional_slice",
+                expected_revision=first["result"]["revision"],
+                repository_id=repository_id,
+                feature_id=feature_id,
+                expected_head={
+                    "proposal_id": first_item["proposal_id"],
+                    **first_item["head"],
+                },
+                title="Dashboard proposal",
+                outcome="The current provisional outcome",
+                example=None,
+                inclusions=["A narrow boundary"],
+                exclusions=[],
+                considerations=[],
+                open_questions=[],
+                criteria=[{
+                    "id": "c-1",
+                    "expected_result": "An observable outcome",
+                    "expected_evidence": "A visible check",
+                }],
+            )
+            expected_head = superseded["context"]["provisional_slice_inventory"]["items"][0]["head"]
+            before = self._files(root)
+            server, thread, base = self._start_server(root)
+            try:
+                snapshots: list[dict[str, Any]] = []
+                for _ in range(2):
+                    with urlopen(f"{base}/api/context") as response:
+                        self.assertEqual(response.status, 200)
+                        snapshots.append(json.loads(response.read()))
+            finally:
+                self._stop_server(server, thread)
+
+            self.assertEqual(snapshots[0], snapshots[1])
+            self.assertEqual(self._files(root), before)
+            context = snapshots[0]
+            self.assertEqual(context["provisional_slice_write_ready"], True)
+            inventory = context["provisional_slice_inventory"]
+            self.assertEqual(inventory["total"], 1)
+            self.assertTrue(inventory["complete"])
+            self.assertEqual(inventory["items"][0]["head"], expected_head)
+            self.assertEqual(inventory["items"][0]["title"], "Dashboard proposal")
+
+            accepted = superseded["context"]["accepted_slice"]
+            progressed = run(
+                "accepted_task_progress",
+                expected_revision=superseded["result"]["revision"],
+                repository_id=repository_id,
+                task_id=accepted["task_id"],
+                feature_agreement_ref=accepted["feature_agreement_ref"],
+                slice_agreement_ref=accepted["slice_agreement_ref"],
+                checkpoint="Initial implementation step",
+                statement="Recorded an unverified implementation update.",
+                evidence_refs=["local observation"],
+            )
+            reviewed = run(
+                "review",
+                expected_revision=progressed["result"]["revision"],
+                review={"verdict": "PASS", "findings": [], "safe_to_proceed": True},
+            )
+            verified = run(
+                "verify",
+                expected_revision=reviewed["result"]["revision"],
+                verification={"evidence": ["focused checks passed"], "sufficient": True},
+            )
+            converged = run(
+                "converge",
+                expected_revision=verified["result"]["revision"],
+                assessment={
+                    "change_id": verified["result"]["change_id"],
+                    "product_truth_changed": False,
+                    "confidence": "HIGH",
+                    "evidence": [{"source": "agent", "reference": "tests/test_dashboard.py"}],
+                    "rationale": "accepted terminal work does not publish Product Truth",
+                },
+            )
+            closed = CoreService.open(root).recover()
+            self.assertEqual(converged["result"]["code"], "DONE")
+            self.assertEqual(closed.revision, verified["result"]["revision"] + 3)
+            after_close = self._files(root)
+            server, thread, base = self._start_server(root)
+            try:
+                with urlopen(f"{base}/api/context") as response:
+                    self.assertEqual(response.status, 200)
+                    closed_context = json.loads(response.read())
+                with urlopen(f"{base}/api/context") as response:
+                    self.assertEqual(response.status, 200)
+                    repeated_context = json.loads(response.read())
+            finally:
+                self._stop_server(server, thread)
+            self.assertEqual(closed_context, repeated_context)
+            self.assertEqual(self._files(root), after_close)
+            closed_inventory = closed_context["provisional_slice_inventory"]
+            self.assertEqual(closed_inventory["total"], 1)
+            self.assertTrue(closed_inventory["complete"])
+            self.assertEqual(closed_inventory["items"][0]["head"], expected_head)
+            self.assertEqual(closed_inventory["items"][0]["title"], "Dashboard proposal")
 
     def test_static_shell_and_assets_are_served_from_packaged_resources(self) -> None:
         resources = files("evospec").joinpath("resources", "dashboard")

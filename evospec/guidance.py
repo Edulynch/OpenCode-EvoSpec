@@ -4,8 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from hashlib import sha256
+import json
+import re
 
-from .domain import IrreversibleAuthorizationStatus, OperationalState, ReviewInspection, WorkingContext, canonical_autonomy_operation
+from .domain import (
+    IrreversibleAuthorizationStatus,
+    OperationalState,
+    ReviewInspection,
+    SESSION_REQUEST_CHECKPOINT,
+    SESSION_REQUEST_TASK,
+    WorkingContext,
+    canonical_autonomy_operation,
+)
 from .lifecycle import LifecycleState, Phase, can_converge, has_acceptable_review
 
 
@@ -92,6 +103,8 @@ class Action(StrEnum):
     EXECUTE_IRREVERSIBLE = "execute_irreversible"
     PROPOSE_AUTONOMY_EXPANSION = "propose_autonomy_expansion"
     RESOLVE_AUTONOMY_EXPANSION = "resolve_autonomy_expansion"
+    ACTIVATE_PROVISIONAL_SLICE_WRITES = "activate_provisional_slice_writes"
+    PROPOSE_PROVISIONAL_SLICE = "propose_provisional_slice"
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +122,15 @@ class ActionGuidance:
 
 _ACTIONS = tuple(Action)
 _COMMON = (Action.CONTEXT, Action.NEW, Action.CHANGE, Action.CONTINUE, Action.PARK, Action.RESUME)
+_READ_ONLY_ACTIONS = frozenset((Action.CONTEXT, Action.LIST_WORK, Action.NEXT_WORK))
+_D4_SCHEMA23_ACTIONS = frozenset((
+    Action.ACCEPTED_TASK_PROGRESS,
+    Action.ACTIVATE_PROVISIONAL_SLICE_WRITES,
+    Action.PROPOSE_PROVISIONAL_SLICE,
+    Action.REVIEW,
+    Action.VERIFY,
+    Action.CONVERGE,
+))
 _ACTION_ORDER = {
     Action.CONTEXT: 0, Action.NEW: 1, Action.CHANGE: 2, Action.CONTINUE: 3, Action.RESUME: 4,
     Action.LIST_WORK: 5, Action.NEXT_WORK: 6, Action.ACTIVATE_WORK: 7,
@@ -118,6 +140,7 @@ _ACTION_ORDER = {
     Action.VERIFY: 17, Action.CONVERGE: 18,
     Action.AUTHORIZE_IRREVERSIBLE: 19, Action.EXECUTE_IRREVERSIBLE: 20,
     Action.PROPOSE_AUTONOMY_EXPANSION: 21, Action.RESOLVE_AUTONOMY_EXPANSION: 22,
+    Action.ACTIVATE_PROVISIONAL_SLICE_WRITES: 23, Action.PROPOSE_PROVISIONAL_SLICE: 24,
 }
 
 
@@ -162,6 +185,27 @@ def for_action(
     context = state.active_context
     if selected is Action.CONTEXT:
         return _allow(selected, "authoritative workflow context is available")
+    if inspection.persisted_schema == 22:
+        if selected in _READ_ONLY_ACTIONS:
+            return _allow(selected, "schema 22 permits read-only context and work-queue projections")
+        return _block(
+            selected,
+            "D1_PROVISIONAL_SCHEMA_READ_ONLY",
+            "schema 22 is read-only; context and work-queue projections remain available",
+            (),
+            None,
+        )
+    if inspection.persisted_schema == 23:
+        if selected in _READ_ONLY_ACTIONS:
+            return _allow(selected, "schema 23 permits read-only context and work-queue projections")
+        if selected not in _D4_SCHEMA23_ACTIONS:
+            return _block(
+                selected,
+                "D4_SCHEMA23_ACTION_UNSUPPORTED",
+                "schema 23 permits only eligible D4 Slice actions and accepted Task progress",
+                (),
+                None,
+            )
     if state.agreements and e1_schema_ready is False:
         return _block(
             selected, "E1_SCHEMA_UPGRADE_REQUIRED",
@@ -235,6 +279,31 @@ def for_action(
             Action.RESOLVE_AUTONOMY_EXPANSION,
             () if context is None else _scope(context),
         )
+    if selected is Action.ACTIVATE_PROVISIONAL_SLICE_WRITES:
+        if _d4_activation_candidate(inspection):
+            return _allow(
+                selected,
+                "the untouched initial schema-15 SESSION_REQUEST lineage may explicitly opt into provisional suggestions",
+            )
+        return _block(
+            selected, "D4_ACTIVATION_NOT_AVAILABLE",
+            "D4 activation requires the exact untouched initial schema-15 SESSION_REQUEST Feature",
+            (), None,
+        )
+    if selected is Action.PROPOSE_PROVISIONAL_SLICE:
+        if (
+            inspection.persisted_schema == 23
+            and state.provisional_slice_activation is not None
+        ):
+            return _allow(
+                selected,
+                "Core may persist a bounded AGENT_SUGGESTION against the current provisional head",
+            )
+        return _block(
+            selected, "D4_PROVISIONAL_WRITES_UNAVAILABLE",
+            "Core provisional Slice writes are not enabled for this persisted schema and activation",
+            (Action.ACTIVATE_PROVISIONAL_SLICE_WRITES,), Action.ACTIVATE_PROVISIONAL_SLICE_WRITES,
+        )
     if selected in (Action.LIST_WORK, Action.NEXT_WORK):
         return _allow(selected, "work queue can be projected")
     if selected is Action.ACTIVATE_WORK:
@@ -291,6 +360,81 @@ def for_action(
     return _active_guidance(inspection, selected, context, e1_schema_ready)
 
 
+def _d4_activation_candidate(inspection: ReviewInspection) -> bool:
+    """Advertise only the pristine first Core-admitted SESSION_REQUEST state."""
+    state = inspection.state
+    context = state.active_context
+    if (
+        inspection.persisted_schema != 15
+        or inspection.e1_schema_ready is not True
+        or state.revision != 2
+        or state.initialization is None
+        or context is None
+        or state.provisional_slice_activation is not None
+        or state.provisional_slice_revisions
+        or state.provisional_slice_heads
+        or state.slice_criteria_revisions
+        or state.slice_criteria_heads
+        or state.r3_schema_upgrade is not None
+        or state.r3b_schema_upgrade is not None
+        or state.e1_schema_upgrade is not None
+        or state.criterion_test_receipts
+        or state.slice_outcome_receipts
+        or state.criterion_coverage_approvals
+        or state.feature_completion_receipts
+        or state.feature_reopen_receipts
+        or state.terminal_archives
+        or state.work_items
+        or len(state.changes) != 1
+        or len(state.features) != 1
+        or len(state.agreements) != 2
+        or context.task_progress is not None
+    ):
+        return False
+    feature_agreement, slice_agreement = state.agreements
+    match = re.fullmatch(
+        r"session:(ses_[A-Za-z0-9_-]{3,128}):(msg_[A-Za-z0-9_-]{3,128}):([0-9a-f]{16})",
+        slice_agreement.source_reference,
+    )
+    if (
+        match is None
+        or feature_agreement.kind != "FEATURE"
+        or slice_agreement.kind != "SLICE"
+        or feature_agreement.source != "SESSION_REQUEST"
+        or slice_agreement.source != "SESSION_REQUEST"
+        or feature_agreement.statement != slice_agreement.statement
+        or feature_agreement.source_reference != slice_agreement.source_reference
+        or match.group(3) != sha256(slice_agreement.statement.encode("utf-8")).hexdigest()[:16]
+        or slice_agreement.initial_task != SESSION_REQUEST_TASK
+        or slice_agreement.checkpoint != SESSION_REQUEST_CHECKPOINT
+        or context.feature_agreement_ref != feature_agreement.id
+        or context.slice_agreement_ref != slice_agreement.id
+        or context.focus != slice_agreement.title
+        or context.current_work != SESSION_REQUEST_TASK
+    ):
+        return False
+    digest = sha256(json.dumps([
+        state.initialization.repository_id,
+        slice_agreement.statement,
+        slice_agreement.statement,
+        SESSION_REQUEST_TASK,
+        SESSION_REQUEST_CHECKPOINT,
+        slice_agreement.statement,
+        slice_agreement.source_reference,
+    ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+    return (
+        feature_agreement.id == f"agreement-feature-{digest}"
+        and slice_agreement.id == f"agreement-slice-{digest}"
+        and str(feature_agreement.feature_id) == f"feature-{digest}"
+        and slice_agreement.feature_id == feature_agreement.feature_id
+        and feature_agreement.change_id == f"change-{digest}"
+        and slice_agreement.change_id == feature_agreement.change_id
+        and slice_agreement.task_id == f"task-{digest}"
+        and context.status is LifecycleState.PROPOSED
+        and context.phase is Phase.RESEARCH
+    )
+
+
 def _active_guidance(
     inspection: ReviewInspection, action: Action, context: WorkingContext,
     e1_schema_ready: bool | None = None,
@@ -325,6 +469,12 @@ def _active_guidance(
             return _allow(action, "exact accepted Task may report unverified progress", scope)
         return _block(action, "E1_PROGRESS_UNAVAILABLE", "typed Task progress requires schema 14, current autonomy, and implementation scope", (), None, scope)
     if action is Action.REVIEW:
+        if inspection.persisted_schema == 23 and context.task_progress is None:
+            return _block(
+                action, "ACCEPTED_TASK_PROGRESS_REQUIRED",
+                "an accepted Task report is required before review begins",
+                (Action.ACCEPTED_TASK_PROGRESS,), Action.ACCEPTED_TASK_PROGRESS, scope,
+            )
         if context.phase in (Phase.RESEARCH, Phase.READY, Phase.IMPLEMENT, Phase.REVIEW):
             return _allow(action, "review can be recorded", scope)
         return _block(action, "VERIFICATION_REQUIRED", "review assurance is already complete enough to verify", (Action.VERIFY,), Action.VERIFY, scope)

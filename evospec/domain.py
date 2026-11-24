@@ -453,6 +453,26 @@ class ProvisionalSliceHead:
     digest: str
 
 
+SESSION_REQUEST_TASK = "Implementar únicamente el resultado expresado en la petición"
+SESSION_REQUEST_CHECKPOINT = "Comprobar el resultado observable expresado en la petición"
+D4_PROVISIONAL_SLICE_ACTIVATION_MARKER = "D4_SCHEMA15_AUTO_FIRST"
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisionalSliceActivation:
+    """Core record of the narrowly eligible schema-15 session-request opt-in."""
+
+    marker: str
+    source_schema: int
+    source_revision: int
+    source_sha256: str
+    repository_id: str
+    feature_id: FeatureId
+    feature_agreement_ref: str
+    slice_agreement_ref: str
+    recorded_revision: int
+
+
 @dataclass(frozen=True, slots=True)
 class CoverageInput:
     """One explicit root file or directory-presence dependency declaration."""
@@ -1604,6 +1624,7 @@ class State:
     feature_reopen_receipts: tuple[FeatureReopenReceipt, ...] = ()
     provisional_slice_revisions: tuple[ProvisionalSliceRevision, ...] = ()
     provisional_slice_heads: tuple[ProvisionalSliceHead, ...] = ()
+    provisional_slice_activation: ProvisionalSliceActivation | None = None
 
 
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -2802,6 +2823,94 @@ def _validate_autonomy_expansions(state: State) -> None:
         raise StateValidationError("resolved autonomy expansion cannot be replayed")
 
 
+def _validate_d4_provisional_slice_state(state: State) -> None:
+    if type(state.provisional_slice_revisions) is not tuple or type(state.provisional_slice_heads) is not tuple:
+        raise StateValidationError("provisional Slice authority must be immutable tuples")
+    if any(type(item) is not ProvisionalSliceRevision for item in state.provisional_slice_revisions):
+        raise StateValidationError("provisional Slice revision shape is invalid")
+    if any(type(item) is not ProvisionalSliceHead for item in state.provisional_slice_heads):
+        raise StateValidationError("provisional Slice head shape is invalid")
+    _unique((item.revision_id for item in state.provisional_slice_revisions), "provisional Slice revision")
+    _unique((item.proposal_id for item in state.provisional_slice_heads), "provisional Slice head")
+    activation = state.provisional_slice_activation
+    if activation is not None:
+        _validate_d4_activation_metadata(state, activation)
+        _validate_d4_activation_source(state, activation)
+
+
+def _validate_d4_activation_metadata(
+    state: State, activation: ProvisionalSliceActivation,
+) -> None:
+    if (
+        type(activation) is not ProvisionalSliceActivation
+        or activation.marker != D4_PROVISIONAL_SLICE_ACTIVATION_MARKER
+        or type(activation.source_schema) is not int
+        or activation.source_schema != 15
+        or type(activation.source_revision) is not int
+        or activation.source_revision != 2
+        or type(activation.recorded_revision) is not int
+        or activation.recorded_revision != activation.source_revision + 1
+        or activation.recorded_revision > state.revision
+        or type(activation.source_sha256) is not str
+        or not re.fullmatch(r"[0-9a-f]{64}", activation.source_sha256)
+        or type(activation.repository_id) is not str
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", activation.repository_id)
+        or type(activation.feature_id) is not str
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", activation.feature_id)
+        or type(activation.feature_agreement_ref) is not str
+        or type(activation.slice_agreement_ref) is not str
+        or not activation.feature_agreement_ref
+        or not activation.slice_agreement_ref
+        or state.initialization is None
+        or state.initialization.repository_id != activation.repository_id
+    ):
+        raise StateValidationError("D4 schema-15 provisional Slice activation is invalid")
+
+
+def _validate_d4_activation_source(
+    state: State, activation: ProvisionalSliceActivation,
+) -> None:
+    feature_agreement = next(
+        (item for item in state.agreements if item.id == activation.feature_agreement_ref),
+        None,
+    )
+    slice_agreement = next(
+        (item for item in state.agreements if item.id == activation.slice_agreement_ref),
+        None,
+    )
+    source_reference = (
+        None if slice_agreement is None
+        else re.fullmatch(
+            r"session:(ses_[A-Za-z0-9_-]{3,128}):(msg_[A-Za-z0-9_-]{3,128}):([0-9a-f]{16})",
+            slice_agreement.source_reference,
+        )
+    )
+    if (
+        len(state.agreements) != 2
+        or feature_agreement is None or feature_agreement.kind != "FEATURE"
+        or slice_agreement is None or slice_agreement.kind != "SLICE"
+        or feature_agreement.feature_id != activation.feature_id
+        or slice_agreement.feature_id != activation.feature_id
+        or feature_agreement.change_id != slice_agreement.change_id
+        or feature_agreement.repository_id != activation.repository_id
+        or slice_agreement.repository_id != activation.repository_id
+        or feature_agreement.source != "SESSION_REQUEST"
+        or slice_agreement.source != "SESSION_REQUEST"
+        or feature_agreement.statement != slice_agreement.statement
+        or feature_agreement.source_reference != slice_agreement.source_reference
+        or not feature_agreement.statement
+        or not feature_agreement.source_reference
+        or source_reference is None
+        or source_reference.group(3) != sha256(
+            feature_agreement.statement.encode("utf-8")
+        ).hexdigest()[:16]
+        or feature_agreement.title == ""
+        or slice_agreement.initial_task != SESSION_REQUEST_TASK
+        or slice_agreement.checkpoint != SESSION_REQUEST_CHECKPOINT
+    ):
+        raise StateValidationError("D4 activation is not bound to the initial session-request Feature")
+
+
 def validate_state(state: State) -> None:
     """Validate scalar values and all cross-record authority relationships."""
     if type(state) is not State:
@@ -3326,14 +3435,7 @@ def validate_state(state: State) -> None:
             revision = revision_index.get(revision.previous_revision_id) if revision.previous_revision_id else None
     if reachable != set(revision_index):
         raise StateValidationError("Slice criteria history must be reachable from Core-owned heads")
-    if type(state.provisional_slice_revisions) is not tuple or type(state.provisional_slice_heads) is not tuple:
-        raise StateValidationError("provisional Slice authority must be immutable tuples")
-    if any(type(item) is not ProvisionalSliceRevision for item in state.provisional_slice_revisions):
-        raise StateValidationError("provisional Slice revision shape is invalid")
-    if any(type(item) is not ProvisionalSliceHead for item in state.provisional_slice_heads):
-        raise StateValidationError("provisional Slice head shape is invalid")
-    _unique((item.revision_id for item in state.provisional_slice_revisions), "provisional Slice revision")
-    _unique((item.proposal_id for item in state.provisional_slice_heads), "provisional Slice head")
+    _validate_d4_provisional_slice_state(state)
     receipt = state.r3_schema_upgrade
     if receipt is not None:
         if type(receipt) is not R3SchemaUpgradeReceipt or state.initialization is None:
@@ -4322,6 +4424,7 @@ class ReviewInspection:
     lock_authorizations: tuple[LockAuthorization, ...] = ()
     # This read-only value comes from the same state.json read as `state`.
     e1_schema_ready: bool | None = None
+    persisted_schema: int | None = None
 
     @property
     def context(self) -> WorkingContext | None:

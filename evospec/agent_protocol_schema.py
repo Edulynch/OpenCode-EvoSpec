@@ -54,6 +54,14 @@ ACTION_KEYS = {
         "feature_agreement_ref", "slice_agreement_ref", "checkpoint",
         "statement", "evidence_refs",
     )),
+    "activate_provisional_slice_writes": frozenset((
+        "action", "expected_revision", "repository_id", "feature_id",
+    )),
+    "propose_provisional_slice": frozenset((
+        "action", "expected_revision", "repository_id", "feature_id",
+        "expected_head", "title", "outcome", "example", "inclusions",
+        "exclusions", "considerations", "open_questions", "criteria",
+    )),
     "criterion_test_result": frozenset((
         "action", "expected_revision", "repository_id", "slice_agreement_ref",
         "criteria_revision_id", "criterion_id", "test_kind", "test_target",
@@ -185,6 +193,73 @@ def parse_input_fingerprint(request: dict[str, JsonValue]) -> str:
     if re.fullmatch(r"[0-9a-f]{64}", value) is None:
         raise ProtocolError("input_fingerprint must be a lowercase SHA-256 digest")
     return value
+
+
+def parse_provisional_slice_head(
+    request: dict[str, JsonValue],
+) -> domain.ProvisionalSliceHead | None:
+    value = _value(request, "expected_head")
+    if value is None:
+        return None
+    raw = _mapping(value, "expected provisional Slice head")
+    _keys(raw, "expected provisional Slice head", frozenset((
+        "proposal_id", "revision_id", "revision", "digest",
+    )))
+    proposal_id = _string(raw, "proposal_id")
+    revision_id = _string(raw, "revision_id")
+    revision = _integer(raw, "revision")
+    digest = _string(raw, "digest")
+    if (
+        re.fullmatch(r"ps-[0-9a-f]{64}", proposal_id) is None
+        or revision_id != f"{proposal_id}-r{revision}"
+        or revision < 1
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        raise ProtocolError("expected provisional Slice head is invalid")
+    return domain.ProvisionalSliceHead(proposal_id, revision_id, revision, digest)
+
+
+def parse_provisional_slice_texts(
+    request: dict[str, JsonValue], name: str,
+) -> tuple[str, ...]:
+    values = _strings(request, name)
+    try:
+        invalid = len(values) > 16 or any(
+            not value.strip() or len(value.encode("utf-8")) > 2048 for value in values
+        )
+    except UnicodeEncodeError as error:
+        raise ProtocolError(f"{name} contains text that is not valid UTF-8") from error
+    if invalid:
+        raise ProtocolError(f"{name} exceeds the D4 fixed text or count limit")
+    return values
+
+
+def parse_provisional_slice_criteria(
+    request: dict[str, JsonValue],
+) -> tuple[domain.ProvisionalSliceCriterion, ...]:
+    values = _list(_value(request, "criteria"), "provisional Slice criteria")
+    if len(values) > 16:
+        raise ProtocolError("provisional Slice criteria exceed the D4 count limit")
+    criteria: list[domain.ProvisionalSliceCriterion] = []
+    for value in values:
+        raw = _mapping(value, "provisional Slice criterion")
+        _keys(raw, "provisional Slice criterion", frozenset((
+            "id", "expected_result", "expected_evidence",
+        )))
+        fields = tuple(
+            _string(raw, name)
+            for name in ("id", "expected_result", "expected_evidence")
+        )
+        try:
+            invalid = any(
+                not item.strip() or len(item.encode("utf-8")) > 2048 for item in fields
+            )
+        except UnicodeEncodeError as error:
+            raise ProtocolError("provisional Slice criterion is not valid UTF-8") from error
+        if invalid:
+            raise ProtocolError("provisional Slice criterion exceeds the D4 text limit")
+        criteria.append(domain.ProvisionalSliceCriterion(*fields))
+    return tuple(criteria)
 
 
 def parse_repository_paths(request: dict[str, JsonValue], name: str) -> tuple[domain.RepositoryPath, ...]:

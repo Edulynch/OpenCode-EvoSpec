@@ -11,6 +11,7 @@ from evospec.domain import (
     FeatureId,
     ExpectedRevision,
     LivingSpecId,
+    ProvisionalSliceCriterion,
     ReviewResult,
     VerificationEvidence,
 )
@@ -21,10 +22,11 @@ from evospec.persistence import (
     FileOperations,
     StateStore,
     _provisional_slice_to_json,
+    _new_d4_provisional_slice_revision,
     encode_json,
 )
 from evospec.services import CoreService, ServiceError
-from evospec.workflow import WorkflowService
+from evospec.workflow import WorkflowError, WorkflowService
 from tests._tempdir import TemporaryDirectory
 from tests.test_services_state import (
     advance_context,
@@ -33,6 +35,7 @@ from tests.test_services_state import (
 )
 from tests.test_persistence import (
     _ProvisionalSliceTestHarness,
+    _create_d4_session_request_fixture,
     _create_provisional_fixture,
     _make_provisional_revision,
 )
@@ -257,6 +260,102 @@ class AtomicPersistenceTests(unittest.TestCase):
 
             retried = stable_service.record_change(state, change)
             self.assertEqual(retried.changes[0].id, ChangeId("orphan-change"))
+
+    def test_d4_proposal_collision_preserves_seeded_immutable_and_authority(self) -> None:
+        with TemporaryDirectory(prefix="evospec-d4-collision-") as temporary:
+            root = Path(temporary)
+            workflow, source = _create_d4_session_request_fixture(root)
+            assert source.initialization is not None
+            feature_id = str(source.features[0].id)
+            repository_id = source.initialization.repository_id
+            enabled = workflow.activate_provisional_slice_writes(
+                repository_id,
+                feature_id,
+                expected_revision=ExpectedRevision(source.revision),
+            )
+            current = CoreService.open(root).recover()
+            assert current.active_context is not None
+            before_unsupported = {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*")
+                if path.is_file()
+            }
+            with self.assertRaises(ServiceError):
+                CoreService.open(root).record_safety_facts(
+                    current,
+                    True,
+                    replace(
+                        current.active_context.safety_facts,
+                        unresolved_decision_details=("unsupported D4 safety mutation",),
+                    ),
+                )
+            self.assertEqual(CoreService.open(root).recover(), current)
+            self.assertEqual(before_unsupported, {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*")
+                if path.is_file()
+            })
+
+            title = "Deterministic collision"
+            outcome = "A bounded suggestion"
+            inclusions = ("A narrow scope",)
+            exclusions = ("No acceptance implied",)
+            considerations: tuple[str, ...] = ()
+            open_questions: tuple[str, ...] = ()
+            criteria = (ProvisionalSliceCriterion("c-1", "A visible outcome", "A focused check"),)
+            revision = _new_d4_provisional_slice_revision(
+                repository_id,
+                feature_id,
+                None,
+                title,
+                outcome,
+                None,
+                inclusions,
+                exclusions,
+                considerations,
+                open_questions,
+                criteria,
+            )
+            record_path = (
+                root / ".evospec" / "records" / "provisional-slices"
+                / f"{revision.revision_id}.json"
+            )
+            record_path.parent.mkdir(parents=True)
+            preexisting = b'{"different":"immutable collision"}'
+            record_path.write_bytes(preexisting)
+            before = {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*")
+                if path.is_file()
+            }
+
+            with self.assertRaises(WorkflowError):
+                workflow.propose_provisional_slice(
+                    repository_id,
+                    feature_id,
+                    None,
+                    title,
+                    outcome,
+                    None,
+                    inclusions,
+                    exclusions,
+                    considerations,
+                    open_questions,
+                    criteria,
+                    expected_revision=ExpectedRevision(current.revision),
+                )
+
+            recovered = CoreService.open(root).recover()
+            self.assertEqual(recovered, current)
+            self.assertEqual(recovered.revision, enabled.revision)
+            self.assertEqual(recovered.provisional_slice_heads, ())
+            self.assertEqual(recovered.provisional_slice_revisions, ())
+            self.assertEqual(record_path.read_bytes(), preexisting)
+            self.assertEqual(before, {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*")
+                if path.is_file()
+            })
 
     def test_provisional_record_orphan_is_inert_when_state_replace_fails(self) -> None:
         with TemporaryDirectory(prefix="evospec-d1-atomic-") as temporary:
