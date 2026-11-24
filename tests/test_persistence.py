@@ -30,6 +30,7 @@ from evospec.domain import (
     Observation,
     ObservationId,
     PendingDiscoveryRecovery,
+    ProductTruthContent,
     ProvisionalSliceCriterion,
     ProvisionalSliceHead,
     ProvisionalSliceProvenance,
@@ -2031,6 +2032,226 @@ class ProvisionalSlicePersistenceTests(unittest.TestCase):
                 {head1.revision_id, head2.revision_id},
             )
             self.assertEqual(StateStore(root).load_state(), revised)
+
+    def test_d4_core_lifecycle_preserves_suggestion_authority_through_terminal_recovery(self) -> None:
+        with TemporaryDirectory(prefix="evospec-d4-lifecycle-") as temporary:
+            root = Path(temporary)
+            workflow, source = _create_d4_session_request_fixture(root)
+            assert source.initialization is not None
+            assert source.active_context is not None
+            repository_id = source.initialization.repository_id
+            feature_id = str(source.features[0].id)
+            enabled = workflow.activate_provisional_slice_writes(
+                repository_id,
+                feature_id,
+                expected_revision=ExpectedRevision(source.revision),
+            )
+
+            def propose(state: State, head: ProvisionalSliceHead | None, outcome: str):
+                return workflow.propose_provisional_slice(
+                    repository_id,
+                    feature_id,
+                    head,
+                    "Lifecycle parity suggestion",
+                    outcome,
+                    None,
+                    ("Keep the proposal bounded",),
+                    ("Do not infer acceptance",),
+                    (),
+                    ("Confirm later",),
+                    (ProvisionalSliceCriterion("c-1", "A visible outcome", "A focused check"),),
+                    expected_revision=ExpectedRevision(state.revision),
+                )
+
+            first_result = propose(CoreService.open(root).recover(), None, "First suggestion")
+            first_state = CoreService.open(root).recover()
+            first_head = first_state.provisional_slice_heads[0]
+            first_path = (
+                root / ".evospec" / "records" / "provisional-slices"
+                / f"{first_head.revision_id}.json"
+            )
+            first_bytes = first_path.read_bytes()
+            second_result = propose(first_state, first_head, "Superseding suggestion")
+            second_state = CoreService.open(root).recover()
+            self.assertEqual(first_result.revision, enabled.revision + 1)
+            self.assertEqual(second_result.revision, first_result.revision + 1)
+            self.assertEqual(second_state.provisional_slice_heads[0].revision, 2)
+            self.assertEqual(first_path.read_bytes(), first_bytes)
+
+            initial_review = workflow.record_review(
+                ReviewResult(ReviewVerdict.PASS, (), True),
+                expected_revision=ExpectedRevision(second_state.revision),
+            )
+            self.assertEqual(initial_review.code, "ACCEPTED_TASK_PROGRESS_REQUIRED")
+            self.assertEqual(CoreService.open(root).recover(), second_state)
+            before_report_files = {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*") if path.is_file()
+            }
+            with self.assertRaises(WorkflowError):
+                workflow.record_progress(
+                    "implement", "the accepted request", (), "legacy write", (), "resume",
+                    expected_revision=ExpectedRevision(second_state.revision),
+                )
+            self.assertEqual(CoreService.open(root).recover(), second_state)
+            self.assertEqual(before_report_files, {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*") if path.is_file()
+            })
+
+            active = second_state.active_context
+            assert active is not None and active.change_id is not None
+            feature_agreement = next(item for item in second_state.agreements if item.kind == "FEATURE")
+            slice_agreement = next(item for item in second_state.agreements if item.kind == "SLICE")
+            assert slice_agreement.task_id is not None
+            progress = workflow.accepted_task_progress(
+                repository_id,
+                slice_agreement.task_id,
+                feature_agreement.id,
+                slice_agreement.id,
+                "Initial implementation step",
+                "An unverified implementation report",
+                ("local test output",),
+                expected_revision=ExpectedRevision(second_state.revision),
+            )
+            reported = CoreService.open(root).recover()
+            self.assertEqual(progress.code, "TASK_PROGRESS_RECORDED")
+            self.assertEqual(reported.revision, second_state.revision + 1)
+            assert reported.active_context is not None
+            assert reported.active_context.task_progress is not None
+            self.assertEqual(reported.active_context.task_progress.report_kind, "REPORTED_UNVERIFIED")
+            self.assertEqual(reported.provisional_slice_activation, second_state.provisional_slice_activation)
+            self.assertEqual(reported.provisional_slice_revisions, second_state.provisional_slice_revisions)
+            self.assertEqual(reported.provisional_slice_heads, second_state.provisional_slice_heads)
+            self.assertEqual(reported.agreements, second_state.agreements)
+
+            premature_verify = workflow.record_verification(
+                VerificationEvidence(("verification evidence",), True),
+                expected_revision=ExpectedRevision(reported.revision),
+            )
+            premature_converge = workflow.converge(
+                convergence_assessment(active.change_id, False),
+                expected_revision=ExpectedRevision(reported.revision),
+            )
+            self.assertEqual(premature_verify.code, "REVIEW_REQUIRED")
+            self.assertEqual(premature_converge.code, "REVIEW_REQUIRED")
+            self.assertEqual(CoreService.open(root).recover(), reported)
+
+            review = workflow.record_review(
+                ReviewResult(ReviewVerdict.PASS, (), True),
+                expected_revision=ExpectedRevision(reported.revision),
+            )
+            self.assertEqual(review.code, "REVIEWED")
+            self.assertEqual(review.revision, reported.revision + 2)
+            before_verification = CoreService.open(root).recover()
+            assert before_verification.active_context is not None
+            self.assertEqual(before_verification.active_context.checkpoints, ())
+            premature_converge = workflow.converge(
+                convergence_assessment(active.change_id, False),
+                expected_revision=ExpectedRevision(before_verification.revision),
+            )
+            self.assertEqual(premature_converge.code, "VERIFICATION_REQUIRED")
+            self.assertEqual(CoreService.open(root).recover(), before_verification)
+
+            verification = workflow.record_verification(
+                VerificationEvidence(("focused verification passed",), True),
+                expected_revision=ExpectedRevision(review.revision),
+            )
+            self.assertEqual(verification.code, "VERIFIED")
+            self.assertEqual(verification.revision, review.revision + 2)
+            before_invalid_convergence = CoreService.open(root).recover()
+            before_invalid_files = {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*") if path.is_file()
+            }
+            invalid_assessments = (
+                convergence_assessment(active.change_id, True),
+                replace(
+                    convergence_assessment(active.change_id, False),
+                    product_truth_content=ProductTruthContent("# Unrequested publication\n"),
+                ),
+            )
+            for assessment in invalid_assessments:
+                with self.assertRaises(WorkflowError):
+                    workflow.converge(
+                        assessment,
+                        expected_revision=ExpectedRevision(before_invalid_convergence.revision),
+                    )
+                self.assertEqual(CoreService.open(root).recover(), before_invalid_convergence)
+            self.assertEqual(
+                before_invalid_files,
+                {
+                    path.relative_to(root / ".evospec"): path.read_bytes()
+                    for path in (root / ".evospec").rglob("*") if path.is_file()
+                },
+            )
+
+            done = workflow.converge(
+                convergence_assessment(active.change_id, False),
+                expected_revision=ExpectedRevision(verification.revision),
+            )
+            recovered = CoreService.open(root).recover()
+            self.assertEqual(done.code, "DONE")
+            self.assertEqual(done.revision, verification.revision + 3)
+            self.assertEqual(recovered.revision, enabled.revision + 10)
+            self.assertIsNone(recovered.active_context)
+            self.assertIsNone(recovered.active_work_id)
+            self.assertEqual(len(recovered.features), 1)
+            self.assertEqual(len(recovered.changes), 1)
+            self.assertEqual(len(recovered.agreements), 2)
+            self.assertEqual(recovered.features, source.features)
+            self.assertEqual(recovered.changes, source.changes)
+            self.assertEqual(recovered.agreements, source.agreements)
+            self.assertEqual(recovered.provisional_slice_activation, second_state.provisional_slice_activation)
+            self.assertEqual(recovered.provisional_slice_revisions, second_state.provisional_slice_revisions)
+            self.assertEqual(recovered.provisional_slice_heads, second_state.provisional_slice_heads)
+            self.assertEqual(recovered.publications, ())
+            self.assertEqual(recovered.publication_history, ())
+            self.assertEqual(recovered.feature_completion_receipts, ())
+            self.assertEqual(recovered.feature_reopen_receipts, ())
+            self.assertEqual(recovered.slice_outcome_receipts, ())
+            self.assertEqual(len(recovered.terminal_archives), 1)
+            archived = recovered.terminal_archives[0]
+            self.assertEqual(archived.context.status, LifecycleState.ACCEPTED)
+            self.assertEqual(archived.context.phase, Phase.DONE)
+            assert archived.context.task_progress is not None
+            self.assertEqual(archived.context.task_progress.report_kind, "REPORTED_UNVERIFIED")
+            assert archived.convergence_assessment is not None
+            self.assertFalse(archived.convergence_assessment.product_truth_changed)
+            self.assertIsNone(archived.convergence_assessment.product_truth_content)
+            self.assertEqual(len(recovered.work_items), 1)
+            self.assertEqual(recovered.work_items[0].operational_state.value, "DONE")
+            self.assertEqual(recovered.work_items[0].terminal_change_id, archived.context.change_id)
+            self.assertEqual(first_path.read_bytes(), first_bytes)
+            closed_files = {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*") if path.is_file()
+            }
+            self.assertEqual(
+                {
+                    path: data for path, data in before_invalid_files.items()
+                    if path.parts[:2] == ("records", "provisional-slices")
+                },
+                {
+                    path: data for path, data in closed_files.items()
+                    if path.parts[:2] == ("records", "provisional-slices")
+                },
+            )
+            self.assertEqual(StateStore(root).load_state(), recovered)
+            state_path = root / ".evospec" / "state.json"
+            original_state_bytes = state_path.read_bytes()
+            for invalid in ("missing_done_work_item", "truth_publication_assessment"):
+                with self.subTest(invalid=invalid):
+                    corrupted = json.loads(original_state_bytes)
+                    if invalid == "missing_done_work_item":
+                        corrupted["work_items"] = []
+                    else:
+                        corrupted["terminal_archives"][0]["convergence_assessment"]["product_truth_changed"] = True
+                    state_path.write_text(json.dumps(corrupted), encoding="utf-8")
+                    with self.assertRaises(RecoveryError):
+                        StateStore(root).load_state()
+                    state_path.write_bytes(original_state_bytes)
+            self.assertEqual(StateStore(root).load_state(), recovered)
 
     def test_d4_provisional_slice_publication_cas_is_process_safe(self) -> None:
         with TemporaryDirectory(prefix="evospec-d4-process-cas-") as temporary:

@@ -34,7 +34,7 @@ from evospec.domain import (
     WorkRelationKind,
 )
 from evospec.lifecycle import Classification, ReviewVerdict
-from evospec.persistence import JsonValue
+from evospec.persistence import JsonValue, StateStore
 from evospec.services import CoreService, RequestScopedObjectiveStatus
 from evospec.workflow import WorkflowError, WorkflowService
 from tests._tempdir import TemporaryDirectory
@@ -180,6 +180,7 @@ class AgentProtocolTests(unittest.TestCase):
                 ),
             ))
             self.assertEqual(first["result"]["code"], "PROVISIONAL_SLICE_PROPOSED")
+            self.assertEqual(first["result"]["revision"], activated["result"]["revision"] + 1)
             self.assertEqual(first["context"]["provisional_slice_inventory"]["total"], 1)
             first_item = first["context"]["provisional_slice_inventory"]["items"][0]
             first_head = first_item["head"]
@@ -212,6 +213,7 @@ class AgentProtocolTests(unittest.TestCase):
                 ),
             ))
             self.assertEqual(second["result"]["code"], "PROVISIONAL_SLICE_PROPOSED")
+            self.assertEqual(second["result"]["revision"], first["result"]["revision"] + 1)
             inventory = second["context"]["provisional_slice_inventory"]
             self.assertEqual(inventory["total"], 1)
             self.assertEqual(inventory["items"][0]["head"]["revision"], 2)
@@ -224,6 +226,46 @@ class AgentProtocolTests(unittest.TestCase):
             self.assertIn(
                 "accepted_task_progress",
                 second["context"]["legal_actions"],
+            )
+            before_report_files = {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*")
+                if path.is_file()
+            }
+            generic_progress = json.loads(execute(
+                root,
+                request(
+                    "progress",
+                    expected_revision=before_progress.revision,
+                    current_action="implement",
+                    focus="the accepted request",
+                    completed_work=[],
+                    current_work="attempt legacy progress",
+                    pending_work=[],
+                    resume_point="resume",
+                ),
+            ))
+            premature_review = json.loads(execute(
+                root,
+                request(
+                    "review",
+                    expected_revision=before_progress.revision,
+                    review={"verdict": "PASS", "findings": [], "safe_to_proceed": True},
+                ),
+            ))
+            self.assertEqual(generic_progress["error"]["code"], "WORKFLOW_ERROR")
+            self.assertEqual(
+                premature_review["result"]["code"],
+                "ACCEPTED_TASK_PROGRESS_REQUIRED",
+            )
+            self.assertEqual(CoreService.open(root).recover(), before_progress)
+            self.assertEqual(
+                before_report_files,
+                {
+                    path.relative_to(root / ".evospec"): path.read_bytes()
+                    for path in (root / ".evospec").rglob("*")
+                    if path.is_file()
+                },
             )
             progressed = json.loads(execute(
                 root,
@@ -248,6 +290,199 @@ class AgentProtocolTests(unittest.TestCase):
             self.assertEqual(after_progress.agreements, before_progress.agreements)
             self.assertEqual(progressed["context"]["provisional_slice_inventory"]["items"][0]["head"]["revision"], 2)
             self.assertTrue(progressed["context"]["provisional_slice_write_ready"])
+
+            before_review = CoreService.open(root).recover()
+            assert before_review.active_context is not None
+            assert before_review.active_context.change_id is not None
+            before_review_files = {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*")
+                if path.is_file()
+            }
+            premature_verify = json.loads(execute(
+                root,
+                request(
+                    "verify",
+                    expected_revision=before_review.revision,
+                    verification={"evidence": ["tests"], "sufficient": True},
+                ),
+            ))
+            premature_converge = json.loads(execute(
+                root,
+                request(
+                    "converge",
+                    expected_revision=before_review.revision,
+                    assessment={
+                        "change_id": str(before_review.active_context.change_id),
+                        "product_truth_changed": False,
+                        "confidence": "HIGH",
+                        "evidence": [{"source": "agent", "reference": "tests/test_agent_protocol.py"}],
+                        "rationale": "premature convergence",
+                    },
+                ),
+            ))
+            self.assertEqual(premature_verify["result"]["code"], "REVIEW_REQUIRED")
+            self.assertEqual(premature_converge["result"]["code"], "REVIEW_REQUIRED")
+            self.assertEqual(CoreService.open(root).recover(), before_review)
+            self.assertEqual(
+                before_review_files,
+                {
+                    path.relative_to(root / ".evospec"): path.read_bytes()
+                    for path in (root / ".evospec").rglob("*")
+                    if path.is_file()
+                },
+            )
+
+            reviewed = json.loads(execute(
+                root,
+                request(
+                    "review",
+                    expected_revision=progressed["result"]["revision"],
+                    review={"verdict": "PASS", "findings": [], "safe_to_proceed": True},
+                ),
+            ))
+            self.assertEqual(reviewed["result"]["code"], "REVIEWED")
+            self.assertEqual(reviewed["result"]["revision"], progressed["result"]["revision"] + 2)
+            before_verification = CoreService.open(root).recover()
+            assert before_verification.active_context is not None
+            assert before_verification.active_context.change_id is not None
+            premature_converge = json.loads(execute(
+                root,
+                request(
+                    "converge",
+                    expected_revision=before_verification.revision,
+                    assessment={
+                        "change_id": str(before_verification.active_context.change_id),
+                        "product_truth_changed": False,
+                        "confidence": "HIGH",
+                        "evidence": [{"source": "agent", "reference": "tests/test_agent_protocol.py"}],
+                        "rationale": "verification is still required",
+                    },
+                ),
+            ))
+            self.assertEqual(premature_converge["result"]["code"], "VERIFICATION_REQUIRED")
+            self.assertEqual(CoreService.open(root).recover(), before_verification)
+
+            verified = json.loads(execute(
+                root,
+                request(
+                    "verify",
+                    expected_revision=reviewed["result"]["revision"],
+                    verification={"evidence": ["focused checks passed"], "sufficient": True},
+                ),
+            ))
+            self.assertEqual(verified["result"]["code"], "VERIFIED")
+            self.assertEqual(verified["result"]["revision"], reviewed["result"]["revision"] + 2)
+            change_id = verified["result"]["change_id"]
+            if type(change_id) is not str:
+                self.fail("expected active D4 Change identifier")
+            false_assessment: dict[str, JsonValue] = {
+                "change_id": change_id,
+                "product_truth_changed": False,
+                "confidence": "HIGH",
+                "evidence": [{"source": "agent", "reference": "tests/test_agent_protocol.py"}],
+                "rationale": "accepted terminal work does not publish Product Truth",
+            }
+            invalid_assessments: tuple[dict[str, JsonValue], ...] = (
+                {
+                    **false_assessment,
+                    "product_truth_changed": True,
+                    "product_truth_content": "# Must not publish\n",
+                },
+                {
+                    **false_assessment,
+                    "product_truth_content": "# Content is not allowed with false convergence\n",
+                },
+            )
+            before_bad_convergence = CoreService.open(root).recover()
+            before_bad_convergence_files = {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*")
+                if path.is_file()
+            }
+            for invalid_assessment in invalid_assessments:
+                rejected = json.loads(execute(
+                    root,
+                    request(
+                        "converge",
+                        expected_revision=before_bad_convergence.revision,
+                        assessment=invalid_assessment,
+                    ),
+                ))
+                self.assertEqual(rejected["error"]["code"], "WORKFLOW_ERROR")
+                self.assertEqual(CoreService.open(root).recover(), before_bad_convergence)
+                self.assertEqual(
+                    before_bad_convergence_files,
+                    {
+                        path.relative_to(root / ".evospec"): path.read_bytes()
+                        for path in (root / ".evospec").rglob("*")
+                        if path.is_file()
+                    },
+                )
+
+            converged = json.loads(execute(
+                root,
+                request(
+                    "converge",
+                    expected_revision=verified["result"]["revision"],
+                    assessment=false_assessment,
+                ),
+            ))
+            closed = CoreService.open(root).recover()
+            self.assertEqual(converged["result"]["code"], "DONE")
+            self.assertEqual(converged["result"]["revision"], verified["result"]["revision"] + 3)
+            self.assertEqual(json.loads((root / ".evospec" / "state.json").read_bytes())["schema"], 23)
+            self.assertIsNone(closed.active_context)
+            self.assertIsNone(closed.active_work_id)
+            self.assertEqual(len(closed.features), 1)
+            self.assertEqual(len(closed.changes), 1)
+            self.assertEqual(closed.features, before_progress.features)
+            self.assertEqual(closed.changes, before_progress.changes)
+            self.assertEqual(closed.agreements, before_progress.agreements)
+            self.assertEqual(len(closed.agreements), 2)
+            self.assertEqual(closed.feature_completion_receipts, ())
+            self.assertEqual(closed.feature_reopen_receipts, ())
+            self.assertEqual(closed.slice_outcome_receipts, ())
+            self.assertEqual(closed.provisional_slice_activation, before_progress.provisional_slice_activation)
+            self.assertEqual(closed.provisional_slice_revisions, before_progress.provisional_slice_revisions)
+            self.assertEqual(closed.provisional_slice_heads, before_progress.provisional_slice_heads)
+            self.assertEqual(closed.publications, ())
+            self.assertEqual(closed.publication_history, ())
+            self.assertEqual(len(closed.terminal_archives), 1)
+            archive = closed.terminal_archives[0]
+            self.assertEqual(archive.context.status.value, "ACCEPTED")
+            self.assertEqual(archive.context.phase.value, "DONE")
+            assert archive.context.task_progress is not None
+            self.assertEqual(archive.context.task_progress.report_kind, "REPORTED_UNVERIFIED")
+            assert archive.convergence_assessment is not None
+            self.assertFalse(archive.convergence_assessment.product_truth_changed)
+            self.assertIsNone(archive.convergence_assessment.product_truth_content)
+            self.assertEqual(len(closed.work_items), 1)
+            self.assertEqual(closed.work_items[0].operational_state.value, "DONE")
+            self.assertEqual(closed.work_items[0].terminal_change_id, archive.context.change_id)
+            self.assertEqual(
+                (root / ".evospec" / "records" / "provisional-slices"
+                 / f"{first_head['revision_id']}.json").read_bytes(),
+                before_report_files[
+                    Path("records") / "provisional-slices" / f"{first_head['revision_id']}.json"
+                ],
+            )
+            closed_files = {
+                path.relative_to(root / ".evospec"): path.read_bytes()
+                for path in (root / ".evospec").rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(
+                {
+                    path: data for path, data in before_report_files.items()
+                    if path.parts[:2] == ("records", "provisional-slices")
+                },
+                {
+                    path: data for path, data in closed_files.items()
+                    if path.parts[:2] == ("records", "provisional-slices")
+                },
+            )
+            self.assertEqual(StateStore(root).load_state(), closed)
 
     def test_request_scoped_objective_protocol_verifies_closes_and_recovers(self) -> None:
         with TemporaryDirectory() as temporary:

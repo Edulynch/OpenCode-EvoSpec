@@ -1577,6 +1577,11 @@ class WorkflowService:
             or type(assessment.product_truth_changed) is not bool
         ):
             raise WorkflowError("convergence requires an assessment for the active Change")
+        if self._inspection_for_state(state).persisted_schema == 23 and (
+            assessment.product_truth_changed is not False
+            or assessment.product_truth_content is not None
+        ):
+            raise WorkflowError("schema 23 permits only false convergence without publication content")
         try:
             validate_convergence_assessment_authority(state, assessment)
         except StateValidationError as error:

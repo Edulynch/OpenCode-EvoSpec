@@ -127,6 +127,9 @@ _D4_SCHEMA23_ACTIONS = frozenset((
     Action.ACCEPTED_TASK_PROGRESS,
     Action.ACTIVATE_PROVISIONAL_SLICE_WRITES,
     Action.PROPOSE_PROVISIONAL_SLICE,
+    Action.REVIEW,
+    Action.VERIFY,
+    Action.CONVERGE,
 ))
 _ACTION_ORDER = {
     Action.CONTEXT: 0, Action.NEW: 1, Action.CHANGE: 2, Action.CONTINUE: 3, Action.RESUME: 4,
@@ -466,6 +469,12 @@ def _active_guidance(
             return _allow(action, "exact accepted Task may report unverified progress", scope)
         return _block(action, "E1_PROGRESS_UNAVAILABLE", "typed Task progress requires schema 14, current autonomy, and implementation scope", (), None, scope)
     if action is Action.REVIEW:
+        if inspection.persisted_schema == 23 and context.task_progress is None:
+            return _block(
+                action, "ACCEPTED_TASK_PROGRESS_REQUIRED",
+                "an accepted Task report is required before review begins",
+                (Action.ACCEPTED_TASK_PROGRESS,), Action.ACCEPTED_TASK_PROGRESS, scope,
+            )
         if context.phase in (Phase.RESEARCH, Phase.READY, Phase.IMPLEMENT, Phase.REVIEW):
             return _allow(action, "review can be recorded", scope)
         return _block(action, "VERIFICATION_REQUIRED", "review assurance is already complete enough to verify", (Action.VERIFY,), Action.VERIFY, scope)

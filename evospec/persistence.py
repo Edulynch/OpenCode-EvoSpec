@@ -119,7 +119,14 @@ from .domain import (
     is_sha256_digest,
     validate_state,
 )
-from .lifecycle import Classification, LifecycleState, Phase, ReviewVerdict
+from .lifecycle import (
+    Classification,
+    LifecycleState,
+    Phase,
+    ReviewVerdict,
+    can_converge,
+    has_acceptable_review,
+)
 from .discovery import DiscoveryPolicy
 from .input_fingerprint import (
     INPUT_POLICY_DIGEST,
@@ -144,6 +151,9 @@ REQUEST_OBJECTIVE_SCHEMA: Final = 20
 SEMANTIC_REQUEST_OBJECTIVE_SCHEMA: Final = 21
 PROVISIONAL_SLICE_SCHEMA: Final = 22
 D4_PROVISIONAL_SLICE_SCHEMA: Final = 23
+_D4_LIFECYCLE_OPERATIONS: Final = frozenset((
+    "lifecycle", "review", "verification", "convergence", "accepted_terminal_archive",
+))
 LEGACY_WRITE_SCHEMA: Final = 13
 E1_TASK_PROGRESS_SCHEMA: Final = 14
 INTEGRATION_REGISTRY_SCHEMA: Final = 1
@@ -1948,6 +1958,295 @@ def _load_provisional_slice_heads(
     return heads
 
 
+def _d4_only_state_fields(candidate: State, current: State, *fields: str) -> bool:
+    return replace(
+        candidate,
+        revision=current.revision,
+        **{field: getattr(current, field) for field in fields},
+    ) == current
+
+
+def _d4_has_reported_task(context: WorkingContext, task_id: str | None = None) -> bool:
+    return (
+        context.task_progress is not None
+        and context.task_progress.report_kind == "REPORTED_UNVERIFIED"
+        and (task_id is None or context.task_progress.task_id == task_id)
+    )
+
+
+def _validate_d4_lifecycle_commit(
+    root: Path, current: State, candidate: State, operation: str,
+) -> None:
+    """Admit only the canonical D4 review, verify, converge and archive commits."""
+    if operation not in _D4_LIFECYCLE_OPERATIONS:
+        raise AtomicFailure("D4 lifecycle operation is unsupported")
+    if candidate.revision != current.revision + 1:
+        raise AtomicFailure("D4 lifecycle operation must publish exactly one revision")
+    active = current.active_context
+    updated = candidate.active_context
+    if active is None:
+        raise AtomicFailure("D4 lifecycle operation requires active work")
+
+    if operation == "lifecycle":
+        transitions = {
+            (LifecycleState.IN_PROGRESS, Phase.IMPLEMENT): (
+                LifecycleState.IN_PROGRESS, Phase.REVIEW,
+            ),
+            (LifecycleState.IN_PROGRESS, Phase.REVIEW): (
+                LifecycleState.VERIFYING, Phase.VERIFY,
+            ),
+            (LifecycleState.VERIFYING, Phase.VERIFY): (
+                LifecycleState.VERIFYING, Phase.CONVERGE,
+            ),
+        }
+        target = transitions.get((active.status, active.phase))
+        if (
+            target is None
+            or not _d4_has_reported_task(active)
+            or not _d4_only_state_fields(candidate, current, "active_context")
+            or updated is None
+        ):
+            raise AtomicFailure("D4 lifecycle phase advance is not authorized")
+        status, phase = target
+        if active.phase is Phase.REVIEW and not has_acceptable_review(active.review):
+            raise AtomicFailure("D4 verification phase requires acceptable review")
+        if active.phase is Phase.VERIFY and (
+            not has_acceptable_review(active.review)
+            or not active.verification.sufficient
+            or not can_converge(active.review, active.verification)
+        ):
+            raise AtomicFailure("D4 convergence phase requires sufficient assurance")
+        if active.convergence_complete:
+            raise AtomicFailure("D4 lifecycle phase advance is not authorized")
+        if updated != replace(active, status=status, phase=phase, paused_pair=None):
+            raise AtomicFailure("D4 lifecycle phase advance changed unrelated context")
+    elif operation == "review":
+        if (
+            (active.status, active.phase) != (LifecycleState.IN_PROGRESS, Phase.REVIEW)
+            or not _d4_has_reported_task(active)
+            or not _d4_only_state_fields(candidate, current, "active_context")
+            or updated is None
+            or updated.review is None
+            or updated != replace(
+                active,
+                review=updated.review,
+                checkpoints=updated.checkpoints,
+                review_evidence=updated.review_evidence,
+                review_findings=updated.review_findings,
+            )
+        ):
+            raise AtomicFailure("D4 review record changed unauthorized state")
+    elif operation == "verification":
+        if (
+            (active.status, active.phase) != (LifecycleState.VERIFYING, Phase.VERIFY)
+            or not _d4_has_reported_task(active)
+            or not has_acceptable_review(active.review)
+            or not _d4_only_state_fields(candidate, current, "active_context")
+            or updated is None
+            or updated != replace(active, verification=updated.verification)
+        ):
+            raise AtomicFailure("D4 verification record changed unauthorized state")
+    elif operation == "convergence":
+        if (
+            (active.status, active.phase) != (LifecycleState.VERIFYING, Phase.CONVERGE)
+            or not _d4_has_reported_task(active)
+            or not has_acceptable_review(active.review)
+            or not active.verification.sufficient
+            or not can_converge(active.review, active.verification)
+            or active.convergence_complete
+            or not _d4_only_state_fields(candidate, current, "active_context")
+            or updated != replace(active, convergence_complete=True)
+        ):
+            raise AtomicFailure("D4 convergence confirmation changed unauthorized state")
+    else:
+        if (
+            (active.status, active.phase) != (LifecycleState.VERIFYING, Phase.CONVERGE)
+            or not _d4_has_reported_task(active)
+            or not has_acceptable_review(active.review)
+            or not active.verification.sufficient
+            or not can_converge(active.review, active.verification)
+            or not active.convergence_complete
+            or active.change_id is None
+            or active.publication is not None
+            or candidate.active_context is not None
+            or candidate.active_work_id is not None
+            or not _d4_only_state_fields(
+                candidate, current, "active_context", "active_work_id",
+                "terminal_archives", "work_items",
+            )
+            or len(candidate.terminal_archives) != 1
+            or candidate.terminal_archives[:len(current.terminal_archives)]
+            != current.terminal_archives
+            or len(candidate.work_items) != 1
+            or candidate.work_items[:len(current.work_items)] != current.work_items
+        ):
+            raise AtomicFailure("D4 accepted terminal archive changed unauthorized state")
+        archive = candidate.terminal_archives[0]
+        assessment = archive.convergence_assessment
+        work_item = candidate.work_items[0]
+        if (
+            archive.context != replace(
+                active, status=LifecycleState.ACCEPTED, phase=Phase.DONE,
+            )
+            or archive.parent_feature_id is not None
+            or archive.legacy_unassessed_acceptance
+            or type(assessment) is not ConvergenceAssessment
+            or assessment.change_id != active.change_id
+            or assessment.product_truth_changed is not False
+            or assessment.product_truth_content is not None
+            or work_item.id != WorkId(f"work-{active.change_id}")
+            or work_item.operational_state is not OperationalState.DONE
+            or work_item.context is not None
+            or work_item.preserved_primary_context is not None
+            or work_item.deferred_side_request is not None
+            or work_item.pending_intake is not None
+            or work_item.reason is not None
+            or work_item.terminal_change_id != active.change_id
+        ):
+            raise AtomicFailure("D4 accepted terminal archive is inconsistent")
+    try:
+        validate_state(candidate)
+        _validate_provisional_slice_authority(
+            root, candidate, schema=D4_PROVISIONAL_SLICE_SCHEMA,
+        )
+    except (StateValidationError, DecodeError, DomainError) as error:
+        raise AtomicFailure("D4 lifecycle candidate is invalid") from error
+
+
+def _validate_d4_lifecycle_recovery(state: State, activation: ProvisionalSliceActivation) -> None:
+    """Restrict schema-23 recovery to the initial lane or its one accepted close."""
+    if (
+        state.preserved_primary_context is not None
+        or state.completed_side_contexts
+        or state.publications
+        or state.publication_history
+        or state.decisions
+        or state.observations
+        or state.drifts
+        or state.locks
+        or state.lock_revisions
+        or state.lock_releases
+        or state.lock_authorizations
+        or state.change_lock_assessments
+        or state.work_relations
+        or state.parked_work is not None
+        or state.preserved_primary_work_id is not None
+        or state.pending_intake is not None
+        or state.deferred_side_request is not None
+        or state.shared_intents
+        or state.deferred_linked_intents
+        or state.pending_capability_selection is not None
+        or state.capability_selection_history
+        or state.pending_discovery_recovery is not None
+        or state.irreversible_authorizations
+        or state.pending_autonomy_expansion is not None
+        or state.autonomy_expansion_history
+        or state.e1_schema_upgrade is not None
+        or state.r3_schema_upgrade is not None
+        or state.r3b_schema_upgrade is not None
+        or state.slice_criteria_revisions
+        or state.slice_criteria_heads
+        or state.criterion_test_receipts
+        or state.slice_outcome_receipts
+        or state.criterion_coverage_approvals
+        or state.feature_completion_receipts
+        or state.feature_reopen_receipts
+    ):
+        raise DecodeError("schema 23 contains authority outside the initial D4 lane")
+
+    change = state.changes[0]
+    slice_agreement = state.agreements[1]
+    work_id = WorkId(f"work-{change.id}")
+    if state.terminal_archives:
+        if (
+            len(state.terminal_archives) != 1
+            or len(state.work_items) != 1
+            or state.active_context is not None
+            or state.active_work_id is not None
+        ):
+            raise DecodeError("schema 23 terminal recovery requires one accepted archive and completed work item")
+        archive = state.terminal_archives[0]
+        context = archive.context
+        assessment = archive.convergence_assessment
+        item = state.work_items[0]
+        if (
+            archive.parent_feature_id is not None
+            or archive.legacy_unassessed_acceptance
+            or context.feature_id != activation.feature_id
+            or context.change_id != change.id
+            or context.feature_agreement_ref != activation.feature_agreement_ref
+            or context.slice_agreement_ref != activation.slice_agreement_ref
+            or context.status is not LifecycleState.ACCEPTED
+            or context.phase is not Phase.DONE
+            or context.side_of is not None
+            or context.publication is not None
+            or not context.convergence_complete
+            or not _d4_has_reported_task(context, slice_agreement.task_id)
+            or not has_acceptable_review(context.review)
+            or not context.verification.sufficient
+            or not can_converge(context.review, context.verification)
+            or type(assessment) is not ConvergenceAssessment
+            or assessment.change_id != change.id
+            or assessment.product_truth_changed is not False
+            or assessment.product_truth_content is not None
+            or item.id != work_id
+            or item.operational_state is not OperationalState.DONE
+            or item.context is not None
+            or item.preserved_primary_context is not None
+            or item.deferred_side_request is not None
+            or item.pending_intake is not None
+            or item.reason is not None
+            or item.terminal_change_id != change.id
+        ):
+            raise DecodeError("schema 23 accepted terminal archive is inconsistent")
+        return
+
+    context = state.active_context
+    if (
+        context is None
+        or state.active_work_id != work_id
+        or state.work_items
+        or context.feature_id != activation.feature_id
+        or context.change_id != change.id
+        or context.feature_agreement_ref != activation.feature_agreement_ref
+        or context.slice_agreement_ref != activation.slice_agreement_ref
+        or context.side_of is not None
+        or context.publication is not None
+    ):
+        raise DecodeError("schema 23 active lifecycle pointers are inconsistent")
+    pair = (context.status, context.phase)
+    if pair == (LifecycleState.PROPOSED, Phase.RESEARCH):
+        valid = (
+            context.task_progress is None
+            and context.review is None
+            and not context.verification.sufficient
+            and not context.convergence_complete
+        )
+    elif pair == (LifecycleState.IN_PROGRESS, Phase.IMPLEMENT):
+        valid = (
+            _d4_has_reported_task(context, slice_agreement.task_id)
+            and context.review is None
+        )
+    elif pair == (LifecycleState.IN_PROGRESS, Phase.REVIEW):
+        valid = _d4_has_reported_task(context, slice_agreement.task_id)
+    elif pair == (LifecycleState.VERIFYING, Phase.VERIFY):
+        valid = (
+            _d4_has_reported_task(context, slice_agreement.task_id)
+            and has_acceptable_review(context.review)
+        )
+    elif pair == (LifecycleState.VERIFYING, Phase.CONVERGE):
+        valid = (
+            _d4_has_reported_task(context, slice_agreement.task_id)
+            and has_acceptable_review(context.review)
+            and context.verification.sufficient
+            and can_converge(context.review, context.verification)
+        )
+    else:
+        valid = False
+    if not valid:
+        raise DecodeError("schema 23 active lifecycle state is inconsistent")
+
+
 def _validate_provisional_slice_authority(
     root: Path, state: State, *, schema: int = PROVISIONAL_SLICE_SCHEMA,
 ) -> None:
@@ -1987,12 +2286,11 @@ def _validate_provisional_slice_authority(
             or state.criterion_coverage_approvals
             or state.feature_completion_receipts
             or state.feature_reopen_receipts
-            or state.terminal_archives
-            or state.work_items
         ):
             raise DecodeError("schema 23 requires the exact D4 initial-session activation lane")
         if len(revisions) > 32 or len(heads) > 32:
             raise DecodeError("D4 provisional Slice project limits are exceeded")
+        _validate_d4_lifecycle_recovery(state, activation)
     resolved_root = _resolved_root(root)
     initialization = state.initialization
     repository_id = sha256(str(resolved_root).encode("utf-8")).hexdigest()[:16]
@@ -4140,7 +4438,7 @@ class _StateStore:
             self.__publish_state_locked(state, strict_directory=True, allow_criteria_upgrade=True)
 
     def publish_lifecycle(self, state: State) -> None:
-        self.__publish_state(state)
+        self.__publish_state(state, d4_operation="lifecycle")
 
     def publish_progress(self, state: State) -> None:
         self.__publish_state(state)
@@ -4149,19 +4447,19 @@ class _StateStore:
         self.__publish_state(state)
 
     def publish_review(self, state: State) -> None:
-        self.__publish_state(state)
+        self.__publish_state(state, d4_operation="review")
 
     def publish_verification(self, state: State) -> None:
-        self.__publish_state(state)
+        self.__publish_state(state, d4_operation="verification")
 
     def publish_convergence(self, state: State) -> None:
-        self.__publish_state(state)
+        self.__publish_state(state, d4_operation="convergence")
 
     def publish_repair(self, state: State) -> None:
         self.__publish_state(state)
 
     def publish_terminal_archive(self, state: State) -> None:
-        self.__publish_state(state)
+        self.__publish_state(state, d4_operation="accepted_terminal_archive")
 
     def publish_primary_restoration(self, state: State) -> None:
         self.__publish_state(state)
@@ -4586,8 +4884,17 @@ class _StateStore:
     ) -> None:
         self.__publish_living_spec(state, publication, content)
 
-    def __publish_state(self, state: State) -> None:
+    def __publish_state(self, state: State, *, d4_operation: str | None = None) -> None:
         with _state_publish_lock(self.__root):
+            if d4_operation is not None:
+                current, schema = _recover_state_with_schema(self.__root)
+                if schema == D4_PROVISIONAL_SLICE_SCHEMA:
+                    self.__publish_state_locked(
+                        state,
+                        allow_d4_lifecycle=d4_operation,
+                        expected_current=current,
+                    )
+                    return
             self.__publish_state_locked(state)
 
     def __check_state_revision(self, state: State) -> State:
@@ -4602,6 +4909,7 @@ class _StateStore:
         allow_feature_completion: bool = False, allow_feature_reopening: bool = False,
         allow_request_objective: bool = False, allow_d4_activation: bool = False,
         allow_d4_task_progress: bool = False, allow_d4_provisional_slice: bool = False,
+        allow_d4_lifecycle: str | None = None,
     ) -> int:
         """Choose the output version from persisted authority, never caller input."""
         state_path = _artifact_path(self.__root, "state.json")
@@ -4623,6 +4931,8 @@ class _StateStore:
             if current.provisional_slice_activation is None:
                 raise AtomicFailure("D4 schema 23 is missing its activation authority")
             if allow_d4_task_progress or allow_d4_provisional_slice:
+                return D4_PROVISIONAL_SLICE_SCHEMA
+            if allow_d4_lifecycle in _D4_LIFECYCLE_OPERATIONS:
                 return D4_PROVISIONAL_SLICE_SCHEMA
             raise AtomicFailure("D4 schema 23 permits only its supported Core writers")
         if allow_request_objective:
@@ -4706,6 +5016,7 @@ class _StateStore:
         allow_feature_completion: bool = False, allow_feature_reopening: bool = False,
         allow_request_objective: bool = False, allow_d4_activation: bool = False,
         allow_d4_task_progress: bool = False, allow_d4_provisional_slice: bool = False,
+        allow_d4_lifecycle: str | None = None,
         expected_current: State | None = None,
     ) -> None:
         current = self.__check_state_revision(state)
@@ -4721,6 +5032,7 @@ class _StateStore:
             allow_d4_activation=allow_d4_activation,
             allow_d4_task_progress=allow_d4_task_progress,
             allow_d4_provisional_slice=allow_d4_provisional_slice,
+            allow_d4_lifecycle=allow_d4_lifecycle,
         )
         if allow_d4_activation and (
             current.provisional_slice_activation is not None
@@ -4745,6 +5057,12 @@ class _StateStore:
             ) != current
         ):
             raise AtomicFailure("D4 proposal may change only its immutable history and current head")
+        if allow_d4_lifecycle is not None:
+            if output_schema != D4_PROVISIONAL_SLICE_SCHEMA:
+                raise AtomicFailure("D4 lifecycle writer requires schema 23")
+            _validate_d4_lifecycle_commit(
+                self.__root, current, state, allow_d4_lifecycle,
+            )
         if (
             current.provisional_slice_activation != state.provisional_slice_activation
             and not allow_d4_activation

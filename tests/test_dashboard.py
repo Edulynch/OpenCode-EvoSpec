@@ -308,6 +308,61 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(inventory["items"][0]["head"], expected_head)
             self.assertEqual(inventory["items"][0]["title"], "Dashboard proposal")
 
+            accepted = superseded["context"]["accepted_slice"]
+            progressed = run(
+                "accepted_task_progress",
+                expected_revision=superseded["result"]["revision"],
+                repository_id=repository_id,
+                task_id=accepted["task_id"],
+                feature_agreement_ref=accepted["feature_agreement_ref"],
+                slice_agreement_ref=accepted["slice_agreement_ref"],
+                checkpoint="Initial implementation step",
+                statement="Recorded an unverified implementation update.",
+                evidence_refs=["local observation"],
+            )
+            reviewed = run(
+                "review",
+                expected_revision=progressed["result"]["revision"],
+                review={"verdict": "PASS", "findings": [], "safe_to_proceed": True},
+            )
+            verified = run(
+                "verify",
+                expected_revision=reviewed["result"]["revision"],
+                verification={"evidence": ["focused checks passed"], "sufficient": True},
+            )
+            converged = run(
+                "converge",
+                expected_revision=verified["result"]["revision"],
+                assessment={
+                    "change_id": verified["result"]["change_id"],
+                    "product_truth_changed": False,
+                    "confidence": "HIGH",
+                    "evidence": [{"source": "agent", "reference": "tests/test_dashboard.py"}],
+                    "rationale": "accepted terminal work does not publish Product Truth",
+                },
+            )
+            closed = CoreService.open(root).recover()
+            self.assertEqual(converged["result"]["code"], "DONE")
+            self.assertEqual(closed.revision, verified["result"]["revision"] + 3)
+            after_close = self._files(root)
+            server, thread, base = self._start_server(root)
+            try:
+                with urlopen(f"{base}/api/context") as response:
+                    self.assertEqual(response.status, 200)
+                    closed_context = json.loads(response.read())
+                with urlopen(f"{base}/api/context") as response:
+                    self.assertEqual(response.status, 200)
+                    repeated_context = json.loads(response.read())
+            finally:
+                self._stop_server(server, thread)
+            self.assertEqual(closed_context, repeated_context)
+            self.assertEqual(self._files(root), after_close)
+            closed_inventory = closed_context["provisional_slice_inventory"]
+            self.assertEqual(closed_inventory["total"], 1)
+            self.assertTrue(closed_inventory["complete"])
+            self.assertEqual(closed_inventory["items"][0]["head"], expected_head)
+            self.assertEqual(closed_inventory["items"][0]["title"], "Dashboard proposal")
+
     def test_static_shell_and_assets_are_served_from_packaged_resources(self) -> None:
         resources = files("evospec").joinpath("resources", "dashboard")
         if not all(resources.joinpath(name).is_file() for name in ("index.html", "dashboard.css", "dashboard.js")):
