@@ -1014,13 +1014,129 @@ test("invalid proposal IDs and mismatched head revision IDs are omitted without 
   const proposals = descendants(content).filter((element) => element.className === "provisional-slice")
   assert.deepEqual(proposals.map((proposal) => proposal.textContent).filter((text) => text.includes("Canonical current head")).length, 1)
   assert.equal(proposals.length, 1)
-  assert.ok(content.textContent.includes("Some provisional proposals were foreign or malformed"))
+  assert.ok(content.textContent.includes("Some provisional proposals were omitted because they were foreign, malformed, or ambiguous"))
   assert.equal(content.textContent.includes("Invalid proposal ID"), false)
   assert.equal(content.textContent.includes("Mismatched head revision"), false)
   assert.equal(content.textContent.includes("Trailing LF proposal ID"), false)
   assert.equal(content.textContent.includes("Saved tasks reappear after reopening"), true)
   assert.equal(descendants(content).filter((element) => element.className === "acceptance-slice").length, 1)
   assert.equal(app.ids.get("active-slice-status").textContent, "Ready for acceptance")
+})
+
+test("ambiguous proposal IDs are omitted in every order without hiding accepted history", async () => {
+  const attachHistory = (context) => {
+    const item = context.slice_acceptance_inventory.items[0]
+    const revisionId = "criteria-prior"
+    const criterion = {
+      id: "AC-prior",
+      expected_result: "The previously accepted result",
+      expected_evidence: "python-unittest:tests/test_prior.py",
+    }
+    context.revision = 11
+    item.historical_acceptance_status = "ACCEPTED_PREVIOUSLY"
+    item.historical_acceptance = {
+      receipt: {
+        id: "receipt-prior",
+        repository_id: context.repository_id,
+        slice_agreement_ref: item.slice_agreement_ref,
+        criteria_revision_id: revisionId,
+        evidence_receipt_ids: ["proof-prior"],
+        input_fingerprint: "b".repeat(64),
+        input_policy_id: "input-policy",
+        input_policy_digest: "c".repeat(64),
+        admission_policy_id: "admission-policy",
+        admission_policy_digest: "d".repeat(64),
+        relevant_drift_digest: "e".repeat(64),
+        basis: "ALL_CRITERIA_FRESH_SUPPORTED_TESTS",
+        source: "CORE_OBJECTIVE_ACCEPTANCE",
+        source_revision: 10,
+        recorded_revision: 11,
+        coverage_contract_digest: null,
+      },
+      criteria_revision: {
+        id: revisionId,
+        slice_agreement_ref: item.slice_agreement_ref,
+        repository_id: context.repository_id,
+        outcome: "Past agreed outcome",
+        example: "Past example",
+        inclusions: [],
+        exclusions: [],
+        decisions: [],
+        criteria: [criterion],
+        source: "INTERACTIVE_TERMINAL",
+        source_reference: "tty:prior",
+        previous_revision_id: null,
+        reason: null,
+        decision_statement: null,
+      },
+      criterion_evidence: [{
+        id: "proof-prior",
+        slice_agreement_ref: item.slice_agreement_ref,
+        criteria_revision_id: revisionId,
+        criterion_id: criterion.id,
+        test_kind: "python-unittest",
+        test_target: "tests/test_prior.py",
+        exit_code: 0,
+        output_sha256: "a".repeat(64),
+        source_revision: 8,
+        recorded_revision: 9,
+      }],
+    }
+  }
+  const conflictId = formattedProposalId("conflicting-proposal")
+  const conflictA = makeProvisionalItem({
+    proposalId: conflictId,
+    title: "Conflicted proposal",
+    expectedResult: "First conflicting body",
+  })
+  const conflictB = makeProvisionalItem({
+    proposalId: conflictId,
+    title: "Different conflicting title",
+    expectedResult: "Second conflicting body",
+    headRevision: 2,
+  })
+  const malformedId = formattedProposalId("malformed-duplicate")
+  const malformedPairFirst = makeProvisionalItem({ proposalId: malformedId, title: "Valid malformed-pair row" })
+  const malformedPairSecond = {
+    ...malformedPairFirst,
+    title: "Malformed duplicate row",
+    head: { ...malformedPairFirst.head, digest: "invalid" },
+  }
+  const exactDuplicate = makeProvisionalItem({
+    proposalId: formattedProposalId("exact-duplicate"),
+    title: "Exact duplicate",
+  })
+  const independent = makeProvisionalItem({
+    proposalId: formattedProposalId("independent-same-title"),
+    title: "Conflicted proposal",
+  })
+
+  for (const conflictingRows of [[conflictA, conflictB], [conflictB, conflictA]]) {
+    const context = makeContext({ outcome: "READY" })
+    attachHistory(context)
+    context.provisional_slice_inventory = makeProvisionalInventory([
+      ...conflictingRows,
+      malformedPairFirst,
+      malformedPairSecond,
+      exactDuplicate,
+      structuredClone(exactDuplicate),
+      independent,
+    ])
+    const app = await loadedDashboard(context)
+    const content = app.ids.get("active-slice-content")
+    const proposals = descendants(content).filter((element) => element.className === "provisional-slice")
+    const acceptedSlice = descendants(content).find((element) =>
+      element.className === "acceptance-slice" && element.textContent.includes("Restore saved tasks")
+    )
+
+    assert.equal(proposals.length, 1)
+    assert.ok(proposals[0].textContent.includes("Conflicted proposal"))
+    assert.ok(content.textContent.includes("ambiguous"))
+    assert.ok(acceptedSlice?.textContent.includes("Accepted previously — current validity not evaluated"))
+    assert.ok(acceptedSlice?.textContent.includes("The previously accepted result"))
+    assert.equal(descendants(content).filter((element) => element.className === "acceptance-slice").length, 1)
+    assert.equal(app.ids.get("active-slice-status").textContent, "Ready for acceptance")
+  }
 })
 
 test("provisional availability, legacy, truncation, and malformed entries remain explicit", async () => {
@@ -1055,7 +1171,7 @@ test("provisional availability, legacy, truncation, and malformed entries remain
   partial.provisional_slice_inventory = makeProvisionalInventory([valid, malformed])
   const partialApp = await loadedDashboard(partial)
   assert.equal(descendants(partialApp.ids.get("active-slice-content")).filter((element) => element.className === "provisional-slice").length, 1)
-  assert.ok(partialApp.ids.get("active-slice-content").textContent.includes("Some provisional proposals were foreign or malformed"))
+  assert.ok(partialApp.ids.get("active-slice-content").textContent.includes("Some provisional proposals were omitted because they were foreign, malformed, or ambiguous"))
   assert.ok(partialApp.ids.get("active-slice-content").textContent.includes("Ready for acceptance"))
 
   const truncated = makeContext()

@@ -759,8 +759,17 @@
       return;
     }
 
+    const proposalIdCounts = new Map();
+    inventory.items.forEach((value) => {
+      const proposalId = objectValue(value).proposal_id;
+      if (typeof proposalId === "string" && /^ps-[0-9a-f]{64}$/.test(proposalId)) {
+        proposalIdCounts.set(proposalId, (proposalIdCounts.get(proposalId) ?? 0) + 1);
+      }
+    });
+    const ambiguousProposalIds = new Set(
+      Array.from(proposalIdCounts).filter(([, count]) => count > 1).map(([proposalId]) => proposalId)
+    );
     const proposals = [];
-    const proposalIds = new Set();
     let omitted = false;
     inventory.items.forEach((value) => {
       const item = objectValue(value);
@@ -785,12 +794,11 @@
           && typeof criterion.expected_evidence === "string" && criterion.expected_evidence.trim()
         )
         && new Set(criterionIds).size === criterionIds.length
-        && !proposalIds.has(item.proposal_id);
+        && !ambiguousProposalIds.has(item.proposal_id);
       if (!valid) {
         omitted = true;
         return;
       }
-      proposalIds.add(item.proposal_id);
       proposals.push({ ...item, criteria });
     });
 
@@ -798,7 +806,7 @@
       provisionalInventoryMessage("This proposal inventory is truncated; additional current heads are not shown.");
     }
     if (omitted) {
-      provisionalInventoryMessage("Some provisional proposals were foreign or malformed and could not be displayed.");
+      provisionalInventoryMessage("Some provisional proposals were omitted because they were foreign, malformed, or ambiguous.");
     }
     const matched = new Map();
     const unmatched = [];
