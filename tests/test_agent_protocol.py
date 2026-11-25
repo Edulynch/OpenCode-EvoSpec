@@ -663,6 +663,22 @@ class AgentProtocolTests(unittest.TestCase):
         self.assertEqual(set(legacy), {
             "status", "source_reference", "request_sha256", "blockers", "heading",
         })
+        incremental = _request_scoped_objective_json(RequestScopedObjectiveStatus(
+            status="BLOCKED",
+            source_reference="session:ses_test0001:msg_test0001:0123456789abcdef",
+            request_sha256="c" * 64,
+            blockers=("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",),
+            heading=None,
+            mode="INCREMENTAL",
+        ))
+        self.assertEqual(incremental, {
+            "status": "BLOCKED",
+            "source_reference": "session:ses_test0001:msg_test0001:0123456789abcdef",
+            "request_sha256": "c" * 64,
+            "blockers": ["REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST"],
+            "heading": None,
+            "mode": "INCREMENTAL",
+        })
         semantic = _request_scoped_objective_json(RequestScopedObjectiveStatus(
             status="PENDING",
             source_reference="session:ses_test0001:msg_test0001:0123456789abcdef",
@@ -894,6 +910,18 @@ class AgentProtocolTests(unittest.TestCase):
                 admitted["result"]["revision"],
                 initialized["result"]["revision"] + 1,
             )
+            self.assertEqual(
+                admitted["context"]["request_scoped_objective"]["status"],
+                "BLOCKED",
+            )
+            self.assertEqual(
+                admitted["context"]["request_scoped_objective"]["blockers"],
+                ["REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST"],
+            )
+            self.assertEqual(
+                admitted["context"]["request_scoped_objective"]["mode"],
+                "INCREMENTAL",
+            )
             _, snapshot = WorkflowService.open(root).input_snapshot(
                 expected_revision=ExpectedRevision(admitted["result"]["revision"]),
             )
@@ -1004,6 +1032,54 @@ class AgentProtocolTests(unittest.TestCase):
             self.assertIsNone(changed["context"]["criterion_verification"])
             self.assertFalse(changed["context"]["continuation"]["terminal_history"])
             self.assertEqual(changed["context"]["feature_completion"]["status"], "BLOCKED")
+
+    def test_incremental_session_request_wire_preserves_raw_text_and_core_goal(self) -> None:
+        with TemporaryDirectory(prefix="evospec-incremental-wire-") as temporary:
+            root = Path(temporary).resolve()
+            initialized = json.loads(execute(root, request("init", expected_revision=0)))
+            repository_id = sha256(str(root).encode("utf-8")).hexdigest()[:16]
+            session_id = "ses_incremental_wire1"
+            message_id = "msg_incremental_wire1"
+            request_text = (
+                "Build a weekend trip planner with budget alerts and saved itineraries."
+                "\t \u0085"
+            )
+            admitted = json.loads(execute(
+                root,
+                request(
+                    "accept_first_slice_session",
+                    expected_revision=initialized["result"]["revision"],
+                    repository_id=repository_id,
+                    session_id=session_id,
+                    message_id=message_id,
+                    request_text=request_text,
+                ),
+            ))
+            self.assertEqual(admitted["result"]["code"], "SESSION_SLICE_RECORDED")
+
+            wire = json.loads(execute(root, request("context")))["context"]
+            accepted = wire["accepted_slice"]
+            objective = wire["request_scoped_objective"]
+            digest = sha256(request_text.encode("utf-8")).hexdigest()
+            self.assertEqual(accepted["session_request"], {
+                "statement": request_text,
+                "sha256": digest,
+                "repository_id": repository_id,
+            })
+            self.assertEqual(
+                accepted["source_reference"],
+                f"session:{session_id}:{message_id}:{digest[:16]}",
+            )
+            self.assertEqual(accepted["slice_title"], request_text.strip())
+            self.assertEqual(wire["autonomy_envelope"]["goal"], accepted["slice_title"])
+            self.assertNotEqual(wire["autonomy_envelope"]["goal"], request_text)
+            self.assertEqual(objective["status"], "BLOCKED")
+            self.assertEqual(objective["mode"], "INCREMENTAL")
+            self.assertEqual(
+                objective["blockers"],
+                ["REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST"],
+            )
+            self.assertEqual(objective["request_sha256"], digest)
 
     def test_session_request_context_fails_closed_when_workspace_scan_fails(self) -> None:
         with TemporaryDirectory() as temporary:

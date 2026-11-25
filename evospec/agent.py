@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Literal
 
-from .domain import AgreementRecord, AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, CriterionCoverageApproval, CriterionTestReceipt, ExpectedRevision, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ProvisionalSliceCriterion, ProvisionalSliceHead, ProvisionalSliceRevision, ReviewInspection, SliceCriteriaHead, SliceCriteriaRevision, SliceCriterion, SliceOutcomeReceipt, State, WorkItem, WorkingContext, is_sha256_digest
+from .domain import AgreementRecord, AutonomyEnvelope, AutonomyEvaluation, AutonomyMetrics, CriterionCoverageApproval, CriterionTestReceipt, ExpectedRevision, IrreversibleAuthorization, IrreversibleAuthorizationSummary, OperationalState, PendingAutonomyExpansion, ProvisionalSliceAdoption, ProvisionalSliceCriterion, ProvisionalSliceHead, ProvisionalSliceRevision, ReviewInspection, SliceCriteriaHead, SliceCriteriaRevision, SliceCriterion, SliceOutcomeReceipt, State, WorkItem, WorkingContext, is_sha256_digest
 from .guidance import (
     ActionGuidance,
     MaterialDecisionEvidence,
@@ -724,8 +724,16 @@ def _provisional_slice_inventory(state: State) -> ProvisionalSliceInventory:
         revision.revision_id: revision
         for revision in state.provisional_slice_revisions
     }
+    adopted_proposal_ids = {
+        adoption.proposal_id
+        for adoption in state.provisional_slice_adoptions
+        if isinstance(adoption, ProvisionalSliceAdoption)
+    }
     heads = sorted(
-        state.provisional_slice_heads,
+        (
+            head for head in state.provisional_slice_heads
+            if head.proposal_id not in adopted_proposal_ids
+        ),
         key=lambda head: (
             str(revisions_by_id[head.revision_id].feature_id),
             head.proposal_id,

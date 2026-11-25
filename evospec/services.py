@@ -21,6 +21,7 @@ from .domain import (
     AssessmentEvidence,
     AgreementRecord,
     SliceCriterion,
+    SliceCriteriaHead,
     SliceCriteriaRevision,
     SliceCriteriaHead,
     IDENTITY,
@@ -55,8 +56,10 @@ from .domain import (
     Feature,
     FeatureId,
     ProvisionalSliceActivation,
+    ProvisionalSliceAdoption,
     ProvisionalSliceCriterion,
     ProvisionalSliceHead,
+    ProvisionalSliceRevision,
     SESSION_REQUEST_CHECKPOINT,
     SESSION_REQUEST_TASK,
     LivingSpecId,
@@ -106,6 +109,8 @@ from .domain import (
     feature_completion_semantic_id,
     feature_completion_statement_text,
     is_sha256_digest,
+    provisional_slice_adoption_identity_digest,
+    provisional_slice_adoption_statement_text,
     request_objective_criteria_revision,
     request_objective_policy,
     request_objective_completion_condition,
@@ -209,11 +214,30 @@ class ServiceConstructionError(TypeError):
 
 @dataclass(frozen=True, slots=True)
 class UserAcceptance:
-    """Acceptance evidence; the CLI must obtain it from a human terminal prompt."""
+    """Acceptance evidence created only after an explicit terminal confirmation."""
 
     statement: str
     source_reference: str
     source: str = "INTERACTIVE_TERMINAL"
+
+
+def _d5_terminal_acceptance(statement: str) -> UserAcceptance:
+    """Acquire the single D5 confirmation inside the supported mutation boundary."""
+    try:
+        interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, OSError, ValueError):
+        interactive = False
+    if not interactive:
+        raise ServiceError("D5 adoption requires an interactive user terminal")
+    token = sha256(statement.encode("utf-8")).hexdigest()[:12]
+    print(f"Adopción D5 para aprobación explícita:\n{statement}", file=sys.stdout, flush=True)
+    try:
+        typed = input(f"Para autorizar la escritura, escribe ACEPTO {token}: ")
+    except (EOFError, KeyboardInterrupt) as error:
+        raise ServiceError("D5 adoption acceptance cancelled") from error
+    if typed != f"ACEPTO {token}":
+        raise ServiceError("D5 adoption was not explicitly confirmed")
+    return UserAcceptance(statement, f"tty:{token}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,6 +301,7 @@ class RequestScopedObjectiveStatus:
     heading: str | None
     kind: str | None = None
     criteria: tuple[tuple[str, str], ...] = ()
+    mode: str | None = None
 
 
 _PYTHON_TEST_RUNNER = (
@@ -438,6 +463,191 @@ def validate_slice_criteria_spec(spec: SliceCriteriaSpec) -> None:
             raise ServiceError("Slice criterion result and expected evidence must be bounded text")
     if len(_slice_criteria_json(spec)) > 32768:
         raise ServiceError("Slice criteria specification exceeds the acceptance size limit")
+
+
+def _d5_text(value: object, label: str, *, preserve_source_text: bool = False) -> str:
+    if type(value) is not str or not value.strip():
+        raise ServiceError(f"D5 {label} must be bounded nonblank text")
+    if not preserve_source_text and value != value.strip():
+        raise ServiceError(f"D5 {label} must be normalized")
+    try:
+        if len(value.encode("utf-8")) > 2048:
+            raise ServiceError(f"D5 {label} exceeds 2 KiB")
+    except UnicodeEncodeError as error:
+        raise ServiceError(f"D5 {label} is not valid UTF-8") from error
+    return value
+
+
+def _d5_adoption_proposal(
+    state: State,
+    repository_root: Path,
+    repository_id: str,
+    feature_id: str,
+    proposal_id: str,
+    revision_id: str,
+    proposal_revision: int,
+    proposal_digest: str,
+    slice_title: str,
+    initial_task: str,
+    checkpoint: str,
+    criteria: SliceCriteriaSpec,
+    question_answers: tuple[tuple[str, str], ...],
+    source_revision: int,
+    source_state_sha256: str,
+    ignore_slice_agreement_ref: str | None = None,
+) -> tuple[ProvisionalSliceRevision, str]:
+    """Validate and render one exact, bounded, explicitly accepted D4 head."""
+    root_identity = sha256(str(repository_root.resolve()).encode("utf-8")).hexdigest()[:16]
+    activation = state.provisional_slice_activation
+    if (
+        state.initialization is None
+        or state.initialization.repository_id != root_identity
+        or repository_id != root_identity
+        or activation is None
+        or activation.repository_id != repository_id
+        or str(activation.feature_id) != feature_id
+        or type(proposal_revision) is not int
+        or type(source_revision) is not int
+        or not is_sha256_digest(source_state_sha256)
+    ):
+        raise ServiceError("D5 adoption root, Feature, or State revision binding is invalid")
+    head = next(
+        (item for item in state.provisional_slice_heads if item.proposal_id == proposal_id),
+        None,
+    )
+    proposal = next(
+        (item for item in state.provisional_slice_revisions if item.revision_id == revision_id),
+        None,
+    )
+    if (
+        head is None
+        or proposal is None
+        or head.revision_id != revision_id
+        or head.revision != proposal_revision
+        or head.digest != proposal_digest
+        or proposal.proposal_id != proposal_id
+        or proposal.revision != proposal_revision
+        or proposal.digest != proposal_digest
+        or proposal.feature_id != feature_id
+        or proposal.repository_id != repository_id
+        or proposal.provenance.kind != "AGENT_SUGGESTION"
+    ):
+        raise ServiceError("D5 adoption must name the exact current AGENT_SUGGESTION head")
+
+    _d5_text(slice_title, "Slice title")
+    _d5_text(initial_task, "initial Task")
+    _d5_text(checkpoint, "checkpoint")
+    validate_slice_criteria_spec(criteria)
+    if any(
+        value != value.strip()
+        for value in (
+            criteria.outcome,
+            criteria.example,
+            *criteria.inclusions,
+            *criteria.exclusions,
+            *criteria.decisions,
+            *(value for item in criteria.criteria for value in (
+                item.id, item.expected_result, item.expected_evidence,
+            )),
+        )
+    ):
+        raise ServiceError("D5 accepted criteria and scope must be normalized")
+    try:
+        accepted_spec = {
+            "slice_title": slice_title,
+            "initial_task": initial_task,
+            "checkpoint": checkpoint,
+            "outcome": criteria.outcome,
+            "example": criteria.example,
+            "inclusions": list(criteria.inclusions),
+            "exclusions": list(criteria.exclusions),
+            "decisions": list(criteria.decisions),
+            "proposal_criteria_mapping": [
+                {
+                    "proposal_criterion_id": source.id,
+                    "accepted_criterion_id": accepted.id,
+                    "expected_result": accepted.expected_result,
+                    "expected_evidence": accepted.expected_evidence,
+                }
+                for source, accepted in zip(proposal.criteria, criteria.criteria, strict=True)
+            ],
+            "material_question_answers": [
+                {"question": question, "answer": answer}
+                for question, answer in question_answers
+            ],
+        }
+        mini_spec_size = len(json.dumps(
+            accepted_spec, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8"))
+    except (AttributeError, TypeError, UnicodeEncodeError, ValueError) as error:
+        raise ServiceError("D5 accepted mini-spec is not a canonical bounded value") from error
+    if mini_spec_size > 32 * 1024:
+        raise ServiceError("D5 accepted mini-spec exceeds 32 KiB")
+
+    if (
+        type(question_answers) is not tuple
+        or len(question_answers) != len(proposal.open_questions)
+        or len(question_answers) > 16
+        or any(
+            type(pair) is not tuple or len(pair) != 2
+            for pair in question_answers
+        )
+    ):
+        raise ServiceError("D5 must explicitly answer every selected material question")
+    for (question, answer), expected_question in zip(
+        question_answers, proposal.open_questions, strict=True,
+    ):
+        if question != expected_question:
+            raise ServiceError("D5 question answers must bind the selected proposal questions in order")
+        _d5_text(question, "proposal question", preserve_source_text=True)
+        _d5_text(answer, "question answer")
+    if len(criteria.criteria) != len(proposal.criteria) or any(
+        accepted.provenance is not None
+        or (
+            accepted.id,
+            accepted.expected_result,
+            accepted.expected_evidence,
+        ) != (
+            source.id,
+            source.expected_result,
+            source.expected_evidence,
+        )
+        for source, accepted in zip(proposal.criteria, criteria.criteria, strict=True)
+    ):
+        raise ServiceError("D5 accepted criteria must map one-to-one to the exact selected proposal criteria")
+    if any(
+        item.kind == "SLICE"
+        and item.feature_id == proposal.feature_id
+        and item.title.casefold() == slice_title.casefold()
+        and item.id != ignore_slice_agreement_ref
+        for item in state.agreements
+    ):
+        raise ServiceError("D5 accepted Slice title collides with existing Feature authority")
+
+    statement = provisional_slice_adoption_statement_text(
+        repository_id=repository_id,
+        feature_id=feature_id,
+        source_revision=source_revision,
+        source_state_sha256=source_state_sha256,
+        proposal=proposal,
+        slice_title=slice_title,
+        initial_task=initial_task,
+        checkpoint=checkpoint,
+        outcome=criteria.outcome,
+        example=criteria.example,
+        inclusions=criteria.inclusions,
+        exclusions=criteria.exclusions,
+        decisions=criteria.decisions,
+        criteria=criteria.criteria,
+        question_answers=question_answers,
+    )
+    try:
+        statement_size = len(statement.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise ServiceError("D5 acceptance statement is not valid UTF-8") from error
+    if statement_size > 64 * 1024:
+        raise ServiceError("D5 acceptance statement exceeds 64 KiB")
+    return proposal, statement
 
 
 def slice_acceptance_statement(
@@ -2383,6 +2593,298 @@ class CoreService:
         except AtomicFailure as error:
             raise ServiceError("D4 provisional Slice proposal was rejected") from error
 
+    def provisional_slice_adoption_agreement(
+        self,
+        state: State,
+        repository_id: str,
+        feature_id: str,
+        proposal_id: str,
+        revision_id: str,
+        proposal_revision: int,
+        proposal_digest: str,
+        slice_title: str,
+        initial_task: str,
+        checkpoint: str,
+        criteria: SliceCriteriaSpec,
+        question_answers: tuple[tuple[str, str], ...],
+    ) -> str:
+        """Render a read-only, revision-and-head-bound D5 acceptance statement."""
+        current = _authoritative_state(self.__persistence, state)
+        _, _, schema = self.__persistence.recover_snapshot()
+        if (
+            schema != 23
+            or current.provisional_slice_activation is None
+            or current.provisional_slice_adoptions
+            or current.active_context is not None
+            or current.active_work_id is not None
+            or len(current.features) != 1
+            or len(current.changes) != 1
+            or len(current.agreements) != 2
+            or len(current.terminal_archives) != 1
+            or len(current.work_items) != 1
+        ):
+            raise ServiceError("D5 adoption requires the closed initial schema-23 D4 lane")
+        source_digest = self.__persistence.state_source_sha256()
+        _, statement = _d5_adoption_proposal(
+            current,
+            self.__repository_root,
+            repository_id,
+            feature_id,
+            proposal_id,
+            revision_id,
+            proposal_revision,
+            proposal_digest,
+            slice_title,
+            initial_task,
+            checkpoint,
+            criteria,
+            question_answers,
+            current.revision,
+            source_digest,
+        )
+        return statement
+
+    def confirmed_provisional_slice_adoption(
+        self,
+        source_revision: int,
+        repository_id: str,
+        feature_id: str,
+        proposal_id: str,
+        revision_id: str,
+        proposal_revision: int,
+        proposal_digest: str,
+        slice_title: str,
+        initial_task: str,
+        checkpoint: str,
+        criteria: SliceCriteriaSpec,
+        question_answers: tuple[tuple[str, str], ...],
+    ) -> State | None:
+        """Recover only an exact prior D5 binding, without another prompt or write."""
+        current, _, schema = self.__persistence.recover_snapshot()
+        if not current.provisional_slice_adoptions:
+            return None
+        if schema != 24 or len(current.provisional_slice_adoptions) != 1:
+            raise ServiceError("D5 adoption history cannot be recovered safely")
+        adoption = current.provisional_slice_adoptions[0]
+        if source_revision != adoption.source_revision:
+            raise ServiceError("D5 retry is not bound to the adoption's source revision")
+        try:
+            _, statement = _d5_adoption_proposal(
+                current,
+                self.__repository_root,
+                repository_id,
+                feature_id,
+                proposal_id,
+                revision_id,
+                proposal_revision,
+                proposal_digest,
+                slice_title,
+                initial_task,
+                checkpoint,
+                criteria,
+                question_answers,
+                adoption.source_revision,
+                adoption.source_state_sha256,
+                ignore_slice_agreement_ref=adoption.slice_agreement_ref,
+            )
+        except ServiceError as error:
+            raise ServiceError("D5 adoption already exists with a different accepted specification") from error
+        expected_reference = f"tty:{sha256(statement.encode('utf-8')).hexdigest()[:12]}"
+        if (
+            statement != adoption.statement
+            or adoption.source != "INTERACTIVE_TERMINAL"
+            or adoption.source_reference != expected_reference
+        ):
+            raise ServiceError("D5 retry differs from the exact committed adoption binding")
+        return current
+
+    def adopt_provisional_slice(
+        self,
+        state: State,
+        repository_id: str,
+        feature_id: str,
+        proposal_id: str,
+        revision_id: str,
+        proposal_revision: int,
+        proposal_digest: str,
+        slice_title: str,
+        initial_task: str,
+        checkpoint: str,
+        criteria: SliceCriteriaSpec,
+        question_answers: tuple[tuple[str, str], ...],
+    ) -> State:
+        """Obtain exact terminal consent, then atomically adopt one D4 proposal."""
+        confirmed = self.confirmed_provisional_slice_adoption(
+            state.revision,
+            repository_id,
+            feature_id,
+            proposal_id,
+            revision_id,
+            proposal_revision,
+            proposal_digest,
+            slice_title,
+            initial_task,
+            checkpoint,
+            criteria,
+            question_answers,
+        )
+        if confirmed is not None:
+            return confirmed
+        current = _authoritative_state(self.__persistence, state)
+        _, _, schema = self.__persistence.recover_snapshot()
+        if (
+            schema != 23
+            or current.provisional_slice_activation is None
+            or current.provisional_slice_adoptions
+            or current.active_context is not None
+            or current.active_work_id is not None
+            or len(current.features) != 1
+            or len(current.changes) != 1
+            or len(current.agreements) != 2
+            or len(current.terminal_archives) != 1
+            or len(current.work_items) != 1
+        ):
+            raise ServiceError("D5 adoption requires the closed initial schema-23 D4 lane")
+        source_digest = self.__persistence.state_source_sha256()
+        proposal, statement = _d5_adoption_proposal(
+            current,
+            self.__repository_root,
+            repository_id,
+            feature_id,
+            proposal_id,
+            revision_id,
+            proposal_revision,
+            proposal_digest,
+            slice_title,
+            initial_task,
+            checkpoint,
+            criteria,
+            question_answers,
+            current.revision,
+            source_digest,
+        )
+        acceptance = _d5_terminal_acceptance(statement)
+
+        identity_digest = provisional_slice_adoption_identity_digest(
+            repository_id=repository_id,
+            feature_id=feature_id,
+            proposal_id=proposal.proposal_id,
+            proposal_revision_id=proposal.revision_id,
+            proposal_revision=proposal.revision,
+            proposal_digest=proposal.digest,
+            source_revision=current.revision,
+            source_state_sha256=source_digest,
+            statement=statement,
+            source_reference=acceptance.source_reference,
+        )
+        feature = next(item for item in current.features if str(item.id) == feature_id)
+        change = Change(
+            ChangeId(f"change-{identity_digest}"),
+            feature.id,
+            slice_title,
+            Classification.FEATURE,
+        )
+        feature_ref = f"agreement-feature-{identity_digest}"
+        slice_ref = f"agreement-slice-{identity_digest}"
+        feature_agreement = AgreementRecord(
+            feature_ref,
+            "FEATURE",
+            feature.id,
+            change.id,
+            feature.title,
+            statement,
+            acceptance.source,
+            acceptance.source_reference,
+            repository_id,
+        )
+        slice_agreement = AgreementRecord(
+            slice_ref,
+            "SLICE",
+            feature.id,
+            change.id,
+            slice_title,
+            statement,
+            acceptance.source,
+            acceptance.source_reference,
+            repository_id,
+            f"task-{identity_digest}",
+            initial_task,
+            checkpoint,
+        )
+        criteria_revision = SliceCriteriaRevision(
+            f"slice-criteria-{identity_digest}-1",
+            slice_ref,
+            repository_id,
+            criteria.outcome,
+            criteria.example,
+            criteria.inclusions,
+            criteria.exclusions,
+            criteria.decisions,
+            criteria.criteria,
+            acceptance.source,
+            acceptance.source_reference,
+        )
+        adoption = ProvisionalSliceAdoption(
+            f"d5-adoption-{sha256(statement.encode('utf-8')).hexdigest()}",
+            repository_id,
+            feature.id,
+            proposal.proposal_id,
+            proposal.revision_id,
+            proposal.revision,
+            proposal.digest,
+            23,
+            current.revision,
+            source_digest,
+            statement,
+            acceptance.source,
+            acceptance.source_reference,
+            feature_ref,
+            slice_ref,
+            change.id,
+            criteria_revision.id,
+            f"task-{identity_digest}",
+            slice_title,
+            initial_task,
+            checkpoint,
+            criteria.outcome,
+            criteria.example,
+            criteria.inclusions,
+            criteria.exclusions,
+            criteria.decisions,
+            criteria.criteria,
+            question_answers,
+            current.revision + 1,
+        )
+        candidate = _record_change(current, change)
+        assert candidate.active_context is not None
+        candidate = replace(
+            candidate,
+            active_context=replace(
+                candidate.active_context,
+                focus=slice_title,
+                current_work=initial_task,
+                checkpoints=(Checkpoint(checkpoint, False),),
+                feature_agreement_ref=feature_ref,
+                slice_agreement_ref=slice_ref,
+            ),
+            agreements=current.agreements + (feature_agreement, slice_agreement),
+            slice_criteria_revisions=(criteria_revision,),
+            slice_criteria_heads=(SliceCriteriaHead(slice_ref, criteria_revision.id),),
+            provisional_slice_adoptions=(adoption,),
+        )
+        saved = _validated(
+            _prepare_state_publication(candidate, current.revision),
+            "D5 provisional Slice adoption was rejected",
+        )
+        try:
+            self.__persistence._publish_d5_provisional_slice_adoption(
+                saved, change, (feature_agreement, slice_agreement),
+                criteria_revision, adoption, source_digest,
+            )
+        except AtomicFailure as error:
+            raise ServiceError("D5 provisional Slice adoption publication was rejected") from error
+        return saved
+
     def accept_next_slice(
         self, state: State, feature_id: str, slice_title: str, initial_task: str,
         checkpoint: str, acceptance: UserAcceptance, criteria: SliceCriteriaSpec,
@@ -2641,7 +3143,10 @@ class CoreService:
 
         try:
             return self.__persistence.transact_e1(
-                current.revision, record, allow_d4_task_progress=True,
+                current.revision,
+                record,
+                allow_d4_task_progress=True,
+                allow_d5_task_progress=True,
             )
         except AtomicFailure as error:
             self.__raise_e1_publication_error(current.revision, error)
@@ -3528,6 +4033,174 @@ class CoreService:
                 blockers.append("REQUEST_OBJECTIVE_ARTIFACT_HASH_UNAVAILABLE")
         return tuple(dict.fromkeys(blockers))
 
+    def _request_objective_incremental_mode_eligible(
+        self,
+        state: State,
+        evidence: SessionRequestEvidence,
+        snapshot: InputSnapshot | None,
+    ) -> bool:
+        """Allow only the ordinary bounded Task route for a truly unparsed request."""
+        feature_agreement, accepted, pair_blockers = self._request_objective_pair(state)
+        if feature_agreement is None or accepted is None or pair_blockers:
+            return False
+        root_identity = sha256(str(self.__repository_root.resolve()).encode("utf-8")).hexdigest()[:16]
+        if (
+            type(evidence) is not SessionRequestEvidence
+            or evidence != self._request_objective_evidence(feature_agreement, accepted)
+            or evidence.repository_id != root_identity
+            or evidence.repository_id != accepted.repository_id
+            or evidence.statement != accepted.statement
+            or evidence.source_reference != accepted.source_reference
+            or state.initialization is None
+            or state.initialization.repository_id != root_identity
+            or len(state.agreements) != 2
+            or tuple(item.id for item in state.agreements) != (
+                feature_agreement.id, accepted.id,
+            )
+            or len(state.features) != 1
+            or len(state.changes) != 1
+            or state.features[0].id != accepted.feature_id
+            or state.features[0].side_of is not None
+            or state.changes[0].id != accepted.change_id
+            or state.changes[0].feature_id != accepted.feature_id
+            or state.changes[0].classification is not Classification.FEATURE
+            or state.changes[0].intent != accepted.statement.strip()
+            or accepted.task_id is None
+            or accepted.initial_task != SESSION_REQUEST_TASK
+            or accepted.checkpoint != SESSION_REQUEST_CHECKPOINT
+            or feature_agreement.repository_id != root_identity
+            or accepted.repository_id != root_identity
+            or feature_agreement.source != "SESSION_REQUEST"
+            or accepted.source != "SESSION_REQUEST"
+            or feature_agreement.source_reference != accepted.source_reference
+            or feature_agreement.statement != accepted.statement
+        ):
+            return False
+
+        active = state.active_context
+        if (
+            active is None
+            or active.feature_id != accepted.feature_id
+            or active.change_id != accepted.change_id
+            or active.side_of is not None
+            or active.feature_agreement_ref != feature_agreement.id
+            or active.slice_agreement_ref != accepted.id
+            or active.focus != accepted.title
+            or (active.status, active.phase) not in {
+                (LifecycleState.PROPOSED, Phase.RESEARCH),
+                (LifecycleState.READY, Phase.READY),
+                (LifecycleState.IN_PROGRESS, Phase.IMPLEMENT),
+                (LifecycleState.IN_PROGRESS, Phase.REVIEW),
+                (LifecycleState.VERIFYING, Phase.VERIFY),
+                (LifecycleState.VERIFYING, Phase.CONVERGE),
+            }
+            or active.decision_ids
+            or active.constraint_ids
+            or active.observation_ids
+            or active.unresolved_material_decision
+            or active.safety_facts.unresolved_decision_details
+            or active.safety_facts.material_clarifications
+            or active.publication is not None
+            or active.convergence_complete
+            or active.autonomy_metrics.human_material_decisions
+            or active.autonomy_metrics.operational_handoffs
+            or active.autonomy_metrics.automatic_operations >= 8
+            or state.active_work_id != _work_id(active)
+            or state.work_items
+            or state.terminal_archives
+        ):
+            return False
+
+        expected_envelope = None if not state.changes else AutonomyEnvelope(
+            state.changes[0].intent,
+            allowed_paths=(RepositoryPath(OBJECTIVE_TEST_TARGET),),
+            operation_budget=8,
+            reversible_actions=("progress", "assess_locks", "review", "verify", "edit"),
+        )
+        if (
+            expected_envelope is None
+            or active.autonomy_envelope != expected_envelope
+            or _evaluate_autonomy(
+                active, "edit", (RepositoryPath(OBJECTIVE_TEST_TARGET),), False,
+            ).authorization is not AutonomyAuthorization.ALLOWED
+            or _evaluate_autonomy(active, "progress", (), False).authorization
+            is not AutonomyAuthorization.ALLOWED
+        ):
+            return False
+        if active.task_progress is not None and (
+            active.task_progress.task_id != accepted.task_id
+            or active.task_progress.report_kind != "REPORTED_UNVERIFIED"
+            or active.task_progress.source_kind != "UNKNOWN"
+            or active.task_progress.source_reference is not None
+        ):
+            return False
+
+        if (
+            state.preserved_primary_context is not None
+            or state.preserved_primary_work_id is not None
+            or state.parked_work is not None
+            or state.pending_intake is not None
+            or state.deferred_side_request is not None
+            or state.shared_intents
+            or state.deferred_linked_intents
+            or state.work_relations
+            or state.pending_capability_selection is not None
+            or state.capability_selection_history
+            or state.pending_discovery_recovery is not None
+            or state.pending_autonomy_expansion is not None
+            or state.autonomy_expansion_history
+            or state.irreversible_authorizations
+            or state.locks
+            or state.lock_revisions
+            or state.lock_releases
+            or state.lock_authorizations
+            or state.change_lock_assessments
+            or state.r3_schema_upgrade is not None
+            or state.r3b_schema_upgrade is not None
+            or state.decisions
+            or state.observations
+            or state.drifts
+            or state.publications
+            or state.publication_history
+            or state.slice_criteria_heads
+            or state.slice_criteria_revisions
+            or state.criterion_test_receipts
+            or state.slice_outcome_receipts
+            or state.criterion_coverage_approvals
+            or state.feature_completion_receipts
+            or state.feature_reopen_receipts
+            or state.completed_side_contexts
+            or state.provisional_slice_adoptions
+        ):
+            return False
+
+        if snapshot is None:
+            return False
+        try:
+            scanned, actual_snapshot = self.input_snapshot(state.revision)
+        except ServiceError:
+            return False
+        if (
+            scanned != state
+            or type(snapshot) is not InputSnapshot
+            or snapshot != actual_snapshot
+            or snapshot.version != INPUT_FINGERPRINT_VERSION
+            or snapshot.policy_id != INPUT_POLICY_ID
+            or snapshot.policy_digest != INPUT_POLICY_DIGEST
+            or snapshot.repository_id != root_identity
+            or not is_sha256_digest(snapshot.fingerprint)
+            or any(
+                path != OBJECTIVE_TEST_TARGET and not path.startswith(".opencode/")
+                for path in snapshot.file_paths
+            )
+            or any(
+                path != ".opencode" and not path.startswith(".opencode/")
+                for path in snapshot.directory_paths
+            )
+        ):
+            return False
+        return True
+
     def _read_request_objective_artifact(
         self,
         snapshot: InputSnapshot,
@@ -3832,6 +4505,13 @@ class CoreService:
             return RequestScopedObjectiveStatus(
                 "BLOCKED", accepted.source_reference, request_sha,
                 ("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",), None,
+                mode=(
+                    "INCREMENTAL"
+                    if self._request_objective_incremental_mode_eligible(
+                        current, evidence, snapshot,
+                    )
+                    else None
+                ),
             )
         canonical_criteria = request_objective_criteria_revision(
             accepted.id,

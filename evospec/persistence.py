@@ -68,6 +68,7 @@ from .domain import (
     IntentAssessment,
     MaterialDecision,
     ProvisionalSliceActivation,
+    ProvisionalSliceAdoption,
     ProvisionalSliceCriterion,
     ProvisionalSliceHead,
     ProvisionalSliceProvenance,
@@ -116,6 +117,7 @@ from .domain import (
     WorkingContext,
     request_objective_criteria_revision,
     request_objective_policy,
+    provisional_slice_adoption_statement_text,
     is_sha256_digest,
     validate_state,
 )
@@ -151,9 +153,11 @@ REQUEST_OBJECTIVE_SCHEMA: Final = 20
 SEMANTIC_REQUEST_OBJECTIVE_SCHEMA: Final = 21
 PROVISIONAL_SLICE_SCHEMA: Final = 22
 D4_PROVISIONAL_SLICE_SCHEMA: Final = 23
+D5_PROVISIONAL_SLICE_SCHEMA: Final = 24
 _D4_LIFECYCLE_OPERATIONS: Final = frozenset((
     "lifecycle", "review", "verification", "convergence", "accepted_terminal_archive",
 ))
+_D5_LIFECYCLE_OPERATIONS: Final = _D4_LIFECYCLE_OPERATIONS
 LEGACY_WRITE_SCHEMA: Final = 13
 E1_TASK_PROGRESS_SCHEMA: Final = 14
 INTEGRATION_REGISTRY_SCHEMA: Final = 1
@@ -212,6 +216,7 @@ STATE_FIELDS_V20: Final = STATE_FIELDS_V19
 STATE_FIELDS_V21: Final = STATE_FIELDS_V20
 STATE_FIELDS_V22: Final = STATE_FIELDS_V21 | frozenset(("provisional_slice_refs", "provisional_slice_heads"))
 STATE_FIELDS_V23: Final = STATE_FIELDS_V22 | frozenset(("provisional_slice_activation",))
+STATE_FIELDS_V24: Final = STATE_FIELDS_V23 | frozenset(("provisional_slice_adoption_refs",))
 CONTEXT_FIELDS: Final = frozenset(
     (
         "feature_id",
@@ -1235,6 +1240,122 @@ def _provisional_slice_activation_from_json(value: JsonValue) -> ProvisionalSlic
     )
 
 
+_PROVISIONAL_SLICE_ADOPTION_FIELDS: Final = frozenset((
+    "id", "repository_id", "feature_id", "proposal_id", "proposal_revision_id",
+    "proposal_revision", "proposal_digest", "source_schema", "source_revision",
+    "source_state_sha256", "statement", "source", "source_reference",
+    "feature_agreement_ref", "slice_agreement_ref", "change_id",
+    "criteria_revision_id", "task_id", "slice_title", "initial_task", "checkpoint",
+    "outcome", "example", "inclusions", "exclusions", "decisions", "criteria",
+    "question_answers", "recorded_revision",
+))
+
+
+def _provisional_slice_adoption_to_json(adoption: ProvisionalSliceAdoption) -> JsonValue:
+    return {
+        "id": adoption.id,
+        "repository_id": adoption.repository_id,
+        "feature_id": str(adoption.feature_id),
+        "proposal_id": adoption.proposal_id,
+        "proposal_revision_id": adoption.proposal_revision_id,
+        "proposal_revision": adoption.proposal_revision,
+        "proposal_digest": adoption.proposal_digest,
+        "source_schema": adoption.source_schema,
+        "source_revision": adoption.source_revision,
+        "source_state_sha256": adoption.source_state_sha256,
+        "statement": adoption.statement,
+        "source": adoption.source,
+        "source_reference": adoption.source_reference,
+        "feature_agreement_ref": adoption.feature_agreement_ref,
+        "slice_agreement_ref": adoption.slice_agreement_ref,
+        "change_id": str(adoption.change_id),
+        "criteria_revision_id": adoption.criteria_revision_id,
+        "task_id": adoption.task_id,
+        "slice_title": adoption.slice_title,
+        "initial_task": adoption.initial_task,
+        "checkpoint": adoption.checkpoint,
+        "outcome": adoption.outcome,
+        "example": adoption.example,
+        "inclusions": list(adoption.inclusions),
+        "exclusions": list(adoption.exclusions),
+        "decisions": list(adoption.decisions),
+        "criteria": [
+            {
+                "id": item.id,
+                "expected_result": item.expected_result,
+                "expected_evidence": item.expected_evidence,
+                **({"provenance": item.provenance} if item.provenance is not None else {}),
+            }
+            for item in adoption.criteria
+        ],
+        "question_answers": [list(item) for item in adoption.question_answers],
+        "recorded_revision": adoption.recorded_revision,
+    }
+
+
+def _provisional_slice_adoption_from_json(value: JsonValue) -> ProvisionalSliceAdoption:
+    raw = _object(value, _PROVISIONAL_SLICE_ADOPTION_FIELDS, "D5 provisional Slice adoption")
+    criteria = tuple(
+        SliceCriterion(
+            _string(item["id"], "D5 accepted criterion id"),
+            _string(item["expected_result"], "D5 accepted criterion result"),
+            _string(item["expected_evidence"], "D5 accepted criterion evidence"),
+            _string(item["provenance"], "D5 accepted criterion provenance")
+            if "provenance" in item else None,
+        )
+        for entry in _array(raw["criteria"], "D5 accepted criteria")
+        for item in (
+            _object(
+                entry,
+                frozenset(("id", "expected_result", "expected_evidence", "provenance"))
+                if isinstance(entry, dict) and "provenance" in entry
+                else frozenset(("id", "expected_result", "expected_evidence")),
+                "D5 accepted criterion",
+            ),
+        )
+    )
+    questions: list[tuple[str, str]] = []
+    for entry in _array(raw["question_answers"], "D5 question answers"):
+        pair = tuple(
+            _string(answer, "D5 question answer")
+            for answer in _array(entry, "D5 question-answer pair")
+        )
+        if len(pair) != 2:
+            raise DecodeError("D5 question-answer pair must contain exactly two strings")
+        questions.append((pair[0], pair[1]))
+    return ProvisionalSliceAdoption(
+        _string(raw["id"], "D5 adoption id"),
+        _string(raw["repository_id"], "D5 adoption repository"),
+        FeatureId(_string(raw["feature_id"], "D5 adoption Feature")),
+        _string(raw["proposal_id"], "D5 adoption proposal"),
+        _string(raw["proposal_revision_id"], "D5 adoption proposal revision id"),
+        _integer(raw["proposal_revision"], "D5 adoption proposal revision"),
+        _string(raw["proposal_digest"], "D5 adoption proposal digest"),
+        _integer(raw["source_schema"], "D5 adoption source schema"),
+        _integer(raw["source_revision"], "D5 adoption source revision"),
+        _string(raw["source_state_sha256"], "D5 adoption source State digest"),
+        _string(raw["statement"], "D5 adoption statement"),
+        _string(raw["source"], "D5 adoption source"),
+        _string(raw["source_reference"], "D5 adoption source reference"),
+        _string(raw["feature_agreement_ref"], "D5 Feature agreement"),
+        _string(raw["slice_agreement_ref"], "D5 Slice agreement"),
+        ChangeId(_string(raw["change_id"], "D5 adoption Change")),
+        _string(raw["criteria_revision_id"], "D5 criteria revision"),
+        _string(raw["task_id"], "D5 adopted Task"),
+        _string(raw["slice_title"], "D5 Slice title"),
+        _string(raw["initial_task"], "D5 initial Task"),
+        _string(raw["checkpoint"], "D5 checkpoint"),
+        _string(raw["outcome"], "D5 outcome"),
+        _string(raw["example"], "D5 example"),
+        _strings(raw["inclusions"], "D5 inclusions"),
+        _strings(raw["exclusions"], "D5 exclusions"),
+        _strings(raw["decisions"], "D5 decisions"),
+        criteria,
+        tuple(questions),
+        _integer(raw["recorded_revision"], "D5 adoption recorded revision"),
+    )
+
+
 _E1_UPGRADE_FIELDS: Final = frozenset((
     "source_revision", "converted_revision", "source_sha256", "statement",
     "source", "source_reference", "repository_id", "feature_agreement_ref", "slice_agreement_ref",
@@ -1958,6 +2079,29 @@ def _load_provisional_slice_heads(
     return heads
 
 
+def _load_provisional_slice_adoptions(
+    root: Path, value: JsonValue,
+) -> tuple[ProvisionalSliceAdoption, ...]:
+    references = _references_from_json(value, "provisional_slice_adoption_refs")
+    if len(references) != 1:
+        raise DecodeError("schema 24 requires exactly one D5 adoption mapping")
+    identities = tuple(identity for identity, _ in references)
+    if identities != tuple(sorted(identities)) or len(identities) != len(set(identities)):
+        raise DecodeError("D5 adoption references must be unique and sorted")
+    loaded: list[ProvisionalSliceAdoption] = []
+    for identity, path in references:
+        expected = RepositoryPath(f"records/provisional-slice-adoptions/{identity}.json")
+        if path != expected:
+            raise DecodeError("D5 adoption record path does not match its identity")
+        adoption = _provisional_slice_adoption_from_json(
+            _read_json(_artifact_path(root, path.value)),
+        )
+        if adoption.id != identity:
+            raise DecodeError("D5 adoption record identity mismatch")
+        loaded.append(adoption)
+    return tuple(loaded)
+
+
 def _d4_only_state_fields(candidate: State, current: State, *fields: str) -> bool:
     return replace(
         candidate,
@@ -2113,6 +2257,146 @@ def _validate_d4_lifecycle_commit(
         raise AtomicFailure("D4 lifecycle candidate is invalid") from error
 
 
+def _validate_d5_lifecycle_commit(
+    root: Path, current: State, candidate: State, operation: str,
+) -> None:
+    """Admit only ordinary Task progress, assurance and closure for adopted D5."""
+    if operation not in _D5_LIFECYCLE_OPERATIONS:
+        raise AtomicFailure("D5 lifecycle operation is unsupported")
+    if candidate.revision != current.revision + 1 or len(current.provisional_slice_adoptions) != 1:
+        raise AtomicFailure("D5 lifecycle operation must advance one adopted Task revision")
+    adoption = current.provisional_slice_adoptions[0]
+    active = current.active_context
+    updated = candidate.active_context
+    if active is None:
+        raise AtomicFailure("D5 lifecycle operation requires active adopted Task work")
+
+    if operation == "lifecycle":
+        transitions = {
+            (LifecycleState.IN_PROGRESS, Phase.IMPLEMENT): (
+                LifecycleState.IN_PROGRESS, Phase.REVIEW,
+            ),
+            (LifecycleState.IN_PROGRESS, Phase.REVIEW): (
+                LifecycleState.VERIFYING, Phase.VERIFY,
+            ),
+            (LifecycleState.VERIFYING, Phase.VERIFY): (
+                LifecycleState.VERIFYING, Phase.CONVERGE,
+            ),
+        }
+        target = transitions.get((active.status, active.phase))
+        if (
+            target is None
+            or not _d4_has_reported_task(active, adoption.task_id)
+            or not _d4_only_state_fields(candidate, current, "active_context")
+            or updated is None
+        ):
+            raise AtomicFailure("D5 lifecycle phase advance is not authorized")
+        status, phase = target
+        if active.phase is Phase.REVIEW and not has_acceptable_review(active.review):
+            raise AtomicFailure("D5 verification phase requires acceptable review")
+        if active.phase is Phase.VERIFY and (
+            not has_acceptable_review(active.review)
+            or not active.verification.sufficient
+            or not can_converge(active.review, active.verification)
+        ):
+            raise AtomicFailure("D5 convergence phase requires sufficient assurance")
+        if active.convergence_complete or updated != replace(
+            active, status=status, phase=phase, paused_pair=None,
+        ):
+            raise AtomicFailure("D5 lifecycle phase advance changed unauthorized context")
+    elif operation == "review":
+        if (
+            (active.status, active.phase) != (LifecycleState.IN_PROGRESS, Phase.REVIEW)
+            or not _d4_has_reported_task(active, adoption.task_id)
+            or not _d4_only_state_fields(candidate, current, "active_context")
+            or updated is None
+            or updated.review is None
+            or updated != replace(
+                active,
+                review=updated.review,
+                checkpoints=updated.checkpoints,
+                review_evidence=updated.review_evidence,
+                review_findings=updated.review_findings,
+            )
+        ):
+            raise AtomicFailure("D5 review record changed unauthorized state")
+    elif operation == "verification":
+        if (
+            (active.status, active.phase) != (LifecycleState.VERIFYING, Phase.VERIFY)
+            or not _d4_has_reported_task(active, adoption.task_id)
+            or not has_acceptable_review(active.review)
+            or not _d4_only_state_fields(candidate, current, "active_context")
+            or updated is None
+            or updated != replace(active, verification=updated.verification)
+        ):
+            raise AtomicFailure("D5 verification record changed unauthorized state")
+    elif operation == "convergence":
+        if (
+            (active.status, active.phase) != (LifecycleState.VERIFYING, Phase.CONVERGE)
+            or not _d4_has_reported_task(active, adoption.task_id)
+            or not has_acceptable_review(active.review)
+            or not active.verification.sufficient
+            or not can_converge(active.review, active.verification)
+            or active.convergence_complete
+            or not _d4_only_state_fields(candidate, current, "active_context")
+            or updated != replace(active, convergence_complete=True)
+        ):
+            raise AtomicFailure("D5 convergence confirmation changed unauthorized state")
+    else:
+        if (
+            (active.status, active.phase) != (LifecycleState.VERIFYING, Phase.CONVERGE)
+            or not _d4_has_reported_task(active, adoption.task_id)
+            or not has_acceptable_review(active.review)
+            or not active.verification.sufficient
+            or not can_converge(active.review, active.verification)
+            or not active.convergence_complete
+            or active.change_id != adoption.change_id
+            or active.publication is not None
+            or candidate.active_context is not None
+            or candidate.active_work_id is not None
+            or not _d4_only_state_fields(
+                candidate, current, "active_context", "active_work_id",
+                "terminal_archives", "work_items",
+            )
+            or len(candidate.terminal_archives) != len(current.terminal_archives) + 1
+            or candidate.terminal_archives[:len(current.terminal_archives)]
+            != current.terminal_archives
+            or len(candidate.work_items) != len(current.work_items) + 1
+            or candidate.work_items[:len(current.work_items)] != current.work_items
+        ):
+            raise AtomicFailure("D5 accepted terminal archive changed unauthorized state")
+        archive = candidate.terminal_archives[-1]
+        assessment = archive.convergence_assessment
+        work_item = candidate.work_items[-1]
+        if (
+            archive.context != replace(
+                active, status=LifecycleState.ACCEPTED, phase=Phase.DONE,
+            )
+            or archive.parent_feature_id is not None
+            or archive.legacy_unassessed_acceptance
+            or type(assessment) is not ConvergenceAssessment
+            or assessment.change_id != adoption.change_id
+            or assessment.product_truth_changed is not False
+            or assessment.product_truth_content is not None
+            or work_item.id != WorkId(f"work-{adoption.change_id}")
+            or work_item.operational_state is not OperationalState.DONE
+            or work_item.context is not None
+            or work_item.preserved_primary_context is not None
+            or work_item.deferred_side_request is not None
+            or work_item.pending_intake is not None
+            or work_item.reason is not None
+            or work_item.terminal_change_id != adoption.change_id
+        ):
+            raise AtomicFailure("D5 accepted terminal archive is inconsistent")
+    try:
+        validate_state(candidate)
+        _validate_provisional_slice_authority(
+            root, candidate, schema=D5_PROVISIONAL_SLICE_SCHEMA,
+        )
+    except (StateValidationError, DecodeError, DomainError) as error:
+        raise AtomicFailure("D5 lifecycle candidate is invalid") from error
+
+
 def _validate_d4_lifecycle_recovery(state: State, activation: ProvisionalSliceActivation) -> None:
     """Restrict schema-23 recovery to the initial lane or its one accepted close."""
     if (
@@ -2247,6 +2531,158 @@ def _validate_d4_lifecycle_recovery(state: State, activation: ProvisionalSliceAc
         raise DecodeError("schema 23 active lifecycle state is inconsistent")
 
 
+def _validate_d5_lifecycle_recovery(
+    state: State, activation: ProvisionalSliceActivation,
+) -> None:
+    """Keep schema 24 to the settled D4 Change plus one adopted Task."""
+    if (
+        state.preserved_primary_context is not None
+        or state.completed_side_contexts
+        or state.publications
+        or state.publication_history
+        or state.decisions
+        or state.observations
+        or state.drifts
+        or state.locks
+        or state.lock_revisions
+        or state.lock_releases
+        or state.lock_authorizations
+        or state.change_lock_assessments
+        or state.work_relations
+        or state.parked_work is not None
+        or state.preserved_primary_work_id is not None
+        or state.pending_intake is not None
+        or state.deferred_side_request is not None
+        or state.shared_intents
+        or state.deferred_linked_intents
+        or state.pending_capability_selection is not None
+        or state.capability_selection_history
+        or state.pending_discovery_recovery is not None
+        or state.irreversible_authorizations
+        or state.pending_autonomy_expansion is not None
+        or state.autonomy_expansion_history
+        or state.e1_schema_upgrade is not None
+        or state.r3_schema_upgrade is not None
+        or state.r3b_schema_upgrade is not None
+        or len(state.provisional_slice_adoptions) != 1
+        or len(state.slice_criteria_revisions) != 1
+        or len(state.slice_criteria_heads) != 1
+        or state.criterion_test_receipts
+        or state.slice_outcome_receipts
+        or state.criterion_coverage_approvals
+        or state.feature_completion_receipts
+        or state.feature_reopen_receipts
+        or len(state.features) != 1
+        or len(state.changes) != 2
+        or len(state.agreements) != 4
+        or len(state.terminal_archives) not in (1, 2)
+        or len(state.work_items) != len(state.terminal_archives)
+    ):
+        raise DecodeError("schema 24 contains authority outside one adopted Task lane")
+
+    adoption = state.provisional_slice_adoptions[0]
+    original_archive = state.terminal_archives[0]
+    original_item = state.work_items[0]
+    original_state = replace(
+        state,
+        active_context=None,
+        active_work_id=None,
+        changes=state.changes[:1],
+        agreements=state.agreements[:2],
+        slice_criteria_revisions=(),
+        slice_criteria_heads=(),
+        provisional_slice_adoptions=(),
+        terminal_archives=(original_archive,),
+        work_items=(original_item,),
+    )
+    _validate_d4_lifecycle_recovery(original_state, activation)
+    if (
+        original_archive.context.change_id != state.changes[0].id
+        or state.changes[1].id != adoption.change_id
+        or state.agreements[2].id != adoption.feature_agreement_ref
+        or state.agreements[3].id != adoption.slice_agreement_ref
+        or state.agreements[3].task_id != adoption.task_id
+        or original_item.id != WorkId(f"work-{state.changes[0].id}")
+        or original_item.operational_state is not OperationalState.DONE
+        or original_item.terminal_change_id != state.changes[0].id
+    ):
+        raise DecodeError("schema 24 does not preserve the original settled D4 Change")
+
+    if len(state.terminal_archives) == 2:
+        if state.active_context is not None or state.active_work_id is not None:
+            raise DecodeError("schema 24 settled Task cannot coexist with active work")
+        archive = state.terminal_archives[1]
+        context = archive.context
+        assessment = archive.convergence_assessment
+        item = state.work_items[1]
+        if (
+            context.feature_id != adoption.feature_id
+            or context.change_id != adoption.change_id
+            or context.feature_agreement_ref != adoption.feature_agreement_ref
+            or context.slice_agreement_ref != adoption.slice_agreement_ref
+            or context.status is not LifecycleState.ACCEPTED
+            or context.phase is not Phase.DONE
+            or context.side_of is not None
+            or context.publication is not None
+            or not context.convergence_complete
+            or not _d4_has_reported_task(context, adoption.task_id)
+            or not has_acceptable_review(context.review)
+            or not context.verification.sufficient
+            or not can_converge(context.review, context.verification)
+            or type(assessment) is not ConvergenceAssessment
+            or assessment.change_id != adoption.change_id
+            or assessment.product_truth_changed is not False
+            or assessment.product_truth_content is not None
+            or archive.parent_feature_id is not None
+            or archive.legacy_unassessed_acceptance
+            or item.id != WorkId(f"work-{adoption.change_id}")
+            or item.operational_state is not OperationalState.DONE
+            or item.context is not None
+            or item.terminal_change_id != adoption.change_id
+        ):
+            raise DecodeError("schema 24 accepted Task archive is inconsistent")
+        return
+
+    context = state.active_context
+    if (
+        context is None
+        or state.active_work_id != WorkId(f"work-{adoption.change_id}")
+        or len(state.work_items) != 1
+        or context.feature_id != adoption.feature_id
+        or context.change_id != adoption.change_id
+        or context.feature_agreement_ref != adoption.feature_agreement_ref
+        or context.slice_agreement_ref != adoption.slice_agreement_ref
+        or context.side_of is not None
+        or context.publication is not None
+    ):
+        raise DecodeError("schema 24 active Task pointers are inconsistent")
+    pair = (context.status, context.phase)
+    if pair == (LifecycleState.PROPOSED, Phase.RESEARCH):
+        valid = (
+            context.task_progress is None
+            and context.review is None
+            and not context.verification.sufficient
+            and not context.convergence_complete
+        )
+    elif pair == (LifecycleState.IN_PROGRESS, Phase.IMPLEMENT):
+        valid = _d4_has_reported_task(context, adoption.task_id) and context.review is None
+    elif pair == (LifecycleState.IN_PROGRESS, Phase.REVIEW):
+        valid = _d4_has_reported_task(context, adoption.task_id)
+    elif pair == (LifecycleState.VERIFYING, Phase.VERIFY):
+        valid = _d4_has_reported_task(context, adoption.task_id) and has_acceptable_review(context.review)
+    elif pair == (LifecycleState.VERIFYING, Phase.CONVERGE):
+        valid = (
+            _d4_has_reported_task(context, adoption.task_id)
+            and has_acceptable_review(context.review)
+            and context.verification.sufficient
+            and can_converge(context.review, context.verification)
+        )
+    else:
+        valid = False
+    if not valid:
+        raise DecodeError("schema 24 active Task lifecycle state is inconsistent")
+
+
 def _validate_provisional_slice_authority(
     root: Path, state: State, *, schema: int = PROVISIONAL_SLICE_SCHEMA,
 ) -> None:
@@ -2254,7 +2690,7 @@ def _validate_provisional_slice_authority(
     heads = state.provisional_slice_heads
     if bool(revisions) != bool(heads):
         raise DecodeError("provisional Slice revisions and heads must be paired")
-    if schema >= D4_PROVISIONAL_SLICE_SCHEMA:
+    if schema == D4_PROVISIONAL_SLICE_SCHEMA:
         activation = state.provisional_slice_activation
         if (
             activation is None
@@ -2291,6 +2727,42 @@ def _validate_provisional_slice_authority(
         if len(revisions) > 32 or len(heads) > 32:
             raise DecodeError("D4 provisional Slice project limits are exceeded")
         _validate_d4_lifecycle_recovery(state, activation)
+    elif schema == D5_PROVISIONAL_SLICE_SCHEMA:
+        activation = state.provisional_slice_activation
+        adoption = state.provisional_slice_adoptions
+        if (
+            activation is None
+            or activation.marker != D4_PROVISIONAL_SLICE_ACTIVATION_MARKER
+            or activation.recorded_revision > state.revision
+            or len(adoption) != 1
+            or len(state.features) != 1
+            or len(state.changes) != 2
+            or len(state.agreements) != 4
+            or state.features[0].id != activation.feature_id
+            or state.changes[0].feature_id != activation.feature_id
+            or state.agreements[0].id != activation.feature_agreement_ref
+            or state.agreements[1].id != activation.slice_agreement_ref
+            or state.agreements[0].kind != "FEATURE"
+            or state.agreements[1].kind != "SLICE"
+            or state.agreements[0].feature_id != activation.feature_id
+            or state.agreements[1].feature_id != activation.feature_id
+            or state.agreements[0].change_id != state.agreements[1].change_id
+            or state.changes[0].id != state.agreements[0].change_id
+            or state.r3_schema_upgrade is not None
+            or state.r3b_schema_upgrade is not None
+            or state.e1_schema_upgrade is not None
+            or len(state.slice_criteria_revisions) != 1
+            or len(state.slice_criteria_heads) != 1
+            or state.criterion_test_receipts
+            or state.slice_outcome_receipts
+            or state.criterion_coverage_approvals
+            or state.feature_completion_receipts
+            or state.feature_reopen_receipts
+            or len(revisions) > 32
+            or len(heads) > 32
+        ):
+            raise DecodeError("schema 24 requires the exact D5 adopted-head lane")
+        _validate_d5_lifecycle_recovery(state, activation)
     resolved_root = _resolved_root(root)
     initialization = state.initialization
     repository_id = sha256(str(resolved_root).encode("utf-8")).hexdigest()[:16]
@@ -2847,6 +3319,7 @@ def _criterion_test_from_json(value: JsonValue, schema: int) -> CriterionTestRec
         if key not in raw or schema in (
             REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
             PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA,
+            D5_PROVISIONAL_SLICE_SCHEMA,
         ) and raw[key] is None:
             return None
         return _string(raw[key], label)
@@ -3048,9 +3521,11 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                     decoded.pop(field)
         if schema in (9, 10):
             raw = _object(decoded, STATE_FIELDS_V10, "state")
-        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA):
+        elif schema in (11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA, D5_PROVISIONAL_SLICE_SCHEMA):
             decoded_fields = set(decoded)
-            if schema == D4_PROVISIONAL_SLICE_SCHEMA and decoded_fields == set(STATE_FIELDS_V23):
+            if schema == D5_PROVISIONAL_SLICE_SCHEMA and decoded_fields == set(STATE_FIELDS_V24):
+                raw = _object(decoded, STATE_FIELDS_V24, "state")
+            elif schema == D4_PROVISIONAL_SLICE_SCHEMA and decoded_fields == set(STATE_FIELDS_V23):
                 raw = _object(decoded, STATE_FIELDS_V23, "state")
             elif schema == PROVISIONAL_SLICE_SCHEMA and decoded_fields == set(STATE_FIELDS_V22):
                 raw = _object(decoded, STATE_FIELDS_V22, "state")
@@ -3139,7 +3614,7 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 legacy_fields,
                 "state",
             )
-        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA):
+        if schema not in (5, 6, 7, 8, 9, 10, 11, 12, LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA, D5_PROVISIONAL_SLICE_SCHEMA):
             raise DecodeError("unknown state schema")
         (
             initialization, deferred, intake, selection, recovery, selection_history,
@@ -3244,20 +3719,26 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
             ) if schema >= FEATURE_CYCLE_SCHEMA else (),
             provisional_slice_revisions=(
                 _load_provisional_slice_revisions(root, raw["provisional_slice_refs"], schema=schema)
-                if schema in (PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA) else ()
+                if schema in (PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA, D5_PROVISIONAL_SLICE_SCHEMA) else ()
             ),
             provisional_slice_heads=(
                 _load_provisional_slice_heads(raw["provisional_slice_heads"], schema=schema)
-                if schema in (PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA) else ()
+                if schema in (PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA, D5_PROVISIONAL_SLICE_SCHEMA) else ()
             ),
             provisional_slice_activation=(
                 _provisional_slice_activation_from_json(raw["provisional_slice_activation"])
-                if schema == D4_PROVISIONAL_SLICE_SCHEMA else None
+                if schema in (D4_PROVISIONAL_SLICE_SCHEMA, D5_PROVISIONAL_SLICE_SCHEMA) else None
+            ),
+            provisional_slice_adoptions=(
+                _load_provisional_slice_adoptions(root, raw["provisional_slice_adoption_refs"])
+                if schema == D5_PROVISIONAL_SLICE_SCHEMA else ()
             ),
         )
         if schema >= R3B_SCHEMA and schema not in (
             REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
             PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA,
+            D5_PROVISIONAL_SLICE_SCHEMA,
+            D5_PROVISIONAL_SLICE_SCHEMA,
         ) and state.r3b_schema_upgrade is None:
             raise DecodeError("schema 17 requires an explicit R3-B conversion receipt")
         if schema == FEATURE_CYCLE_SCHEMA and not state.feature_reopen_receipts:
@@ -3277,11 +3758,11 @@ def _recover_state_with_schema(root: Path) -> tuple[State, int | None]:
                 or not any(item.source == REQUEST_SCOPED_OBJECTIVE for item in state.slice_outcome_receipts)
             ):
                 raise DecodeError(f"schema {schema} requires its canonical request-objective proof")
-        elif schema in (PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA) and has_request_objective:
+        elif schema in (PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA, D5_PROVISIONAL_SLICE_SCHEMA) and has_request_objective:
             if _request_objective_schema_for_state(state) is None:
                 raise DecodeError("schema 22 cannot weaken existing request-objective proof")
         validate_state(state)
-        if schema in (PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA):
+        if schema in (PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA, D5_PROVISIONAL_SLICE_SCHEMA):
             _validate_provisional_slice_authority(root, state, schema=schema)
         _validate_capability_selection_authority(state, schema)
         contexts = tuple(
@@ -3793,14 +4274,18 @@ def _request_objective_schema_for_state(state: State) -> int | None:
 
 def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
     """Preserve each accepted layout until a scoped authority decision changes it."""
-    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA):
+    if schema not in (LEGACY_WRITE_SCHEMA, E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA, FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA, REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA, PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA, D5_PROVISIONAL_SLICE_SCHEMA):
         raise ValueError("unsupported state writer schema")
     if schema < SCHEMA and (state.slice_criteria_revisions or state.slice_criteria_heads):
         raise ValueError("Slice criteria cannot be silently downgraded")
     if schema < D4_PROVISIONAL_SLICE_SCHEMA and state.provisional_slice_activation is not None:
         raise ValueError("D4 provisional Slice activation cannot be silently downgraded")
-    if schema == D4_PROVISIONAL_SLICE_SCHEMA and state.provisional_slice_activation is None:
+    if schema >= D4_PROVISIONAL_SLICE_SCHEMA and state.provisional_slice_activation is None:
         raise ValueError("schema 23 requires the D4 provisional Slice activation marker")
+    if schema < D5_PROVISIONAL_SLICE_SCHEMA and state.provisional_slice_adoptions:
+        raise ValueError("D5 provisional Slice adoption cannot be silently downgraded")
+    if schema == D5_PROVISIONAL_SLICE_SCHEMA and len(state.provisional_slice_adoptions) != 1:
+        raise ValueError("schema 24 requires exactly one D5 provisional Slice adoption")
     if schema < PROVISIONAL_SLICE_SCHEMA and (
         state.provisional_slice_revisions or state.provisional_slice_heads
     ):
@@ -3810,6 +4295,7 @@ def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
         and schema not in (
             REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
             PROVISIONAL_SLICE_SCHEMA, D4_PROVISIONAL_SLICE_SCHEMA,
+            D5_PROVISIONAL_SLICE_SCHEMA,
         )
         and state.r3b_schema_upgrade is None
     ):
@@ -3839,6 +4325,14 @@ def _state_bytes(state: State, schema: int = SCHEMA) -> bytes:
             value_d1["provisional_slice_activation"] = _provisional_slice_activation_to_json(
                 state.provisional_slice_activation,
             )
+        if schema >= D5_PROVISIONAL_SLICE_SCHEMA:
+            value_d1["provisional_slice_adoption_refs"] = [
+                {
+                    "id": item.id,
+                    "path": f"records/provisional-slice-adoptions/{item.id}.json",
+                }
+                for item in state.provisional_slice_adoptions
+            ]
     else:
         value_d1 = {}
     if schema in (REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA) and (
@@ -4118,7 +4612,7 @@ class _StateStore:
             E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA,
             FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA,
             REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
-            D4_PROVISIONAL_SLICE_SCHEMA,
+            D4_PROVISIONAL_SLICE_SCHEMA, D5_PROVISIONAL_SLICE_SCHEMA,
         )
         return state, (schema in ready_schemas if state.agreements else None), schema
 
@@ -4129,7 +4623,7 @@ class _StateStore:
             E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA,
             FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA,
             REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
-            D4_PROVISIONAL_SLICE_SCHEMA,
+            D4_PROVISIONAL_SLICE_SCHEMA, D5_PROVISIONAL_SLICE_SCHEMA,
         )
 
     def activate_provisional_slice_writes(
@@ -4314,6 +4808,120 @@ class _StateStore:
                 expected_current=current,
             )
             return candidate
+
+    def _publish_d5_provisional_slice_adoption(
+        self,
+        state: State,
+        change: Change,
+        agreements: tuple[AgreementRecord, AgreementRecord],
+        criteria: SliceCriteriaRevision,
+        adoption: ProvisionalSliceAdoption,
+        source_state_sha256: str,
+    ) -> None:
+        """Publish the one D5 adoption aggregate and schema-24 pointer under CAS."""
+        with _state_publish_lock(self.__root):
+            current, schema = _recover_state_with_schema(self.__root)
+            if schema != D4_PROVISIONAL_SLICE_SCHEMA:
+                raise AtomicFailure("D5 adoption requires exact schema-23 source authority")
+            if (
+                state.revision != current.revision + 1
+                or current.provisional_slice_adoptions
+                or current.provisional_slice_activation is None
+                or current.active_context is not None
+                or current.active_work_id is not None
+                or len(current.features) != 1
+                or len(current.changes) != 1
+                or len(current.agreements) != 2
+                or len(current.terminal_archives) != 1
+                or len(current.work_items) != 1
+            ):
+                raise AtomicFailure("D5 adoption source is not the closed initial D4 lane")
+            state_path = _artifact_path(self.__root, "state.json")
+            actual_source_digest = sha256(state_path.read_bytes()).hexdigest()
+            if (
+                source_state_sha256 != actual_source_digest
+                or adoption.source_schema != D4_PROVISIONAL_SLICE_SCHEMA
+                or adoption.source_revision != current.revision
+                or adoption.source_state_sha256 != actual_source_digest
+                or adoption.recorded_revision != state.revision
+            ):
+                raise AtomicFailure("D5 adoption source bytes changed after consent")
+            if (
+                len(agreements) != 2
+                or agreements[0].kind != "FEATURE"
+                or agreements[1].kind != "SLICE"
+                or state.agreements != current.agreements + agreements
+                or state.changes != current.changes + (change,)
+                or state.slice_criteria_revisions != (criteria,)
+                or state.slice_criteria_heads != (
+                    SliceCriteriaHead(agreements[1].id, criteria.id),
+                )
+                or state.provisional_slice_revisions != current.provisional_slice_revisions
+                or state.provisional_slice_heads != current.provisional_slice_heads
+                or state.provisional_slice_activation != current.provisional_slice_activation
+                or state.provisional_slice_adoptions != (adoption,)
+                or change.id in {item.id for item in current.changes}
+                or any(item.id in {existing.id for existing in current.agreements} for item in agreements)
+                or criteria.id in {item.id for item in current.slice_criteria_revisions}
+                or replace(
+                    state,
+                    revision=current.revision,
+                    active_context=current.active_context,
+                    active_work_id=current.active_work_id,
+                    changes=current.changes,
+                    agreements=current.agreements,
+                    slice_criteria_revisions=current.slice_criteria_revisions,
+                    slice_criteria_heads=current.slice_criteria_heads,
+                    provisional_slice_adoptions=current.provisional_slice_adoptions,
+                ) != current
+            ):
+                raise AtomicFailure("D5 adoption must append only its exact accepted aggregate")
+            if self.__writer_schema_locked(current, allow_d5_adoption=True) != D5_PROVISIONAL_SLICE_SCHEMA:
+                raise AtomicFailure("D5 schema-24 adoption is unavailable")
+            try:
+                validate_state(state)
+                _validate_provisional_slice_authority(
+                    self.__root, state, schema=D5_PROVISIONAL_SLICE_SCHEMA,
+                )
+            except (StateValidationError, DecodeError, DomainError) as error:
+                raise AtomicFailure("D5 adoption candidate is invalid") from error
+
+            artifacts = (
+                (
+                    f"records/agreements/{agreements[0].id}.json",
+                    encode_json(_agreement_to_json(agreements[0])),
+                ),
+                (
+                    f"records/agreements/{agreements[1].id}.json",
+                    encode_json(_agreement_to_json(agreements[1])),
+                ),
+                (
+                    f"records/changes/{change.id}.json",
+                    encode_json(_change_to_json(change)),
+                ),
+                (
+                    f"records/slice-criteria/{criteria.id}.json",
+                    encode_json(_slice_criteria_to_json(criteria)),
+                ),
+                (
+                    f"records/provisional-slice-adoptions/{adoption.id}.json",
+                    encode_json(_provisional_slice_adoption_to_json(adoption)),
+                ),
+            )
+            if any(len(data) > 128 * 1024 for _, data in artifacts):
+                raise AtomicFailure("D5 immutable adoption record exceeds 128 KiB")
+            for relative, data in artifacts:
+                path = _artifact_path(self.__root, relative)
+                if path.exists() and path.read_bytes() != data:
+                    raise AtomicFailure("D5 immutable adoption record identity collides")
+            for relative, data in artifacts:
+                self.__publish_immutable(relative, data, strict_directory=True)
+            self.__publish_state_locked(
+                state,
+                strict_directory=True,
+                allow_d5_adoption=True,
+                expected_current=current,
+            )
 
     def r3_schema_ready(self) -> bool:
         """Schema 15 stays readable; it never becomes an R3 writer without consent."""
@@ -4500,6 +5108,7 @@ class _StateStore:
         self, expected_revision: int, transform: Callable[[State], State], *,
         upgrade: bool = False, source_digest: str | None = None,
         allow_d4_task_progress: bool = False,
+        allow_d5_task_progress: bool = False,
     ) -> State:
         """Validate and publish one E1 operation entirely under the state writer lock."""
         with _state_publish_lock(self.__root):
@@ -4511,12 +5120,14 @@ class _StateStore:
             source_schema = self.__writer_schema_locked(
                 current, allow_e1_upgrade=upgrade,
                 allow_d4_task_progress=allow_d4_task_progress,
+                allow_d5_task_progress=allow_d5_task_progress,
             )
             if source_schema not in (
                 E1_TASK_PROGRESS_SCHEMA, SCHEMA, R3_SCHEMA, R3B_SCHEMA,
                 FEATURE_COMPLETION_SCHEMA, FEATURE_CYCLE_SCHEMA,
                 REQUEST_OBJECTIVE_SCHEMA, SEMANTIC_REQUEST_OBJECTIVE_SCHEMA,
                 *((D4_PROVISIONAL_SLICE_SCHEMA,) if allow_d4_task_progress else ()),
+                *((D5_PROVISIONAL_SLICE_SCHEMA,) if allow_d5_task_progress else ()),
             ):
                 raise AtomicFailure("E1_TASK_PROGRESS_REQUIRES_SCHEMA_14")
             candidate = transform(current)
@@ -4535,9 +5146,23 @@ class _StateStore:
                     )
                 except (StateValidationError, DecodeError) as error:
                     raise AtomicFailure("D4 Task progress candidate is invalid") from error
+            elif source_schema == D5_PROVISIONAL_SLICE_SCHEMA:
+                if (
+                    not allow_d5_task_progress
+                    or replace(candidate, revision=current.revision, active_context=current.active_context) != current
+                ):
+                    raise AtomicFailure("D5 Task progress must preserve all accepted authority")
+                try:
+                    validate_state(candidate)
+                    _validate_provisional_slice_authority(
+                        self.__root, candidate, schema=D5_PROVISIONAL_SLICE_SCHEMA,
+                    )
+                except (StateValidationError, DecodeError) as error:
+                    raise AtomicFailure("D5 Task progress candidate is invalid") from error
             self.__publish_state_locked(
                 candidate, strict_directory=True, allow_e1_upgrade=upgrade,
                 allow_d4_task_progress=allow_d4_task_progress,
+                allow_d5_task_progress=allow_d5_task_progress,
                 expected_current=current,
             )
             return candidate
@@ -4895,6 +5520,13 @@ class _StateStore:
                         expected_current=current,
                     )
                     return
+                if schema == D5_PROVISIONAL_SLICE_SCHEMA:
+                    self.__publish_state_locked(
+                        state,
+                        allow_d5_lifecycle=d4_operation,
+                        expected_current=current,
+                    )
+                    return
             self.__publish_state_locked(state)
 
     def __check_state_revision(self, state: State) -> State:
@@ -4910,6 +5542,8 @@ class _StateStore:
         allow_request_objective: bool = False, allow_d4_activation: bool = False,
         allow_d4_task_progress: bool = False, allow_d4_provisional_slice: bool = False,
         allow_d4_lifecycle: str | None = None,
+        allow_d5_adoption: bool = False, allow_d5_task_progress: bool = False,
+        allow_d5_lifecycle: str | None = None,
     ) -> int:
         """Choose the output version from persisted authority, never caller input."""
         state_path = _artifact_path(self.__root, "state.json")
@@ -4927,6 +5561,16 @@ class _StateStore:
             if source_schema != SCHEMA:
                 raise AtomicFailure("D4 activation requires exact schema-15 source authority")
             return D4_PROVISIONAL_SLICE_SCHEMA
+        if allow_d5_adoption:
+            if source_schema != D4_PROVISIONAL_SLICE_SCHEMA or current.provisional_slice_adoptions:
+                raise AtomicFailure("D5 adoption requires exact schema-23 source authority")
+            return D5_PROVISIONAL_SLICE_SCHEMA
+        if source_schema == D5_PROVISIONAL_SLICE_SCHEMA:
+            if not current.provisional_slice_adoptions:
+                raise AtomicFailure("D5 schema 24 is missing its adoption authority")
+            if allow_d5_task_progress or allow_d5_lifecycle in _D5_LIFECYCLE_OPERATIONS:
+                return D5_PROVISIONAL_SLICE_SCHEMA
+            raise AtomicFailure("D5 schema 24 permits only its supported Core writers")
         if source_schema == D4_PROVISIONAL_SLICE_SCHEMA:
             if current.provisional_slice_activation is None:
                 raise AtomicFailure("D4 schema 23 is missing its activation authority")
@@ -5017,6 +5661,8 @@ class _StateStore:
         allow_request_objective: bool = False, allow_d4_activation: bool = False,
         allow_d4_task_progress: bool = False, allow_d4_provisional_slice: bool = False,
         allow_d4_lifecycle: str | None = None,
+        allow_d5_adoption: bool = False, allow_d5_task_progress: bool = False,
+        allow_d5_lifecycle: str | None = None,
         expected_current: State | None = None,
     ) -> None:
         current = self.__check_state_revision(state)
@@ -5033,6 +5679,9 @@ class _StateStore:
             allow_d4_task_progress=allow_d4_task_progress,
             allow_d4_provisional_slice=allow_d4_provisional_slice,
             allow_d4_lifecycle=allow_d4_lifecycle,
+            allow_d5_adoption=allow_d5_adoption,
+            allow_d5_task_progress=allow_d5_task_progress,
+            allow_d5_lifecycle=allow_d5_lifecycle,
         )
         if allow_d4_activation and (
             current.provisional_slice_activation is not None
@@ -5063,6 +5712,22 @@ class _StateStore:
             _validate_d4_lifecycle_commit(
                 self.__root, current, state, allow_d4_lifecycle,
             )
+        if allow_d5_adoption and (
+            output_schema != D5_PROVISIONAL_SLICE_SCHEMA
+            or current.provisional_slice_adoptions
+            or len(state.provisional_slice_adoptions) != 1
+        ):
+            raise AtomicFailure("D5 adoption writer requires its one exact schema conversion")
+        if allow_d5_task_progress and output_schema == D5_PROVISIONAL_SLICE_SCHEMA and (
+            replace(state, revision=current.revision, active_context=current.active_context) != current
+        ):
+            raise AtomicFailure("D5 Task progress may change only active Task context")
+        if allow_d5_lifecycle is not None:
+            if output_schema != D5_PROVISIONAL_SLICE_SCHEMA:
+                raise AtomicFailure("D5 lifecycle writer requires schema 24")
+            _validate_d5_lifecycle_commit(
+                self.__root, current, state, allow_d5_lifecycle,
+            )
         if (
             current.provisional_slice_activation != state.provisional_slice_activation
             and not allow_d4_activation
@@ -5076,8 +5741,17 @@ class _StateStore:
             and not allow_d4_provisional_slice
         ):
             raise AtomicFailure("provisional Slice history requires its Core writer")
+        if state.provisional_slice_adoptions != current.provisional_slice_adoptions and not (
+            allow_d5_adoption
+            and not current.provisional_slice_adoptions
+            and len(state.provisional_slice_adoptions) == 1
+        ):
+            raise AtomicFailure("D5 adoption history requires its one-time Core writer")
         if current.agreements and state.agreements != current.agreements and not (
-            allow_next_slice and state.agreements[:len(current.agreements)] == current.agreements
+            (
+                allow_next_slice or allow_d5_adoption
+            )
+            and state.agreements[:len(current.agreements)] == current.agreements
             and len(state.agreements) == len(current.agreements) + 2
         ):
             raise AtomicFailure("the original accepted E1 agreements cannot be replaced")

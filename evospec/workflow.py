@@ -288,6 +288,105 @@ class WorkflowService:
             "bounded provisional Slice suggestion persisted; accepted authority was not changed",
         )
 
+    def provisional_slice_adoption_agreement(
+        self,
+        repository_id: str,
+        feature_id: str,
+        proposal_id: str,
+        revision_id: str,
+        proposal_revision: int,
+        proposal_digest: str,
+        slice_title: str,
+        initial_task: str,
+        checkpoint: str,
+        criteria: SliceCriteriaSpec,
+        question_answers: tuple[tuple[str, str], ...],
+        *,
+        expected_revision: ExpectedRevision,
+    ) -> str:
+        """Preview exact D5 consent without changing Core authority."""
+        state = self._mutation_state(expected_revision)
+        try:
+            return self.__core.provisional_slice_adoption_agreement(
+                state,
+                repository_id,
+                feature_id,
+                proposal_id,
+                revision_id,
+                proposal_revision,
+                proposal_digest,
+                slice_title,
+                initial_task,
+                checkpoint,
+                criteria,
+                question_answers,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+
+    def adopt_provisional_slice(
+        self,
+        repository_id: str,
+        feature_id: str,
+        proposal_id: str,
+        revision_id: str,
+        proposal_revision: int,
+        proposal_digest: str,
+        slice_title: str,
+        initial_task: str,
+        checkpoint: str,
+        criteria: SliceCriteriaSpec,
+        question_answers: tuple[tuple[str, str], ...],
+        *,
+        expected_revision: ExpectedRevision,
+    ) -> WorkflowResult:
+        """Acquire terminal consent inside Core before committing one exact D5 mapping."""
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise WorkflowError("D5 adoption requires an exact expected State revision")
+        try:
+            recovered = self.__core.confirmed_provisional_slice_adoption(
+                expected_revision,
+                repository_id,
+                feature_id,
+                proposal_id,
+                revision_id,
+                proposal_revision,
+                proposal_digest,
+                slice_title,
+                initial_task,
+                checkpoint,
+                criteria,
+                question_answers,
+            )
+            if recovered is not None:
+                return self._result(
+                    "PROVISIONAL_SLICE_ADOPTION_RECOVERED",
+                    recovered,
+                    "exact previously committed D5 adoption recovered without another write",
+                )
+            state = self._mutation_state(expected_revision)
+            saved = self.__core.adopt_provisional_slice(
+                state,
+                repository_id,
+                feature_id,
+                proposal_id,
+                revision_id,
+                proposal_revision,
+                proposal_digest,
+                slice_title,
+                initial_task,
+                checkpoint,
+                criteria,
+                question_answers,
+            )
+        except ServiceError as error:
+            raise WorkflowError(str(error)) from error
+        return self._result(
+            "PROVISIONAL_SLICE_ADOPTED",
+            saved,
+            "exact provisional proposal accepted as one actionable Task; criteria remain unverified",
+        )
+
     def request_scoped_objective_status(
         self, state: State, input_snapshot: InputSnapshot | None,
     ) -> RequestScopedObjectiveStatus | None:

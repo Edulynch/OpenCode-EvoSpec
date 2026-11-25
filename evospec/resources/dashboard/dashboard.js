@@ -586,6 +586,15 @@
     const slice = create("section", "acceptance-slice");
     slice.append(create("h4", "acceptance-slice-title", item.slice_title));
     const revision = objectValue(item.criteria_revision);
+    slice.append(create("p", "eyebrow", "Agreement status"));
+    const agreementStatus = create(
+      "span",
+      "status-label agreement-status",
+      item.authority_status === "CANONICAL" ? "Agreed" : "Agreement unavailable"
+    );
+    agreementStatus.dataset.status = "waiting";
+    acceptanceStatuses.push(agreementStatus);
+    slice.append(agreementStatus);
     const scopeLabels = {
       ACTIVE: "Active",
       PARKED: item.operational_state === "BLOCKED" ? "Blocked (parked)" : item.operational_state === "FROZEN" ? "Paused (parked)" : "Parked",

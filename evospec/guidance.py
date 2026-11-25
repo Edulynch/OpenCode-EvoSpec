@@ -131,6 +131,12 @@ _D4_SCHEMA23_ACTIONS = frozenset((
     Action.VERIFY,
     Action.CONVERGE,
 ))
+_D5_SCHEMA24_ACTIONS = frozenset((
+    Action.ACCEPTED_TASK_PROGRESS,
+    Action.REVIEW,
+    Action.VERIFY,
+    Action.CONVERGE,
+))
 _ACTION_ORDER = {
     Action.CONTEXT: 0, Action.NEW: 1, Action.CHANGE: 2, Action.CONTINUE: 3, Action.RESUME: 4,
     Action.LIST_WORK: 5, Action.NEXT_WORK: 6, Action.ACTIVATE_WORK: 7,
@@ -203,6 +209,17 @@ def for_action(
                 selected,
                 "D4_SCHEMA23_ACTION_UNSUPPORTED",
                 "schema 23 permits only eligible D4 Slice actions and accepted Task progress",
+                (),
+                None,
+            )
+    if inspection.persisted_schema == 24:
+        if selected in _READ_ONLY_ACTIONS:
+            return _allow(selected, "schema 24 permits read-only projections and one adopted Task lifecycle")
+        if selected not in _D5_SCHEMA24_ACTIONS:
+            return _block(
+                selected,
+                "D5_SCHEMA24_ACTION_UNSUPPORTED",
+                "schema 24 permits only the adopted Task lifecycle and read-only projections",
                 (),
                 None,
             )

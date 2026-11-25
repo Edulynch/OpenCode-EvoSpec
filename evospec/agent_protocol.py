@@ -285,6 +285,9 @@ def _request_scoped_objective_json(
             {"operation": operation, "provenance": provenance}
             for operation, provenance in getattr(objective, "criteria", ())
         ]
+    mode = getattr(objective, "mode", None)
+    if mode is not None:
+        value["mode"] = mode
     return value
 
 
