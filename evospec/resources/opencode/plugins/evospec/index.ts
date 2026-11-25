@@ -1268,7 +1268,7 @@ function requestScopedIncrementalBinding(snapshot, root) {
     : null
   const rootRepositoryID = createHash("sha256").update(root, "utf8").digest("hex").slice(0, 16)
   const exactEnvelope = envelope && typeof envelope === "object" && !Array.isArray(envelope)
-    && envelope.goal === request?.statement
+    && envelope.goal === accepted?.slice_title
     && JSON.stringify(envelope.allowed_paths) === JSON.stringify(["index.html"])
     && envelope.operation_budget === 8
     && JSON.stringify(envelope.reversible_actions) === JSON.stringify([
