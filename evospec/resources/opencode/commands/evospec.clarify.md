@@ -2,4 +2,4 @@
 description: Answer returned EvoSpec material clarification questions.
 ---
 <!-- EvoSpec-managed: opencode-v2 -->
-Load the detailed `evospec` skill and use the EvoSpec tool for canonical context and guidance first. Honor the returned preflight and `legal_actions`, and map $ARGUMENTS only to currently returned question IDs. Submit revision-bound `clarify` answers only when allowed. Never infer legality from a phase name or submit unrelated IDs. Report terminal `NO_ACTION` or `USER` intervention as returned.
+First read `evospec_continuity` status. In composed mode, record the exact clarified question and decision with its current revision using `operation: "clarify"`; this records a decision, not a synthetic acceptance. If Core reports legacy `MIXED_AUTHORITY` because `.evospec/state.json` exists, use `evospec_context` and only the exact legal legacy action at its current revision. Never migrate, initialize, or switch modes. Preserve foreign SDD documents and ask only material questions. User input: $ARGUMENTS

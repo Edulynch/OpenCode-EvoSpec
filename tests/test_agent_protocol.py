@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -77,6 +78,132 @@ def activate_side(root: Path) -> int:
 
 
 class AgentProtocolTests(unittest.TestCase):
+    def test_composed_continuity_uses_the_provider_neutral_protocol_without_legacy_init(self) -> None:
+        with TemporaryDirectory(
+            prefix="evospec-continuity-protocol-",
+            dir=os.environ.get("EVOSPEC_AC0_TEST_TMPDIR") or None,
+        ) as temporary:
+            root = Path(temporary)
+            request_data = {
+                "title": "Protocol Feature",
+                "outcome": "Persist a composed outcome.",
+                "criteria": [{
+                    "description": "The protocol test passes.",
+                    "check_kind": "python-unittest",
+                    "check_target": "tests.test_agent_protocol",
+                }],
+                "increments": [],
+                "tasks": [{
+                    "title": "Implement the protocol path",
+                    "description": "Use the shared Core operation.",
+                    "criteria": [0],
+                }],
+                "plan": "One short unsliced correction path.",
+            }
+            response = json.loads(execute(root, request(
+                "continuity", operation="specify", expected_revision=0,
+                session_id="ses_protocol_continuity_123", data=request_data,
+            )))
+            self.assertNotIn("error", response)
+            continuity = response["continuity"]
+            self.assertEqual(continuity["mode"], "COMPOSED")
+            self.assertEqual(continuity["revision"], 1)
+            self.assertEqual(continuity["selected_feature"]["increments"], [])
+            self.assertEqual(
+                json.loads(execute(root, request(
+                    "continuity", operation="status", session_id="ses_protocol_continuity_123",
+                )))["continuity"]["selected_feature"]["id"],
+                continuity["selected_feature"]["id"],
+            )
+            feature = continuity["selected_feature"]
+            feature_id = feature["id"]
+            task_id = feature["tasks"][0]["id"]
+            pause_reason = "Pause for a separately tracked dependency."
+            detour_title = "Resolve the external dependency"
+            paused_response = json.loads(execute(root, request(
+                "continuity", operation="pause",
+                expected_revision=continuity["revision"],
+                session_id="ses_protocol_continuity_123",
+                data={
+                    "reason": pause_reason,
+                    "detour_kind": "EXTERNAL",
+                    "detour_title": detour_title,
+                    "return_task_id": task_id,
+                },
+            )))
+            self.assertNotIn("error", paused_response)
+            paused = paused_response["continuity"]
+            self.assertEqual(paused["revision"], continuity["revision"] + 1)
+            paused_feature = paused["selected_feature"]
+            self.assertTrue(paused_feature["paused"])
+            self.assertEqual(paused_feature["pause_reason"], pause_reason)
+            detour = paused_feature["detours"][0]
+            self.assertEqual(
+                (detour["feature_id"], detour["kind"], detour["title"],
+                 detour["return_task_id"], detour["result"]),
+                (feature_id, "EXTERNAL", detour_title, task_id, None),
+            )
+
+            recovery_session = "ses_protocol_continuity_recovery_456"
+            before_status = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            recovered = json.loads(execute(root, request(
+                "continuity", operation="status", session_id=recovery_session,
+            )))["continuity"]
+            after_status = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            self.assertEqual(before_status, after_status)
+            self.assertEqual(recovered["selection_scope"], "worktree")
+            self.assertEqual(recovered["selected_feature_id"], feature_id)
+            self.assertTrue(recovered["selected_feature"]["paused"])
+            self.assertEqual(recovered["selected_feature"]["pause_reason"], pause_reason)
+
+            detour_summary = "The external dependency is resolved; resume the original Task."
+            resumed_response = json.loads(execute(root, request(
+                "continuity", operation="resume",
+                expected_revision=paused["revision"],
+                session_id=recovery_session,
+                data={"feature_id": feature_id, "detour_summary": detour_summary},
+            )))
+            self.assertNotIn("error", resumed_response)
+            resumed = resumed_response["continuity"]
+            self.assertEqual(resumed["revision"], paused["revision"] + 1)
+            self.assertFalse(resumed["selected_feature"]["paused"])
+            self.assertIsNone(resumed["selected_feature"]["pause_reason"])
+            resumed_detour = resumed["selected_feature"]["detours"][0]
+            self.assertEqual(resumed_detour["result"], detour_summary)
+            self.assertEqual(resumed_detour["reported_by_session_id"], recovery_session)
+            self.assertEqual(resumed_detour["resolved_revision"], resumed["revision"])
+            before_status = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            after_resume = json.loads(execute(root, request(
+                "continuity", operation="status",
+                session_id="ses_protocol_continuity_after_resume_789",
+            )))["continuity"]
+            after_status = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            self.assertEqual(before_status, after_status)
+            self.assertEqual(after_resume["selected_feature_id"], feature_id)
+            self.assertFalse(after_resume["selected_feature"]["paused"])
+            self.assertEqual(
+                after_resume["selected_feature"]["detours"][0]["result"],
+                detour_summary,
+            )
+
+            invalid = json.loads(execute(root, request(
+                "continuity", operation="status", session_id="model-controlled",
+                unexpected="field",
+            )))
+            self.assertEqual(invalid["error"]["code"], "INVALID_REQUEST")
+
     def test_d4_protocol_activates_and_projects_only_core_current_provisional_head(self) -> None:
         with TemporaryDirectory(prefix="evospec-d4-protocol-") as temporary:
             root = Path(temporary)

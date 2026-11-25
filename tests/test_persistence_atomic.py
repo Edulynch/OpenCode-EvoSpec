@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -21,10 +22,12 @@ from evospec.persistence import (
     BinaryFile,
     FileOperations,
     StateStore,
+    RecoveryError,
     _provisional_slice_to_json,
     _new_d4_provisional_slice_revision,
     encode_json,
 )
+from evospec.continuity import execute as execute_continuity
 from evospec.services import CoreService, ServiceError
 from evospec.workflow import WorkflowError, WorkflowService
 from tests._tempdir import TemporaryDirectory
@@ -123,6 +126,37 @@ class FailingDirectoryFsync(FileOperations):
 
 
 class AtomicPersistenceTests(unittest.TestCase):
+    def test_composed_mode_and_legacy_state_writer_fail_closed_without_mixed_artifacts(self) -> None:
+        with TemporaryDirectory(
+            prefix="evospec-composed-legacy-barrier-",
+            dir=os.environ.get("EVOSPEC_AC0_TEST_TMPDIR") or None,
+        ) as temporary:
+            root = Path(temporary)
+            execute_continuity(root, "specify", 0, "ses_persist_barrier_123", {
+                "title": "Composed only",
+                "outcome": "Keep the new mode separate.",
+                "criteria": [{
+                    "description": "Atomic persistence tests pass.",
+                    "check_kind": "python-unittest",
+                    "check_target": "tests.test_persistence_atomic",
+                }],
+                "increments": [],
+                "tasks": [{"title": "Write the mode barrier", "criteria": [0]}],
+            })
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            with self.assertRaises(RecoveryError):
+                CoreService.open(root).recover()
+            with self.assertRaises(RecoveryError):
+                StateStore(root).load_state()
+            after = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            self.assertEqual(before, after)
+
     def test_legacy_recovery_state_publication_failure_keeps_original_authority(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

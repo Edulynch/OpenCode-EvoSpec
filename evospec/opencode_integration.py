@@ -24,8 +24,12 @@ CONTINUATION = ".opencode/plugins/evospec/continuation.mjs"
 MANIFEST = ".evospec/opencode-resources.json"
 SKILL = ".opencode/skills/evospec/SKILL.md"
 COMMANDS = (
-    "evospec.init.md", "evospec.start.md", "evospec.continue.md", "evospec.status.md",
-    "evospec.clarify.md", "evospec.review.md", "evospec.converge.md", "evospec.context.md",
+    "evospec.specify.md", "evospec.clarify.md", "evospec.plan.md",
+    "evospec.tasks.md", "evospec.implement.md", "evospec.use.md",
+    "evospec.change.md", "evospec.status.md", "evospec.verify.md",
+    "evospec.pause.md", "evospec.resume.md", "evospec.close.md",
+    "evospec.init.md", "evospec.start.md", "evospec.continue.md",
+    "evospec.review.md", "evospec.converge.md", "evospec.context.md",
     "evospec.doctor.md",
 )
 AGENT_COMMAND_PLACEHOLDER = "__EVOSPEC_AGENT_COMMAND__"

@@ -1,13 +1,15 @@
 # OpenCode V2 integration
 
-EvoSpec integrates with **OpenCode V2** through a dependency-free local plugin, nine native commands, and the `evospec` skill. The plugin registers typed tools that call EvoSpec's provider-neutral protocol or CLI for the current OpenCode session. It also adds a session-context hook that directs EvoSpec lifecycle work to the skill and canonical context.
+EvoSpec integrates with **OpenCode V2** through a dependency-free local plugin, nineteen native commands, and the `evospec` skill. The plugin registers typed tools that call EvoSpec's provider-neutral protocol or CLI for the current OpenCode session. It also adds a session-context hook that directs EvoSpec lifecycle work to the skill and canonical context.
 
-> **E0 V2 boundary:** This page describes the current OpenCode integration and its nine `/evospec.*` commands. The unprefixed `/specify`, `/clarify`, `/plan`, `/implement`, `/status`, and `/change` names in [`methodology.md`](methodology.md) are approved E0 method-level UX, not commands provided by the current integration or a selected implementation design.
+> **E0 V2 boundary:** This page describes the source integration and its nineteen `/evospec.*` commands. The unprefixed `/specify`, `/clarify`, `/plan`, `/implement`, `/status`, and `/change` names in [`methodology.md`](methodology.md) remain method-level UX; they are not installed by this integration.
+
+The composed continuity MVP described in the [consolidated MVP contract](ac0-consolidated-mvp.md) is implemented in this source branch, but is not a merged release or independently qualified native OpenCode workflow. Automated adapter tests are not evidence that a live permission dialog appeared or that a user approved it.
 
 The integration writes only these EvoSpec-owned resources:
 
 - `.opencode/plugins/evospec/index.ts`
-- `.opencode/commands/evospec.*.md` (nine commands)
+- `.opencode/commands/evospec.*.md` (nineteen commands)
 - `.opencode/skills/evospec/SKILL.md`
 - `.evospec/opencode-resources.json` (ownership and SHA-256 manifest)
 - `.evospec/integrations.json` (the shared provider registry)
@@ -54,7 +56,7 @@ evospec integrate opencode --dry-run
 
 ## OpenCode V2 resources
 
-The local plugin is auto-loaded from `.opencode/plugins/evospec/index.ts`. It uses OpenCode V2's `ctx.tool.transform` API and the executing session's location to invoke `evospec-agent` and `evospec`. It registers the raw provider-neutral protocol tool and typed helpers for context, intake, progress, review, verification, continuation, clarification, discovery recovery, capability selection, work queue operations, convergence, and the narrowly bounded request-scoped objective lane below.
+The local plugin is auto-loaded from `.opencode/plugins/evospec/index.ts`. It uses OpenCode V2's `ctx.tool.transform` API and the executing session's location to invoke `evospec-agent` and `evospec`. It registers the raw provider-neutral protocol tool and typed helpers for composed continuity, legacy context/intake/progress/review/verification/continuation, discovery recovery, capability selection, work queue operations, convergence, and the narrowly bounded request-scoped objective lane below.
 
 For a human-accepted E1 Task, use the dedicated `evospec_accepted_task_progress` tool only when Core's current context offers that action. It requires the exact revision, repository ID, Task ID, accepted Feature/Slice references, checkpoint, statement and bounded evidence leads. OpenCode enforces its native tool permission; Core revalidates persisted scope and authorization. The generic `evospec` tool refuses the new action, and the legacy `evospec_progress` path cannot mutate an active accepted E1 Task. The dedicated action has no automatic stale-revision retry. Progress remains explicitly **unverified**, and no new slash command or E0 method command is created.
 
@@ -64,17 +66,22 @@ The `permission.asked` and `permission.replied` events in OpenCode v2.3.2 are **
 
 The V2 plugin has no runtime import from `@opencode/plugin`; OpenCode loads the local TypeScript module without project dependencies. At startup it verifies that all typed tools were registered. The skill is auto-discovered from `.opencode/skills/evospec/SKILL.md`. Commands remain ordinary V2 Markdown commands under `.opencode/commands/`.
 
-The integration installs exactly these nine native commands:
+The source integration packages twelve composed continuity commands:
 
-1. `/evospec.init` — initialize EvoSpec authority for the repository.
-2. `/evospec.start` — start a model-assessed new or changed work item.
-3. `/evospec.continue` — recover the current work context when continuation is legal.
-4. `/evospec.status` — show the current authoritative context without mutation.
-5. `/evospec.clarify` — answer clarification questions returned by EvoSpec.
-6. `/evospec.review` — record product review and, when legal, technical verification.
-7. `/evospec.converge` — explicitly request convergence when it is legal.
-8. `/evospec.context` — show protocol context and legal actions without mutation.
-9. `/evospec.doctor` — run the local read-only diagnostic without auto-remediation.
+1. `/evospec.specify` — create a Feature in a fresh root and explicitly opt into composed mode.
+2. `/evospec.clarify` — record a decision against the current Feature revision.
+3. `/evospec.plan` — record the current implementation plan.
+4. `/evospec.tasks` — read Tasks or add an incrementally discovered Task.
+5. `/evospec.implement` — query the queue, checkpoint before effects, and report afterward.
+6. `/evospec.use` — inspect or select a Feature for this session or the worktree default.
+7. `/evospec.change` — record a correction or amend a Feature, preserving closure history.
+8. `/evospec.status` — show composed status read-only, with a legacy read-only fallback.
+9. `/evospec.verify` — run one criterion's declared supported check and record its result.
+10. `/evospec.pause` — persist a pause and optional related/external detour.
+11. `/evospec.resume` — resume or explicitly reconcile an unresolved attempt.
+12. `/evospec.close` — request closure only when current checks and Tasks satisfy Core guards.
+
+Seven legacy commands remain: `/evospec.init`, `/evospec.start`, `/evospec.continue`, `/evospec.review`, `/evospec.converge`, `/evospec.context`, and `/evospec.doctor`. Composed and legacy authority are disjoint. `/evospec.status` and `/evospec.clarify` route only from Core's reported mode; they never migrate, initialize, or combine the stores. See the [composed MVP contract](ac0-consolidated-mvp.md) for schema, persistence, task/evidence distinctions, and limitations.
 
 ### R2-C2: detect host delegation contract candidates, fail closed
 

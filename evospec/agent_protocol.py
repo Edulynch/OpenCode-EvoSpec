@@ -28,6 +28,7 @@ from .agent_protocol_schema import (
     parse_clarification_answers,
     parse_convergence_assessment,
     parse_expected_revision,
+    parse_continuity_request,
     parse_test_exit_code,
     parse_irreversible_operation_kind,
     parse_git_history_rewrite_policy,
@@ -53,7 +54,7 @@ from .agent_protocol_schema import (
     parse_work_relation_kind,
     validate_action_request,
 )
-from .domain import AssessmentOperation, AutonomyEnvelope, AutonomyEnvelopeDelta, CriterionCoverageApproval, CriterionTestReceipt, SliceCriteriaRevision, SliceOutcomeReceipt
+from .domain import AssessmentOperation, AutonomyEnvelope, AutonomyEnvelopeDelta, ContinuityError, CriterionCoverageApproval, CriterionTestReceipt, SliceCriteriaRevision, SliceOutcomeReceipt
 from .input_fingerprint import (
     COVERAGE_CONTRACT_VERSION,
     INPUT_FINGERPRINT_VERSION,
@@ -722,11 +723,20 @@ def _work_queue_json(context: AgentContext) -> dict[str, JsonValue]:
 def execute(root: Path, payload: str) -> str:
     """Execute one JSON request against the root's canonical workflow facade."""
     try:
-        workflow = WorkflowService.open(root)
         request = decode_request(payload)
-        if parse_action(request) == "autonomy_evaluate":
+        action = parse_action(request)
+        if action == "continuity":
+            validate_action_request(request, "continuity")
+            operation, expected_revision, session_id, data = parse_continuity_request(request)
+            return _encode({
+                "continuity": WorkflowService.open(root).continuity(
+                    operation, expected_revision, session_id, data,
+                ),
+            })
+        workflow = WorkflowService.open(root)
+        if action == "autonomy_evaluate":
             return _execute_autonomy_evaluation(workflow, request)
-        if parse_action(request) == "context":
+        if action == "context":
             validate_action_request(request, "context")
             inspection = workflow.inspect_locks()
             return encode_success(
@@ -742,6 +752,8 @@ def execute(root: Path, payload: str) -> str:
         )
     except ProtocolError as error:
         return encode_error("INVALID_REQUEST", str(error))
+    except ContinuityError as error:
+        return encode_error(error.code, str(error))
     except StaleRevisionError as error:
         return encode_stale_revision(
             str(error), error.expected_revision, error.actual_revision

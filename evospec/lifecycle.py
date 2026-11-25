@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from hashlib import sha256
+import json
 from typing import Final, Protocol
 
 
@@ -226,3 +228,106 @@ def advance(
         raise LifecycleError("terminal work retains its prior valid phase")
     validate_context_state(requested_status, requested_phase, unresolved_material_decision, review, verification, 0, (PHASE_STATES[current_phase], current_phase) if requested_status == LifecycleState.PAUSED else None, None)
     return requested_status, requested_phase
+
+
+def continuity_current_checks(
+    state: dict[str, object], feature: dict[str, object],
+) -> dict[str, dict[str, object]]:
+    """Project only receipts whose criterion digest still matches canonical text."""
+    current = {
+        item["id"]: _continuity_digest(item)
+        for item in feature["criteria"]
+    }
+    latest: dict[str, dict[str, object]] = {}
+    for receipt in state["checks"]:
+        criterion_id = receipt.get("criterion_id")
+        if criterion_id in current and receipt.get("criterion_digest") == current[criterion_id]:
+            latest[criterion_id] = {
+                "passed": receipt.get("exit_code") == 0,
+                "exit_code": receipt.get("exit_code"),
+                "check_kind": receipt.get("check_kind"),
+                "check_target": receipt.get("check_target"),
+                "output_sha256": receipt.get("output_sha256"),
+                "task_id": receipt.get("task_id"),
+                "reported_by_session_id": receipt.get("reported_by_session_id"),
+                "recorded_revision": receipt.get("recorded_revision"),
+            }
+    return latest
+
+
+def continuity_task_status(
+    state: dict[str, object], feature: dict[str, object], task: dict[str, object],
+) -> str:
+    """Derive operational status; a report alone never completes a Task."""
+    execution = state["execution"]
+    if execution is not None and execution["task_id"] == task["id"]:
+        return "OUTCOME_UNKNOWN"
+    attempts = [item for item in state["attempts"] if item["task_id"] == task["id"]]
+    if not attempts:
+        return "READY"
+    last = attempts[-1]
+    if last["status"] in ("STARTED", "OUTCOME_UNKNOWN"):
+        return "OUTCOME_UNKNOWN"
+    if last["status"] == "RECONCILED_INCOMPLETE":
+        return "READY"
+    if last.get("result_status") == "BLOCKED":
+        return "BLOCKED"
+    if last["status"] == "REPORTED" and last.get("result_status") != "SUCCEEDED":
+        return "REPORTED"
+    if last["status"] not in ("REPORTED", "RECONCILED_COMPLETE"):
+        return "READY"
+    checks = continuity_current_checks(state, feature)
+    if all(checks.get(identity, {}).get("passed") for identity in task["criteria_ids"]):
+        return "COMPLETED"
+    return "REPORTED"
+
+
+def continuity_task_eligible(
+    state: dict[str, object], feature: dict[str, object],
+    tasks: list[dict[str, object]], task: dict[str, object],
+) -> bool:
+    """Require every dependency to be completed and the Task itself ready."""
+    by_id = {item["id"]: item for item in tasks}
+    checks = continuity_current_checks(state, feature)
+    if any(
+        dependency not in by_id
+        or continuity_task_status(state, feature, by_id[dependency]) != "COMPLETED"
+        for dependency in task["depends_on"]
+    ):
+        return False
+    return continuity_task_status(state, feature, task) == "READY"
+
+
+def continuity_close_blockers(
+    state: dict[str, object], feature_id: str,
+    feature_state: dict[str, object], feature: dict[str, object],
+    tasks: list[dict[str, object]],
+) -> tuple[str, ...]:
+    """Return objective closure blockers without treating reports as evidence."""
+    blockers: list[str] = []
+    if state["execution"] is not None:
+        blockers.append("a checkpointed Task has an unknown outcome")
+    if feature_id in state["paused_features"]:
+        blockers.append("paused work must be explicitly resumed before closure")
+    checks = continuity_current_checks(state, feature)
+    missing = [
+        item["id"] for item in feature["criteria"]
+        if not checks.get(item["id"], {}).get("passed")
+    ]
+    incomplete = [
+        task["id"] for task in tasks
+        if continuity_task_status(state, feature, task) != "COMPLETED"
+    ]
+    if missing:
+        blockers.append("criteria lack current passing checks: " + ", ".join(missing))
+    if incomplete:
+        blockers.append("Tasks are not complete: " + ", ".join(incomplete))
+    if feature_state["status"] != "OPEN":
+        blockers.append("only an open Feature can be closed")
+    return tuple(blockers)
+
+
+def _continuity_digest(value: object) -> str:
+    return sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
