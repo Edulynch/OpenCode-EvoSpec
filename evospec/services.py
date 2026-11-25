@@ -4064,7 +4064,7 @@ class CoreService:
             or state.changes[0].id != accepted.change_id
             or state.changes[0].feature_id != accepted.feature_id
             or state.changes[0].classification is not Classification.FEATURE
-            or state.changes[0].intent != accepted.statement
+            or state.changes[0].intent != accepted.statement.strip()
             or accepted.task_id is None
             or accepted.initial_task != SESSION_REQUEST_TASK
             or accepted.checkpoint != SESSION_REQUEST_CHECKPOINT

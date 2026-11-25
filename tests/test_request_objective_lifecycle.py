@@ -336,6 +336,93 @@ class RequestObjectiveLifecycleTests(unittest.TestCase):
         self.assertEqual(stale_projection.status, "BLOCKED")
         self.assertIn("REQUEST_OBJECTIVE_PROOF_STALE", stale_projection.blockers)
 
+    def test_incremental_lineage_uses_trimmed_change_intent_without_normalizing_source(self) -> None:
+        request_text = (
+            "Build a weekend trip planner with budget alerts and saved itineraries.\t "
+        )
+        request_digest = sha256(request_text.encode("utf-8")).hexdigest()
+        with TemporaryDirectory(prefix="evospec-incremental-trimmed-lineage-") as temporary:
+            root = Path(temporary).resolve()
+            workflow = WorkflowService.open(root)
+            initialized = workflow.init()
+            repository_id = sha256(str(root).encode("utf-8")).hexdigest()[:16]
+            evidence = SessionRequestEvidence(
+                "ses_incremental_space1",
+                "msg_incremental_space1",
+                request_text,
+                repository_id,
+            )
+            self.assertIsNone(request_objective_criteria_revision(
+                "slice-incremental-whitespace",
+                repository_id,
+                evidence.source_reference,
+                request_text,
+            ))
+            accepted = workflow.accept_first_slice_session(
+                evidence,
+                expected_revision=ExpectedRevision(initialized.revision),
+            )
+            state, snapshot = workflow.input_snapshot(
+                expected_revision=ExpectedRevision(accepted.revision),
+            )
+            self.assertEqual(state.agreements[0].statement, request_text)
+            self.assertEqual(state.agreements[1].statement, request_text)
+            self.assertEqual(state.changes[0].intent, request_text.strip())
+            self.assertEqual(
+                state.agreements[1].source_reference,
+                evidence.source_reference,
+            )
+            self.assertEqual(
+                evidence.source_reference,
+                f"session:ses_incremental_space1:msg_incremental_space1:{request_digest[:16]}",
+            )
+
+            core = CoreService.open(root)
+            feature, accepted_record, blockers = core._request_objective_pair(state)
+            assert feature is not None and accepted_record is not None and not blockers
+            admitted_evidence = core._request_objective_evidence(feature, accepted_record)
+            assert admitted_evidence is not None
+            revision_before = state.revision
+            self.assertTrue(
+                core._request_objective_incremental_mode_eligible(
+                    state, admitted_evidence, snapshot,
+                ),
+            )
+            status = workflow.request_scoped_objective_status(state, snapshot)
+            self.assertIsNotNone(status)
+            assert status is not None
+            self.assertEqual(status.status, "BLOCKED")
+            self.assertEqual(
+                status.blockers,
+                ("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",),
+            )
+            self.assertEqual(status.mode, "INCREMENTAL")
+            self.assertEqual(status.request_sha256, request_digest)
+            persisted = CoreService.open(root).recover()
+            self.assertEqual(persisted, state)
+            self.assertEqual(persisted.revision, revision_before)
+
+            changed_intent = replace(
+                state,
+                changes=(replace(
+                    state.changes[0],
+                    intent=f"{state.changes[0].intent} altered",
+                ),),
+            )
+            self.assertFalse(
+                core._request_objective_incremental_mode_eligible(
+                    changed_intent, admitted_evidence, snapshot,
+                ),
+            )
+            self.assertFalse(
+                core._request_objective_incremental_mode_eligible(
+                    state,
+                    replace(admitted_evidence, session_id="ses_wrong_space"),
+                    snapshot,
+                ),
+            )
+            self.assertEqual(CoreService.open(root).recover(), state)
+
     def test_unsupported_request_incremental_mode_is_read_only_and_stays_bounded(self) -> None:
         request_text = "Create a todo application with a form and persistent storage."
         with TemporaryDirectory(prefix="evospec-incremental-objective-") as temporary:
