@@ -124,6 +124,70 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn("Session intake alone does not register formal Slice criteria", skill)
         self.assertIn("trailing same-session user messages", skill)
 
+    def test_context_hook_injects_supported_and_guarded_incremental_routes_without_conflict(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "plugin.ts").write_text(_resources()[PLUGIN], encoding="utf-8")
+            (root / "continuation.mjs").write_text(_resources()[CONTINUATION], encoding="utf-8")
+            runner = root / "context-hook.ts"
+            runner.write_text(
+                '''import plugin from "./plugin.ts"
+
+const hooks = new Map(), tools = []
+const assert = (condition, message) => { if (!condition) throw new Error(message) }
+const runtime = {
+  tool: {
+    transform: async (fn) => fn({ add: (tool) => tools.push(tool) }),
+    list: async () => tools.map((tool) => ({ id: tool.name })),
+  },
+  session: { hook: async (name, handler) => hooks.set(name, handler) },
+  permission: { hook: async () => {} },
+}
+await plugin.setup(runtime)
+const contextHook = hooks.get("context")
+assert(typeof contextHook === "function", "the actual OpenCode context hook is registered")
+const emittedFor = async (request_scoped_objective) => {
+  const event = { system: [], request_scoped_objective }
+  await contextHook(event)
+  return event.system.map((item) => item.text).join("\\n")
+}
+const supported = await emittedFor({ status: "PENDING", kind: "PERSONAL_TASKS_WEB" })
+assert(supported.includes("For a canonical PERSONAL_TASKS_WEB objective"),
+  "the supported one-shot lane is present in emitted hook instructions")
+assert(supported.includes("ordinary OpenCode edit/write permission")
+  && supported.includes("same objective/source is now PENDING")
+  && supported.includes("same source is VERIFIED"),
+  "the supported lane keeps its normal permission and PENDING/VERIFIED gates")
+
+const incremental = await emittedFor({
+  status: "BLOCKED",
+  mode: "INCREMENTAL",
+  blockers: ["REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST"],
+})
+assert(incremental.includes("status exactly BLOCKED, mode exactly INCREMENTAL")
+  && incremental.includes("exactly one blocker: REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST"),
+  "only the precise unsupported incremental projection is admitted")
+assert(incremental.includes("fresh source, executing-session, repository-root, revision, input-fingerprint, and scope checks")
+  && incremental.includes("ordinary Core-authorized next_action")
+  && incremental.includes("normal OpenCode file permissions"),
+  "the emitted exception remains source-bound and subject to normal Core and host gates")
+assert(incremental.includes("marker grants no file/objective permission, criteria, proof")
+  && incremental.includes("Never call evospec_request_scoped_objective for this branch"),
+  "the incremental marker grants neither permission nor objective proof")
+assert(incremental.includes("Material decisions are handled before mode routing")
+  && incremental.includes("unsupported requests outside the exact guarded INCREMENTAL continuation below"),
+  "material and other unsupported cases retain their fail-closed routes")
+assert(!incremental.includes("Treat any non-null request_scoped_objective")
+  && !incremental.includes("never send evospec_continue"),
+  "the emitted instructions contain no conflicting blanket one-shot policy")
+''',
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                ("bun", "run", str(runner)), cwd=root, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_first_slice_handoff_is_read_only_tty_scoped_and_fails_closed(self) -> None:
         # A natural new Feature should not occupy the empty E1 work slot
         # before the user has seen and accepted the first Slice.
@@ -814,6 +878,287 @@ const rawDenied = JSON.parse((await raw.execute({ request: JSON.stringify({
   action: "request_scoped_objective", expected_revision: 10,
 }) }, { sessionID })).content)
 assert(rawDenied.error.code === "DEDICATED_TOOL_REQUIRED", "raw objective mutation is denied")
+''',
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                ("bun", "run", str(runner)), cwd=root, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_incremental_mode_is_source_and_scope_bound_and_never_activates_d4(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "plugin.ts").write_text(_resources()[PLUGIN], encoding="utf-8")
+            (root / "continuation.mjs").write_text(_resources()[CONTINUATION], encoding="utf-8")
+            runner = root / "incremental.ts"
+            runner.write_text(
+                '''import plugin from "./plugin.ts"
+import { createHash } from "node:crypto"
+import { realpath } from "node:fs/promises"
+
+const definitions = [], requests = [], writes = [], permissions = []
+const assert = (condition, message) => { if (!condition) throw new Error(message) }
+const sessionID = "ses_incremental001"
+const userMessageID = "msg_incremental001"
+const requestText = "Create a todo application with a form and persistent storage."
+const digest = createHash("sha256").update(requestText, "utf8").digest("hex")
+const sourceReference = `session:${sessionID}:${userMessageID}:${digest.slice(0, 16)}`
+const repositoryID = createHash("sha256").update(await realpath(process.cwd()), "utf8").digest("hex").slice(0, 16)
+const assistantMessage = (id) => ({
+  type: "assistant", id, agent: "build",
+  model: { id: "model-test", providerID: "provider-test" },
+  content: [], time: { created: 0 },
+})
+const originalUser = { type: "user", id: userMessageID, text: requestText, files: [] }
+let messages = []
+let activeContext
+let canonical = {}
+let responseQueue = []
+const envelope = {
+  goal: requestText,
+  allowed_paths: ["index.html"],
+  operation_budget: 8,
+  reversible_actions: ["progress", "assess_locks", "review", "verify", "edit"],
+  external_wait_allowed: true,
+  retry_budget: 0,
+  irreversible_permissions: [],
+  stop_conditions: ["material decision required", "scope expansion proposed", "irreversible operation proposed"],
+}
+const makeContext = (overrides = {}) => ({
+  context: {
+    revision: 7,
+    repository_id: repositoryID,
+    initialization_state: "INITIALIZED",
+    lifecycle: ["IN_PROGRESS", "IMPLEMENT"],
+    feature_id: "feature-incremental",
+    change_id: "change-incremental",
+    stale: false,
+    stale_reason: null,
+    completed_terminal: false,
+    side_work_active: false,
+    pending_intake: false,
+    pending_autonomy_expansion: null,
+    pending_discovery_recovery: null,
+    pending_capability_selection: null,
+    irreversible_authorizations: [],
+    active_locks: [],
+    active_locks_total: 0,
+    active_locks_complete: true,
+    r3_schema_ready: false,
+    r3b_schema_ready: false,
+    accepted_slice: {
+      feature_agreement_ref: "feature-agreement",
+      slice_agreement_ref: "slice-agreement",
+      feature_title: requestText,
+      slice_title: requestText,
+      task_id: "task-incremental",
+      initial_task: "Implementar únicamente el resultado expresado en la petición",
+      checkpoint: "Probar el resultado acotado de la petición",
+      source: "SESSION_REQUEST",
+      source_reference: sourceReference,
+      criteria_status: "NOT_RECORDED",
+      criteria_revision: null,
+      session_request: { statement: requestText, sha256: digest, repository_id: repositoryID },
+    },
+    input_snapshot: {
+      version: "r3-root-input-v2",
+      policy_id: "r3-root-input-v2",
+      policy_digest: "a".repeat(64),
+      repository_id: repositoryID,
+      fingerprint: "b".repeat(64),
+      file_count: 0,
+      directory_count: 0,
+      total_bytes: 0,
+    },
+    request_scoped_objective: {
+      status: "BLOCKED",
+      source_reference: sourceReference,
+      request_sha256: digest,
+      blockers: ["REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST"],
+      heading: null,
+      mode: "INCREMENTAL",
+    },
+    autonomy_envelope: envelope,
+    autonomy_metrics: {
+      automatic_operations: 1,
+      human_material_decisions: 0,
+      operational_handoffs: 0,
+    },
+    decision_state: {
+      unresolved_material_decision: false,
+      clarification_count: 0,
+      constraint_count: 0,
+      review_verdict: null,
+      verification_sufficient: false,
+    },
+    outcome: {
+      kind: "SAFE_AUTOMATIC_OPERATION",
+      message: "Core permits the existing ordinary path",
+      material_decision: null,
+    },
+    legal_actions: ["accepted_task_progress", "propose_provisional_slice"],
+    guidance: [
+      { action: "accepted_task_progress", allowed: true, intervention: "AUTOMATIC" },
+      { action: "propose_provisional_slice", allowed: true, intervention: "AUTOMATIC" },
+    ],
+    ...overrides,
+  },
+})
+const runtime = {
+  tool: {
+    transform: async (fn) => fn({ add: (tool) => definitions.push(tool) }),
+    list: async () => definitions.map((tool) => ({ id: tool.name })),
+  },
+  session: {
+    get: async () => ({ location: { directory: process.cwd() } }),
+    context: async ({ sessionID: id }) => {
+      assert(id === sessionID, "incremental source stays in the executing session")
+      return messages
+    },
+    hook: async () => {},
+  },
+  permission: {
+    assert: async (request) => { permissions.push(request); throw new Error("incremental read must not request objective permission") },
+  },
+}
+await plugin.setup(runtime)
+Object.defineProperty(Bun, "spawn", { value(_command, options) {
+  if (options.stdin) writes.push(options.stdin.text().then((value) => requests.push(JSON.parse(value))))
+  const request = responseQueue.shift()
+  const response = request === undefined ? canonical : request
+  return { stdout: new Blob([JSON.stringify(response)]).stream(),
+    stderr: new Blob([""]).stream(), exited: Promise.resolve(0) }
+} })
+const continuation = definitions.find((item) => item.name === "evospec_continuation")
+const objectiveTool = definitions.find((item) => item.name === "evospec_request_scoped_objective")
+assert(continuation && objectiveTool, "both continuation and dedicated objective tools remain registered")
+let invocation = 0
+const call = (tool, args = {}) => {
+  const id = `msg_assistant_incremental${String(++invocation).padStart(3, "0")}`
+  messages = [originalUser, assistantMessage(id)]
+  activeContext = { sessionID, agent: "build", messageID: id, id: `call_${invocation}`,
+    signal: new AbortController().signal }
+  return tool.execute(args, activeContext)
+}
+const baseArgs = {
+  explicit_task: null, operation: null, paths: [], irreversible: false,
+  external_status: null, failure_code: null, attempt: 0,
+}
+canonical = makeContext()
+let result = JSON.parse((await call(continuation, baseArgs)).content)
+await Promise.all(writes)
+assert(result.mode === "INCREMENTAL" && result.revision === 7,
+  "Core's exact blocked opt-in is consumed only after canonical source validation: " + JSON.stringify(result))
+assert(result.directive === "CONTINUE"
+  && result.next_action.action === "accepted_task_progress",
+  "incremental mode delegates to the current ordinary Core action")
+assert(requests.every((item) => item.action === "context"),
+  "incremental mode performs only fresh read-only Core context requests")
+assert(permissions.length === 0, "incremental routing never invokes objective permission")
+
+// D4 activation is a distinct explicit choice and may never be produced by a
+// read-only consultation/continuation directive.
+canonical = { context: {
+  ...makeContext().context,
+  lifecycle: ["PROPOSED", "RESEARCH"],
+  legal_actions: ["activate_provisional_slice_writes"],
+  guidance: [{ action: "activate_provisional_slice_writes", allowed: true, intervention: "AUTOMATIC" }],
+} }
+result = JSON.parse((await call(continuation, baseArgs)).content)
+assert(result.directive === "FAIL_CLOSED" && result.mode === undefined
+  && !String(result.reason).includes("activate_provisional_slice_writes"),
+  "continuation never auto-activates D4 even when Core lists activation")
+
+const expectBlocked = async (response, reason, args = baseArgs) => {
+  canonical = response
+  const output = JSON.parse((await call(continuation, args)).content)
+  await Promise.all(writes)
+  assert(output.directive === "FAIL_CLOSED"
+    && output.refresh_context === false && output.mode === undefined,
+    reason + " fails closed without an incremental fallback")
+  assert(requests.every((item) => item.action === "context"),
+    reason + " remains read-only")
+}
+const valid = makeContext().context
+for (const [changes, reason] of [
+  [{ request_scoped_objective: { ...valid.request_scoped_objective, mode: undefined } }, "missing mode"],
+  [{ request_scoped_objective: { ...valid.request_scoped_objective, mode: "UNKNOWN" } }, "unknown mode"],
+  [{ request_scoped_objective: { ...valid.request_scoped_objective, blockers: [
+    "UNEXPECTED_BLOCKER",
+  ] } }, "unknown blocker"],
+  [{ request_scoped_objective: { ...valid.request_scoped_objective, blockers: [
+    "REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST", "REQUEST_OBJECTIVE_ARTIFACT_MISSING",
+  ] } }, "multiple blockers"],
+  [{ request_scoped_objective: { ...valid.request_scoped_objective, status: "PENDING" } }, "non-blocked status"],
+  [{ accepted_slice: { ...valid.accepted_slice, session_request: {
+    ...valid.accepted_slice.session_request, repository_id: "wrong-root",
+  } } }, "wrong repository"],
+  [{ request_scoped_objective: { ...valid.request_scoped_objective, request_sha256: "0".repeat(64) } },
+    "altered source digest"],
+  [{ autonomy_envelope: { ...valid.autonomy_envelope, allowed_paths: ["index.html", "other.html"] } },
+    "expanded scope"],
+]) {
+  await expectBlocked({ context: { ...valid, ...changes } }, reason)
+}
+canonical = makeContext()
+responseQueue = [
+  canonical,
+  { context: {
+    ...makeContext().context,
+    input_snapshot: { ...makeContext().context.input_snapshot, fingerprint: "0".repeat(64) },
+  } },
+]
+result = JSON.parse((await call(continuation, baseArgs)).content)
+await Promise.all(writes)
+assert(result.directive === "FAIL_CLOSED" && result.mode === undefined,
+  "a snapshot changed between fresh Core reads cannot enter incremental routing")
+responseQueue = []
+
+// Existing Core gates remain authoritative and are never converted to an
+// incremental continuation.
+canonical = { context: { ...makeContext().context, stale: true } }
+result = JSON.parse((await call(continuation, baseArgs)).content)
+assert(result.refresh_context === true && result.mode === undefined, "stale context only refreshes")
+canonical = { context: {
+  ...makeContext().context,
+  outcome: { kind: "HUMAN_MATERIAL_DECISION", message: "choose one", material_decision: {
+    decision: "choose", options: ["one", "two"],
+  } },
+} }
+const decisionRequestCount = requests.length
+result = JSON.parse((await call(continuation, baseArgs)).content)
+assert(result.directive === "ASK_USER" && result.mode === undefined
+  && result.material_decision.decision === "choose"
+  && JSON.stringify(result.material_decision.options) === JSON.stringify(["one", "two"])
+  && requests.length === decisionRequestCount + 1,
+  "material decisions return Core's exact choice before any incremental source rebind")
+canonical = makeContext()
+result = JSON.parse((await call(continuation, { ...baseArgs, external_status: "PENDING" })).content)
+assert(result.directive === "WAIT" && result.mode === undefined, "pending external work still waits")
+canonical = { context: {
+  ...makeContext().context, completed_terminal: true, outcome: null,
+} }
+result = JSON.parse((await call(continuation, baseArgs)).content)
+assert(result.directive === "COMPLETE" && result.mode === undefined, "terminal state completes without an incremental route")
+canonical = { context: {
+  ...makeContext().context,
+  outcome: { kind: "STRUCTURAL_DEFECT", message: "malformed Core state", material_decision: null },
+} }
+result = JSON.parse((await call(continuation, baseArgs)).content)
+assert(result.directive === "FAIL_CLOSED" && result.mode === undefined,
+  "structural defects remain fail closed")
+
+// The dedicated one-shot tool keeps its exact BLOCKED behavior and permission
+// gate; incremental mode never routes through it.
+canonical = makeContext()
+result = JSON.parse((await call(objectiveTool, { expected_revision: 7 })).content)
+await Promise.all(writes)
+assert(result.code === "REQUEST_SCOPED_OBJECTIVE_BLOCKED",
+  "unsupported requests remain blocked on the dedicated objective route")
+assert(permissions.length === 0, "blocked one-shot objective never reaches host permission")
+assert(requests.every((item) => item.action === "context"),
+  "no Core writes, receipts, or D4 activation occur")
 ''',
                 encoding="utf-8",
             )

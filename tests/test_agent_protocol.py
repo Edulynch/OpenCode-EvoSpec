@@ -663,6 +663,22 @@ class AgentProtocolTests(unittest.TestCase):
         self.assertEqual(set(legacy), {
             "status", "source_reference", "request_sha256", "blockers", "heading",
         })
+        incremental = _request_scoped_objective_json(RequestScopedObjectiveStatus(
+            status="BLOCKED",
+            source_reference="session:ses_test0001:msg_test0001:0123456789abcdef",
+            request_sha256="c" * 64,
+            blockers=("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",),
+            heading=None,
+            mode="INCREMENTAL",
+        ))
+        self.assertEqual(incremental, {
+            "status": "BLOCKED",
+            "source_reference": "session:ses_test0001:msg_test0001:0123456789abcdef",
+            "request_sha256": "c" * 64,
+            "blockers": ["REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST"],
+            "heading": None,
+            "mode": "INCREMENTAL",
+        })
         semantic = _request_scoped_objective_json(RequestScopedObjectiveStatus(
             status="PENDING",
             source_reference="session:ses_test0001:msg_test0001:0123456789abcdef",
@@ -893,6 +909,18 @@ class AgentProtocolTests(unittest.TestCase):
             self.assertEqual(
                 admitted["result"]["revision"],
                 initialized["result"]["revision"] + 1,
+            )
+            self.assertEqual(
+                admitted["context"]["request_scoped_objective"]["status"],
+                "BLOCKED",
+            )
+            self.assertEqual(
+                admitted["context"]["request_scoped_objective"]["blockers"],
+                ["REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST"],
+            )
+            self.assertEqual(
+                admitted["context"]["request_scoped_objective"]["mode"],
+                "INCREMENTAL",
             )
             _, snapshot = WorkflowService.open(root).input_snapshot(
                 expected_revision=ExpectedRevision(admitted["result"]["revision"]),

@@ -7,14 +7,23 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from evospec.domain import (
+    AssessmentConfidence,
+    AssessmentEvidence,
+    ConvergenceAssessment,
     CriterionTestReceipt,
     ExpectedRevision,
     OperationalState,
+    ProvisionalSliceCriterion,
+    RepositoryPath,
+    ReviewResult,
+    VerificationEvidence,
     request_objective_criteria_revision,
     validate_state,
 )
+from evospec.lifecycle import ReviewVerdict
 from evospec.persistence import (
     REQUEST_OBJECTIVE_SCHEMA,
     SCHEMA,
@@ -88,7 +97,21 @@ class RequestObjectiveLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(status)
         assert status is not None
         self.assertEqual(status.status, "PENDING")
+        self.assertIsNone(status.mode)
         self.assertEqual(self._schema(), SCHEMA, "read-only status must not select schema 20")
+        with patch("evospec.services.request_objective_criteria_revision", return_value=None):
+            unsupported_criteria = workflow.request_scoped_objective_status(
+                before, snapshot,
+            )
+        self.assertIsNotNone(unsupported_criteria)
+        assert unsupported_criteria is not None
+        self.assertEqual(unsupported_criteria.status, "BLOCKED")
+        self.assertEqual(
+            unsupported_criteria.blockers,
+            ("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",),
+        )
+        self.assertIsNone(unsupported_criteria.mode)
+        self.assertEqual(CoreService.open(self.root).recover(), before)
 
         first = workflow.request_scoped_objective(
             self.evidence,
@@ -129,6 +152,7 @@ class RequestObjectiveLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(status)
         assert status is not None
         self.assertEqual(status.status, "VERIFIED")
+        self.assertIsNone(status.mode)
 
         # A changed file with the same visible heading invalidates the old proof.
         self._write_page(SAME_OBJECTIVE_PAGE)
@@ -196,6 +220,7 @@ class RequestObjectiveLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(status)
         assert status is not None
         self.assertEqual(status.status, "COMPLETE")
+        self.assertIsNone(status.mode)
         reread, reread_snapshot = self._state_snapshot()
         replay = WorkflowService.open(self.root).request_scoped_objective(
             self.evidence,
@@ -310,6 +335,226 @@ class RequestObjectiveLifecycleTests(unittest.TestCase):
         assert stale_projection is not None
         self.assertEqual(stale_projection.status, "BLOCKED")
         self.assertIn("REQUEST_OBJECTIVE_PROOF_STALE", stale_projection.blockers)
+
+    def test_unsupported_request_incremental_mode_is_read_only_and_stays_bounded(self) -> None:
+        request_text = "Create a todo application with a form and persistent storage."
+        with TemporaryDirectory(prefix="evospec-incremental-objective-") as temporary:
+            root = Path(temporary).resolve()
+            workflow = WorkflowService.open(root)
+            workflow.init()
+            repository_id = sha256(str(root).encode("utf-8")).hexdigest()[:16]
+            evidence = SessionRequestEvidence(
+                "ses_incremental123", "msg_incremental123", request_text, repository_id,
+            )
+            accepted = workflow.accept_first_slice_session(
+                evidence,
+                expected_revision=ExpectedRevision(CoreService.open(root).recover().revision),
+            )
+            state, snapshot = workflow.input_snapshot(
+                expected_revision=ExpectedRevision(accepted.revision),
+            )
+
+            status = workflow.request_scoped_objective_status(state, snapshot)
+            self.assertIsNotNone(status)
+            assert status is not None
+            self.assertEqual(status.status, "BLOCKED")
+            self.assertEqual(status.blockers, ("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",))
+            self.assertEqual(status.mode, "INCREMENTAL")
+            self.assertEqual(CoreService.open(root).recover(), state)
+            self.assertEqual(self._schema_for(root), SCHEMA)
+            self.assertFalse(state.slice_criteria_revisions)
+            self.assertFalse(state.slice_outcome_receipts)
+            self.assertIsNone(state.provisional_slice_activation)
+
+            # The mode remains available after the one authorized file appears.
+            (root / "index.html").write_text("<main>ordinary work</main>\n", encoding="utf-8")
+            state, snapshot = workflow.input_snapshot(
+                expected_revision=ExpectedRevision(state.revision),
+            )
+            status = workflow.request_scoped_objective_status(state, snapshot)
+            self.assertIsNotNone(status)
+            assert status is not None
+            self.assertEqual(status.mode, "INCREMENTAL")
+
+            # Explicit D4 activation and suggestions remain independent of the
+            # read-only objective projection and preserve its exact envelope.
+            feature_id = str(state.features[0].id)
+            activated = workflow.activate_provisional_slice_writes(
+                repository_id, feature_id,
+                expected_revision=ExpectedRevision(state.revision),
+            )
+            state, snapshot = workflow.input_snapshot(
+                expected_revision=ExpectedRevision(activated.revision),
+            )
+            status = workflow.request_scoped_objective_status(state, snapshot)
+            self.assertIsNotNone(status)
+            assert status is not None
+            self.assertEqual(status.mode, "INCREMENTAL")
+            proposal = workflow.propose_provisional_slice(
+                repository_id,
+                feature_id,
+                None,
+                "Suggested bounded follow-up",
+                "A later task remains a proposal",
+                None,
+                ("Keep the suggestion separate",),
+                ("Do not alter the admitted request",),
+                (),
+                ("Which later detail should be chosen?",),
+                (ProvisionalSliceCriterion(
+                    "c-1", "The suggestion remains visible", "Focused test",
+                ),),
+                expected_revision=ExpectedRevision(state.revision),
+            )
+            state, snapshot = workflow.input_snapshot(
+                expected_revision=ExpectedRevision(proposal.revision),
+            )
+            status = workflow.request_scoped_objective_status(state, snapshot)
+            self.assertIsNotNone(status)
+            assert status is not None
+            self.assertEqual(status.mode, "INCREMENTAL")
+            self.assertFalse(state.provisional_slice_adoptions)
+
+            # The marker requires the exact admitted source, current bounded
+            # snapshot and the unexpanded Core envelope.
+            core = CoreService.open(root)
+            feature, accepted_record, _ = core._request_objective_pair(state)
+            assert feature is not None and accepted_record is not None
+            session_evidence = core._request_objective_evidence(feature, accepted_record)
+            assert session_evidence is not None
+            self.assertFalse(core._request_objective_incremental_mode_eligible(
+                state, session_evidence, replace(snapshot, repository_id="wrong-root"),
+            ))
+            self.assertFalse(core._request_objective_incremental_mode_eligible(
+                state, replace(session_evidence, session_id="ses_wrong1234"), snapshot,
+            ))
+            self.assertFalse(core._request_objective_incremental_mode_eligible(
+                state, session_evidence, None,
+            ))
+            assert state.active_context is not None
+            active_context = state.active_context
+            assert active_context.autonomy_envelope is not None
+            self.assertFalse(core._request_objective_incremental_mode_eligible(
+                replace(
+                    state,
+                    active_context=replace(
+                        active_context,
+                        autonomy_envelope=replace(
+                            active_context.autonomy_envelope,
+                            allowed_paths=(),
+                        ),
+                    ),
+                ),
+                session_evidence,
+                snapshot,
+            ))
+            self.assertFalse(core._request_objective_incremental_mode_eligible(
+                replace(state, provisional_slice_adoptions=(object(),)),
+                session_evidence,
+                snapshot,
+            ))
+            (root / "README.md").write_text("out of scope\n", encoding="utf-8")
+            foreign_state, foreign_snapshot = workflow.input_snapshot(
+                expected_revision=ExpectedRevision(state.revision),
+            )
+            status = workflow.request_scoped_objective_status(
+                foreign_state, foreign_snapshot,
+            )
+            self.assertIsNotNone(status)
+            assert status is not None
+            self.assertIsNone(status.mode)
+            self.assertEqual(CoreService.open(root).recover(), foreign_state)
+            (root / "README.md").unlink()
+            state, snapshot = workflow.input_snapshot(
+                expected_revision=ExpectedRevision(foreign_state.revision),
+            )
+            status = workflow.request_scoped_objective_status(state, snapshot)
+            self.assertIsNotNone(status)
+            assert status is not None
+            self.assertEqual(status.mode, "INCREMENTAL")
+            self.assertEqual(CoreService.open(root).recover(), state)
+
+            accepted_slice = state.agreements[1]
+            assert accepted_slice.task_id is not None
+            progress = workflow.accepted_task_progress(
+                repository_id,
+                accepted_slice.task_id,
+                state.agreements[0].id,
+                accepted_slice.id,
+                "Focused test",
+                "Reported ordinary implementation progress.",
+                ("index.html",),
+                expected_revision=ExpectedRevision(state.revision),
+            )
+            state, snapshot = workflow.input_snapshot(
+                expected_revision=ExpectedRevision(progress.revision),
+            )
+            status = workflow.request_scoped_objective_status(state, snapshot)
+            self.assertIsNotNone(status)
+            assert status is not None
+            self.assertEqual(status.mode, "INCREMENTAL")
+            assert state.active_context is not None
+            assert state.active_context.task_progress is not None
+            self.assertEqual(
+                state.active_context.task_progress.report_kind,
+                "REPORTED_UNVERIFIED",
+            )
+
+            reviewed = workflow.record_review(
+                ReviewResult(ReviewVerdict.PASS, (), True),
+                expected_revision=ExpectedRevision(state.revision),
+            )
+            state, snapshot = workflow.input_snapshot(
+                expected_revision=ExpectedRevision(reviewed.revision),
+            )
+            status = workflow.request_scoped_objective_status(state, snapshot)
+            self.assertIsNotNone(status)
+            assert status is not None
+            self.assertEqual(status.mode, "INCREMENTAL")
+
+            verified = workflow.record_verification(
+                VerificationEvidence(("focused checks",), True),
+                expected_revision=ExpectedRevision(state.revision),
+            )
+            state, snapshot = workflow.input_snapshot(
+                expected_revision=ExpectedRevision(verified.revision),
+            )
+            status = workflow.request_scoped_objective_status(state, snapshot)
+            self.assertIsNotNone(status)
+            assert status is not None
+            self.assertEqual(status.mode, "INCREMENTAL")
+
+            assert (
+                state.active_context is not None
+                and state.active_context.change_id is not None
+                and state.active_context.feature_id is not None
+            )
+            converged = workflow.converge(
+                ConvergenceAssessment(
+                    state.active_context.change_id,
+                    False,
+                    AssessmentConfidence.HIGH,
+                    (AssessmentEvidence(
+                        "agent", RepositoryPath("index.html"),
+                        state.active_context.feature_id,
+                    ),),
+                    "The accepted task does not change Product Truth.",
+                ),
+                expected_revision=ExpectedRevision(state.revision),
+            )
+            closed, snapshot = workflow.input_snapshot(
+                expected_revision=ExpectedRevision(converged.revision),
+            )
+            status = workflow.request_scoped_objective_status(closed, snapshot)
+            self.assertIsNotNone(status)
+            assert status is not None
+            self.assertIsNone(status.mode)
+            self.assertEqual(closed.feature_completion_receipts, ())
+            self.assertEqual(closed.slice_outcome_receipts, ())
+            self.assertEqual(closed.revision, converged.revision)
+
+    def _schema_for(self, root: Path) -> int:
+        return json.loads((root / ".evospec" / "state.json").read_text())["schema"]
 
 
 class StaticSchema20CompatibilityTests(unittest.TestCase):

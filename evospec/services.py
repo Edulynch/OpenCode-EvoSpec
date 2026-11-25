@@ -301,6 +301,7 @@ class RequestScopedObjectiveStatus:
     heading: str | None
     kind: str | None = None
     criteria: tuple[tuple[str, str], ...] = ()
+    mode: str | None = None
 
 
 _PYTHON_TEST_RUNNER = (
@@ -4032,6 +4033,174 @@ class CoreService:
                 blockers.append("REQUEST_OBJECTIVE_ARTIFACT_HASH_UNAVAILABLE")
         return tuple(dict.fromkeys(blockers))
 
+    def _request_objective_incremental_mode_eligible(
+        self,
+        state: State,
+        evidence: SessionRequestEvidence,
+        snapshot: InputSnapshot | None,
+    ) -> bool:
+        """Allow only the ordinary bounded Task route for a truly unparsed request."""
+        feature_agreement, accepted, pair_blockers = self._request_objective_pair(state)
+        if feature_agreement is None or accepted is None or pair_blockers:
+            return False
+        root_identity = sha256(str(self.__repository_root.resolve()).encode("utf-8")).hexdigest()[:16]
+        if (
+            type(evidence) is not SessionRequestEvidence
+            or evidence != self._request_objective_evidence(feature_agreement, accepted)
+            or evidence.repository_id != root_identity
+            or evidence.repository_id != accepted.repository_id
+            or evidence.statement != accepted.statement
+            or evidence.source_reference != accepted.source_reference
+            or state.initialization is None
+            or state.initialization.repository_id != root_identity
+            or len(state.agreements) != 2
+            or tuple(item.id for item in state.agreements) != (
+                feature_agreement.id, accepted.id,
+            )
+            or len(state.features) != 1
+            or len(state.changes) != 1
+            or state.features[0].id != accepted.feature_id
+            or state.features[0].side_of is not None
+            or state.changes[0].id != accepted.change_id
+            or state.changes[0].feature_id != accepted.feature_id
+            or state.changes[0].classification is not Classification.FEATURE
+            or state.changes[0].intent != accepted.statement
+            or accepted.task_id is None
+            or accepted.initial_task != SESSION_REQUEST_TASK
+            or accepted.checkpoint != SESSION_REQUEST_CHECKPOINT
+            or feature_agreement.repository_id != root_identity
+            or accepted.repository_id != root_identity
+            or feature_agreement.source != "SESSION_REQUEST"
+            or accepted.source != "SESSION_REQUEST"
+            or feature_agreement.source_reference != accepted.source_reference
+            or feature_agreement.statement != accepted.statement
+        ):
+            return False
+
+        active = state.active_context
+        if (
+            active is None
+            or active.feature_id != accepted.feature_id
+            or active.change_id != accepted.change_id
+            or active.side_of is not None
+            or active.feature_agreement_ref != feature_agreement.id
+            or active.slice_agreement_ref != accepted.id
+            or active.focus != accepted.title
+            or (active.status, active.phase) not in {
+                (LifecycleState.PROPOSED, Phase.RESEARCH),
+                (LifecycleState.READY, Phase.READY),
+                (LifecycleState.IN_PROGRESS, Phase.IMPLEMENT),
+                (LifecycleState.IN_PROGRESS, Phase.REVIEW),
+                (LifecycleState.VERIFYING, Phase.VERIFY),
+                (LifecycleState.VERIFYING, Phase.CONVERGE),
+            }
+            or active.decision_ids
+            or active.constraint_ids
+            or active.observation_ids
+            or active.unresolved_material_decision
+            or active.safety_facts.unresolved_decision_details
+            or active.safety_facts.material_clarifications
+            or active.publication is not None
+            or active.convergence_complete
+            or active.autonomy_metrics.human_material_decisions
+            or active.autonomy_metrics.operational_handoffs
+            or active.autonomy_metrics.automatic_operations >= 8
+            or state.active_work_id != _work_id(active)
+            or state.work_items
+            or state.terminal_archives
+        ):
+            return False
+
+        expected_envelope = None if not state.changes else AutonomyEnvelope(
+            state.changes[0].intent,
+            allowed_paths=(RepositoryPath(OBJECTIVE_TEST_TARGET),),
+            operation_budget=8,
+            reversible_actions=("progress", "assess_locks", "review", "verify", "edit"),
+        )
+        if (
+            expected_envelope is None
+            or active.autonomy_envelope != expected_envelope
+            or _evaluate_autonomy(
+                active, "edit", (RepositoryPath(OBJECTIVE_TEST_TARGET),), False,
+            ).authorization is not AutonomyAuthorization.ALLOWED
+            or _evaluate_autonomy(active, "progress", (), False).authorization
+            is not AutonomyAuthorization.ALLOWED
+        ):
+            return False
+        if active.task_progress is not None and (
+            active.task_progress.task_id != accepted.task_id
+            or active.task_progress.report_kind != "REPORTED_UNVERIFIED"
+            or active.task_progress.source_kind != "UNKNOWN"
+            or active.task_progress.source_reference is not None
+        ):
+            return False
+
+        if (
+            state.preserved_primary_context is not None
+            or state.preserved_primary_work_id is not None
+            or state.parked_work is not None
+            or state.pending_intake is not None
+            or state.deferred_side_request is not None
+            or state.shared_intents
+            or state.deferred_linked_intents
+            or state.work_relations
+            or state.pending_capability_selection is not None
+            or state.capability_selection_history
+            or state.pending_discovery_recovery is not None
+            or state.pending_autonomy_expansion is not None
+            or state.autonomy_expansion_history
+            or state.irreversible_authorizations
+            or state.locks
+            or state.lock_revisions
+            or state.lock_releases
+            or state.lock_authorizations
+            or state.change_lock_assessments
+            or state.r3_schema_upgrade is not None
+            or state.r3b_schema_upgrade is not None
+            or state.decisions
+            or state.observations
+            or state.drifts
+            or state.publications
+            or state.publication_history
+            or state.slice_criteria_heads
+            or state.slice_criteria_revisions
+            or state.criterion_test_receipts
+            or state.slice_outcome_receipts
+            or state.criterion_coverage_approvals
+            or state.feature_completion_receipts
+            or state.feature_reopen_receipts
+            or state.completed_side_contexts
+            or state.provisional_slice_adoptions
+        ):
+            return False
+
+        if snapshot is None:
+            return False
+        try:
+            scanned, actual_snapshot = self.input_snapshot(state.revision)
+        except ServiceError:
+            return False
+        if (
+            scanned != state
+            or type(snapshot) is not InputSnapshot
+            or snapshot != actual_snapshot
+            or snapshot.version != INPUT_FINGERPRINT_VERSION
+            or snapshot.policy_id != INPUT_POLICY_ID
+            or snapshot.policy_digest != INPUT_POLICY_DIGEST
+            or snapshot.repository_id != root_identity
+            or not is_sha256_digest(snapshot.fingerprint)
+            or any(
+                path != OBJECTIVE_TEST_TARGET and not path.startswith(".opencode/")
+                for path in snapshot.file_paths
+            )
+            or any(
+                path != ".opencode" and not path.startswith(".opencode/")
+                for path in snapshot.directory_paths
+            )
+        ):
+            return False
+        return True
+
     def _read_request_objective_artifact(
         self,
         snapshot: InputSnapshot,
@@ -4336,6 +4505,13 @@ class CoreService:
             return RequestScopedObjectiveStatus(
                 "BLOCKED", accepted.source_reference, request_sha,
                 ("REQUEST_OBJECTIVE_UNSUPPORTED_REQUEST",), None,
+                mode=(
+                    "INCREMENTAL"
+                    if self._request_objective_incremental_mode_eligible(
+                        current, evidence, snapshot,
+                    )
+                    else None
+                ),
             )
         canonical_criteria = request_objective_criteria_revision(
             accepted.id,
