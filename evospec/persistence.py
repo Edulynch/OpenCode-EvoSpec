@@ -7,12 +7,14 @@ import os
 import re
 import tempfile
 import threading
+from copy import deepcopy
+from importlib import import_module
 from contextlib import contextmanager
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
-from typing import Final, Protocol, TypeAlias, TypeVar
+from typing import Final, Protocol, TypeAlias, TypeVar, cast
 
 from .domain import (
     AgreementRecord,
@@ -36,6 +38,7 @@ from .domain import (
     ChangeId,
     Checkpoint,
     ConvergenceAssessment,
+    ContinuityError,
     Decision,
     DecisionId,
     DomainError,
@@ -98,6 +101,9 @@ from .domain import (
     SliceOutcomeReceipt,
     FeatureCompletionReceipt,
     FeatureReopenReceipt,
+    ContinuityPending,
+    ContinuityPendingWrite,
+    ContinuityStateData,
     TaskProgress,
     TerminalArchive,
     PendingIntake,
@@ -120,6 +126,7 @@ from .domain import (
     provisional_slice_adoption_statement_text,
     is_sha256_digest,
     validate_state,
+    validate_continuity_state,
 )
 from .lifecycle import (
     Classification,
@@ -154,6 +161,7 @@ SEMANTIC_REQUEST_OBJECTIVE_SCHEMA: Final = 21
 PROVISIONAL_SLICE_SCHEMA: Final = 22
 D4_PROVISIONAL_SLICE_SCHEMA: Final = 23
 D5_PROVISIONAL_SLICE_SCHEMA: Final = 24
+_CONTINUITY_RECOVERY_MAX_BYTES: Final = 4 * 1024 * 1024
 _D4_LIFECYCLE_OPERATIONS: Final = frozenset((
     "lifecycle", "review", "verification", "convergence", "accepted_terminal_archive",
 ))
@@ -4474,6 +4482,13 @@ def _state_publish_lock(root: Path) -> Iterator[None]:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _reject_composed_continuity_mode(root: Path) -> None:
+    """Legacy readers fail closed when the shared-lock opt-in marker exists."""
+    marker = _artifact_path(root, "continuity.json")
+    if marker.exists() or marker.is_symlink():
+        raise RecoveryError("COMPOSED_CONTINUITY_MODE_ACTIVE: legacy authority is disabled")
+
+
 class StateStore:
     """Read-only authoritative state recovery."""
 
@@ -4483,6 +4498,7 @@ class StateStore:
         self.__root = _resolved_root(root)
 
     def load_state(self) -> State:
+        _reject_composed_continuity_mode(self.__root)
         return _recover_state(self.__root)
 
 
@@ -4532,6 +4548,235 @@ def _atomic_replace(
         # its next step must be recovery, never an assumed automatic retry.
         if strict_directory:
             raise AtomicFailure("publication durability is uncertain after replacement") from error
+
+
+def _encode_recoverable_continuity(
+    state: ContinuityStateData, description: str,
+) -> bytes:
+    encoded = encode_json(cast(JsonValue, cast(object, state)))
+    if len(encoded) > _CONTINUITY_RECOVERY_MAX_BYTES:
+        raise ContinuityError(
+            "LIMIT_EXCEEDED",
+            f"serialized continuity {description} exceeds its 4 MiB recovery bound",
+        )
+    return encoded
+
+
+class ContinuityPersistence:
+    """Shared-lock state and recoverable Markdown publication for composed work."""
+
+    __slots__ = ("__root", "__operations")
+
+    def __init__(self, root: Path, operations: FileOperations | None = None) -> None:
+        self.__root = _resolved_root(root)
+        self.__operations = FileOperations() if operations is None else operations
+
+    @property
+    def root(self) -> Path:
+        return self.__root
+
+    @property
+    def repository_id(self) -> str:
+        return sha256(str(self.__root).encode("utf-8")).hexdigest()[:16]
+
+    def transaction(self):
+        return _state_publish_lock(self.__root)
+
+    def assert_legacy_absent(self) -> None:
+        path = _artifact_path(self.__root, "state.json")
+        if path.exists() or path.is_symlink():
+            raise ContinuityError(
+                "MIXED_AUTHORITY",
+                "legacy state.json and composed continuity cannot coexist; no migration or automatic mode switch is supported",
+            )
+
+    def load(self) -> ContinuityStateData | None:
+        marker = _artifact_path(self.__root, "continuity.json")
+        self.__safe_document_path(".evospec/continuity.json")
+        self.assert_legacy_absent()
+        if not marker.exists():
+            return None
+        try:
+            with marker.open("rb") as handle:
+                encoded = handle.read(_CONTINUITY_RECOVERY_MAX_BYTES + 1)
+            if len(encoded) > _CONTINUITY_RECOVERY_MAX_BYTES:
+                raise ContinuityError(
+                    "CORRUPT_CONTINUITY", "continuity.json exceeds its recovery bound",
+                )
+            raw = decode_json(encoded.decode("utf-8"))
+        except ContinuityError:
+            raise
+        except (OSError, UnicodeDecodeError, DecodeError, RecursionError) as error:
+            raise ContinuityError(
+                "CORRUPT_CONTINUITY", "continuity.json cannot be recovered",
+            ) from error
+        validate_continuity_state(raw, repository_id=self.repository_id)
+        return cast(ContinuityStateData, cast(object, raw))
+
+    def check_documents(self, state: ContinuityStateData) -> None:
+        for relative, expected in state["documents"].items():
+            actual = self.__document_hash(relative)
+            if actual != expected:
+                raise ContinuityError(
+                    "DOCUMENT_DIVERGED",
+                    f"{relative} changed outside Core; preserve it and reconcile manually",
+                )
+
+    def commit(
+        self, current: ContinuityStateData, candidate: ContinuityStateData,
+        writes: dict[str, tuple[bytes, str | None]],
+    ) -> None:
+        if candidate["pending"] is not None:
+            raise ContinuityError("INVALID_STATE", "candidate state cannot contain a pending journal")
+        next_state = deepcopy(candidate)
+        documents = dict(current["documents"])
+        pending_writes: list[ContinuityPendingWrite] = []
+        for relative, (content, before_hash) in sorted(writes.items()):
+            self.__safe_document_path(relative)
+            if type(content) is not bytes or len(content) > 512 * 1024:
+                raise ContinuityError("LIMIT_EXCEEDED", f"{relative} exceeds the document size limit")
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ContinuityError("INVALID_DOCUMENT", f"{relative} is not UTF-8") from error
+            actual_hash = self.__document_hash(relative)
+            digest = sha256(content).hexdigest()
+            if actual_hash != before_hash and actual_hash != digest:
+                raise ContinuityError(
+                    "DOCUMENT_DIVERGED",
+                    f"{relative} changed; reconcile it manually before writing",
+                )
+            documents[relative] = digest
+            pending_writes.append({
+                "path": relative, "before": before_hash,
+                "content": text, "sha256": digest,
+            })
+        next_state["documents"] = documents
+        next_state["revision"] = candidate["revision"]
+        next_state["pending"] = None
+        validate_continuity_state(
+            next_state, repository_id=self.repository_id, pending_state=True,
+        )
+        _ = _encode_recoverable_continuity(next_state, "state")
+        next_state_record: dict[str, object] = {}
+        next_state_record.update(next_state)
+        pending_record: ContinuityPending = {
+            "next_state": next_state_record,
+            "writes": pending_writes,
+        }
+        journal: ContinuityStateData = {
+            **current,
+            "pending": pending_record,
+        }
+        validate_continuity_state(journal, repository_id=self.repository_id)
+        journal_bytes = _encode_recoverable_continuity(journal, "recovery journal")
+        marker = _artifact_path(self.__root, "continuity.json")
+        try:
+            _atomic_replace(
+                marker,
+                journal_bytes,
+                self.__operations,
+                strict_directory=True,
+            )
+        except (AtomicFailure, RecoveryError) as error:
+            raise ContinuityError(
+                "PUBLICATION_UNCERTAIN",
+                "continuity journal publication is uncertain; reread before retrying",
+            ) from error
+        self.recover_pending(journal)
+
+    def recover_pending(self, state: ContinuityStateData) -> None:
+        validate_continuity_state(state, repository_id=self.repository_id)
+        _ = _encode_recoverable_continuity(state, "recovery journal")
+        pending = state["pending"]
+        if pending is None:
+            raise ContinuityError("NO_RECOVERY", "there is no pending document transaction")
+        self.assert_legacy_absent()
+        next_state = pending["next_state"]
+        validate_continuity_state(
+            next_state, repository_id=self.repository_id, pending_state=True,
+        )
+        next_state = cast(ContinuityStateData, cast(object, next_state))
+        final_state = deepcopy(next_state)
+        final_state["pending"] = None
+        validate_continuity_state(final_state, repository_id=self.repository_id)
+        final_state_bytes = _encode_recoverable_continuity(final_state, "state")
+        prepared_writes: list[tuple[str, Path, bytes]] = []
+        for item in pending["writes"]:
+            relative = item["path"]
+            content = item["content"]
+            expected = item["sha256"]
+            before = item["before"]
+            if not isinstance(content, str):
+                raise ContinuityError("CORRUPT_CONTINUITY", "recovery journal text is invalid")
+            try:
+                data = content.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ContinuityError("CORRUPT_CONTINUITY", "journal text is not UTF-8") from error
+            if sha256(data).hexdigest() != expected:
+                raise ContinuityError("CORRUPT_CONTINUITY", "journal document digest does not match")
+            destination = self.__safe_document_path(relative)
+            actual = self.__document_hash(relative)
+            if actual == expected:
+                continue
+            if actual != before:
+                raise ContinuityError(
+                    "DOCUMENT_DIVERGED",
+                    f"{relative} no longer matches either journal version; manual reconciliation is required",
+                )
+            prepared_writes.append((relative, destination, data))
+        for relative, destination, data in prepared_writes:
+            try:
+                _atomic_replace(destination, data, self.__operations, strict_directory=True)
+            except (AtomicFailure, RecoveryError) as error:
+                raise ContinuityError(
+                    "RECOVERY_INCOMPLETE",
+                    f"publication for {relative} remains journaled; reconcile again after inspecting it",
+                ) from error
+        try:
+            _atomic_replace(
+                _artifact_path(self.__root, "continuity.json"),
+                final_state_bytes,
+                self.__operations,
+                strict_directory=True,
+            )
+        except (AtomicFailure, RecoveryError) as error:
+            raise ContinuityError(
+                "PUBLICATION_UNCERTAIN",
+                "documents are published but the journal may still be pending; reread before retrying",
+            ) from error
+
+    def __document_hash(self, relative: object) -> str | None:
+        path = self.__safe_document_path(relative)
+        if not path.exists():
+            return None
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise ContinuityError("UNSAFE_PATH", f"{path.name} is not a regular file")
+            return sha256(path.read_bytes()).hexdigest()
+        except OSError as error:
+            raise ContinuityError("DOCUMENT_UNREADABLE", f"{path.name} cannot be read") from error
+
+    def __safe_document_path(self, relative: object) -> Path:
+        if type(relative) is not str or re.fullmatch(
+            r"(?:\.evospec/continuity\.json|specs/README\.md|"
+            r"specs/[0-9]{3,}-[a-z0-9]+(?:-[a-z0-9]+)*/"
+            r"(?:spec|plan|tasks|decisions)\.md)",
+            relative,
+        ) is None:
+            raise ContinuityError("UNSAFE_PATH", "continuity path is outside the managed document set")
+        path = self.__root / Path(relative)
+        current = self.__root
+        try:
+            for part in Path(relative).parts:
+                current = current / part
+                if current.is_symlink():
+                    raise ContinuityError("UNSAFE_PATH", "continuity refuses symbolic-link targets")
+            if not path.resolve().is_relative_to(self.__root):
+                raise ContinuityError("UNSAFE_PATH", "continuity path escapes the repository")
+        except OSError as error:
+            raise ContinuityError("UNSAFE_PATH", "continuity path cannot be resolved") from error
+        return path
 
 
 def load_integration_providers(root: Path) -> tuple[str, ...]:
@@ -4601,8 +4846,27 @@ class _StateStore:
         state, _, _ = self.recover_snapshot()
         return state
 
+    def composed_continuity(
+        self, operation: str, expected_revision: int | None,
+        session_id: str, data: dict[str, object],
+    ) -> dict[str, object]:
+        """Route composed mutations through persistence-owned file operations."""
+        execute_continuity = cast(
+            Callable[
+                [Path, str, int | None, str, dict[str, object], FileOperations],
+                dict[str, object],
+            ],
+            getattr(import_module(".continuity", __package__), "execute"),
+        )
+
+        return execute_continuity(
+            self.__root, operation, expected_revision, session_id, data,
+            self.__operations,
+        )
+
     def recover_snapshot(self) -> tuple[State, bool | None, int | None]:
         """Pair write readiness and the persisted schema with one recovered State."""
+        _reject_composed_continuity_mode(self.__root)
         state, schema = _recover_state_with_schema(self.__root)
         if state.agreements:
             expected_id = sha256(str(self.__root).encode("utf-8")).hexdigest()[:16]
@@ -5665,6 +5929,11 @@ class _StateStore:
         allow_d5_lifecycle: str | None = None,
         expected_current: State | None = None,
     ) -> None:
+        continuity = _artifact_path(self.__root, "continuity.json")
+        if continuity.exists() or continuity.is_symlink():
+            raise AtomicFailure(
+                "COMPOSED_CONTINUITY_MODE_ACTIVE: legacy state writers are disabled"
+            )
         current = self.__check_state_revision(state)
         if expected_current is not None and current != expected_current:
             raise AtomicFailure("State authority changed before scoped publication")
@@ -5854,6 +6123,11 @@ class _StateStore:
     def __publish_immutable(
         self, relative: str, data: bytes, *, strict_directory: bool = False,
     ) -> None:
+        continuity = _artifact_path(self.__root, "continuity.json")
+        if continuity.exists() or continuity.is_symlink():
+            raise AtomicFailure(
+                "COMPOSED_CONTINUITY_MODE_ACTIVE: legacy record writers are disabled"
+            )
         destination = _artifact_path(self.__root, relative)
         if destination.exists():
             if destination.read_bytes() != data:

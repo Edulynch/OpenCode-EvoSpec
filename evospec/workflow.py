@@ -109,6 +109,7 @@ from .services import (
     next_slice_acceptance_statement,
 )
 from .input_fingerprint import InputSnapshot
+from .persistence import FileOperations
 
 
 class WorkflowError(Exception):
@@ -172,12 +173,23 @@ class WorkflowService:
         self.__core = core
 
     @classmethod
-    def open(cls, root: Path) -> WorkflowService:
-        return cls(root, CoreService.open(root))
+    def open(
+        cls, root: Path, operations: FileOperations | None = None,
+    ) -> WorkflowService:
+        return cls(root, CoreService.open(root, operations))
 
     def e1_schema_ready(self) -> bool:
         """Expose the actual local persisted schema to read-only projections."""
         return self.__core.e1_schema_ready()
+
+    def continuity(
+        self, operation: str, expected_revision: int | None,
+        session_id: str, data: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Use the single Core boundary for composed Feature operations."""
+        return self.__core.composed_continuity(
+            operation, expected_revision, session_id, {} if data is None else data,
+        )
 
     def init(self, *, expected_revision: ExpectedRevision | None = None) -> InitResult:
         state, blocked = self._preflight(Action.INIT, expected_revision)

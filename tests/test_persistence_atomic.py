@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import unittest
+import os
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 from evospec.domain import (
     Change,
     ChangeId,
+    ContinuityError,
+    ContinuityStateData,
     Feature,
     FeatureId,
     ExpectedRevision,
@@ -19,12 +24,16 @@ from evospec.lifecycle import LifecycleState, Phase, ReviewVerdict
 from evospec.persistence import (
     AtomicFailure,
     BinaryFile,
+    ContinuityPersistence,
     FileOperations,
     StateStore,
+    RecoveryError,
+    JsonValue,
     _provisional_slice_to_json,
     _new_d4_provisional_slice_revision,
     encode_json,
 )
+from evospec.continuity import execute as execute_continuity
 from evospec.services import CoreService, ServiceError
 from evospec.workflow import WorkflowError, WorkflowService
 from tests._tempdir import TemporaryDirectory
@@ -123,6 +132,206 @@ class FailingDirectoryFsync(FileOperations):
 
 
 class AtomicPersistenceTests(unittest.TestCase):
+    @staticmethod
+    def _seed_continuity(
+        root: Path,
+    ) -> tuple[ContinuityPersistence, ContinuityStateData]:
+        _ = execute_continuity(root, "specify", 0, "ses_size_bound_123", {
+            "title": "Bounded journal",
+            "outcome": "A pending journal remains recoverable.",
+            "criteria": [{
+                "description": "Persistence tests pass.",
+                "check_kind": "python-unittest",
+                "check_target": "tests.test_persistence_atomic",
+            }],
+            "increments": [],
+            "tasks": [{"title": "Check recovery", "criteria": [0]}],
+        })
+        store = ContinuityPersistence(root)
+        current = store.load()
+        if current is None:
+            raise AssertionError("expected initialized continuity state")
+        return store, current
+
+    def test_oversized_continuity_journal_is_rejected_before_publication(self) -> None:
+        with TemporaryDirectory(prefix="evospec-continuity-size-") as temporary:
+            root = Path(temporary)
+            store, current = self._seed_continuity(root)
+            candidate = deepcopy(current)
+            candidate["revision"] += 1
+            content = b"\x01" * 350_000
+            writes: dict[str, tuple[bytes, str | None]] = {
+                relative: (content, None)
+                for relative in (
+                    "specs/999-size-bound/spec.md",
+                    "specs/999-size-bound/plan.md",
+                )
+            }
+            marker = root / ".evospec" / "continuity.json"
+            before_marker = marker.read_bytes()
+            failing_store = ContinuityPersistence(root, FailSecondReplace())
+
+            with self.assertRaises(ContinuityError) as raised:
+                with failing_store.transaction():
+                    failing_store.commit(current, candidate, writes)
+
+            try:
+                recovered = store.load()
+            except ContinuityError as error:
+                load_error = error.code
+            else:
+                load_error = None
+                if (
+                    recovered is None
+                    or recovered["pending"] is not None
+                    or recovered["revision"] != current["revision"]
+                ):
+                    load_error = "STATE_CHANGED"
+            self.assertEqual(
+                (
+                    raised.exception.code,
+                    marker.stat().st_size > 4 * 1024 * 1024,
+                    load_error,
+                    marker.read_bytes() == before_marker,
+                    any((root / relative).exists() for relative in writes),
+                ),
+                ("LIMIT_EXCEEDED", False, None, True, False),
+            )
+
+    def test_continuity_state_reader_accepts_exact_bound_and_rejects_one_byte_over(self) -> None:
+        with TemporaryDirectory(prefix="evospec-continuity-reader-bound-") as temporary:
+            root = Path(temporary)
+            store, current = self._seed_continuity(root)
+            maximum = 4 * 1024 * 1024
+            exact = deepcopy(current)
+            documents = dict(exact["documents"])
+            initial_path = "specs/999-" + "a" + "/spec.md"
+            documents[initial_path] = "0" * 64
+            exact["documents"] = documents
+            padding = maximum - len(encode_json(cast(JsonValue, cast(object, exact))))
+            self.assertGreater(padding, 0)
+            _ = documents.pop(initial_path)
+            exact_path = "specs/999-" + "a" * (padding + 1) + "/spec.md"
+            documents[exact_path] = "0" * 64
+            exact_bytes = encode_json(cast(JsonValue, cast(object, exact)))
+            self.assertEqual(len(exact_bytes), maximum)
+
+            marker = root / ".evospec" / "continuity.json"
+            _ = marker.write_bytes(exact_bytes)
+            self.assertEqual(store.load(), exact)
+
+            oversized = deepcopy(exact)
+            oversized_documents = dict(oversized["documents"])
+            _ = oversized_documents.pop(exact_path)
+            oversized_documents[f"{exact_path[:-len('/spec.md')]}a/spec.md"] = "0" * 64
+            oversized["documents"] = oversized_documents
+            oversized_bytes = encode_json(cast(JsonValue, cast(object, oversized)))
+            self.assertEqual(len(oversized_bytes), maximum + 1)
+            _ = marker.write_bytes(oversized_bytes)
+            with self.assertRaises(ContinuityError) as raised:
+                _ = store.load()
+            self.assertEqual(raised.exception.code, "CORRUPT_CONTINUITY")
+
+    def test_oversized_continuity_state_is_rejected_without_mutation(self) -> None:
+        with TemporaryDirectory(prefix="evospec-continuity-state-size-") as temporary:
+            root = Path(temporary)
+            store, current = self._seed_continuity(root)
+            candidate = deepcopy(current)
+            candidate["revision"] += 1
+            feature_id = next(iter(current["features"]))
+            candidate["session_features"] = {
+                **current["session_features"],
+                **{
+                    f"ses_pad_{number:05d}_" + "x" * 240: feature_id
+                    for number in range(18_000)
+                },
+            }
+            marker = root / ".evospec" / "continuity.json"
+            before_marker = marker.read_bytes()
+
+            with self.assertRaises(ContinuityError) as raised:
+                with store.transaction():
+                    store.commit(current, candidate, {})
+
+            self.assertEqual(raised.exception.code, "LIMIT_EXCEEDED")
+            self.assertIn("4 MiB", str(raised.exception))
+            self.assertEqual(marker.read_bytes(), before_marker)
+            self.assertEqual(store.load(), current)
+
+    def test_near_bound_interrupted_journal_recovers_to_next_valid_state(self) -> None:
+        with TemporaryDirectory(prefix="evospec-continuity-near-bound-") as temporary:
+            root = Path(temporary)
+            store, current = self._seed_continuity(root)
+            candidate = deepcopy(current)
+            candidate["revision"] += 1
+            content = b"\x01" * 348_000
+            writes: dict[str, tuple[bytes, str | None]] = {
+                relative: (content, None)
+                for relative in (
+                    "specs/999-size-bound/spec.md",
+                    "specs/999-size-bound/plan.md",
+                )
+            }
+            failing_store = ContinuityPersistence(root, FailSecondReplace())
+            with self.assertRaises(ContinuityError) as raised:
+                with failing_store.transaction():
+                    failing_store.commit(current, candidate, writes)
+            self.assertEqual(raised.exception.code, "RECOVERY_INCOMPLETE")
+
+            marker = root / ".evospec" / "continuity.json"
+            journal_bytes = marker.read_bytes()
+            self.assertGreater(len(journal_bytes), 4_150_000)
+            self.assertLessEqual(len(journal_bytes), 4 * 1024 * 1024)
+            pending = store.load()
+            if pending is None or pending["pending"] is None:
+                self.fail("expected readable interrupted journal")
+            self.assertEqual(pending["revision"], current["revision"])
+            self.assertEqual(
+                pending["pending"]["next_state"]["revision"],
+                candidate["revision"],
+            )
+            with store.transaction():
+                store.recover_pending(pending)
+            recovered = store.load()
+            self.assertIsNotNone(recovered)
+            if recovered is None:
+                return
+            self.assertEqual(recovered["revision"], candidate["revision"])
+            self.assertIsNone(recovered["pending"])
+            for relative in writes:
+                self.assertEqual((root / relative).read_bytes(), content)
+
+    def test_composed_mode_and_legacy_state_writer_fail_closed_without_mixed_artifacts(self) -> None:
+        with TemporaryDirectory(
+            prefix="evospec-composed-legacy-barrier-",
+            dir=os.environ.get("EVOSPEC_AC0_TEST_TMPDIR") or None,
+        ) as temporary:
+            root = Path(temporary)
+            execute_continuity(root, "specify", 0, "ses_persist_barrier_123", {
+                "title": "Composed only",
+                "outcome": "Keep the new mode separate.",
+                "criteria": [{
+                    "description": "Atomic persistence tests pass.",
+                    "check_kind": "python-unittest",
+                    "check_target": "tests.test_persistence_atomic",
+                }],
+                "increments": [],
+                "tasks": [{"title": "Write the mode barrier", "criteria": [0]}],
+            })
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            with self.assertRaises(RecoveryError):
+                CoreService.open(root).recover()
+            with self.assertRaises(RecoveryError):
+                StateStore(root).load_state()
+            after = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            self.assertEqual(before, after)
+
     def test_legacy_recovery_state_publication_failure_keeps_original_authority(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

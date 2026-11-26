@@ -1,0 +1,303 @@
+# AC0 — Composed continuity MVP contract
+
+This document describes the source-implemented, opt-in composed workflow for
+tracking Features, optional Increments, Tasks, checks, pauses, and recovery in
+an OpenCode V2 worktree. It is a product contract, not a runtime project
+record. It records the source implementation and acceptance areas from the
+[original #72 contract](https://github.com/Edulynch/OpenCode-EvoSpec/issues/72);
+it does not own consumer Feature or Task state. See
+[OpenCode V2 integration](opencode.md) for the host boundary.
+
+## ADR — one composed writer, separate legacy authority
+
+**Status:** implemented in source; native-host qualification remains separate.
+
+**Context.** The existing lifecycle path already routes requests through the
+provider-neutral protocol, `WorkflowService`, and `CoreService` into
+persistence. AC0 also needs readable Markdown artifacts, revision-bound
+updates, safe interrupted-publication recovery, and exclusion between
+concurrent processes. A writer in a command, plugin, or a second service would
+create another authority and could bypass Core's checks and persistence
+coordination.
+
+| Before this decision | Decision and resulting contract |
+| --- | --- |
+| Existing projects may use legacy `.evospec/state.json` and its established lifecycle. | Composed work is a separate, explicit opt-in for a fresh root, stored in `.evospec/continuity.json`; it is never silently mixed with or migrated from legacy state. |
+| Adapter-owned state changes would duplicate lifecycle and revision rules. | All supported composed operations follow `protocol → WorkflowService → CoreService → continuity.execute → ContinuityPersistence`. The adapter supplies the executing host session and enforces its ordinary permission boundary; Core owns validation, revision checks and durable changes. |
+| A multi-document update can be interrupted between file replacements. | Core records a pending journal before publishing Markdown. Recovery validates the complete journal and every destination before replacing any document, resumes only missing writes, and stops on any third version. |
+| Thread-only synchronization would not coordinate separate host processes. | Continuity operations hold the root-keyed shared persistence lock across load, validation and commit, with an expected-revision check under that lock. |
+
+**Why not add another writer:** the OpenCode adapter and commands are request
+surfaces, not state owners. The single composed entry point reuses Core's
+revision and publication boundary; adding a direct JSON/Markdown writer would
+make those paths disagree about authority, recovery, and stale requests.
+Composed persistence is a distinct schema from legacy `state.json`, but it is
+still reached through the Core facade.
+
+## Product mini-spec: M1–M7
+
+These names and order preserve the seven acceptance areas in [#72](https://github.com/Edulynch/OpenCode-EvoSpec/issues/72).
+They are not seven executed increments, and the deterministic evidence below
+does not establish that every user journey has passed in a live OpenCode host.
+
+### M1 — Command and natural-language entry; read purity
+
+- The packaged integration provides the `/evospec.*` commands and skill; both
+  guide requests through the composed Core operations. The intended user
+  experience does not require a fixed command sequence.
+- `status`, `tasks`, and `use` without an argument are reads. The Core fixture
+  [`test_specify_writes_stable_composed_markdown_and_reads_without_writing`](../tests/test_continuity.py)
+  confirms that these reads leave fixture files byte-identical.
+- That unit test does not establish live natural-language interpretation or
+  host behavior. Selecting a Feature with `use <id>` is a mutation, not a
+  read-only status request.
+
+### M2 — Three successive Increments under dynamic `implement --all`
+
+- The acceptance scenario is one `--all` request that advances through three
+  successive Increments, asks Core for the next eligible Task after each
+  checkpoint/result, and does not duplicate attempts. There is no fixed
+  three-Task/list cap, and `--all` does not imply closure.
+- The packaged command and skill describe that loop. The deterministic Core
+  fixture [`test_more_than_three_dynamic_tasks_and_worktree_session_selection`](../tests/test_continuity.py)
+  creates three Increments and grows the Task list to seven; it does **not**
+  execute three successive Increments through the packaged `--all` loop.
+  Seven Tasks are not evidence of three completed Increments, and live
+  `--all` behavior is not demonstrated.
+
+### M3 — In-work visual change, bounded external detour, and affected evidence
+
+- The acceptance scenario changes the visible result during implementation
+  (the #72 example changes a button to blue), preserves a bounded related or
+  external detour, records the return Task and detour result, then returns to
+  the right work and reevaluates evidence affected by the change.
+- Core records a durable pause and detour with a required return Task/result;
+  an explicit pause remains paused until explicit resume, and a pending
+  detour cannot be nested. This is bookkeeping, not cancellation or a sandbox
+  that constrains arbitrary effects during the detour.
+- The deterministic
+  [`external-return fixture`](../tests/test_continuity.py) checks preservation
+  of an unrelated fixture file and explicit return. It is not a live visual
+  edit or host interruption test. The verifier now captures Core-owned input
+  snapshots around the allow-listed check and Core admits a receipt only when
+  those snapshots still match the current input scope. This is implemented
+  freshness evidence, not a live visual edit or host interruption result.
+
+### M4 — Fresh-session recovery of an unknown outcome before replay
+
+- After a possible effect with no recorded result, a new session must inspect
+  the unresolved attempt and reconcile the exact Task as `COMPLETE` or
+  `INCOMPLETE` with an evidence reference before any replay.
+- The supported protocol persists `implement/begin` before effects, leaves one
+  unresolved worktree execution, blocks another begin, and requires explicit
+  `resume` reconciliation. The deterministic
+  [`checkpoint/unknown-outcome fixture`](../tests/test_continuity.py) verifies
+  that a new session can read the attempt and cannot begin it again.
+- The fixture is synthetic and begins with the checkpoint already persisted.
+  It does not qualify a real host crash after an effect but before that
+  checkpoint became durable; effects outside the supported begin-before-effect
+  boundary are not detected automatically.
+
+### M5 — Respect host denial/revocation; never fabricate closure
+
+- A host denial, cancellation, or revoked permission is a stop, not a reason
+  to retry through another path. A permission request or Core result is not
+  proof that a human approved it.
+- Core `close` is explicit and is blocked by a paused Feature, unresolved
+  attempt, incomplete Task, or criterion without a current passing check.
+  Deterministic Core tests exercise those guards; they do not prove live host
+  denial/revocation behavior or create permission evidence.
+
+### M6 — Verify, close, and reopen with preserved history
+
+- Verification is criterion-scoped; closure requires all current criteria to
+  pass and all Tasks to be complete. Reopening advances the cycle and retains
+  the prior closure and check history. A check, closure, and release remain
+  distinct authorities.
+- [`test_criterion_checks_gate_close_and_reopening_preserves_historical_closure`](../tests/test_continuity.py)
+  covers the Core fixture path. Core input-snapshot fixtures also verify that
+  changed implementation or test bytes, mismatched before/after snapshots,
+  and a Task no longer linked to the criterion cannot produce a fresh check.
+  The packaged adapter obtains both snapshots from Core, binds the check to
+  the linked Task, and submits neither caller-provided snapshots nor a
+  model-reported result.
+
+### M7 — Direct correction without an artificial Slice
+
+- A bounded correction can be recorded directly as a `CORRECTION` Feature
+  with no Increments, instead of creating a Slice only to satisfy a workflow
+  ritual.
+- [`test_plain_pause_resume_keeps_direct_correction_without_a_false_detour`](../tests/test_continuity.py)
+  checks that direct Core path. It is deterministic fixture evidence, not a
+  claim about every natural-language route in a live host.
+
+## Cross-cutting mode, document, and persistence contract
+
+- `specify` is the explicit opt-in for a fresh root. A legacy
+  `.evospec/state.json` blocks composed mode and a composed marker blocks
+  legacy recovery; there is no automatic migration, mode switch, or mixed
+  authority. Managed paths are repository-bound and reject symlink/escaping
+  targets.
+- `.evospec/continuity.json` (schema 1) owns operational state: revision,
+  Feature directory/status/cycle, selection, Task-attempt state/history,
+  active checkpoint, checks, close/reopen history, pauses, stable IDs,
+  managed-document digests, and any pending publication journal.
+- Feature, plan, Task, and decision content is held in the structured Markdown
+  data blocks rather than duplicated as a second mutable definition in the
+  state record.
+- A Feature requires at least one criterion and Task and may have up to 100
+  ordered optional Increments. Tasks link to current criteria and may link to
+  an Increment and earlier Tasks as dependencies. Selection is session-local
+  with a worktree default; it does not create an independent execution slot.
+- Consumer Feature documents live under `specs/README.md` and
+  `specs/NNN-<slug>/{spec,plan,tasks,decisions}.md`. A managed Markdown file
+  is a readable container: Core parses its structured JSON data block, while
+  headings, prose, and Task checkboxes are rendered projections. Editing a
+  checkbox does not record progress. The README index is delimited and
+  generated index updates preserve bytes outside that block.
+- Core checks the full digest of each managed file before mutation. An
+  external edit or deletion—including a manual edit outside a JSON block—is
+  divergence, not an instruction to merge or overwrite. There is no human
+  Markdown reconciliation UX in this MVP; preserve the change and reconcile
+  it manually before a supported write. This does not complete
+  [AC-DOC #71](https://github.com/Edulynch/OpenCode-EvoSpec/issues/71).
+- Each read/modify/publish continuity transaction holds the root-keyed shared
+  persistence lock across load, validation, and commit. The process lock uses
+  `msvcrt.locking` on Windows and `fcntl.flock` on POSIX alongside an
+  in-process reentrant lock. Its lock file is in the platform temporary
+  `evospec-state-locks` directory. It coordinates protocol writers, not
+  arbitrary filesystem effects, a scheduler, or a distributed lock. The
+  [`separate-process regression`](../tests/test_continuity.py) checks that two
+  same-revision writers produce one commit and one `STALE_REVISION`.
+- A commit journals candidate state and intended document bytes/digests before
+  publication. The exact serialized state and pending journal each fit the
+  4 MiB recovery bound; writes preflight their serialized size. Recovery
+  checks the serialized journal and final state, then validates every
+  destination against its prior or intended digest before replacing any
+  document. It resumes only missing writes and stops with
+  `DOCUMENT_DIVERGED` on a third version. Each managed Markdown write is
+  limited to 512 KiB. After incomplete or uncertain publication, reread
+  status and reconcile; do not infer success or blindly retry.
+
+## OpenCode commands and protocol
+
+The packaged OpenCode V2 integration exposes the dedicated
+`evospec_continuity` tool and twelve composed commands:
+
+| Command | Core operation | Use |
+| --- | --- | --- |
+| `/evospec.specify` | `specify` | Opt in on a fresh root or add a Feature in composed mode. |
+| `/evospec.clarify` | `clarify` | Record a question and its decision. |
+| `/evospec.plan` | `plan` | Record the selected Feature's plan. |
+| `/evospec.tasks` | `tasks` | Read the queue or add a Task linked to current IDs. |
+| `/evospec.implement` | `implement` | Queue, checkpoint before effects, and report afterward; `--all` re-queries eligible Tasks dynamically. |
+| `/evospec.use` | `use` | Read or change session/worktree Feature selection. |
+| `/evospec.change` | `change` | Amend a Feature or create a correction. |
+| `/evospec.status` | `status` | Read the composed projection; legacy fallback stays read-only. |
+| `/evospec.verify` | `verify` | Run and record one criterion's supported check. |
+| `/evospec.pause` | `pause` | Persist a pause, optionally with a detour/return Task. |
+| `/evospec.resume` | `resume` | Resume, recover a pending publication, or reconcile an attempt. |
+| `/evospec.close` | `close` | Request closure when Core's current guards pass. |
+
+All operations use the same provider-neutral request envelope:
+
+```json
+{
+  "action": "continuity",
+  "operation": "status",
+  "expected_revision": null,
+  "session_id": "<host-supplied session>",
+  "data": {}
+}
+```
+
+For a mutation, supply the revision just read; stale revisions fail rather than
+being silently replayed. OpenCode supplies the session identity. Empty
+`status`, `tasks`, and `use` calls are read-only; selection with a Feature ID
+is a mutation. Mutating operations and checks pass through the dedicated
+adapter's ordinary OpenCode permission boundary. Permission is independent of
+Feature acceptance and does not establish that a permission dialog appeared or
+that a human approved it.
+
+### Verification input freshness
+
+- `/evospec.verify` requires the current Feature, criterion, and a Task linked
+  to that criterion. After the allow-listed descriptor and ordinary host
+  permission gates, the adapter asks Core for `input_snapshot` at the current
+  revision immediately before and after the test. It submits those Core
+  snapshots with the actual process exit code and output digest; callers do
+  not supply snapshots or results. Core checks both snapshots against each
+  other and a fresh scan when admitting the receipt. A missing/invalid
+  snapshot, input mismatch, unlinked Task, or revision drift cannot create a
+  fresh passing check. The receipt records the observed input scope, Task ID,
+  criterion digest, descriptor, exit code, and output digest.
+- The effective `continuity-root-input-v1` scope includes regular files and
+  directory entries throughout the canonical repository root, whether Git
+  tracks or ignores them. It excludes root `.git` and `.evospec`,
+  `specs/README.md`, exact managed-document paths in the current continuity
+  state, and the directory entries for those managed Feature folders. Other
+  repository inputs remain in scope. The digest binds sorted normalized
+  relative file paths and content SHA-256 values, plus sorted normalized
+  directory paths and presence. Core applies the base scanner's limits of
+  50,000 files, 100,000 entries, 1 GiB total file bytes, and depth 128; it
+  rejects unsafe entries and fails if the two scans are unstable or differ.
+- This is trusted-local operational freshness evidence, not an OS sandbox or
+  proof that arbitrary test code has no hidden dependency or read.
+
+## Bounds and operational limits
+
+- State schema is exactly `1`; the serialized state and pending journal are
+  each limited to 4 MiB on write and recovery. The reader reads at most the
+  bound plus one byte to reject oversize input. Each managed Markdown write is
+  limited to 512 KiB.
+- The model allows up to 1,000 Features, 1,000 Tasks per Feature, 200 criteria
+  per Feature, and 100 Increments per Feature. `clarify` rejects an append when
+  the existing decision list already has 1,000 entries; `pause`/`resume` detour
+  entries also use that list but have no separate count cap. Each Feature needs
+  at least one criterion and one Task.
+- Text limits are UTF-8 byte limits: Feature title 2,048; outcome 8,192;
+  criterion description 2,048; plan 16,384; Task title 2,048 and description
+  4,096; clarification question/decision 2,048; Task checkpoint 2,048 and
+  report 4,096. Newline, carriage return, and tab are accepted only for
+  explicitly multiline fields; NUL and unsupported controls are rejected.
+- History is retained; the implementation defines no pruning, archive, or
+  schema migration operation for this MVP. The 4 MiB bound is not a guarantee
+  of indefinite growth: over-bound writes are rejected and recovery fails
+  closed rather than silently truncating history.
+- The OpenCode verifier accepts only the two declared check kinds and their
+  constrained target forms. A check is tied to current Core context, linked
+  Task, Core input snapshots, and ordinary host permission; it is not a
+  sandbox against arbitrary same-user code.
+
+## Implementation map
+
+- Provider-neutral dispatch: [`agent_protocol.py`](../evospec/agent_protocol.py)
+  and [`agent_protocol_schema.py`](../evospec/agent_protocol_schema.py).
+- Application and Core boundary:
+  [`workflow.py`](../evospec/workflow.py) →
+  [`services.py`](../evospec/services.py).
+- Composed transition, projection, and state validation:
+  [`continuity.py`](../evospec/continuity.py),
+  [`domain.py`](../evospec/domain.py), and
+  [`lifecycle.py`](../evospec/lifecycle.py).
+- Canonical Markdown codec and transactional persistence:
+  [`continuity_documents.py`](../evospec/continuity_documents.py) and
+  [`persistence.py`](../evospec/persistence.py).
+- Packaged OpenCode route and user guidance:
+  [`plugin`](../evospec/resources/opencode/plugins/evospec/index.ts),
+  [`skill`](../evospec/resources/opencode/skills/evospec/SKILL.md),
+  and [`continuity tests`](../tests/test_continuity.py).
+
+The audited source commit
+[`b4c6090`](https://github.com/Edulynch/OpenCode-EvoSpec/commit/b4c609039863fd3a5a018a886ccfa9409e0b3c7c)
+had a successful hosted push CI run
+([45733307123](https://github.com/Edulynch/OpenCode-EvoSpec/actions/runs/45733307123));
+a separate PR-event result was not observed. That run applies to that exact
+commit, not later working-tree changes. The reported OpenCode v2.4.1 E2E was
+blocked because the local service `/api/info` returned
+`Authentication required`; the Ubuntu real-browser gate was blocked for lack
+of a verified process boundary, and Linux/Windows runner smokes were omitted.
+These deterministic and hosted results do not establish live M1–M7 success,
+native permission qualification, or a published release. The integration
+boundary and outstanding qualification are tracked in [`opencode.md`](opencode.md);
+the evidence summary is in [#72 comment 7179636311](https://github.com/Edulynch/OpenCode-EvoSpec/issues/72#issuecomment-7179636311).

@@ -24,6 +24,7 @@ T = TypeVar("T")
 
 ACTION_KEYS = {
     "context": frozenset(("action",)),
+    "continuity": frozenset(("action", "operation", "expected_revision", "session_id", "data")),
     "autonomy_evaluate": frozenset(("action", "expected_revision", "operation", "paths", "irreversible")),
     "propose_autonomy_expansion": frozenset(("action", "expected_revision", "delta")),
     "resolve_autonomy_expansion": frozenset(("action", "expected_revision", "proposal_id", "decision", "narrowed_envelope")),
@@ -145,6 +146,23 @@ def parse_expected_revision(request: dict[str, JsonValue]) -> domain.ExpectedRev
     if revision < 0:
         raise ProtocolError("expected_revision must be nonnegative")
     return domain.ExpectedRevision(revision)
+
+
+def parse_continuity_request(
+    request: dict[str, JsonValue],
+) -> tuple[str, int | None, str, dict[str, JsonValue]]:
+    """Parse the composed-work envelope; the host adapter supplies session_id."""
+    _keys(request, "continuity request", ACTION_KEYS["continuity"])
+    operation = _string(request, "operation")
+    session_id = _string(request, "session_id")
+    if not session_id.strip():
+        raise ProtocolError("session_id must be nonblank")
+    raw_revision = request.get("expected_revision")
+    if raw_revision is not None and (type(raw_revision) is not int or raw_revision < 0):
+        raise ProtocolError("expected_revision must be a nonnegative integer or null")
+    data_value = request.get("data", {})
+    data = _mapping(data_value, "continuity data")
+    return operation, raw_revision, session_id, data
 
 
 def parse_test_exit_code(request: dict[str, JsonValue]) -> int:

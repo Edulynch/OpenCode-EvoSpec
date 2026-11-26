@@ -40,7 +40,7 @@ class OpenCodeIntegrationTests(unittest.TestCase):
     def registry(self) -> IntegrationRegistry:
         return IntegrationRegistry((self.provider,))
 
-    def test_packaged_resources_are_dependency_free_v2_plugin_nine_commands_and_skill(self) -> None:
+    def test_packaged_resources_are_dependency_free_v2_plugin_composed_commands_and_skill(self) -> None:
         resources = _resources()
         self.assertEqual(set(resources), {
             PLUGIN,
@@ -48,7 +48,13 @@ class OpenCodeIntegrationTests(unittest.TestCase):
             SKILL,
             *(f".opencode/commands/{name}" for name in COMMANDS),
         })
-        self.assertEqual(len(COMMANDS), 9)
+        self.assertEqual(len(COMMANDS), 19)
+        self.assertEqual(sum(name in COMMANDS for name in (
+            "evospec.specify.md", "evospec.clarify.md", "evospec.plan.md",
+            "evospec.tasks.md", "evospec.implement.md", "evospec.use.md",
+            "evospec.change.md", "evospec.status.md", "evospec.verify.md",
+            "evospec.pause.md", "evospec.resume.md", "evospec.close.md",
+        )), 12)
         plugin = resources[PLUGIN]
         self.assertIn('windowsHide: globalThis.process.platform === "win32"', plugin)
         self.assertIn("runtime.tool.transform", plugin)
@@ -60,6 +66,9 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn('"evospec_start"', plugin)
         self.assertIn('"evospec_assessed_start"', plugin)
         self.assertIn('"evospec_continuation"', plugin)
+        self.assertIn('"evospec_continuity"', plugin)
+        self.assertIn("evospec_continuity_verify", plugin)
+        self.assertIn('continuityRequest("status"', plugin)
         self.assertIn("deriveContinuationDirective", plugin)
         self.assertIn("runtime.session.hook(\"context\"", plugin)
         self.assertIn("runtime.session.get({ sessionID: context.sessionID })", plugin)
@@ -80,24 +89,30 @@ class OpenCodeIntegrationTests(unittest.TestCase):
 
         # The normal OpenCode context hook and skill discovery must recognize human questions.
         self.assertIn("¿dónde seguimos?", plugin)
-        self.assertIn("call only evospec_context", plugin)
+        self.assertIn("load the evospec skill and call only read operations", plugin)
+        self.assertIn("first evospec_continuity status", plugin)
+        self.assertIn("evospec_context for the legacy projection", plugin)
         self.assertIn("Read-only questions never initialize", plugin)
         self.assertIn("evospec_first_slice_handoff", plugin)
         self.assertIn("evospec_first_slice_handoff", skill)
         self.assertIn("evospec_propose_file_edit", skill)
         self.assertIn("interactive terminal", skill)
         self.assertIn("¿dónde seguimos?", skill)
-        self.assertIn("Call **only** `evospec_context`", skill)
-        self.assertIn("accepted_slice.checkpoint", skill)
-        self.assertIn("task_progress.checkpoint", skill)
+        self.assertIn("first `evospec_continuity` status", skill)
+        self.assertIn("legacy projection", skill)
+        self.assertIn("accepted Slice's initial checkpoint is not completed work", skill)
+        self.assertIn("A report is not a check", skill)
+        self.assertIn("do not write or suggest terminal/TTY recovery", skill)
+        self.assertNotIn("do not write or suggest terminal/TTY recovery", plugin)
         self.assertIn("REPORTED_UNVERIFIED", skill)
-        self.assertIn("If state is missing, invalid, from another worktree, or ambiguous", skill)
-        self.assertIn("If `evospec_context` is unavailable or its call fails", skill)
+        self.assertIn("corrupt, diverged, missing, cross-root, or ambiguous state", skill)
+        self.assertIn("same-user code", skill)
         self.assertIn("Do not substitute Engram", skill)
         self.assertIn("If evospec_context is unavailable or fails", plugin)
         self.assertIn("accepted Slice details attached to parked items", skill)
         self.assertIn("never select, reactivate", skill.lower())
-        self.assertIn("accepted work_queue items as inactive", plugin)
+        self.assertIn("state as **inactive**", skill)
+        self.assertNotIn("accepted Slice details attached to parked items", plugin)
         self.assertIn("evospec_request_scoped_objective", skill)
         self.assertIn("insufficient proof", skill)
         self.assertIn("PERSONAL_TASKS_WEB", plugin)
@@ -109,17 +124,13 @@ class OpenCodeIntegrationTests(unittest.TestCase):
 
         # Both slash consultations share the same read-only contract, even when natural
         # language activates the skill without a slash command.
-        for command in ("evospec.context.md", "evospec.status.md"):
-            resource = resources[f".opencode/commands/{command}"]
-            self.assertIn("call only `evospec_context`", resource)
-            self.assertIn("REPORTED_UNVERIFIED", resource)
-            self.assertIn("read-only", resource)
-            self.assertIn("work_queue", resource)
-            self.assertIn("inactive", resource)
-            self.assertEqual(
-                resource,
-                (Path(__file__).parents[1] / ".opencode" / "commands" / command).read_text(encoding="utf-8"),
-            )
+        legacy_context = resources[".opencode/commands/evospec.context.md"]
+        self.assertIn("read-only", legacy_context)
+        self.assertIn("work_queue", legacy_context)
+        self.assertIn("inactive", legacy_context)
+        composed_status = resources[".opencode/commands/evospec.status.md"]
+        self.assertIn("call `evospec_continuity` status only", composed_status)
+        self.assertIn("call only `evospec_context`", composed_status)
 
         self.assertIn("Session intake alone does not register formal Slice criteria", skill)
         self.assertIn("trailing same-session user messages", skill)
@@ -1920,9 +1931,9 @@ const runtime = {
   },
 }
 await plugin.setup(runtime)
-assert(definitions.length === 34, "raw protocol tool and all typed helpers register")
+assert(definitions.length === 35, "raw protocol tool and all typed helpers register")
 const names = new Set(definitions.map((definition) => definition.name))
-for (const name of ["evospec", "evospec_start", "evospec_first_slice_handoff", "evospec_session_first_slice", "evospec_request_scoped_objective", "evospec_propose_file_edit", "evospec_auto_readiness", "evospec_auto_contract", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_criterion_test", "evospec_criterion_test_r3b", "evospec_accept_slice_outcome", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
+for (const name of ["evospec", "evospec_continuity", "evospec_start", "evospec_first_slice_handoff", "evospec_session_first_slice", "evospec_request_scoped_objective", "evospec_propose_file_edit", "evospec_auto_readiness", "evospec_auto_contract", "evospec_assessed_start", "evospec_continuation", "evospec_wait", "evospec_retry", "evospec_context", "evospec_work_list", "evospec_work_next", "evospec_work_activate", "evospec_work_state", "evospec_work_relation", "evospec_recover_discovery", "evospec_select_capability", "evospec_progress", "evospec_accepted_task_progress", "evospec_criterion_test", "evospec_criterion_test_r3b", "evospec_accept_slice_outcome", "evospec_review", "evospec_verify", "evospec_continue", "evospec_clarify", "evospec_structure_material_clarification", "evospec_recover_legacy_non_material_detail", "evospec_converge", "evospec_irreversible_authorize", "evospec_irreversible_execute"]) assert(names.has(name), `missing registered tool ${name}`)
 const contextEntry = definitions.find((definition) => definition.name === "evospec_context")
 assert(contextEntry.options?.codemode === false, "canonical read-only context bypasses deferred Code Mode discovery")
 assert(definitions.filter((definition) => definition.options?.codemode === false).length === 1, "only canonical context is directly exposed")
@@ -2056,6 +2067,223 @@ assert(JSON.stringify(cliCommand.command) === JSON.stringify([...expectedCliComm
 assert(commands.every((item) => item.cwd === process.cwd()), "all subprocesses execute in the current session project")
 assert(commands.filter((item) => item.command.includes("--root")).every((item) => item.command.slice(-2).join(" ") === `--root ${process.cwd()}`), "protocol calls forward the current project root")
 '''.replace("__EXPECTED_CLI_COMMAND__", json.dumps(list(_cli_command()))),
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                ("bun", "run", str(runner)), cwd=root, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_composed_plugin_binds_verification_to_task_and_core_input_snapshots(self) -> None:
+        with TemporaryDirectory(
+            prefix="evospec-continuity-host-gate-",
+            dir=os.environ.get("EVOSPEC_AC0_TEST_TMPDIR") or None,
+        ) as temporary:
+            root = Path(temporary)
+            (root / "plugin.ts").write_text(_resources()[PLUGIN], encoding="utf-8")
+            (root / "continuation.mjs").write_text(_resources()[CONTINUATION], encoding="utf-8")
+            runner = root / "continuity-runner.ts"
+            runner.write_text(
+                '''import plugin from "./plugin.ts"
+
+const definitions = []
+const permissionRequests = []
+const protocolRequests = []
+const testCommands = []
+const pendingReads = []
+const inputSnapshotsProduced = []
+let coreRevision = 10
+let inputFingerprint = "a".repeat(64)
+let mutateInputsDuringTest = false
+let driftRevisionDuringTest = false
+let scenarioOperations = []
+let scenarioCursor = 0
+let protocolCallCount = 0
+const featureID = "F-00000000000000000000000000000001"
+const criterionID = "C-00000000000000000000000000000002"
+const taskID = "T-00000000000000000000000000000003"
+const criterion = {
+  id: criterionID,
+  digest: "a".repeat(64),
+  check_kind: "python-unittest",
+  check_target: "tests.test_continuity",
+}
+const state = (revision) => ({
+  mode: "COMPOSED",
+  revision,
+  selected_feature_id: featureID,
+  execution: null,
+  features: [{
+    id: featureID,
+    status: "OPEN",
+    criteria: [criterion],
+    tasks: [{ id: taskID, criteria_ids: [criterionID] }],
+  }],
+})
+const assert = (condition, message) => { if (!condition) throw new Error(message) }
+const beginScenario = (operations, { mutateInputs = false, driftRevision = false } = {}) => {
+  scenarioOperations = operations
+  scenarioCursor = 0
+  mutateInputsDuringTest = mutateInputs
+  driftRevisionDuringTest = driftRevision
+}
+const snapshot = () => ({
+  policy_id: "continuity-root-input-v1",
+  policy_digest: "b".repeat(64),
+  fingerprint: inputFingerprint,
+})
+const runtime = {
+  tool: {
+    transform: async (callback) => callback({ add: (definition) => definitions.push(definition) }),
+    list: async () => definitions.map((definition) => ({ id: definition.name })),
+  },
+  session: {
+    get: async ({ sessionID }) => {
+      assert(sessionID === "ses-continuity", "continuity uses the executing session")
+      return { location: { directory: process.cwd() } }
+    },
+    hook: async () => {},
+  },
+  permission: {
+    assert: async (request) => permissionRequests.push(request),
+  },
+}
+await plugin.setup(runtime)
+const tool = definitions.find((definition) => definition.name === "evospec_continuity")
+assert(tool, "the composed typed tool is registered")
+assert(tool.input.additionalProperties === false, "the composed tool rejects undeclared arguments")
+assert(tool.input.properties.operation.enum.includes("verify"), "the composed operation surface is explicit")
+assert(tool.input.properties.data.properties.input_snapshot_before === undefined
+  && tool.input.properties.data.properties.input_snapshot_after === undefined,
+"input snapshots are not caller-supplied tool arguments")
+Object.defineProperty(Bun, "spawn", { value(command, options) {
+  assert(options.cwd === process.cwd(), "both Core and check commands stay in the executing root")
+  if (options.stdin !== undefined) {
+    const slot = protocolCallCount++
+    const operation = scenarioOperations[scenarioCursor++]
+    assert(operation, "the plugin made only expected Core requests")
+    pendingReads.push(options.stdin.text().then((text) => {
+      protocolRequests[slot] = JSON.parse(text)
+    }))
+    const revision = operation === "verify" ? coreRevision + 1 : coreRevision
+    const continuity = operation === "input_snapshot"
+      ? { ...state(revision), input_snapshot: snapshot() }
+      : state(revision)
+    if (operation === "verify") coreRevision = revision
+    if (operation === "input_snapshot") inputSnapshotsProduced.push(snapshot())
+    return {
+      stdout: new Blob([JSON.stringify({ continuity })]).stream(),
+      stderr: new Blob([""]).stream(),
+      exited: Promise.resolve(0),
+    }
+  }
+  testCommands.push(command)
+  if (mutateInputsDuringTest) inputFingerprint = "c".repeat(64)
+  if (driftRevisionDuringTest) coreRevision += 1
+  return {
+    stdout: new Blob(["focused check output"]).stream(),
+    stderr: new Blob([""]).stream(),
+    exited: Promise.resolve(0),
+  }
+} })
+const context = {
+  sessionID: "ses-continuity",
+  agent: "agent",
+  messageID: "msg-continuity",
+  id: "tool-continuity",
+  signal: new AbortController().signal,
+}
+beginScenario(["status"])
+await tool.execute({ operation: "status" }, context)
+assert(permissionRequests.length === 0, "read-only status does not request write permission")
+beginScenario(["status"])
+let unlinkedTaskRejected = false
+try {
+  await tool.execute({
+    operation: "verify",
+    expected_revision: 10,
+    data: {
+      feature_id: featureID,
+      criterion_id: criterionID,
+      task_id: "T-00000000000000000000000000000004",
+    },
+  }, context)
+} catch (error) {
+  unlinkedTaskRejected = String(error).includes("linked")
+}
+await Promise.all(pendingReads)
+assert(unlinkedTaskRejected && permissionRequests.length === 0 && testCommands.length === 0,
+"an unlinked Task cannot request permission or execute a check")
+beginScenario(["status", "status", "input_snapshot", "status", "input_snapshot", "verify"])
+const passed = JSON.parse((await tool.execute({
+  operation: "verify",
+  expected_revision: 10,
+  data: { feature_id: featureID, criterion_id: criterionID, task_id: taskID },
+}, context)).content)
+await Promise.all(pendingReads)
+assert(passed.check.result === "CHECK_RECORDED_PASS", "unchanged Core snapshots permit a recorded check")
+const passReceipt = protocolRequests.find((request) => request.operation === "verify")
+assert(passReceipt.expected_revision === 10
+  && passReceipt.data.task_id === taskID
+  && JSON.stringify(passReceipt.data.input_snapshot_before) === JSON.stringify(inputSnapshotsProduced[0])
+  && JSON.stringify(passReceipt.data.input_snapshot_after) === JSON.stringify(inputSnapshotsProduced[1]),
+"Core receipt carries the linked Task and the two Core-produced snapshots")
+assert(inputSnapshotsProduced[0].fingerprint === inputSnapshotsProduced[1].fingerprint,
+"unchanged inputs have matching pre/post snapshots")
+assert(permissionRequests.length === 1
+  && permissionRequests[0].action === "evospec_continuity_verify",
+"criterion execution passes through the host permission API")
+const permissionResource = JSON.parse(permissionRequests[0].resources[0])
+assert(permissionResource.repository_root === process.cwd()
+  && permissionResource.task_id === taskID,
+"permission is bound to the executing repository and linked Task")
+assert(testCommands.length === 1, "only the allow-listed criterion command executes")
+
+inputFingerprint = "b".repeat(64)
+beginScenario(["status", "status", "input_snapshot", "status", "input_snapshot"], { mutateInputs: true })
+let inputChangeRejected = false
+try {
+  await tool.execute({
+    operation: "verify",
+    expected_revision: 11,
+    data: { feature_id: featureID, criterion_id: criterionID, task_id: taskID },
+  }, context)
+} catch (error) {
+  inputChangeRejected = String(error).includes("STALE_INPUT")
+}
+await Promise.all(pendingReads)
+assert(inputChangeRejected, "same-revision input changes refuse the check receipt")
+assert(inputSnapshotsProduced[2].fingerprint !== inputSnapshotsProduced[3].fingerprint,
+"the changed input is observed by the Core post-check snapshot")
+assert(protocolRequests.filter((request) => request.operation === "verify").length === 1,
+"changed inputs are never sent to Core as a receipt")
+
+inputFingerprint = "d".repeat(64)
+beginScenario(["status", "status", "input_snapshot", "status"], { driftRevision: true })
+let staleRejected = false
+try {
+  await tool.execute({
+    operation: "verify",
+    expected_revision: 11,
+    data: { feature_id: featureID, criterion_id: criterionID, task_id: taskID },
+  }, context)
+} catch (error) {
+  staleRejected = String(error).includes("STALE_REVISION")
+}
+await Promise.all(pendingReads)
+assert(staleRejected, "Core revision drift during the test prevents receipt publication")
+assert(protocolRequests.filter((request) => request.operation === "verify").length === 1,
+"revision drift never creates another receipt")
+assert(testCommands.length === 3, "each authorized scenario runs only its allow-listed command")
+assert(permissionRequests.length === 3, "each execution attempt passes through host permission")
+await Promise.all(pendingReads)
+assert(protocolRequests.map((request) => request.operation).join(",") ===
+  "status,status,status,status,input_snapshot,status,input_snapshot,verify,status,status,input_snapshot,status,input_snapshot,status,status,input_snapshot,status",
+"Core snapshots bracket each check after permission, and stale cases do not submit receipts")
+assert(protocolRequests.filter((request) => request.operation === "input_snapshot")
+  .map((request) => request.expected_revision).join(",") === "10,10,11,11,11",
+"every pre/post snapshot is bound to the exact check revision")
+''',
                 encoding="utf-8",
             )
             completed = subprocess.run(

@@ -2363,6 +2363,15 @@ class CoreService:
         service.__repository_root = root.resolve()
         return service
 
+    def composed_continuity(
+        self, operation: str, expected_revision: int | None,
+        session_id: str, data: dict[str, object],
+    ) -> dict[str, object]:
+        """Route composed work through the Core facade and shared persistence contract."""
+        return self.__persistence.composed_continuity(
+            operation, expected_revision, session_id, data,
+        )
+
     def accept_first_slice(
         self,
         state: State,

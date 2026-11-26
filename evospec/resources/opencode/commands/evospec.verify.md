@@ -1,0 +1,5 @@
+---
+description: Run the selected criterion's allow-listed check and record its result.
+---
+<!-- EvoSpec-managed: opencode-v2 -->
+Call `evospec_continuity` with `operation: "verify"`, the current revision, Feature ID, criterion ID, and ID of a Task linked to that criterion. Do not supply input snapshots or a claimed result. The plugin resolves the criterion's canonical test target, requests ordinary host permission, rechecks Core authority, then obtains Core `input_snapshot` values immediately before and after running only the allow-listed Python unittest module or Node test file. Core rechecks the snapshots against each other and the current input scope when admitting the receipt. An unlinked Task, unavailable/invalid snapshot, input mismatch, or revision drift fails closed; no fresh pass is recorded. Report only the actual exit code and output digest returned by the check. A failed check is evidence of failure; a pass is criterion verification only, not Feature acceptance or closure. Do not replay a stale attempt or reuse its output as fresh evidence. User input: $ARGUMENTS
