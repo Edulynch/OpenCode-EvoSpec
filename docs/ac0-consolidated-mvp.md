@@ -24,8 +24,8 @@ coordination.
 | --- | --- |
 | Existing projects may use legacy `.evospec/state.json` and its established lifecycle. | Composed work is a separate, explicit opt-in for a fresh root, stored in `.evospec/continuity.json`; it is never silently mixed with or migrated from legacy state. |
 | Adapter-owned state changes would duplicate lifecycle and revision rules. | All supported composed operations follow `protocol → WorkflowService → CoreService → continuity.execute → ContinuityPersistence`. The adapter supplies the executing host session and enforces its ordinary permission boundary; Core owns validation, revision checks and durable changes. |
-| A multi-document update can be interrupted between file replacements. | Core records a pending journal before publishing Markdown. Recovery validates the complete journal and every destination before replacing any document, resumes only missing writes, and stops on any third version. |
-| Thread-only synchronization would not coordinate separate host processes. | Continuity operations hold the root-keyed shared persistence lock across load, validation and commit, with an expected-revision check under that lock. |
+| A multi-document update can be interrupted between file replacements. | Core records a bounded pending journal before publishing Markdown. Recovery preflights the journal read set and every destination before replacing documents, resumes only missing writes, and stops on any third version. A second read-set check runs before state publication. |
+| Thread-only synchronization would not coordinate separate host processes, and an editor does not honor Core's lock. | Continuity operations hold the root-keyed shared persistence lock across load, validation and commit, with an expected-revision check under that lock. Core compares observed document digests before journaling and during recovery; a noncooperating editor can still race the final check/replace boundary, so any detected conflict remains journaled for inspection rather than being overwritten. |
 
 **Why not add another writer:** the OpenCode adapter and commands are request
 surfaces, not state owners. The single composed entry point reuses Core's
@@ -141,26 +141,45 @@ does not establish that every user journey has passed in a live OpenCode host.
 - `.evospec/continuity.json` (schema 1) owns operational state: revision,
   Feature directory/status/cycle, selection, Task-attempt state/history,
   active checkpoint, checks, close/reopen history, pauses, stable IDs,
-  managed-document digests, and any pending publication journal.
-- Feature, plan, Task, and decision content is held in the structured Markdown
-  data blocks rather than duplicated as a second mutable definition in the
-  state record.
+  semantic and byte digests, typed identity metadata, and any pending
+  publication journal. It does not duplicate current Feature/plan/Task
+  definitions.
+- Ordinary Markdown is the direct human authority under
+  `specs/README.md` and `specs/NNN-<slug>/{spec,tasks}.md`, with `plan.md` and
+  `decisions.md` only when useful. New documents use headings, prose, list
+  fields and small stable-ID markers, not a fenced full-JSON authority block.
+  Existing JSON-in-Markdown documents are legacy input accepted only by the
+  explicit, permissioned `upgrade_markdown` transition.
 - A Feature requires at least one criterion and Task and may have up to 100
   ordered optional Increments. Tasks link to current criteria and may link to
   an Increment and earlier Tasks as dependencies. Selection is session-local
   with a worktree default; it does not create an independent execution slot.
-- Consumer Feature documents live under `specs/README.md` and
-  `specs/NNN-<slug>/{spec,plan,tasks,decisions}.md`. A managed Markdown file
-  is a readable container: Core parses its structured JSON data block, while
-  headings, prose, and Task checkboxes are rendered projections. Editing a
-  checkbox does not record progress. The README index is delimited and
-  generated index updates preserve bytes outside that block.
-- Core checks the full digest of each managed file before mutation. An
-  external edit or deletion—including a manual edit outside a JSON block—is
-  divergence, not an instruction to merge or overwrite. There is no human
-  Markdown reconciliation UX in this MVP; preserve the change and reconcile
-  it manually before a supported write. This does not complete
-  [AC-DOC #71](https://github.com/Edulynch/OpenCode-EvoSpec/issues/71).
+- `status` and `tasks` parse without writing. The projection reports semantic
+  edits, formatting/notes drift, generated-checklist drift, and
+  identity/reference conflicts separately. A semantic edit or identity
+  conflict is never projected as accepted Feature state or evidence. A changed
+  checkbox is only generated-region drift; it never records Task progress.
+- Adopting human definitions requires explicit `reconcile` at the current
+  revision and exact Feature ID. Existing IDs are immutable. New
+  criterion/increment/Task/decision declarations use typed aliases such as
+  `C-new-filter` or `T-filter-task`; linked references must be complete and
+  unambiguous. Removals require the exact `retire_ids` set and IDs are never
+  reused. Semantic edits to a closed Feature require
+  `reopen_feature_id` equal to that Feature ID and append normal reopen
+  history. Read-only status never triggers reconciliation.
+- A clean schema-1 JSON-in-Markdown fixture can transition only on explicit
+  `upgrade_markdown`. It refuses dirty or mixed document formats and never
+  migrates legacy `.evospec/state.json`. It preserves attempts, checkpoints,
+  checks, decisions and closure history. Historical checks lacking a
+  task-definition digest remain historical and not fresh; reverify before
+  relying on them.
+- The README Feature index and the Tasks checklist are generated projections;
+  index replacement preserves bytes outside its marker block. Core uses the
+  same root lock and journal for Markdown and the operational index. When a
+  detected editor race conflicts with a journal read set, no state revision
+  is published and manual reconciliation is required. Filesystem editors do
+  not participate in the lock: an edit racing after the final recheck may be
+  observed only on the next read, where digest validation fails closed.
 - Each read/modify/publish continuity transaction holds the root-keyed shared
   persistence lock across load, validation, and commit. The process lock uses
   `msvcrt.locking` on Windows and `fcntl.flock` on POSIX alongside an
@@ -196,7 +215,7 @@ The packaged OpenCode V2 integration exposes the dedicated
 | `/evospec.status` | `status` | Read the composed projection; legacy fallback stays read-only. |
 | `/evospec.verify` | `verify` | Run and record one criterion's supported check. |
 | `/evospec.pause` | `pause` | Persist a pause, optionally with a detour/return Task. |
-| `/evospec.resume` | `resume` | Resume, recover a pending publication, or reconcile an attempt. |
+| `/evospec.resume` | `resume`, `reconcile`, `upgrade_markdown` | Resume or recover; explicitly adopt human Markdown edits or explicitly upgrade clean legacy JSON-in-Markdown. |
 | `/evospec.close` | `close` | Request closure when Core's current guards pass. |
 
 All operations use the same provider-neutral request envelope:

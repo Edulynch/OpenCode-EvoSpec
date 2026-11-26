@@ -80,6 +80,72 @@ def activate_side(root: Path) -> int:
 
 
 class AgentProtocolTests(unittest.TestCase):
+    def test_composed_protocol_routes_read_then_revision_bound_markdown_reconcile(self) -> None:
+        with TemporaryDirectory(
+            prefix="evospec-continuity-reconcile-protocol-",
+            dir=os.environ.get("EVOSPEC_AC0_TEST_TMPDIR") or None,
+        ) as temporary:
+            root = Path(temporary)
+            request_data: dict[str, JsonValue] = {
+                "title": "Protocol Markdown Feature",
+                "outcome": "Return only matching records.",
+                "criteria": [{
+                    "description": "Only matching records remain visible.",
+                    "check_kind": "python-unittest",
+                    "check_target": "tests.test_agent_protocol",
+                }],
+                "increments": [],
+                "tasks": [{
+                    "title": "Implement filtering",
+                    "description": "Filter records before display.",
+                    "criteria": [0],
+                }],
+                "plan": "",
+            }
+            created = json.loads(execute(root, request(
+                "continuity", operation="specify", expected_revision=0,
+                session_id="ses_protocol_markdown_123", data=request_data,
+            )))
+            self.assertNotIn("error", created)
+            continuity = created["continuity"]
+            feature = continuity["selected_feature"]
+            spec_path = root / "specs" / feature["directory"] / "spec.md"
+            spec_path.write_text(
+                spec_path.read_text(encoding="utf-8").replace(
+                    "Return only matching records.",
+                    "Return matching records after applying the human-edited filter.",
+                ),
+                encoding="utf-8",
+            )
+            before_status = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            proposed = json.loads(execute(root, request(
+                "continuity", operation="status",
+                session_id="ses_protocol_markdown_123",
+            )))["continuity"]
+            self.assertEqual(proposed["status"], "DOCUMENT_RECONCILIATION_REQUIRED")
+            self.assertEqual(proposed["features"], [])
+            self.assertEqual(before_status, {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            })
+
+            adopted = json.loads(execute(root, request(
+                "continuity", operation="reconcile",
+                expected_revision=proposed["revision"],
+                session_id="ses_protocol_markdown_123",
+                data={"feature_id": feature["id"]},
+            )))
+            self.assertNotIn("error", adopted)
+            result = adopted["continuity"]
+            self.assertEqual(result["revision"], proposed["revision"] + 1)
+            self.assertEqual(
+                result["selected_feature"]["outcome"],
+                "Return matching records after applying the human-edited filter.",
+            )
+
     def test_composed_continuity_uses_the_provider_neutral_protocol_without_legacy_init(self) -> None:
         with TemporaryDirectory(
             prefix="evospec-continuity-protocol-",

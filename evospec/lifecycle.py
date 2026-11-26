@@ -300,6 +300,9 @@ def continuity_current_checks(
     task_criteria = None if tasks is None else {
         item["id"]: set(item["criteria_ids"]) for item in tasks
     }
+    task_digests = None if tasks is None else {
+        item["id"]: _continuity_digest(item) for item in tasks
+    }
     latest: dict[str, dict[str, object]] = {}
     for receipt in state["checks"]:
         criterion_id = receipt.get("criterion_id")
@@ -310,6 +313,10 @@ def continuity_current_checks(
             and receipt.get("observed_input_scope") == input_scope
             and isinstance(receipt_task_id, str)
             and (task_id is None or receipt_task_id == task_id)
+            and (
+                task_digests is None
+                or receipt.get("task_digest") == task_digests.get(receipt_task_id)
+            )
             and (
                 task_criteria is None
                 or criterion_id in task_criteria.get(receipt_task_id, set())
@@ -333,6 +340,7 @@ def continuity_task_status(
     state: ContinuityStateView,
     feature: ContinuityFeatureView,
     task: ContinuityTaskView,
+    tasks: Sequence[ContinuityTaskView] | None = None,
 ) -> str:
     """Derive operational status; a report alone never completes a Task."""
     execution = state["execution"]
@@ -352,7 +360,9 @@ def continuity_task_status(
         return "REPORTED"
     if last["status"] not in ("REPORTED", "RECONCILED_COMPLETE"):
         return "READY"
-    checks = continuity_current_checks(state, feature, task_id=task["id"])
+    checks = continuity_current_checks(
+        state, feature, tasks=tasks, task_id=task["id"],
+    )
     if all(checks.get(identity, {}).get("passed") for identity in task["criteria_ids"]):
         return "COMPLETED"
     return "REPORTED"
@@ -368,11 +378,11 @@ def continuity_task_eligible(
     by_id = {item["id"]: item for item in tasks}
     if any(
         dependency not in by_id
-        or continuity_task_status(state, feature, by_id[dependency]) != "COMPLETED"
+        or continuity_task_status(state, feature, by_id[dependency], tasks) != "COMPLETED"
         for dependency in task["depends_on"]
     ):
         return False
-    return continuity_task_status(state, feature, task) == "READY"
+    return continuity_task_status(state, feature, task, tasks) == "READY"
 
 
 def continuity_close_blockers(
@@ -395,7 +405,7 @@ def continuity_close_blockers(
     ]
     incomplete = [
         task["id"] for task in tasks
-        if continuity_task_status(state, feature, task) != "COMPLETED"
+        if continuity_task_status(state, feature, task, tasks) != "COMPLETED"
     ]
     if missing:
         blockers.append("criteria lack current passing checks: " + ", ".join(missing))

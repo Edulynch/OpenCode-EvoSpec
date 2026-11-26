@@ -12,6 +12,7 @@ from typing import Any, NotRequired, TypedDict, TypeGuard
 from unittest.mock import patch
 
 from evospec.continuity import ContinuityError, execute
+from evospec.continuity_documents import parse_all as parse_all_documents
 from evospec.input_fingerprint import InputFingerprintError
 from evospec.persistence import AtomicFailure, FileOperations, RecoveryError, StateStore
 from tests._tempdir import TemporaryDirectory
@@ -235,6 +236,50 @@ def spec_request(title: str = "Three increment Feature") -> dict[str, object]:
     }
 
 
+def _rewrite_as_legacy_fixture(root: Path) -> dict[str, object]:
+    state_path = root / ".evospec" / "continuity.json"
+    state: dict[str, Any] = json.loads(state_path.read_text(encoding="utf-8"))
+    documents = state["documents"]
+    if not isinstance(documents, dict):
+        raise AssertionError("expected a document index")
+    for feature_id, feature_state in state["features"].items():
+        parsed = parse_all_documents(root, state, feature_id)
+        directory = feature_state["directory"]
+        values = {
+            "spec": parsed["spec"],
+            "plan": parsed["plan"],
+            "tasks": {"feature_id": feature_id, "tasks": parsed["tasks"]},
+            "decisions": {
+                "feature_id": feature_id, "decisions": parsed["decisions"],
+            },
+        }
+        for name, value in values.items():
+            relative = f"specs/{directory}/{name}.md"
+            if relative not in documents:
+                continue
+            body = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+            content = (
+                f"# Legacy {name}\n\n"
+                f"<!-- evospec-feature: {feature_id} -->\n\n"
+                "<!-- evospec-data:start -->\n"
+                "```json\n"
+                f"{body}\n"
+                "```\n"
+                "<!-- evospec-data:end -->\n"
+            ).encode("utf-8")
+            (root / Path(relative)).write_bytes(content)
+            documents[relative] = sha256(content).hexdigest()
+    state.pop("semantic_digests", None)
+    state.pop("identity_metadata", None)
+    for check in state["checks"]:
+        check.pop("task_digest", None)
+    state_path.write_text(
+        json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return state
+
+
 class FailReplace(FileOperations):
     def __init__(self, fail_on: int) -> None:
         self.fail_on = fail_on
@@ -244,6 +289,28 @@ class FailReplace(FileOperations):
         self.count += 1
         if self.count == self.fail_on:
             raise OSError("injected continuity publication failure")
+        super().replace(source, target)
+
+
+class EditOnJournalReplace(FileOperations):
+    def __init__(self, path: Path, content: str) -> None:
+        self.path = path
+        self.content = content
+        self.edited = False
+
+    def replace(self, source: Path, target: Path) -> None:
+        if not self.edited and target.name == "continuity.json":
+            self.path.write_text(self.content, encoding="utf-8")
+            self.edited = True
+        super().replace(source, target)
+
+
+class TrackReplacements(FileOperations):
+    def __init__(self) -> None:
+        self.targets: list[Path] = []
+
+    def replace(self, source: Path, target: Path) -> None:
+        self.targets.append(target)
         super().replace(source, target)
 
 
@@ -326,11 +393,15 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(len({feature["id"], *(item["id"] for item in feature["increments"]), *(item["id"] for item in feature["tasks"]), *(item["id"] for item in feature["criteria"])}), 8)
             self.assertTrue((root / "specs" / "README.md").is_file())
             folder = root / "specs" / feature["directory"]
+            for path in folder.glob("*.md"):
+                content = path.read_bytes()
+                self.assertNotIn(b"<!-- evospec-data:start -->", content)
+                self.assertNotIn(b"<!-- evospec-data:end -->", content)
             self.assertEqual(
                 {path.name for path in folder.iterdir()},
-                {"spec.md", "plan.md", "tasks.md", "decisions.md"},
+                {"spec.md", "plan.md", "tasks.md"},
             )
-            self.assertIn("editing this checkbox does not record progress", (folder / "tasks.md").read_text(encoding="utf-8"))
+            self.assertIn("checkboxes do not record progress", (folder / "tasks.md").read_text(encoding="utf-8"))
             self.assertFalse((root / ".evospec" / "state.json").exists())
 
             before = {
@@ -346,6 +417,903 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(before, after)
             with self.assertRaises(RecoveryError):
                 StateStore(root).load_state()
+
+    def test_manual_filtering_edit_is_read_only_then_reconciles_and_reverifies(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            request = {
+                **spec_request("Filter records"),
+                "increments": [],
+                "tasks": [{
+                    "title": "Implement the unfiltered list",
+                    "description": "Render all records.",
+                    "criteria": [0],
+                }],
+                "plan": "",
+            }
+            initial = self.call(root, "specify", 0, data=request)
+            feature = _selected_feature(initial)
+            old_task = feature["tasks"][0]
+            criterion = feature["criteria"][0]
+            completed = self.report_success(root, initial, old_task)
+            completed = self.record_check(
+                root, completed["revision"], old_task, criterion,
+            )
+
+            folder = root / "specs" / feature["directory"]
+            spec_path = folder / "spec.md"
+            tasks_path = folder / "tasks.md"
+            spec = spec_path.read_text(encoding="utf-8")
+            spec = spec.replace(
+                "Deliver the complete user-visible outcome.",
+                "Show only records matching the requested filter.",
+            ).replace(
+                "The focused regression suite passes.",
+                "Only matching records remain visible.",
+            )
+            spec_path.write_text(spec, encoding="utf-8")
+            tasks = tasks_path.read_text(encoding="utf-8")
+            start = tasks.index(f"### `{old_task['id']}` — Implement the unfiltered list")
+            end = tasks.index("<!-- evospec-generated:start -->", start)
+            definition = (
+                "### `T-filter-task` — Implement filtered search\n"
+                "- Increment: `none`\n"
+                f"- Criteria: `{criterion['id']}`\n"
+                "- Depends on: none\n"
+                "- Description:\n"
+                "  Filter records before rendering the result list.\n\n"
+            )
+            tasks_path.write_text(
+                tasks[:start] + definition + tasks[end:],
+                encoding="utf-8",
+            )
+
+            before_status = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            proposed = execute(root, "status", None, "ses_ac0_primary_123")
+            after_status = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            self.assertEqual(before_status, after_status)
+            self.assertEqual(proposed["status"], "DOCUMENT_RECONCILIATION_REQUIRED")
+            changes = proposed["document_changes"]
+            self.assertEqual(
+                set(changes["semantic"]),
+                {
+                    f"specs/{feature['directory']}/spec.md",
+                    f"specs/{feature['directory']}/tasks.md",
+                },
+            )
+            self.assertEqual(changes["identity_ref_conflicts"], [])
+            self.assertEqual(proposed["features"], [])
+
+            reconciled = self.call(root, "reconcile", proposed["revision"], data={
+                "feature_id": feature["id"],
+                "retire_ids": [old_task["id"]],
+            })
+            adopted = _selected_feature(reconciled)
+            new_task = adopted["tasks"][0]
+            self.assertRegex(new_task["id"], r"^T-[0-9a-f]{32}$")
+            self.assertEqual(new_task["criteria_ids"], [criterion["id"]])
+            self.assertEqual(new_task["title"], "Implement filtered search")
+            stale = _criterion_check(adopted["criteria"][0])
+            self.assertFalse(stale["fresh"])
+            self.assertEqual(stale["stale_reason"], "criterion_changed")
+            self.assertEqual(new_task["status"], "READY")
+
+            started = self.call(root, "implement", reconciled["revision"], data={
+                "task_id": new_task["id"], "phase": "begin",
+            })
+            reported = self.call(root, "implement", started["revision"], data={
+                "task_id": new_task["id"], "phase": "report",
+                "result": "SUCCEEDED", "report": "Filtering is implemented.",
+            })
+            verified = self.record_check(
+                root, reported["revision"], new_task, adopted["criteria"][0],
+            )
+            self.assertEqual(_selected_feature(verified)["tasks"][0]["status"], "COMPLETED")
+            closed = self.call(root, "close", verified["revision"])
+            self.assertEqual(_selected_feature(closed)["status"], "CLOSED")
+            self.assertEqual(len(_selected_feature(closed)["closure_history"]), 1)
+
+    def test_direct_plan_edit_is_read_only_until_reconcile(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            initial = self.call(root, "specify", 0, data={
+                **spec_request("Hand-edited plan"),
+                "increments": [],
+                "tasks": [{"title": "Build the first path", "criteria": [0]}],
+                "plan": "Build the first path before polishing it.",
+            })
+            feature = _selected_feature(initial)
+            plan_path = root / "specs" / feature["directory"] / "plan.md"
+            authored = plan_path.read_text(encoding="utf-8").replace(
+                "Build the first path before polishing it.",
+                "Build the first path, then add the filter.",
+            )
+            plan_path.write_text(authored, encoding="utf-8")
+            before_status = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+
+            proposed = execute(root, "status", None, "ses_ac0_primary_123")
+
+            self.assertEqual(proposed["status"], "DOCUMENT_RECONCILIATION_REQUIRED")
+            self.assertEqual(proposed["revision"], initial["revision"])
+            self.assertEqual(
+                proposed["document_changes"]["semantic"],
+                [f"specs/{feature['directory']}/plan.md"],
+            )
+            self.assertEqual(before_status, {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            })
+
+            reconciled = self.call(root, "reconcile", proposed["revision"], data={
+                "feature_id": feature["id"],
+            })
+
+            self.assertEqual(_selected_feature(reconciled)["plan"], "Build the first path, then add the filter.")
+            self.assertEqual(plan_path.read_text(encoding="utf-8"), authored)
+            self.assertEqual(
+                execute(root, "status", None, "ses_ac0_primary_123")["document_changes"]["semantic"],
+                [],
+            )
+
+    def test_generated_index_tracks_worktree_default_and_lifecycle(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            first = self.call(root, "specify", 0, data={
+                **spec_request("First indexed Feature"),
+                "increments": [],
+                "tasks": [{"title": "Complete first Feature", "criteria": [0]}],
+                "plan": "",
+            })
+            first_feature = _selected_feature(first)
+            readme = root / "specs" / "README.md"
+
+            def index_entry(feature_id: str) -> str:
+                matches = [
+                    line for line in readme.read_text(encoding="utf-8").splitlines()
+                    if f"`{feature_id}`" in line
+                ]
+                self.assertEqual(len(matches), 1)
+                return matches[0]
+
+            first_entry = index_entry(first_feature["id"])
+            self.assertIn(" — OPEN — worktree default", first_entry)
+            first_link = first_entry.split("](", 1)[1].split(")", 1)[0]
+            self.assertTrue((root / "specs" / first_link).is_file())
+
+            before_note = "## Human overview\n\nKeep this introductory text.\n"
+            after_note = "\nHuman appendix remains unchanged.\n"
+            text = readme.read_text(encoding="utf-8")
+            text = text.replace(
+                "<!-- evospec-index:start -->",
+                before_note + "<!-- evospec-index:start -->",
+                1,
+            ).replace(
+                "<!-- evospec-index:end -->",
+                "<!-- evospec-index:end -->" + after_note,
+                1,
+            )
+            readme.write_text(text, encoding="utf-8")
+            reconcile_operations = TrackReplacements()
+            reconciled = self.call(root, "reconcile", first["revision"], data={
+                "feature_id": first_feature["id"],
+            }, operations=reconcile_operations)
+            self.assertNotIn(readme.resolve(), {
+                path.resolve() for path in reconcile_operations.targets
+            })
+            self.assertIn(before_note.strip(), readme.read_text(encoding="utf-8"))
+            self.assertIn(after_note.strip(), readme.read_text(encoding="utf-8"))
+
+            second = self.call(root, "specify", reconciled["revision"], data={
+                **spec_request("Second indexed Feature"),
+                "increments": [],
+                "tasks": [{"title": "Complete second Feature", "criteria": [0]}],
+                "plan": "",
+            })
+            second_feature = _selected_feature(second)
+            self.assertIn(" — OPEN", index_entry(first_feature["id"]))
+            self.assertNotIn("worktree default", index_entry(first_feature["id"]))
+            self.assertIn(" — OPEN — worktree default", index_entry(second_feature["id"]))
+            second_link = index_entry(second_feature["id"]).split("](", 1)[1].split(")", 1)[0]
+            self.assertTrue((root / "specs" / second_link).is_file())
+
+            selected_default = self.call(root, "use", second["revision"], data={
+                "feature_id": first_feature["id"], "scope": "worktree",
+            })
+            session_status = execute(root, "status", None, "ses_ac0_primary_123")
+            self.assertEqual(session_status["selected_feature_id"], second_feature["id"])
+            self.assertEqual(session_status["selection_scope"], "session")
+            self.assertIn(" — OPEN — worktree default", index_entry(first_feature["id"]))
+            self.assertNotIn("worktree default", index_entry(second_feature["id"]))
+
+            no_index_rewrite = TrackReplacements()
+            same_default = self.call(root, "use", selected_default["revision"], data={
+                "feature_id": first_feature["id"], "scope": "worktree",
+            }, operations=no_index_rewrite)
+            self.assertNotIn(readme.resolve(), {
+                path.resolve() for path in no_index_rewrite.targets
+            })
+            session_selected = self.call(root, "use", same_default["revision"], data={
+                "feature_id": first_feature["id"], "scope": "session",
+            })
+            reported = self.report_success(
+                root, session_selected, first_feature["tasks"][0],
+            )
+            verified = self.record_check(
+                root, reported["revision"],
+                first_feature["tasks"][0], first_feature["criteria"][0],
+            )
+            close_operations = TrackReplacements()
+            closed = self.call(
+                root, "close", verified["revision"], data={
+                    "feature_id": first_feature["id"],
+                }, operations=close_operations,
+            )
+            self.assertIn(readme.resolve(), {
+                path.resolve() for path in close_operations.targets
+            })
+            self.assertIn(" — CLOSED — worktree default", index_entry(first_feature["id"]))
+            self.assertIn(before_note.strip(), readme.read_text(encoding="utf-8"))
+            self.assertIn(after_note.strip(), readme.read_text(encoding="utf-8"))
+            self.assertFalse(
+                (root / "specs" / first_feature["directory"] / "plan.md").exists(),
+            )
+            self.assertFalse(
+                (root / "specs" / first_feature["directory"] / "decisions.md").exists(),
+            )
+            self.assertEqual(_selected_feature(closed)["status"], "CLOSED")
+
+    def test_direct_addition_of_pending_criterion_and_task_preserves_completed_work(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            initial = self.call(root, "specify", 0, data={
+                "title": "Create and filter records",
+                "outcome": "Create a usable record list and let users filter it.",
+                "criteria": [
+                    {
+                        "description": "The records page is created and loads.",
+                        "check_kind": "python-unittest",
+                        "check_target": "tests.test_continuity",
+                    },
+                    {
+                        "description": "All existing records are shown.",
+                        "check_kind": "python-unittest",
+                        "check_target": "tests.test_continuity",
+                    },
+                ],
+                "increments": [],
+                "tasks": [
+                    {
+                        "title": "Create the records page",
+                        "description": "Create the page and load its records.",
+                        "criteria": [0],
+                    },
+                    {
+                        "title": "Render all records",
+                        "description": "Show every loaded record.",
+                        "criteria": [1],
+                    },
+                ],
+                "plan": "",
+            })
+            feature = _selected_feature(initial)
+            old_feature_id = feature["id"]
+            old_criteria = list(feature["criteria"])
+            old_tasks = list(feature["tasks"])
+            first = self.report_success(root, initial, old_tasks[0])
+            first = self.record_check(
+                root, first["revision"], old_tasks[0], old_criteria[0],
+            )
+            self.assertEqual(
+                _criterion_check(_selected_feature(first)["criteria"][0])["fresh"],
+                True,
+            )
+
+            folder = root / "specs" / feature["directory"]
+            spec_path = folder / "spec.md"
+            tasks_path = folder / "tasks.md"
+            spec = spec_path.read_text(encoding="utf-8")
+            criterion_definition = (
+                "- `C-filter` — Only records matching the requested filter are shown.\n"
+                "  - Check: `python-unittest`\n"
+                "  - Target: `tests.test_continuity`\n"
+            )
+            marker = "\n\n## Increments (optional Slices)"
+            self.assertIn(marker, spec)
+            spec_path.write_text(
+                spec.replace(marker, f"\n\n{criterion_definition}\n{marker[2:]}", 1),
+                encoding="utf-8",
+            )
+            tasks = tasks_path.read_text(encoding="utf-8")
+            definition = (
+                "### `T-filter` — Implement record filtering\n"
+                "- Increment: `none`\n"
+                "- Criteria: `C-filter`\n"
+                "- Depends on: none\n"
+                "- Description:\n"
+                "  Filter the loaded records before rendering them.\n\n"
+            )
+            generated = "<!-- evospec-generated:start -->"
+            before_generated, after_generated = tasks.split(generated, 1)
+            tasks_path.write_text(
+                before_generated.rstrip("\r\n") + "\n\n" + definition
+                + generated + after_generated,
+                encoding="utf-8",
+            )
+            before_status = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            revision_before_status = first["revision"]
+
+            proposed = execute(root, "status", None, "ses_ac0_primary_123")
+
+            self.assertEqual(proposed["revision"], revision_before_status)
+            self.assertEqual(proposed["status"], "DOCUMENT_RECONCILIATION_REQUIRED")
+            self.assertEqual(
+                set(proposed["document_changes"]["semantic"]),
+                {
+                    f"specs/{feature['directory']}/spec.md",
+                    f"specs/{feature['directory']}/tasks.md",
+                },
+            )
+            self.assertEqual(before_status, {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            })
+
+            reconciled = self.call(root, "reconcile", proposed["revision"], data={
+                "feature_id": old_feature_id,
+            })
+            adopted = _selected_feature(reconciled)
+            current_criteria = adopted["criteria"]
+            current_tasks = adopted["tasks"]
+            new_criterion = next(
+                item for item in current_criteria
+                if item["description"] == "Only records matching the requested filter are shown."
+            )
+            new_task = next(
+                item for item in current_tasks
+                if item["title"] == "Implement record filtering"
+            )
+            self.assertEqual(adopted["id"], old_feature_id)
+            self.assertTrue({item["id"] for item in old_criteria} <= {
+                item["id"] for item in current_criteria
+            })
+            self.assertTrue({item["id"] for item in old_tasks} <= {
+                item["id"] for item in current_tasks
+            })
+            self.assertRegex(new_criterion["id"], r"^C-[0-9a-f]{32}$")
+            self.assertRegex(new_task["id"], r"^T-[0-9a-f]{32}$")
+            self.assertEqual(new_task["criteria_ids"], [new_criterion["id"]])
+            self.assertEqual(new_task["status"], "READY")
+            self.assertTrue(_criterion_check(current_criteria[0])["fresh"])
+            self.assertIsNone(current_criteria[2].get("check"))
+            self.assertEqual(
+                {item["id"] for item in current_tasks},
+                {item["id"] for item in old_tasks} | {new_task["id"]},
+            )
+
+            second = self.report_success(
+                root, reconciled, next(item for item in current_tasks if item["title"] == "Render all records"),
+            )
+            second = self.record_check(
+                root, second["revision"],
+                next(item for item in _selected_feature(second)["tasks"] if item["title"] == "Render all records"),
+                next(item for item in _selected_feature(second)["criteria"] if item["description"] == "All existing records are shown."),
+            )
+            third = self.report_success(
+                root, second, next(item for item in _selected_feature(second)["tasks"] if item["id"] == new_task["id"]),
+            )
+            completed = self.record_check(
+                root, third["revision"],
+                next(item for item in _selected_feature(third)["tasks"] if item["id"] == new_task["id"]),
+                next(item for item in _selected_feature(third)["criteria"] if item["id"] == new_criterion["id"]),
+            )
+            complete_feature = _selected_feature(completed)
+            self.assertTrue(all(item["status"] == "COMPLETED" for item in complete_feature["tasks"]))
+            self.assertTrue(all(
+                _criterion_check(item)["fresh"] and _criterion_check(item)["passed"]
+                for item in complete_feature["criteria"]
+            ))
+            closed = self.call(root, "close", completed["revision"])
+            self.assertEqual(_selected_feature(closed)["status"], "CLOSED")
+            self.assertEqual(len(_selected_feature(closed)["closure_history"]), 1)
+
+    def test_format_notes_and_generated_checkbox_are_separate_from_semantics(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            initial = self.call(root, "specify", 0, data={
+                **spec_request("Notes and checkbox"),
+                "increments": [],
+                "tasks": [{"title": "One task", "criteria": [0]}],
+                "plan": "",
+            })
+            feature = _selected_feature(initial)
+            folder = root / "specs" / feature["directory"]
+            spec_path = folder / "spec.md"
+            tasks_path = folder / "tasks.md"
+            spec = spec_path.read_text(encoding="utf-8")
+            spec_path.write_text(
+                spec.replace(
+                    "<!-- evospec-notes:end -->",
+                    "Author note: keep the filtering example small.\n<!-- evospec-notes:end -->",
+                ),
+                encoding="utf-8",
+            )
+            original_files = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            note_status = execute(root, "status", None, "ses_ac0_primary_123")
+            self.assertEqual(original_files, {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            })
+            self.assertEqual(note_status["document_changes"]["semantic"], [])
+            self.assertEqual(
+                note_status["document_changes"]["format_notes"],
+                [f"specs/{feature['directory']}/spec.md"],
+            )
+            self.assertEqual(note_status["document_changes"]["generated"], [])
+            noted = self.call(root, "reconcile", note_status["revision"], data={
+                "feature_id": feature["id"],
+            })
+            self.assertIn(
+                "Author note: keep the filtering example small.",
+                spec_path.read_text(encoding="utf-8"),
+            )
+
+            task_id = _selected_feature(noted)["tasks"][0]["id"]
+            tasks = tasks_path.read_text(encoding="utf-8")
+            tasks_path.write_text(
+                tasks.replace(f"- [ ] `{task_id}`", f"- [x] `{task_id}`"),
+                encoding="utf-8",
+            )
+            before_checkbox_status = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            checkbox_status = execute(root, "status", None, "ses_ac0_primary_123")
+            self.assertEqual(before_checkbox_status, {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            })
+            self.assertEqual(checkbox_status["document_changes"]["semantic"], [])
+            self.assertEqual(checkbox_status["document_changes"]["format_notes"], [])
+            self.assertEqual(
+                checkbox_status["document_changes"]["generated"],
+                [f"specs/{feature['directory']}/tasks.md"],
+            )
+            self.assertEqual(
+                checkbox_status["selected_feature"]["tasks"][0]["status"],
+                "READY",
+            )
+            refreshed = self.call(root, "reconcile", checkbox_status["revision"], data={
+                "feature_id": feature["id"],
+            })
+            self.assertEqual(_selected_feature(refreshed)["tasks"][0]["status"], "READY")
+            self.assertIn(f"- [ ] `{task_id}`", tasks_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                execute(root, "status", None, "ses_ac0_primary_123")[
+                    "document_changes"
+                ]["generated"],
+                [],
+            )
+
+    def test_status_and_reconcile_fail_closed_on_unknown_duplicate_or_dangling_ids(self) -> None:
+        for invalid_edit in ("unknown-stable-id", "duplicate-id", "dangling-reference"):
+            with self.subTest(invalid_edit=invalid_edit), self._temp() as temporary:
+                root = Path(temporary)
+                initial = self.call(root, "specify", 0, data={
+                    **spec_request("Identity conflict"),
+                    "increments": [],
+                    "tasks": [{"title": "One task", "criteria": [0]}],
+                    "plan": "",
+                })
+                feature = _selected_feature(initial)
+                folder = root / "specs" / feature["directory"]
+                spec_path = folder / "spec.md"
+                tasks_path = folder / "tasks.md"
+                criterion_id = feature["criteria"][0]["id"]
+                if invalid_edit == "unknown-stable-id":
+                    replacement = "C-" + "0" * 32
+                    spec_path.write_text(
+                        spec_path.read_text(encoding="utf-8").replace(
+                            criterion_id, replacement,
+                        ),
+                        encoding="utf-8",
+                    )
+                    tasks_path.write_text(
+                        tasks_path.read_text(encoding="utf-8").replace(
+                            criterion_id, replacement,
+                        ),
+                        encoding="utf-8",
+                    )
+                elif invalid_edit == "duplicate-id":
+                    content = spec_path.read_text(encoding="utf-8")
+                    start = content.index("## Acceptance criteria\n\n") + len(
+                        "## Acceptance criteria\n\n",
+                    )
+                    end = content.index("\n\n## Increments", start)
+                    block = content[start:end]
+                    spec_path.write_text(
+                        content[:end] + "\n\n" + block + content[end:],
+                        encoding="utf-8",
+                    )
+                else:
+                    tasks_path.write_text(
+                        tasks_path.read_text(encoding="utf-8").replace(
+                            criterion_id, "C-" + "0" * 32,
+                        ),
+                        encoding="utf-8",
+                    )
+                before = {
+                    path.relative_to(root): path.read_bytes()
+                    for path in root.rglob("*") if path.is_file()
+                }
+                projected = execute(root, "status", None, "ses_ac0_primary_123")
+                self.assertEqual(
+                    projected["status"], "DOCUMENT_CONFLICT",
+                )
+                self.assertTrue(projected["document_changes"]["identity_ref_conflicts"])
+                self.assertEqual(projected["features"], [])
+                self.assertEqual(before, {
+                    path.relative_to(root): path.read_bytes()
+                    for path in root.rglob("*") if path.is_file()
+                })
+                with self.assertRaises(ContinuityError) as raised:
+                    self.call(root, "reconcile", initial["revision"], data={
+                        "feature_id": feature["id"],
+                    })
+                self.assertIn(
+                    raised.exception.code,
+                    ("IDENTITY_CONFLICT", "DOCUMENT_DIVERGED"),
+                )
+
+    def test_closed_feature_reconcile_requires_exact_explicit_reopen(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            initial = self.call(root, "specify", 0, data={
+                **spec_request("Explicit reopen"),
+                "increments": [],
+                "tasks": [{"title": "Implement current behavior", "criteria": [0]}],
+                "plan": "",
+            })
+            feature = _selected_feature(initial)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            reported = self.report_success(root, initial, task)
+            verified = self.record_check(
+                root, reported["revision"], task, criterion,
+            )
+            closed = self.call(root, "close", verified["revision"])
+            folder = root / "specs" / feature["directory"]
+            spec_path = folder / "spec.md"
+            spec_path.write_text(
+                spec_path.read_text(encoding="utf-8").replace(
+                    "The focused regression suite passes.",
+                    "The revised behavior passes its focused regression.",
+                ),
+                encoding="utf-8",
+            )
+            proposed = execute(root, "status", None, "ses_ac0_primary_123")
+            self.assertEqual(proposed["status"], "DOCUMENT_RECONCILIATION_REQUIRED")
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            for reopen_feature_id in ("F-" + "0" * 32, None):
+                data: dict[str, object] = {"feature_id": feature["id"]}
+                if reopen_feature_id is not None:
+                    data["reopen_feature_id"] = reopen_feature_id
+                with self.assertRaises(ContinuityError) as raised:
+                    self.call(root, "reconcile", closed["revision"], data=data)
+                self.assertEqual(raised.exception.code, "REOPEN_INTENT_REQUIRED")
+                self.assertEqual(before, {
+                    path.relative_to(root): path.read_bytes()
+                    for path in root.rglob("*") if path.is_file()
+                })
+            reopened = self.call(root, "reconcile", closed["revision"], data={
+                "feature_id": feature["id"],
+                "reopen_feature_id": feature["id"],
+            })
+            current = _selected_feature(reopened)
+            self.assertEqual(current["status"], "OPEN")
+            reopened_state = json.loads(
+                (root / ".evospec" / "continuity.json").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(reopened_state["features"][feature["id"]]["cycle"], 2)
+            self.assertEqual(len(current["closure_history"]), 1)
+            self.assertEqual(len(current["reopen_history"]), 1)
+            self.assertEqual(
+                _criterion_check(current["criteria"][0])["stale_reason"],
+                "criterion_changed",
+            )
+            self.assertIn(
+                f"`{feature['id']}` — OPEN — worktree default",
+                (root / "specs" / "README.md").read_text(encoding="utf-8"),
+            )
+
+    def test_closed_feature_rejects_semantic_writes_until_explicit_change(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            initial = self.call(root, "specify", 0, data={
+                **spec_request("Closed semantic writes"),
+                "increments": [],
+                "tasks": [{"title": "Complete current behavior", "criteria": [0]}],
+                "plan": "",
+            })
+            feature = _selected_feature(initial)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            reported = self.report_success(root, initial, task)
+            verified = self.record_check(
+                root, reported["revision"], task, criterion,
+            )
+            closed = self.call(root, "close", verified["revision"])
+            folder = root / "specs" / feature["directory"]
+            before_files = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            closed_state = json.loads(
+                (root / ".evospec" / "continuity.json").read_text(encoding="utf-8"),
+            )
+            attempts = (
+                ("clarify", {"question": "Should this change?", "decision": "Not yet."}),
+                ("plan", {"plan": "Add the unapproved next step."}),
+                ("tasks", {
+                    "task_title": "Add an incomplete task",
+                    "task_description": "This must not be published while closed.",
+                    "criteria_ids": [criterion["id"]],
+                }),
+                ("implement", {"task_id": task["id"], "phase": "begin"}),
+                ("verify", {}),
+                ("pause", {
+                    "reason": "This detour must not append history while closed.",
+                    "detour_kind": "RELATED",
+                    "detour_title": "Inspect a related issue",
+                    "return_task_id": task["id"],
+                }),
+            )
+            for operation, data in attempts:
+                with self.subTest(operation=operation), self.assertRaises(
+                    ContinuityError,
+                ) as raised:
+                    self.call(root, operation, closed["revision"], data=data)
+                self.assertEqual(raised.exception.code, "REOPEN_INTENT_REQUIRED")
+                self.assertIn("reconcile", str(raised.exception))
+                self.assertEqual(before_files, {
+                    path.relative_to(root): path.read_bytes()
+                    for path in root.rglob("*") if path.is_file()
+                })
+                current_state = json.loads(
+                    (root / ".evospec" / "continuity.json").read_text(encoding="utf-8"),
+                )
+                self.assertEqual(current_state, closed_state)
+
+            self.assertFalse((folder / "plan.md").exists())
+            self.assertFalse((folder / "decisions.md").exists())
+            for operation, revision, data in (
+                ("status", None, None),
+                ("tasks", None, None),
+                ("implement", closed["revision"], {"phase": "queue"}),
+            ):
+                query = self.call(root, operation, revision, data=data)
+                self.assertEqual(_selected_feature(query)["status"], "CLOSED")
+            self.assertEqual(before_files, {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            })
+            closed_feature = _selected_feature(closed)
+            self.assertEqual(len(closed_feature["tasks"]), 1)
+            self.assertEqual(closed_feature["tasks"][0]["status"], "COMPLETED")
+            self.assertEqual(len(closed_feature["closure_history"]), 1)
+            self.assertEqual(closed_feature["reopen_history"], [])
+
+            reopened = self.call(root, "change", closed["revision"], data={
+                "feature_id": feature["id"],
+                "outcome": "An explicitly reopened follow-up outcome.",
+                "task_title": "Implement the follow-up",
+                "task_description": "Continue in a new recorded cycle.",
+                "criteria_ids": [criterion["id"]],
+            })
+            reopened_feature = _selected_feature(reopened)
+            self.assertEqual(reopened_feature["status"], "OPEN")
+            self.assertEqual(reopened_feature["cycle"], 2)
+            self.assertEqual(len(reopened_feature["closure_history"]), 1)
+            self.assertEqual(len(reopened_feature["reopen_history"]), 1)
+            self.assertEqual(len(reopened_feature["tasks"]), 2)
+            self.assertEqual(reopened_feature["tasks"][1]["status"], "READY")
+            self.assertIn(
+                f"`{feature['id']}` — OPEN — worktree default",
+                (root / "specs" / "README.md").read_text(encoding="utf-8"),
+            )
+
+    def test_schema_one_legacy_fixture_upgrade_preserves_history_and_checkpoint(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            first = self.call(root, "specify", 0, data={
+                **spec_request("Closed legacy Feature"),
+                "increments": [],
+                "tasks": [{"title": "Complete first Feature", "criteria": [0]}],
+                "plan": "",
+            })
+            feature = _selected_feature(first)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            reported = self.report_success(root, first, task)
+            verified = self.record_check(
+                root, reported["revision"], task, criterion,
+            )
+            closed = self.call(root, "close", verified["revision"])
+            second = self.call(root, "specify", closed["revision"], data={
+                **spec_request("Checkpointed legacy Feature"),
+                "increments": [],
+                "tasks": [{"title": "Continue second Feature", "criteria": [0]}],
+                "plan": "",
+            })
+            second_feature = _selected_feature(second)
+            checkpointed = self.call(root, "implement", second["revision"], data={
+                "task_id": second_feature["tasks"][0]["id"],
+                "phase": "begin",
+                "report": "Preserve this checkpoint through the fixture upgrade.",
+            })
+            self.assertEqual(
+                _execution(checkpointed)["task_id"],
+                second_feature["tasks"][0]["id"],
+            )
+            legacy = _rewrite_as_legacy_fixture(root)
+            legacy_checks = json.loads(json.dumps(legacy["checks"]))
+            legacy_attempts = json.loads(json.dumps(legacy["attempts"]))
+            legacy_execution = json.loads(json.dumps(legacy["execution"]))
+            legacy_closures = json.loads(json.dumps(legacy["closures"]))
+            revision = legacy["revision"]
+
+            before_blocked_write = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "plan", revision, data={"plan": "not a legacy write"})
+            self.assertEqual(raised.exception.code, "UPGRADE_REQUIRED")
+            self.assertEqual(before_blocked_write, {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            })
+
+            upgraded = execute(
+                root, "upgrade_markdown", revision, "ses_ac0_primary_123",
+            )
+            self.assertEqual(upgraded["revision"], revision + 1)
+            saved = json.loads(
+                (root / ".evospec" / "continuity.json").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(saved["checks"], legacy_checks)
+            self.assertEqual(saved["attempts"], legacy_attempts)
+            self.assertEqual(saved["execution"], legacy_execution)
+            self.assertEqual(saved["closures"], legacy_closures)
+            first_after = next(
+                item for item in upgraded["features"]
+                if item["id"] == feature["id"]
+            )
+            second_after = next(
+                item for item in upgraded["features"]
+                if item["id"] == second_feature["id"]
+            )
+            self.assertEqual(first_after["status"], "CLOSED")
+            self.assertEqual(len(first_after["closure_history"]), 1)
+            self.assertEqual(second_after["tasks"][0]["status"], "OUTCOME_UNKNOWN")
+            legacy_check = _criterion_check(first_after["criteria"][0])
+            self.assertFalse(legacy_check["fresh"])
+            self.assertTrue(legacy_check["historical_passed"])
+            self.assertEqual(legacy_check["stale_reason"], "task_changed")
+            for path in (root / "specs").glob("*/*.md"):
+                self.assertNotIn(b"<!-- evospec-data:start -->", path.read_bytes())
+
+    def test_legacy_upgrade_refuses_dirty_or_mixed_markdown_sources(self) -> None:
+        for source_kind in ("dirty", "mixed"):
+            with self.subTest(source_kind=source_kind), self._temp() as temporary:
+                root = Path(temporary)
+                initial = self.call(root, "specify", 0, data={
+                    **spec_request("Legacy safety"),
+                    "increments": [],
+                    "tasks": [{"title": "One task", "criteria": [0]}],
+                    "plan": "",
+                })
+                feature = _selected_feature(initial)
+                legacy = _rewrite_as_legacy_fixture(root)
+                spec_path = root / "specs" / feature["directory"] / "spec.md"
+                if source_kind == "dirty":
+                    spec_path.write_text(
+                        spec_path.read_text(encoding="utf-8") + "\nConcurrent note.\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    from evospec.continuity_documents import render_document
+
+                    parsed = parse_all_documents(root, legacy, feature["id"])
+                    content = render_document(
+                        "spec", parsed["spec"], legacy, feature["id"], parsed["spec"],
+                    ).encode("utf-8")
+                    spec_path.write_bytes(content)
+                    legacy["documents"][
+                        f"specs/{feature['directory']}/spec.md"
+                    ] = sha256(content).hexdigest()
+                    (root / ".evospec" / "continuity.json").write_text(
+                        json.dumps(
+                            legacy, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        encoding="utf-8",
+                    )
+                before = {
+                    path.relative_to(root): path.read_bytes()
+                    for path in root.rglob("*") if path.is_file()
+                }
+                with self.assertRaises(ContinuityError) as raised:
+                    self.call(root, "upgrade_markdown", initial["revision"])
+                self.assertEqual(
+                    raised.exception.code,
+                    "DOCUMENT_DIVERGED" if source_kind == "dirty" else "UPGRADE_UNSAFE",
+                )
+                self.assertEqual(before, {
+                    path.relative_to(root): path.read_bytes()
+                    for path in root.rglob("*") if path.is_file()
+                })
+
+    def test_reconcile_read_set_race_stops_before_replacing_any_document(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            first = self.call(root, "specify", 0, data={
+                **spec_request("Selected Feature"),
+                "increments": [],
+                "tasks": [{"title": "Selected Task", "criteria": [0]}],
+                "plan": "",
+            })
+            first_feature = _selected_feature(first)
+            second = self.call(root, "specify", first["revision"], data={
+                **spec_request("Concurrent Feature"),
+                "increments": [],
+                "tasks": [{"title": "Other Task", "criteria": [0]}],
+                "plan": "",
+            })
+            selected_spec = root / "specs" / first_feature["directory"] / "spec.md"
+            selected_original = selected_spec.read_text(encoding="utf-8")
+            selected_spec.write_text(
+                selected_original.replace(
+                    "Deliver the complete user-visible outcome.",
+                    "Adopt this human-authored outcome.",
+                ),
+                encoding="utf-8",
+            )
+            other_feature = _selected_feature(second)
+            other_spec = root / "specs" / other_feature["directory"] / "spec.md"
+            raced_content = "Concurrent editor update; preserve this text.\n"
+            operations = EditOnJournalReplace(other_spec, raced_content)
+            before_revision = second["revision"]
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "reconcile", before_revision, data={
+                    "feature_id": first_feature["id"],
+                }, operations=operations)
+            self.assertEqual(raised.exception.code, "DOCUMENT_DIVERGED")
+            self.assertTrue(operations.edited)
+            self.assertEqual(other_spec.read_text(encoding="utf-8"), raced_content)
+            self.assertIn(
+                "Adopt this human-authored outcome.",
+                selected_spec.read_text(encoding="utf-8"),
+            )
+            state = json.loads(
+                (root / ".evospec" / "continuity.json").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(state["revision"], before_revision)
+            self.assertIsNotNone(state["pending"])
 
     def test_more_than_three_dynamic_tasks_and_worktree_session_selection(self) -> None:
         with self._temp() as temporary:
@@ -862,13 +1830,13 @@ class ContinuityTests(unittest.TestCase):
             pending = self.call(root, "status", None)
             self.assertEqual(pending["status"], "RECOVERY_REQUIRED")
             journal = json.loads((root / ".evospec" / "continuity.json").read_text(encoding="utf-8"))
-            published = next(item for item in journal["pending"]["writes"] if item["path"].endswith("/decisions.md"))
-            decisions = root / Path(published["path"])
-            decisions.write_text("manual concurrent edit", encoding="utf-8")
+            published = next(item for item in journal["pending"]["writes"] if item["path"].endswith("/spec.md"))
+            spec = root / Path(published["path"])
+            spec.write_text("manual concurrent edit", encoding="utf-8")
             with self.assertRaises(ContinuityError) as raised:
                 self.call(root, "resume", 0)
             self.assertEqual(raised.exception.code, "DOCUMENT_DIVERGED")
-            self.assertEqual(decisions.read_text(encoding="utf-8"), "manual concurrent edit")
+            self.assertEqual(spec.read_text(encoding="utf-8"), "manual concurrent edit")
 
     def test_same_revision_competing_writers_serialize_and_only_one_commits(self) -> None:
         with self._temp() as temporary:
