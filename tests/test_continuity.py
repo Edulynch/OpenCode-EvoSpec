@@ -8,11 +8,132 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard, TypedDict
 
 from evospec.continuity import ContinuityError, execute
 from evospec.persistence import AtomicFailure, FileOperations, RecoveryError, StateStore
 from tests._tempdir import TemporaryDirectory
+
+
+class _IncrementView(TypedDict):
+    id: str
+
+
+class _ExecutionView(TypedDict):
+    task_id: str
+
+
+class _FeatureView(TypedDict):
+    id: str
+    directory: str
+    kind: str
+    status: str
+    paused: bool
+    pause_reason: str | None
+    increments: list[_IncrementView]
+    tasks: list[dict[str, object]]
+    criteria: list[dict[str, object]]
+    decisions: list[dict[str, object]]
+    detours: list[dict[str, object]]
+    closure_history: list[object]
+    reopen_history: list[object]
+    plan: str
+
+
+class _ContinuityView(TypedDict):
+    revision: int
+    mode: str | None
+    status: str | None
+    selected_feature: _FeatureView | None
+    execution: _ExecutionView | None
+
+
+def _record(value: object) -> TypeGuard[dict[str, object]]:
+    return isinstance(value, dict) and all(isinstance(key, str) for key in value)
+
+
+def _text(value: object) -> TypeGuard[str]:
+    return isinstance(value, str)
+
+
+def _optional_text(value: object) -> TypeGuard[str | None]:
+    return value is None or isinstance(value, str)
+
+
+def _increment_view(value: object) -> TypeGuard[_IncrementView]:
+    return _record(value) and _text(value.get("id"))
+
+
+def _execution_view(value: object) -> TypeGuard[_ExecutionView]:
+    return _record(value) and _text(value.get("task_id"))
+
+
+def _record_views(value: object) -> TypeGuard[list[dict[str, object]]]:
+    return isinstance(value, list) and all(_record(item) for item in value)
+
+
+def _increment_views(value: object) -> TypeGuard[list[_IncrementView]]:
+    return isinstance(value, list) and all(_increment_view(item) for item in value)
+
+
+def _feature_view(value: object) -> TypeGuard[_FeatureView]:
+    if not _record(value):
+        return False
+    return (
+        _text(value.get("id"))
+        and _text(value.get("directory"))
+        and _text(value.get("kind"))
+        and _text(value.get("status"))
+        and isinstance(value.get("paused"), bool)
+        and _optional_text(value.get("pause_reason"))
+        and _increment_views(value.get("increments"))
+        and _record_views(value.get("tasks"))
+        and _record_views(value.get("criteria"))
+        and _record_views(value.get("decisions"))
+        and _record_views(value.get("detours"))
+        and isinstance(value.get("closure_history"), list)
+        and isinstance(value.get("reopen_history"), list)
+        and _text(value.get("plan"))
+    )
+
+
+def _continuity_view(value: object) -> _ContinuityView:
+    if not _record(value):
+        raise AssertionError("expected continuity response object")
+    revision = value.get("revision")
+    mode = value.get("mode")
+    status = value.get("status")
+    selected_feature = value.get("selected_feature")
+    execution = value.get("execution")
+    if type(revision) is not int:
+        raise AssertionError("expected integer continuity revision")
+    if not _optional_text(mode) or not _optional_text(status):
+        raise AssertionError("expected optional text continuity fields")
+    if selected_feature is not None and not _feature_view(selected_feature):
+        raise AssertionError("expected selected feature view")
+    if execution is not None and not _execution_view(execution):
+        raise AssertionError("expected execution view")
+    return {
+        "revision": revision,
+        "mode": mode,
+        "status": status,
+        "selected_feature": selected_feature,
+        "execution": execution,
+    }
+
+
+def _selected_feature(result: _ContinuityView) -> _FeatureView:
+    feature = result["selected_feature"]
+    if feature is None:
+        raise AssertionError("expected selected feature")
+    return feature
+
+
+def _execution(result: _ContinuityView) -> _ExecutionView:
+    execution = result["execution"]
+    if execution is None:
+        raise AssertionError("expected active execution")
+    return execution
 
 
 def _competing_process_plan(
@@ -26,10 +147,10 @@ def _competing_process_plan(
     ready.put("ready")
     try:
         start.wait(timeout=30)
-        result = execute(
+        result = _continuity_view(execute(
             Path(root), "plan", expected_revision,
             f"ses_ac0_process_{plan[-1]}", {"plan": plan},
-        )
+        ))
     except ContinuityError as error:
         outcomes.put({"status": error.code})
     except Exception as error:
@@ -41,7 +162,7 @@ def _competing_process_plan(
         outcomes.put({
             "status": "committed",
             "revision": result["revision"],
-            "plan": result["selected_feature"]["plan"],
+            "plan": _selected_feature(result)["plan"],
         })
 
 
@@ -94,14 +215,14 @@ class ContinuityTests(unittest.TestCase):
         self, root: Path, operation: str, revision: int | None,
         session: str = "ses_ac0_primary_123", data: dict[str, object] | None = None,
         operations: FileOperations | None = None,
-    ) -> dict[str, object]:
-        return execute(root, operation, revision, session, data, operations)
+    ) -> _ContinuityView:
+        return _continuity_view(execute(root, operation, revision, session, data, operations))
 
     def test_specify_writes_stable_composed_markdown_and_reads_without_writing(self) -> None:
         with self._temp() as temporary:
             root = Path(temporary)
             first = self.call(root, "specify", 0, data=spec_request())
-            feature = first["selected_feature"]
+            feature = _selected_feature(first)
             self.assertRegex(feature["directory"], r"^\d{3,}-")
             self.assertEqual(first["mode"], "COMPOSED")
             self.assertEqual(len(feature["increments"]), 3)
@@ -134,19 +255,22 @@ class ContinuityTests(unittest.TestCase):
         with self._temp() as temporary:
             root = Path(temporary)
             first = self.call(root, "specify", 0, data=spec_request())
-            feature_a = first["selected_feature"]
+            feature_a = _selected_feature(first)
             feature_id_a = feature_a["id"]
             revision = first["revision"]
             criterion_id = feature_a["criteria"][0]["id"]
+            latest: _ContinuityView | None = None
             for number in range(4, 8):
-                result = self.call(root, "tasks", revision, data={
+                latest = self.call(root, "tasks", revision, data={
                     "task_title": f"Dynamically expanded task {number}",
                     "task_description": "Added from current requirements.",
                     "criteria_ids": [criterion_id],
                     "depends_on": [feature_a["tasks"][-1]["id"]] if number == 4 else [],
                 })
-                revision = result["revision"]
-            self.assertEqual(len(result["selected_feature"]["tasks"]), 7)
+                revision = latest["revision"]
+            if latest is None:
+                self.fail("expected dynamic task expansion")
+            self.assertEqual(len(_selected_feature(latest)["tasks"]), 7)
 
             another = self.call(root, "specify", revision, "ses_ac0_other_456", {
                 **spec_request("Independent feature"),
@@ -157,27 +281,27 @@ class ContinuityTests(unittest.TestCase):
                     "criteria": [0],
                 }],
             })
-            self.assertNotEqual(another["selected_feature"]["id"], feature_id_a)
-            self.assertEqual(self.call(root, "use", None)["selected_feature"]["id"], feature_id_a)
+            self.assertNotEqual(_selected_feature(another)["id"], feature_id_a)
+            self.assertEqual(_selected_feature(self.call(root, "use", None))["id"], feature_id_a)
             self.assertEqual(
-                self.call(root, "use", None, "ses_ac0_other_456")["selected_feature"]["id"],
-                another["selected_feature"]["id"],
+                _selected_feature(self.call(root, "use", None, "ses_ac0_other_456"))["id"],
+                _selected_feature(another)["id"],
             )
 
     def test_checkpoint_unknown_outcome_requires_reconciliation_and_external_return_preserves_work(self) -> None:
         with self._temp() as temporary:
             root = Path(temporary)
             current = self.call(root, "specify", 0, data=spec_request("Blue button sequence"))
-            feature = current["selected_feature"]
+            feature = _selected_feature(current)
             task = feature["tasks"][0]
             current = self.call(root, "implement", current["revision"], data={
                 "task_id": task["id"], "phase": "begin",
                 "report": "Checkpoint before changing the blue button.",
             })
-            self.assertEqual(current["execution"]["task_id"], task["id"])
-            self.assertEqual(current["selected_feature"]["tasks"][0]["status"], "OUTCOME_UNKNOWN")
+            self.assertEqual(_execution(current)["task_id"], task["id"])
+            self.assertEqual(_selected_feature(current)["tasks"][0]["status"], "OUTCOME_UNKNOWN")
             second_session = self.call(root, "status", None, "ses_ac0_restarted_789")
-            self.assertEqual(second_session["execution"]["task_id"], task["id"])
+            self.assertEqual(_execution(second_session)["task_id"], task["id"])
             with self.assertRaises(ContinuityError) as raised:
                 self.call(root, "implement", current["revision"], "ses_ac0_restarted_789", {
                     "task_id": task["id"], "phase": "begin",
@@ -199,21 +323,24 @@ class ContinuityTests(unittest.TestCase):
             })
             self.assertEqual(external.read_text(encoding="utf-8"), "preserved unrelated user change")
             self.assertEqual(returned["execution"], None)
-            self.assertEqual(returned["selected_feature"]["tasks"][0]["status"], "READY")
+            self.assertEqual(_selected_feature(returned)["tasks"][0]["status"], "READY")
             attempts = json.loads((root / ".evospec" / "continuity.json").read_text(encoding="utf-8"))["attempts"]
             self.assertEqual([item["status"] for item in attempts], ["RECONCILED_INCOMPLETE"])
-            result_decision = returned["selected_feature"]["decisions"][-1]
-            self.assertIn("Detour result for", result_decision["question"])
-            self.assertIn("recorded by session", result_decision["question"])
-            self.assertEqual(returned["selected_feature"]["criteria"][0]["check"], None)
+            result_decision = _selected_feature(returned)["decisions"][-1]
+            result_question = result_decision["question"]
+            if not isinstance(result_question, str):
+                self.fail("expected recorded decision question")
+            self.assertIn("Detour result for", result_question)
+            self.assertIn("recorded by session", result_question)
+            self.assertEqual(_selected_feature(returned)["criteria"][0]["check"], None)
 
     def test_related_and_external_detours_require_a_return_and_recorded_result(self) -> None:
         with self._temp() as temporary:
             root = Path(temporary)
             principal = self.call(root, "specify", 0, data=spec_request("Principal work"))
-            principal_feature = principal["selected_feature"]
+            principal_feature = _selected_feature(principal)
             other = self.call(root, "specify", principal["revision"], data=spec_request("Other work"))
-            other_task_id = other["selected_feature"]["tasks"][0]["id"]
+            other_task_id = _selected_feature(other)["tasks"][0]["id"]
             principal_task_id = principal_feature["tasks"][0]["id"]
             feature_id = principal_feature["id"]
             selected = self.call(root, "use", other["revision"], data={
@@ -250,7 +377,7 @@ class ContinuityTests(unittest.TestCase):
                     "detour_title": f"{kind.title()} detour",
                     "return_task_id": principal_task_id,
                 })
-                pause_record = paused["selected_feature"]["decisions"][-1]
+                pause_record = _selected_feature(paused)["decisions"][-1]
                 clarified = self.call(root, "clarify", paused["revision"], data={
                     "feature_id": feature_id,
                     "question": (
@@ -259,8 +386,8 @@ class ContinuityTests(unittest.TestCase):
                     ),
                     "decision": "Forged result-like clarification is not a detour result.",
                 })
-                self.assertTrue(clarified["selected_feature"]["paused"])
-                self.assertIsNone(clarified["selected_feature"]["detours"][-1]["result"])
+                self.assertTrue(_selected_feature(clarified)["paused"])
+                self.assertIsNone(_selected_feature(clarified)["detours"][-1]["result"])
                 before_resume = files()
                 for result in (None, ""):
                     data = {"feature_id": feature_id}
@@ -279,11 +406,14 @@ class ContinuityTests(unittest.TestCase):
                     "feature_id": feature_id,
                     "detour_summary": summary,
                 })
-                feature = returned["selected_feature"]
+                feature = _selected_feature(returned)
                 result_record = feature["decisions"][-1]
-                self.assertIn(pause_record["id"], result_record["question"])
-                self.assertIn(principal_task_id, result_record["question"])
-                self.assertIn("ses_ac0_primary_123", result_record["question"])
+                result_question = result_record["question"]
+                if not isinstance(result_question, str):
+                    self.fail("expected recorded decision question")
+                self.assertIn(pause_record["id"], result_question)
+                self.assertIn(principal_task_id, result_question)
+                self.assertIn("ses_ac0_primary_123", result_question)
                 self.assertEqual(result_record["decision"], summary)
                 self.assertFalse(feature["paused"])
                 detour = feature["detours"][-1]
@@ -313,7 +443,7 @@ class ContinuityTests(unittest.TestCase):
                 }],
                 "task_title": "Apply the isolated correction",
             })
-            feature = correction["selected_feature"]
+            feature = _selected_feature(correction)
             self.assertEqual(feature["kind"], "CORRECTION")
             self.assertEqual(feature["increments"], [])
 
@@ -322,9 +452,9 @@ class ContinuityTests(unittest.TestCase):
                 "reason": "Pause ordinary work.",
             })
             restarted = self.call(root, "status", None, "ses_ac0_restarted_456")
-            self.assertTrue(restarted["selected_feature"]["paused"])
+            self.assertTrue(_selected_feature(restarted)["paused"])
             self.assertEqual(
-                restarted["selected_feature"]["pause_reason"], "Pause ordinary work.",
+                _selected_feature(restarted)["pause_reason"], "Pause ordinary work.",
             )
             before_resume = {
                 path.relative_to(root): path.read_bytes()
@@ -347,10 +477,10 @@ class ContinuityTests(unittest.TestCase):
             resumed = self.call(root, "resume", paused["revision"], data={
                 "feature_id": feature["id"],
             }, session="ses_ac0_restarted_456")
-            self.assertFalse(resumed["selected_feature"]["paused"])
-            self.assertIsNone(resumed["selected_feature"]["pause_reason"])
-            self.assertEqual(resumed["selected_feature"]["decisions"], [])
-            self.assertEqual(resumed["selected_feature"]["increments"], [])
+            self.assertFalse(_selected_feature(resumed)["paused"])
+            self.assertIsNone(_selected_feature(resumed)["pause_reason"])
+            self.assertEqual(_selected_feature(resumed)["decisions"], [])
+            self.assertEqual(_selected_feature(resumed)["increments"], [])
 
     def test_criterion_checks_gate_close_and_reopening_preserves_historical_closure(self) -> None:
         with self._temp() as temporary:
@@ -364,7 +494,7 @@ class ContinuityTests(unittest.TestCase):
                     "criteria": [0],
                 }],
             })
-            feature = result["selected_feature"]
+            feature = _selected_feature(result)
             task = feature["tasks"][0]
             criterion = feature["criteria"][0]
             result = self.call(root, "implement", result["revision"], data={
@@ -384,8 +514,8 @@ class ContinuityTests(unittest.TestCase):
                 "output_sha256": sha256(b"passing check").hexdigest(), "task_id": task["id"],
             })
             result = self.call(root, "close", result["revision"])
-            self.assertEqual(result["selected_feature"]["status"], "CLOSED")
-            self.assertEqual(len(result["selected_feature"]["closure_history"]), 1)
+            self.assertEqual(_selected_feature(result)["status"], "CLOSED")
+            self.assertEqual(len(_selected_feature(result)["closure_history"]), 1)
 
             result = self.call(root, "change", result["revision"], data={
                 "feature_id": feature["id"],
@@ -400,7 +530,7 @@ class ContinuityTests(unittest.TestCase):
                 "task_description": "Keep old receipts immutable.",
                 "criteria_ids": [criterion["id"]],
             })
-            feature = result["selected_feature"]
+            feature = _selected_feature(result)
             self.assertEqual(feature["status"], "OPEN")
             self.assertEqual(len(feature["closure_history"]), 1)
             self.assertEqual(len(feature["reopen_history"]), 1)
@@ -494,7 +624,7 @@ class ContinuityTests(unittest.TestCase):
                 self.assertIn(committed["plan"], ("process plan A", "process plan B"))
                 current = self.call(root, "status", None)
                 self.assertEqual(current["revision"], revision + 1)
-                self.assertEqual(current["selected_feature"]["plan"], committed["plan"])
+                self.assertEqual(_selected_feature(current)["plan"], committed["plan"])
             finally:
                 for process in processes:
                     if process.is_alive():

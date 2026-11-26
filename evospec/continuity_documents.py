@@ -6,9 +6,24 @@ import json
 import re
 from hashlib import sha256
 from pathlib import Path
+from typing import cast
 
-from .lifecycle import continuity_task_status
-from .domain import ContinuityError
+from .lifecycle import (
+    ContinuityFeatureView,
+    ContinuityStateView,
+    ContinuityTaskView,
+    continuity_task_status,
+)
+from .domain import (
+    ContinuityError,
+    ContinuityCriterionDocument,
+    ContinuityDecisionDocument,
+    ContinuityFeatureDocument,
+    ContinuityIncrementDocument,
+    ContinuityPlanDocument,
+    ContinuityStateData,
+    ContinuityTaskDocument,
+)
 
 _ID = re.compile(r"^[FSTCD]-[0-9a-f]{32}$")
 _DIRECTORY = re.compile(r"^[0-9]{3,}-[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -36,13 +51,13 @@ def initial_documents(
 
 
 def feature_document_writes(
-    root: Path, state: dict[str, object], feature_id: str,
+    root: Path, state: ContinuityStateData, feature_id: str,
     documents: dict[str, dict[str, object]], *, initial: bool = False,
 ) -> dict[str, tuple[bytes, str | None]]:
     folder = state["features"][feature_id]["directory"]
     feature = documents.get("spec")
     if feature is None:
-        feature = read_feature(root, state, feature_id)
+        feature = cast(dict[str, object], cast(object, read_feature(root, state, feature_id)))
     writes: dict[str, tuple[bytes, str | None]] = {}
     for name, value in documents.items():
         relative = f"specs/{folder}/{name}.md"
@@ -53,7 +68,7 @@ def feature_document_writes(
 
 
 def spec_write(
-    root: Path, state: dict[str, object], feature_id: str,
+    root: Path, state: ContinuityStateData, feature_id: str,
     feature: dict[str, object],
 ) -> dict[str, tuple[bytes, str | None]]:
     relative = f"specs/{state['features'][feature_id]['directory']}/spec.md"
@@ -66,11 +81,11 @@ def spec_write(
 
 
 def plan_write(
-    root: Path, state: dict[str, object], feature_id: str,
+    root: Path, state: ContinuityStateData, feature_id: str,
     feature: dict[str, object], plan: str,
 ) -> dict[str, tuple[bytes, str | None]]:
     relative = f"specs/{state['features'][feature_id]['directory']}/plan.md"
-    value = {"feature_id": feature_id, "plan": plan}
+    value: dict[str, object] = {"feature_id": feature_id, "plan": plan}
     return {
         relative: (
             render_document("plan", value, state, feature_id, feature).encode("utf-8"),
@@ -80,11 +95,11 @@ def plan_write(
 
 
 def tasks_write(
-    root: Path, state: dict[str, object], feature_id: str,
+    root: Path, state: ContinuityStateData, feature_id: str,
     tasks: list[dict[str, object]], feature: dict[str, object],
 ) -> dict[str, tuple[bytes, str | None]]:
     relative = f"specs/{state['features'][feature_id]['directory']}/tasks.md"
-    value = {"feature_id": feature_id, "tasks": tasks}
+    value: dict[str, object] = {"feature_id": feature_id, "tasks": tasks}
     return {
         relative: (
             render_document("tasks", value, state, feature_id, feature).encode("utf-8"),
@@ -94,11 +109,11 @@ def tasks_write(
 
 
 def decisions_write(
-    root: Path, state: dict[str, object], feature_id: str,
+    root: Path, state: ContinuityStateData, feature_id: str,
     decisions: list[dict[str, object]], feature: dict[str, object],
 ) -> dict[str, tuple[bytes, str | None]]:
     relative = f"specs/{state['features'][feature_id]['directory']}/decisions.md"
-    value = {"feature_id": feature_id, "decisions": decisions}
+    value: dict[str, object] = {"feature_id": feature_id, "decisions": decisions}
     return {
         relative: (
             render_document("decisions", value, state, feature_id, feature).encode("utf-8"),
@@ -108,7 +123,7 @@ def decisions_write(
 
 
 def render_document(
-    name: str, value: dict[str, object], state: dict[str, object],
+    name: str, value: dict[str, object], state: ContinuityStateData,
     feature_id: str, feature: dict[str, object],
 ) -> str:
     if name == "spec":
@@ -116,11 +131,11 @@ def render_document(
         criteria = "\n".join(
             f"- `{item['id']}` — {item['description']} "
             f"(`{item['check_kind']}: {item['check_target']}`)"
-            for item in value["criteria"]
+            for item in cast(list[ContinuityCriterionDocument], value["criteria"])
         )
         increments = "\n".join(
             f"- `{item['id']}` — **{item['title']}**: {item['outcome']}"
-            for item in value["increments"]
+            for item in cast(list[ContinuityIncrementDocument], value["increments"])
         ) or "- No Slice grouping; Tasks belong directly to this Feature."
         return (
             f"# {value['title']}\n\n"
@@ -136,8 +151,12 @@ def render_document(
         return f"# Plan for `{feature_id}`\n\n{text}\n\n{_data_block(value)}"
     if name == "tasks":
         rows = [f"# Tasks for `{feature_id}`", ""]
-        for task in value["tasks"]:
-            status = continuity_task_status(state, feature, task)
+        for task in cast(list[ContinuityTaskDocument], value["tasks"]):
+            status = continuity_task_status(
+                cast(ContinuityStateView, cast(object, state)),
+                cast(ContinuityFeatureView, cast(object, feature)),
+                cast(ContinuityTaskView, cast(object, task)),
+            )
             checkbox = "x" if status == "COMPLETED" else " "
             rows.extend((
                 f"## - [{checkbox}] `{task['id']}` {task['title']}",
@@ -154,7 +173,7 @@ def render_document(
         return "\n".join(rows) + "\n"
     if name == "decisions":
         rows = [f"# Decisions for `{feature_id}`", ""]
-        for decision in value["decisions"]:
+        for decision in cast(list[ContinuityDecisionDocument], value["decisions"]):
             rows.extend((f"## `{decision['id']}` — {decision['question']}", "", decision["decision"], ""))
         rows.append(_data_block(value))
         return "\n".join(rows) + "\n"
@@ -167,7 +186,7 @@ def _data_block(value: dict[str, object]) -> str:
 
 
 def read_document(
-    root: Path, state: dict[str, object], feature_id: str, name: str,
+    root: Path, state: ContinuityStateData, feature_id: str, name: str,
 ) -> dict[str, object]:
     relative = f"specs/{state['features'][feature_id]['directory']}/{_DOCUMENT_NAMES[name]}.md"
     safe_document_path(root, relative)
@@ -183,67 +202,84 @@ def read_document(
     if not block.startswith("```json\n") or not block.endswith("\n```"):
         raise ContinuityError("DOCUMENT_DIVERGED", f"{relative} has a malformed canonical data block")
     try:
-        value = json.loads(block[len("```json\n"):-len("\n```")])
+        value: object = json.loads(block[len("```json\n"):-len("\n```")])
     except (ValueError, RecursionError) as error:
         raise ContinuityError("DOCUMENT_DIVERGED", f"{relative} data cannot be parsed") from error
     if type(value) is not dict or value.get("feature_id", feature_id) != feature_id:
         raise ContinuityError("DOCUMENT_DIVERGED", f"{relative} data belongs to another Feature")
-    return value
+    return cast(dict[str, object], value)
 
 
-def read_feature(root: Path, state: dict[str, object], feature_id: str) -> dict[str, object]:
+def read_feature(
+    root: Path, state: ContinuityStateData, feature_id: str,
+) -> ContinuityFeatureDocument:
     value = read_document(root, state, feature_id, "spec")
     if set(value) != {"id", "kind", "title", "outcome", "criteria", "increments"} or value["id"] != feature_id:
         raise ContinuityError("DOCUMENT_DIVERGED", "Feature specification is malformed")
     _validate_feature(value)
-    return value
+    return cast(ContinuityFeatureDocument, cast(object, value))
 
 
-def read_plan(root: Path, state: dict[str, object], feature_id: str) -> dict[str, object]:
+def read_plan(
+    root: Path, state: ContinuityStateData, feature_id: str,
+) -> ContinuityPlanDocument:
     value = read_document(root, state, feature_id, "plan")
     if set(value) != {"feature_id", "plan"} or type(value["plan"]) is not str:
         raise ContinuityError("DOCUMENT_DIVERGED", "Feature plan is malformed")
-    return value
+    return cast(ContinuityPlanDocument, cast(object, value))
 
 
-def read_tasks(root: Path, state: dict[str, object], feature_id: str) -> list[dict[str, object]]:
+def read_tasks(
+    root: Path, state: ContinuityStateData, feature_id: str,
+) -> list[ContinuityTaskDocument]:
     value = read_document(root, state, feature_id, "tasks")
     if set(value) != {"feature_id", "tasks"} or type(value["tasks"]) is not list:
         raise ContinuityError("DOCUMENT_DIVERGED", "Feature Task list is malformed")
-    tasks = value["tasks"]
-    ids = [item.get("id") for item in tasks if type(item) is dict]
+    tasks = cast(list[object], value["tasks"])
+    ids = [
+        cast(dict[str, object], item).get("id")
+        for item in tasks
+        if type(item) is dict
+    ]
     if len(ids) != len(tasks) or len(ids) != len(set(ids)):
         raise ContinuityError("DOCUMENT_DIVERGED", "Feature Task IDs are not unique")
     try:
         _validate_tasks(tasks, read_feature(root, state, feature_id))
     except (KeyError, TypeError, ValueError) as error:
         raise ContinuityError("DOCUMENT_DIVERGED", "Feature Task definitions are malformed") from error
-    return tasks
+    return cast(list[ContinuityTaskDocument], cast(object, tasks))
 
 
-def read_decisions(root: Path, state: dict[str, object], feature_id: str) -> list[dict[str, object]]:
+def read_decisions(
+    root: Path, state: ContinuityStateData, feature_id: str,
+) -> list[ContinuityDecisionDocument]:
     value = read_document(root, state, feature_id, "decisions")
     if set(value) != {"feature_id", "decisions"} or type(value["decisions"]) is not list:
         raise ContinuityError("DOCUMENT_DIVERGED", "Feature decisions are malformed")
-    decisions = value["decisions"]
-    ids = [item.get("id") for item in decisions if type(item) is dict]
+    decisions = cast(list[object], value["decisions"])
+    ids = [
+        cast(dict[str, object], item).get("id")
+        for item in decisions
+        if type(item) is dict
+    ]
     if len(ids) != len(decisions) or len(ids) != len(set(ids)) or any(
         not isinstance(item, str) or _ID.fullmatch(item) is None or item[0] != "D"
         for item in ids
     ):
         raise ContinuityError("DOCUMENT_DIVERGED", "Feature decision identities are malformed")
+    decision_records = cast(list[ContinuityDecisionDocument], cast(object, decisions))
     if any(
         set(item) != {"id", "question", "decision"}
         or not isinstance(item["question"], str) or not item["question"]
         or not isinstance(item["decision"], str) or not item["decision"]
-        for item in decisions
+        for item in decision_records
     ):
         raise ContinuityError("DOCUMENT_DIVERGED", "Feature decision content is malformed")
-    return decisions
+    return decision_records
 
 
 def index_write(
-    root: Path, state: dict[str, object],
+    root: Path, state: ContinuityStateData,
     *, new_feature: tuple[str, str, str] | None = None,
 ) -> dict[str, tuple[bytes, str | None]]:
     relative = "specs/README.md"
@@ -355,7 +391,7 @@ def _validate_feature(value: dict[str, object]) -> None:
             raise ContinuityError("DOCUMENT_DIVERGED", "Feature increment is malformed")
 
 
-def _validate_tasks(tasks: list[object], feature: dict[str, object]) -> None:
+def _validate_tasks(tasks: list[object], feature: ContinuityFeatureDocument) -> None:
     criteria = {item["id"] for item in feature["criteria"]}
     increments = {item["id"] for item in feature["increments"]}
     ids: set[str] = set()

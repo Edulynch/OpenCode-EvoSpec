@@ -2346,7 +2346,7 @@ def _git_identity_rewrite_plan(
 class CoreService:
     """Expose only validated operation-specific authority mutations."""
 
-    __slots__ = ("__operations", "__persistence", "__repository_root")
+    __slots__ = ("__persistence", "__repository_root")
 
     def __init__(self, persistence: StatePersistence) -> Never:
         if TYPE_CHECKING:
@@ -2354,14 +2354,12 @@ class CoreService:
                 _StateStore
             )
             self.__repository_root = Path()
-            self.__operations = FileOperations()
         raise ServiceConstructionError("use CoreService.open()")
 
     @classmethod
     def open(cls, root: Path, operations: FileOperations | None = None) -> CoreService:
         service = object.__new__(cls)
-        service.__operations = FileOperations() if operations is None else operations
-        service.__persistence = _StateStore(root, service.__operations)
+        service.__persistence = _StateStore(root, operations)
         service.__repository_root = root.resolve()
         return service
 
@@ -2370,11 +2368,8 @@ class CoreService:
         session_id: str, data: dict[str, object],
     ) -> dict[str, object]:
         """Route composed work through the Core facade and shared persistence contract."""
-        from .continuity import execute as execute_continuity
-
-        return execute_continuity(
-            self.__repository_root, operation, expected_revision, session_id,
-            data, self.__operations,
+        return self.__persistence.composed_continuity(
+            operation, expected_revision, session_id, data,
         )
 
     def accept_first_slice(

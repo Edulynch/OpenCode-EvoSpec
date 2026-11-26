@@ -10,7 +10,7 @@ from pathlib import PurePosixPath
 import re
 import unicodedata
 from collections.abc import Hashable, Iterable
-from typing import NewType
+from typing import Literal, NewType, NoReturn, TypedDict, cast
 
 from .lifecycle import (
     Classification,
@@ -4882,11 +4882,160 @@ _CONTINUITY_DOC = re.compile(
 )
 
 
+class ContinuityFeatureIndex(TypedDict):
+    directory: str
+    status: Literal["OPEN", "CLOSED"]
+    cycle: int
+
+
+class ContinuityCriterionDocument(TypedDict):
+    id: str
+    description: str
+    check_kind: str
+    check_target: str
+
+
+class ContinuityIncrementDocument(TypedDict):
+    id: str
+    title: str
+    outcome: str
+
+
+class ContinuityFeatureDocument(TypedDict):
+    id: str
+    kind: str
+    title: str
+    outcome: str
+    criteria: list[ContinuityCriterionDocument]
+    increments: list[ContinuityIncrementDocument]
+
+
+class ContinuityPlanDocument(TypedDict):
+    feature_id: str
+    plan: str
+
+
+class ContinuityTaskDocument(TypedDict):
+    id: str
+    title: str
+    description: str
+    increment_id: str | None
+    criteria_ids: list[str]
+    depends_on: list[str]
+
+
+class ContinuityDecisionDocument(TypedDict):
+    id: str
+    question: str
+    decision: str
+
+
+class ContinuityTaskState(TypedDict):
+    attempts: int
+
+
+class ContinuityAttempt(TypedDict):
+    task_id: str
+    attempt: int
+    status: str
+    session_id: str
+    checkpoint: str
+    result: str | None
+    result_status: str | None
+    evidence_ref: str | None
+
+
+class ContinuityExecution(TypedDict):
+    task_id: str
+    attempt: int
+    session_id: str
+    status: str
+
+
+class ContinuityCheck(TypedDict):
+    criterion_id: str
+    criterion_digest: str
+    check_kind: str
+    check_target: str
+    exit_code: int
+    output_sha256: str
+    reported_by_session_id: str
+    task_id: str | None
+    recorded_revision: int
+
+
+class ContinuityCriterionDigest(TypedDict):
+    id: str
+    digest: str
+
+
+class ContinuityClosure(TypedDict):
+    id: str
+    feature_id: str
+    cycle: int
+    revision: int
+    criteria: list[ContinuityCriterionDigest]
+    session_id: str
+
+
+class ContinuityReopen(TypedDict):
+    feature_id: str
+    cycle: int
+    previous_closure_id: str
+    session_id: str
+
+
+class ContinuityDetour(TypedDict):
+    id: str
+    feature_id: str
+    kind: str
+    title: str
+    return_task_id: str
+    result: str | None
+    reported_by_session_id: str | None
+    created_revision: int
+    resolved_revision: int | None
+
+
+class ContinuityPendingWrite(TypedDict):
+    path: str
+    before: str | None
+    content: str
+    sha256: str
+
+
+class ContinuityPending(TypedDict):
+    next_state: dict[str, object]
+    writes: list[ContinuityPendingWrite]
+
+
+class ContinuityStateData(TypedDict):
+    schema: int
+    mode: str
+    repository_id: str
+    revision: int
+    features: dict[str, ContinuityFeatureIndex]
+    default_feature_id: str | None
+    session_features: dict[str, str]
+    task_states: dict[str, ContinuityTaskState]
+    attempts: list[ContinuityAttempt]
+    execution: ContinuityExecution | None
+    checks: list[ContinuityCheck]
+    closures: list[ContinuityClosure]
+    reopens: list[ContinuityReopen]
+    paused_features: list[str]
+    pause_reasons: dict[str, str]
+    detours: list[ContinuityDetour]
+    documents: dict[str, str]
+    ids: list[str]
+    pending: ContinuityPending | None
+
+
 def validate_continuity_state(
     value: object, *, repository_id: str | None = None, pending_state: bool = False,
 ) -> None:
     """Validate the bounded operational index; Feature definitions remain in Markdown."""
-    def invalid(detail: str) -> None:
+    def invalid(detail: str) -> NoReturn:
         raise ContinuityError("CORRUPT_CONTINUITY", detail)
 
     def valid_text(value: object, maximum: int) -> bool:
@@ -4902,7 +5051,7 @@ def validate_continuity_state(
 
     if type(value) is not dict or set(value) != _CONTINUITY_FIELDS:
         invalid("continuity state fields are not exact")
-    state = value
+    state = cast(dict[str, object], cast(object, value))
     if (
         type(state["schema"]) is not int or state["schema"] != 1
         or state["mode"] != "COMPOSED"
@@ -4922,7 +5071,21 @@ def validate_continuity_state(
     if pending_state and state["pending"] is not None:
         invalid("journal next state cannot contain another pending transaction")
 
-    features = state["features"]
+    features = cast(dict[str, object], state["features"])
+    session_features = cast(dict[str, object], state["session_features"])
+    task_states = cast(dict[str, object], state["task_states"])
+    attempts = cast(list[object], state["attempts"])
+    execution = cast(dict[str, object] | None, state["execution"])
+    checks = cast(list[object], state["checks"])
+    closures = cast(list[object], state["closures"])
+    reopens = cast(list[object], state["reopens"])
+    paused_features = cast(list[object], state["paused_features"])
+    pause_reasons = cast(dict[str, object], state["pause_reasons"])
+    detours = cast(list[object], state["detours"])
+    document_map = cast(dict[str, object], state["documents"])
+    ids = cast(list[object], state["ids"])
+    revision = cast(int, state["revision"])
+    pending = cast(dict[str, object] | None, state["pending"])
     if len(features) > 1000:
         invalid("Feature index exceeds its supported bound")
     directories: set[str] = set()
@@ -4938,7 +5101,7 @@ def validate_continuity_state(
             or type(entry["cycle"]) is not int or entry["cycle"] < 1
         ):
             invalid("Feature index is invalid")
-        directories.add(entry["directory"])
+        directories.add(cast(ContinuityFeatureIndex, cast(object, entry))["directory"])
     if state["default_feature_id"] is not None and (
         not isinstance(state["default_feature_id"], str)
         or state["default_feature_id"] not in features
@@ -4947,17 +5110,16 @@ def validate_continuity_state(
     if any(
         not isinstance(session, str) or not session or len(session) > 256
         or not isinstance(feature_id, str) or feature_id not in features
-        for session, feature_id in state["session_features"].items()
+        for session, feature_id in session_features.items()
     ):
         invalid("session selection is invalid")
-    if any(not isinstance(item, str) for item in state["paused_features"]):
+    if any(not isinstance(item, str) for item in paused_features):
         invalid("paused Feature reference is invalid")
-    if len(state["paused_features"]) > 1 or len(set(state["paused_features"])) != len(state["paused_features"]):
+    if len(paused_features) > 1 or len(set(paused_features)) != len(paused_features):
         invalid("at most one composed Feature can be paused at a time")
-    if any(feature_id not in features for feature_id in state["paused_features"]):
+    if any(feature_id not in features for feature_id in paused_features):
         invalid("paused Feature reference is invalid")
-    pause_reasons = state["pause_reasons"]
-    if set(pause_reasons) != set(state["paused_features"]) or any(
+    if set(pause_reasons) != set(paused_features) or any(
         not isinstance(feature_id, str) or feature_id not in features
         or not valid_text(reason, 2048)
         for feature_id, reason in pause_reasons.items()
@@ -4965,7 +5127,7 @@ def validate_continuity_state(
         invalid("paused Feature reasons do not match operational pause state")
 
     counters: dict[str, int] = {}
-    for task_id, entry in state["task_states"].items():
+    for task_id, entry in task_states.items():
         if (
             not isinstance(task_id, str) or _CONTINUITY_ID.fullmatch(task_id) is None
             or task_id[0] != "T" or type(entry) is not dict
@@ -4974,7 +5136,7 @@ def validate_continuity_state(
         ):
             invalid("Task attempt counters are invalid")
         counters[task_id] = 0
-    for attempt in state["attempts"]:
+    for attempt in attempts:
         if (
             type(attempt) is not dict
             or set(attempt) != {
@@ -5000,10 +5162,13 @@ def validate_continuity_state(
         counters[attempt["task_id"]] += 1
         if attempt["attempt"] != counters[attempt["task_id"]]:
             invalid("Task attempt numbering is not contiguous")
-    if any(state["task_states"][task_id]["attempts"] != count for task_id, count in counters.items()):
+    if any(
+        cast(ContinuityTaskState, cast(object, task_states[task_id]))["attempts"] != count
+        for task_id, count in counters.items()
+    ):
         invalid("Task attempt counters disagree with history")
 
-    for check in state["checks"]:
+    for check in checks:
         if (
             type(check) is not dict
             or set(check) != {
@@ -5031,28 +5196,26 @@ def validate_continuity_state(
                 )
             )
             or type(check["recorded_revision"]) is not int
-            or not 1 <= check["recorded_revision"] <= state["revision"]
+            or not 1 <= check["recorded_revision"] <= revision
         ):
             invalid("criterion check history is invalid")
 
-    document_map = state["documents"]
     if any(
         not isinstance(path, str) or _CONTINUITY_DOC.fullmatch(path) is None
         or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
         for path, digest in document_map.items()
     ):
         invalid("document digest index is invalid")
-    ids = state["ids"]
     if any(not isinstance(item, str) or _CONTINUITY_ID.fullmatch(item) is None for item in ids):
         invalid("stable identity registry is invalid")
     if (
         len(ids) != len(set(ids))
-        or any(item not in ids for item in (*features.keys(), *state["task_states"].keys()))
+        or any(item not in ids for item in (*features.keys(), *task_states.keys()))
     ):
         invalid("stable identity registry is invalid")
     detour_ids: set[str] = set()
     pending_detours = 0
-    for detour in state["detours"]:
+    for detour in detours:
         if (
             type(detour) is not dict
             or set(detour) != {
@@ -5073,13 +5236,13 @@ def validate_continuity_state(
             or detour["return_task_id"][0] != "T"
             or detour["return_task_id"] not in counters
             or type(detour["created_revision"]) is not int
-            or not 1 <= detour["created_revision"] <= state["revision"]
+            or not 1 <= detour["created_revision"] <= revision
             or (
                 detour["result"] is None
                 and (
                     detour["reported_by_session_id"] is not None
                     or detour["resolved_revision"] is not None
-                    or detour["feature_id"] not in state["paused_features"]
+                    or detour["feature_id"] not in paused_features
                 )
             )
             or (
@@ -5088,7 +5251,7 @@ def validate_continuity_state(
                     not valid_text(detour["result"], 4096)
                     or not valid_text(detour["reported_by_session_id"], 256)
                     or type(detour["resolved_revision"]) is not int
-                    or not detour["created_revision"] < detour["resolved_revision"] <= state["revision"]
+                    or not detour["created_revision"] < detour["resolved_revision"] <= revision
                 )
             )
         ):
@@ -5099,7 +5262,7 @@ def validate_continuity_state(
     if pending_detours > 1:
         invalid("at most one detour can be unresolved")
 
-    for item in state["closures"]:
+    for item in closures:
         if (
             type(item) is not dict
             or set(item) != {"id", "feature_id", "cycle", "revision", "criteria", "session_id"}
@@ -5108,8 +5271,10 @@ def validate_continuity_state(
             or not isinstance(item["feature_id"], str)
             or item["feature_id"] not in features
             or type(item["cycle"]) is not int or item["cycle"] < 1
-            or item["cycle"] > features[item["feature_id"]]["cycle"]
-            or type(item["revision"]) is not int or not 1 <= item["revision"] <= state["revision"]
+            or item["cycle"] > cast(
+                ContinuityFeatureIndex, cast(object, features[item["feature_id"]])
+            )["cycle"]
+            or type(item["revision"]) is not int or not 1 <= item["revision"] <= revision
             or type(item["criteria"]) is not list
             or any(
                 type(criterion) is not dict
@@ -5119,28 +5284,34 @@ def validate_continuity_state(
                 or criterion["id"][0] != "C"
                 or not isinstance(criterion["digest"], str)
                 or re.fullmatch(r"[0-9a-f]{64}", criterion["digest"]) is None
-                for criterion in item["criteria"]
+                for criterion in cast(list[object], item["criteria"])
             )
-            or len({criterion["id"] for criterion in item["criteria"]}) != len(item["criteria"])
+            or len({
+                cast(dict[str, object], cast(object, criterion))["id"]
+                for criterion in cast(list[object], item["criteria"])
+            }) != len(cast(list[object], item["criteria"]))
             or not isinstance(item["session_id"], str) or not item["session_id"]
         ):
             invalid("Feature closure history is invalid")
     closure_cycles: dict[tuple[str, int], str] = {}
     closure_id_set: set[str] = set()
-    for item in state["closures"]:
+    validated_closures = cast(list[ContinuityClosure], cast(object, closures))
+    for item in validated_closures:
         key = (item["feature_id"], item["cycle"])
         if key in closure_cycles or item["id"] in closure_id_set:
             invalid("Feature cycle has duplicate closure receipts")
         closure_cycles[key] = item["id"]
         closure_id_set.add(item["id"])
-    for item in state["reopens"]:
+    for item in reopens:
         if (
             type(item) is not dict
             or set(item) != {"feature_id", "cycle", "previous_closure_id", "session_id"}
             or not isinstance(item["feature_id"], str)
             or item["feature_id"] not in features
             or type(item["cycle"]) is not int or item["cycle"] < 2
-            or item["cycle"] > features[item["feature_id"]]["cycle"]
+            or item["cycle"] > cast(
+                ContinuityFeatureIndex, cast(object, features[item["feature_id"]])
+            )["cycle"]
             or item["previous_closure_id"] != closure_cycles.get(
                 (item["feature_id"], item["cycle"] - 1),
             )
@@ -5148,21 +5319,24 @@ def validate_continuity_state(
         ):
             invalid("Feature reopen history is invalid")
     reopen_cycles: set[tuple[str, int]] = set()
-    for item in state["reopens"]:
+    validated_reopens = cast(list[ContinuityReopen], cast(object, reopens))
+    for item in validated_reopens:
         key = (item["feature_id"], item["cycle"])
         if key in reopen_cycles:
             invalid("Feature cycle has duplicate reopen records")
         reopen_cycles.add(key)
     for feature_id, entry in features.items():
-        cycle = entry["cycle"]
+        cycle = cast(ContinuityFeatureIndex, cast(object, entry))["cycle"]
         if (
             any((feature_id, index) not in closure_cycles for index in range(1, cycle))
-            or (entry["status"] == "CLOSED" and (feature_id, cycle) not in closure_cycles)
+            or (
+                cast(ContinuityFeatureIndex, cast(object, entry))["status"] == "CLOSED"
+                and (feature_id, cycle) not in closure_cycles
+            )
             or any((feature_id, index) not in reopen_cycles for index in range(2, cycle + 1))
         ):
             invalid("Feature closure and reopen history does not match its current cycle")
 
-    execution = state["execution"]
     if execution is not None:
         if (
             set(execution) != {"task_id", "attempt", "session_id", "status"}
@@ -5173,26 +5347,31 @@ def validate_continuity_state(
             or execution["status"] != "OUTCOME_UNKNOWN"
         ):
             invalid("in-flight Task checkpoint is invalid")
+        checked_execution = cast(ContinuityExecution, cast(object, execution))
+        checked_attempts = cast(list[ContinuityAttempt], cast(object, attempts))
         active = next((
-            item for item in reversed(state["attempts"])
-            if item["task_id"] == execution["task_id"] and item["attempt"] == execution["attempt"]
+            item for item in reversed(checked_attempts)
+            if item["task_id"] == checked_execution["task_id"]
+            and item["attempt"] == checked_execution["attempt"]
         ), None)
         if active is None or active["status"] not in ("STARTED", "OUTCOME_UNKNOWN"):
             invalid("in-flight Task attempt does not match its history")
 
-    pending = state["pending"]
     if pending is None:
         return
     if type(pending) is not dict or set(pending) != {"next_state", "writes"}:
         invalid("recovery journal is invalid")
-    next_state = pending["next_state"]
-    writes = pending["writes"]
+    pending_record = cast(dict[str, object], cast(object, pending))
+    next_state_value = pending_record["next_state"]
+    writes_value = pending_record["writes"]
     if (
-        type(next_state) is not dict or type(writes) is not list
-        or next_state.get("revision") != state["revision"] + 1
-        or next_state.get("pending") is not None
+        type(next_state_value) is not dict or type(writes_value) is not list
+        or cast(dict[str, object], cast(object, next_state_value)).get("revision") != revision + 1
+        or cast(dict[str, object], cast(object, next_state_value)).get("pending") is not None
     ):
         invalid("recovery journal next state is inconsistent")
+    next_state = cast(dict[str, object], cast(object, next_state_value))
+    writes = cast(list[object], writes_value)
     validate_continuity_state(
         next_state, repository_id=repository_id, pending_state=True,
     )
@@ -5209,7 +5388,7 @@ def validate_continuity_state(
             or not isinstance(item["content"], str)
             or not isinstance(item["sha256"], str)
             or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
-            or next_state["documents"].get(item["path"]) != item["sha256"]
+            or cast(dict[str, object], next_state["documents"]).get(item["path"]) != item["sha256"]
         ):
             invalid("recovery journal write is invalid")
         try:

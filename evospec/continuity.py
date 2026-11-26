@@ -4,27 +4,47 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
-from typing import Final
+from typing import Final, TypeVar
 from uuid import uuid4
+from collections.abc import Mapping
 
 from .continuity_documents import (
-    decisions_write as _render_decision_write,
+    decisions_write as _write_decisions,
     feature_document_writes as _writes_for_feature,
     index_write as _index_write,
-    initial_documents as _initial_documents,
+    initial_documents as _build_initial_documents,
     new_directory as _new_directory,
-    plan_write as _render_plan_write,
+    plan_write as _write_plan,
     read_decisions as _read_decisions,
     read_feature as _read_feature,
     read_plan as _read_plan,
     read_tasks as _read_tasks,
-    spec_write as _render_spec_write,
-    tasks_write as _render_task_write,
+    spec_write as _write_spec,
+    tasks_write as _write_tasks,
 )
-from .domain import ContinuityError
+from .domain import (
+    ContinuityAttempt,
+    ContinuityCheck,
+    ContinuityClosure,
+    ContinuityCriterionDocument,
+    ContinuityDecisionDocument,
+    ContinuityDetour,
+    ContinuityExecution,
+    ContinuityFeatureDocument,
+    ContinuityFeatureIndex,
+    ContinuityIncrementDocument,
+    ContinuityReopen,
+    ContinuityStateData,
+    ContinuityTaskDocument,
+    ContinuityError,
+)
 from .lifecycle import (
+    ContinuityFeatureView,
+    ContinuityStateView,
+    ContinuityTaskView,
     continuity_close_blockers,
     continuity_current_checks,
     continuity_task_eligible,
@@ -46,6 +66,91 @@ _COMMANDS = frozenset((
     "specify", "clarify", "plan", "tasks", "implement", "use", "change",
     "status", "verify", "pause", "resume", "close",
 ))
+
+_DocumentRecord = TypeVar("_DocumentRecord", bound=Mapping[str, object])
+
+
+def _plain_record(record: Mapping[str, object]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    result.update(record)
+    return result
+
+
+def _plain_records(
+    records: list[_DocumentRecord],
+) -> list[dict[str, object]]:
+    return [_plain_record(record) for record in records]
+
+
+def _initial_documents(
+    feature: ContinuityFeatureDocument,
+    tasks: list[ContinuityTaskDocument],
+    plan: str,
+) -> dict[str, dict[str, object]]:
+    return _build_initial_documents(
+        _plain_record(feature), _plain_records(tasks), plan,
+    )
+
+
+def _render_task_write(
+    root: Path, state: ContinuityStateData, feature_id: str,
+    tasks: list[ContinuityTaskDocument], feature: ContinuityFeatureDocument,
+) -> dict[str, tuple[bytes, str | None]]:
+    return _write_tasks(
+        root, state, feature_id, _plain_records(tasks), _plain_record(feature),
+    )
+
+
+def _render_decision_write(
+    root: Path, state: ContinuityStateData, feature_id: str,
+    decisions: list[ContinuityDecisionDocument],
+    feature: ContinuityFeatureDocument,
+) -> dict[str, tuple[bytes, str | None]]:
+    return _write_decisions(
+        root, state, feature_id,
+        _plain_records(decisions), _plain_record(feature),
+    )
+
+
+def _render_plan_write(
+    root: Path, state: ContinuityStateData, feature_id: str,
+    feature: ContinuityFeatureDocument, plan: str,
+) -> dict[str, tuple[bytes, str | None]]:
+    return _write_plan(root, state, feature_id, _plain_record(feature), plan)
+
+
+def _render_spec_write(
+    root: Path, state: ContinuityStateData, feature_id: str,
+    feature: ContinuityFeatureDocument,
+) -> dict[str, tuple[bytes, str | None]]:
+    return _write_spec(root, state, feature_id, _plain_record(feature))
+
+
+def _continuity_state_view(state: ContinuityStateData) -> ContinuityStateView:
+    execution = state["execution"]
+    return {
+        "checks": tuple(state["checks"]),
+        "attempts": tuple(state["attempts"]),
+        "execution": None if execution is None else {"task_id": execution["task_id"]},
+        "paused_features": tuple(state["paused_features"]),
+    }
+
+
+def _continuity_feature_view(
+    feature: ContinuityFeatureDocument,
+) -> ContinuityFeatureView:
+    return {"criteria": tuple(feature["criteria"])}
+
+
+def _continuity_task_view(task: ContinuityTaskDocument) -> ContinuityTaskView:
+    return {
+        "id": task["id"],
+        "title": task["title"],
+        "description": task["description"],
+        "increment_id": task["increment_id"],
+        "criteria_ids": tuple(task["criteria_ids"]),
+        "depends_on": tuple(task["depends_on"]),
+    }
 
 
 def execute(
@@ -115,7 +220,10 @@ def _specify(
         multiline=True, allow_empty=True,
     )
     docs = _initial_documents(record, task_records, plan)
-    state["features"] = {feature_id: {"directory": folder, "status": "OPEN", "cycle": 1}}
+    feature_state: ContinuityFeatureIndex = {
+        "directory": folder, "status": "OPEN", "cycle": 1,
+    }
+    state["features"] = {feature_id: feature_state}
     state["default_feature_id"] = feature_id
     state["session_features"] = {session_id: feature_id}
     state["task_states"] = {task["id"]: {"attempts": 0} for task in task_records}
@@ -129,7 +237,7 @@ def _specify(
 
 
 def _mutate(
-    store: ContinuityPersistence, state: dict[str, object], operation: str,
+    store: ContinuityPersistence, state: ContinuityStateData, operation: str,
     session_id: str, data: dict[str, object],
 ) -> dict[str, object]:
     root = store.root
@@ -146,9 +254,10 @@ def _mutate(
         candidate = _copy_state(state)
         record, task_records = _new_feature(data, "FEATURE", candidate)
         folder, _ordinal = _new_directory(root, record["title"])
-        candidate["features"][record["id"]] = {
+        feature_state: ContinuityFeatureIndex = {
             "directory": folder, "status": "OPEN", "cycle": 1,
         }
+        candidate["features"][record["id"]] = feature_state
         candidate["default_feature_id"] = record["id"]
         candidate["session_features"][session_id] = record["id"]
         for task in task_records:
@@ -166,16 +275,17 @@ def _mutate(
 
     if operation == "change" and data.get("feature_id") is None:
         _keys(data, {"title", "outcome", "criteria", "task_title", "task_description"})
+        criteria_value = data.get("criteria")
         record, task_records = _new_feature({
             "title": data.get("title"),
             "outcome": data.get("outcome"),
-            "criteria": data.get("criteria"),
+            "criteria": criteria_value,
             "increments": [],
             "tasks": [{
                 "title": data.get("task_title"),
                 "description": data.get("task_description", ""),
-                "criteria": list(range(len(data.get("criteria", []))))
-                if type(data.get("criteria")) is list else [],
+                "criteria": list(range(len(criteria_value)))
+                if type(criteria_value) is list else [],
             }],
             "plan": "",
         }, "CORRECTION", state)
@@ -183,9 +293,10 @@ def _mutate(
         candidate = _copy_state(state)
         if len(candidate["features"]) >= _MAX_FEATURES:
             raise ContinuityError("LIMIT_EXCEEDED", "project Feature limit is exceeded")
-        candidate["features"][record["id"]] = {
+        feature_state: ContinuityFeatureIndex = {
             "directory": folder, "status": "OPEN", "cycle": 1,
         }
+        candidate["features"][record["id"]] = feature_state
         candidate["default_feature_id"] = record["id"]
         candidate["session_features"][session_id] = record["id"]
         for task in task_records:
@@ -243,10 +354,11 @@ def _mutate(
         increments = feature["increments"]
         if increment_id is not None and increment_id not in {item["id"] for item in increments}:
             raise ContinuityError("INVALID_REQUEST", "increment_id is not part of the selected Feature")
+        assert increment_id is None or isinstance(increment_id, str)
         depends_on = _id_list(data.get("depends_on", []), "depends_on", "T", {item["id"] for item in tasks})
         if len(tasks) >= _MAX_TASKS:
             raise ContinuityError("LIMIT_EXCEEDED", "Feature Task limit is exceeded")
-        task = {
+        task: ContinuityTaskDocument = {
             "id": _new_id("T", candidate), "title": title, "description": description,
             "increment_id": increment_id, "criteria_ids": criteria_ids,
             "depends_on": depends_on,
@@ -271,12 +383,17 @@ def _mutate(
                 )
             if feature_id in candidate["paused_features"]:
                 raise ContinuityError("FEATURE_PAUSED", "resume the selected Feature before dispatch")
-            if not continuity_task_eligible(candidate, feature, tasks, task):
+            if not continuity_task_eligible(
+                _continuity_state_view(candidate),
+                _continuity_feature_view(feature),
+                tuple(_continuity_task_view(item) for item in tasks),
+                _continuity_task_view(task),
+            ):
                 raise ContinuityError("TASK_NOT_ELIGIBLE", "Task dependencies or current checks are not complete")
             task_state = candidate["task_states"][task["id"]]
             attempt = task_state["attempts"] + 1
             task_state["attempts"] = attempt
-            entry = {
+            entry: ContinuityAttempt = {
                 "task_id": task["id"], "attempt": attempt, "status": "STARTED",
                 "session_id": session_id, "checkpoint": _text(
                     data.get("report", f"Attempt {attempt} checkpointed before effects"),
@@ -285,10 +402,11 @@ def _mutate(
                 "result": None, "result_status": None, "evidence_ref": None,
             }
             candidate["attempts"].append(entry)
-            candidate["execution"] = {
+            execution_record: ContinuityExecution = {
                 "task_id": task["id"], "attempt": attempt, "session_id": session_id,
                 "status": "OUTCOME_UNKNOWN",
             }
+            candidate["execution"] = execution_record
             writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
         elif phase == "report":
             execution = candidate["execution"]
@@ -339,13 +457,14 @@ def _mutate(
         task_id = _text(data.get("task_id", ""), "task_id", maximum=256, allow_empty=True)
         if task_id:
             _by_id(tasks, task_id, "T", "task_id")
-        candidate["checks"].append({
+        check: ContinuityCheck = {
             "criterion_id": criterion["id"], "criterion_digest": _digest(criterion),
             "check_kind": criterion["check_kind"], "check_target": criterion["check_target"],
             "exit_code": exit_code, "output_sha256": output_digest,
             "reported_by_session_id": session_id, "task_id": task_id or None,
             "recorded_revision": state["revision"] + 1,
-        })
+        }
+        candidate["checks"].append(check)
         writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
 
     elif operation == "pause":
@@ -361,17 +480,20 @@ def _mutate(
                     "record the pending detour result before starting another detour",
                 )
             detour_title = _text(data.get("detour_title"), "detour_title", maximum=2048)
-            return_task_id = data.get("return_task_id")
-            _by_id(tasks, return_task_id, "T", "return_task_id")
+            return_task = _by_id(
+                tasks, data.get("return_task_id"), "T", "return_task_id",
+            )
+            return_task_id = return_task["id"]
             detour_id = _new_id("D", candidate, {item["id"] for item in decisions})
-            candidate["detours"].append({
+            detour: ContinuityDetour = {
                 "id": detour_id, "feature_id": feature_id,
                 "kind": detour_kind, "title": detour_title,
                 "return_task_id": return_task_id, "result": None,
                 "reported_by_session_id": None,
                 "created_revision": state["revision"] + 1,
                 "resolved_revision": None,
-            })
+            }
+            candidate["detours"].append(detour)
             decisions.append({
                 "id": detour_id,
                 "question": (
@@ -427,6 +549,7 @@ def _mutate(
         elif reconcile is not None:
             raise ContinuityError("NO_ACTIVE_ATTEMPT", "there is no unresolved Task attempt to reconcile")
         if pending_detour is not None:
+            assert detour_result is not None
             decisions.append({
                 "id": _new_id("D", candidate, {item["id"] for item in decisions}),
                 "question": (
@@ -448,14 +571,18 @@ def _mutate(
     elif operation == "close":
         _keys(data, {"feature_id"})
         blockers = continuity_close_blockers(
-            state, feature_id, candidate["features"][feature_id], feature, tasks,
+            _continuity_state_view(state),
+            feature_id,
+            {"status": candidate["features"][feature_id]["status"]},
+            _continuity_feature_view(feature),
+            tuple(_continuity_task_view(item) for item in tasks),
         )
         if blockers:
             raise ContinuityError("CLOSE_BLOCKED", "; ".join(blockers))
         feature_state = candidate["features"][feature_id]
         if feature_state["status"] == "CLOSED":
             raise ContinuityError("ALREADY_CLOSED", "Feature is already closed in this cycle")
-        receipt = {
+        receipt: ContinuityClosure = {
                 "id": _new_id("D", candidate, {item.get("id") for item in candidate["closures"]}), "feature_id": feature_id,
             "cycle": feature_state["cycle"], "revision": state["revision"] + 1,
             "criteria": [
@@ -486,7 +613,8 @@ def _mutate(
         increment_id = data.get("increment_id")
         if increment_id is not None and increment_id not in {item["id"] for item in changed["increments"]}:
             raise ContinuityError("INVALID_REQUEST", "increment_id is not part of the selected Feature")
-        task = {
+        assert increment_id is None or isinstance(increment_id, str)
+        task: ContinuityTaskDocument = {
             "id": _new_id("T", candidate), "title": task_title,
             "description": task_description, "increment_id": increment_id,
             "criteria_ids": criteria_ids, "depends_on": [],
@@ -504,11 +632,13 @@ def _mutate(
                 ),
                 None,
             )
-            candidate["reopens"].append({
+            assert previous is not None
+            reopen: ContinuityReopen = {
                 "feature_id": feature_id, "cycle": feature_state["cycle"] + 1,
-                "previous_closure_id": None if previous is None else previous["id"],
+                "previous_closure_id": previous["id"],
                 "session_id": session_id,
-            })
+            }
+            candidate["reopens"].append(reopen)
             feature_state["cycle"] += 1
             feature_state["status"] = "OPEN"
         writes.update(_render_spec_write(root, candidate, feature_id, changed))
@@ -522,8 +652,8 @@ def _mutate(
 
 
 def _publish_mutation(
-    store: ContinuityPersistence, state: dict[str, object],
-    candidate: dict[str, object], writes: dict[str, tuple[bytes, str | None]],
+    store: ContinuityPersistence, state: ContinuityStateData,
+    candidate: ContinuityStateData, writes: dict[str, tuple[bytes, str | None]],
     session_id: str,
 ) -> dict[str, object]:
     candidate["revision"] = state["revision"] + 1
@@ -533,7 +663,7 @@ def _publish_mutation(
     return _project(store, saved, session_id)
 
 
-def _empty_state(root: Path) -> dict[str, object]:
+def _empty_state(root: Path) -> ContinuityStateData:
     return {
         "schema": SCHEMA, "mode": "COMPOSED",
         "repository_id": sha256(str(root).encode("utf-8")).hexdigest()[:16],
@@ -546,7 +676,7 @@ def _empty_state(root: Path) -> dict[str, object]:
 
 
 def _project(
-    store: ContinuityPersistence, state: dict[str, object], session_id: str,
+    store: ContinuityPersistence, state: ContinuityStateData, session_id: str,
 ) -> dict[str, object]:
     if state["pending"] is not None:
         return {
@@ -565,28 +695,38 @@ def _project(
             "features": sorted(state["features"]),
         }
     selected = state["session_features"].get(session_id) or state["default_feature_id"]
+    feature_views: list[dict[str, object]] = []
     result: dict[str, object] = {
         "mode": "COMPOSED", "revision": state["revision"],
         "default_feature_id": state["default_feature_id"],
         "selected_feature_id": selected,
         "selection_scope": "session" if session_id in state["session_features"] else "worktree",
-        "features": [],
+        "features": feature_views,
         "execution": state["execution"],
     }
     for feature_id in sorted(state["features"]):
         feature = _read_feature(root, state, feature_id)
         tasks = _read_tasks(root, state, feature_id)
         feature_state = state["features"][feature_id]
-        current_checks = continuity_current_checks(state, feature)
-        task_projection = []
+        continuity_state = _continuity_state_view(state)
+        continuity_feature = _continuity_feature_view(feature)
+        current_checks = continuity_current_checks(continuity_state, continuity_feature)
+        task_projection: list[dict[str, object]] = []
         for task in tasks:
-            status = continuity_task_status(state, feature, task)
+            continuity_task = _continuity_task_view(task)
+            status = continuity_task_status(
+                continuity_state, continuity_feature, continuity_task,
+            )
             task_projection.append({
                 **task, "status": status,
                 "attempts": state["task_states"][task["id"]]["attempts"],
-                "eligible": continuity_task_eligible(state, feature, tasks, task),
+                "eligible": continuity_task_eligible(
+                    continuity_state, continuity_feature,
+                    tuple(_continuity_task_view(item) for item in tasks),
+                    continuity_task,
+                ),
             })
-        feature_view = {
+        feature_view: dict[str, object] = {
             "id": feature_id, "directory": feature_state["directory"],
             "kind": feature["kind"], "title": feature["title"],
             "outcome": feature["outcome"], "status": feature_state["status"],
@@ -612,11 +752,12 @@ def _project(
                 item for item in state["reopens"] if item["feature_id"] == feature_id
             ],
         }
-        result["features"].append(feature_view)
-    result["selected_feature"] = next(
-        (feature for feature in result["features"] if feature["id"] == selected), None
+        feature_views.append(feature_view)
+    selected_feature = next(
+        (feature for feature in feature_views if feature["id"] == selected), None
     )
-    result["next_task"] = _next_task(result["selected_feature"])
+    result["selected_feature"] = selected_feature
+    result["next_task"] = _next_task(selected_feature)
     return result
 
 
@@ -632,7 +773,7 @@ def _next_task(feature: object) -> str | None:
     )
 
 
-def _active_attempt(state: dict[str, object]) -> dict[str, object]:
+def _active_attempt(state: ContinuityStateData) -> ContinuityAttempt:
     execution = state["execution"]
     if execution is None:
         raise ContinuityError("NO_ACTIVE_ATTEMPT", "no Task attempt is in progress")
@@ -643,8 +784,8 @@ def _active_attempt(state: dict[str, object]) -> dict[str, object]:
 
 
 def _pending_detour(
-    state: dict[str, object], feature_id: str,
-) -> dict[str, object] | None:
+    state: ContinuityStateData, feature_id: str,
+) -> ContinuityDetour | None:
     return next(
         (
             item for item in state["detours"]
@@ -654,7 +795,7 @@ def _pending_detour(
     )
 
 
-def _execution_feature(root: Path, state: dict[str, object]) -> str:
+def _execution_feature(root: Path, state: ContinuityStateData) -> str:
     execution = state["execution"]
     assert execution is not None
     owners = [
@@ -667,8 +808,8 @@ def _execution_feature(root: Path, state: dict[str, object]) -> str:
 
 
 def _new_feature(
-    data: dict[str, object], kind: str, prior_state: dict[str, object],
-) -> tuple[dict[str, object], list[dict[str, object]]]:
+    data: dict[str, object], kind: str, prior_state: ContinuityStateData,
+) -> tuple[ContinuityFeatureDocument, list[ContinuityTaskDocument]]:
     _keys(data, {"title", "outcome", "criteria", "increments", "tasks", "plan"})
     title = _text(data.get("title"), "title", maximum=2048)
     outcome = _text(data.get("outcome"), "outcome", maximum=8192, multiline=True)
@@ -682,7 +823,7 @@ def _new_feature(
     increments_raw = data.get("increments", [])
     if type(increments_raw) is not list or len(increments_raw) > _MAX_INCREMENTS:
         raise ContinuityError("INVALID_REQUEST", "increments must be an array of at most 100 items")
-    increments = [
+    increments: list[ContinuityIncrementDocument] = [
         {
             "id": _new_id("S", prior_state, allocated),
             "title": _text(item.get("title") if type(item) is dict else None, "increment title", maximum=2048),
@@ -695,7 +836,7 @@ def _new_feature(
     tasks_raw = data.get("tasks")
     if type(tasks_raw) is not list or not tasks_raw or len(tasks_raw) > _MAX_TASKS:
         raise ContinuityError("INVALID_REQUEST", "a Feature needs at least one Task (up to 1000)")
-    task_records: list[dict[str, object]] = []
+    task_records: list[ContinuityTaskDocument] = []
     for index, raw in enumerate(tasks_raw):
         if type(raw) is not dict or set(raw) - {
             "title", "description", "increment_index", "criteria", "depends_on",
@@ -725,7 +866,7 @@ def _new_feature(
             "criteria_ids": [criteria[value]["id"] for value in criterion_indexes],
             "depends_on": [task_records[value]["id"] for value in dependency_indexes],
         })
-    record: dict[str, object] = {
+    record: ContinuityFeatureDocument = {
         "id": _new_id("F", prior_state, allocated), "kind": kind, "title": title, "outcome": outcome,
         "criteria": criteria, "increments": increments,
     }
@@ -733,9 +874,9 @@ def _new_feature(
 
 
 def _new_criterion(
-    raw: object, state: dict[str, object] | None = None,
+    raw: object, state: ContinuityStateData,
     allocated: set[str] | None = None,
-) -> dict[str, object]:
+) -> ContinuityCriterionDocument:
     if type(raw) is not dict or set(raw) - {"id", "description", "check_kind", "check_target"}:
         raise ContinuityError("INVALID_REQUEST", "criterion fields are invalid")
     description = _text(raw.get("description"), "criterion description", maximum=2048)
@@ -748,15 +889,16 @@ def _new_criterion(
     if kind == "node-test" and re.fullmatch(r"tests/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\.test\.mjs", target) is None:
         raise ContinuityError("INVALID_REQUEST", "node check_target must name a tests/*.test.mjs file")
     return {
-        "id": _new_id("C", {} if state is None else state, allocated),
+        "id": _new_id("C", state, allocated),
         "description": description, "check_kind": kind, "check_target": target,
     }
 
 
 def _amend_feature(
-    feature: dict[str, object], data: dict[str, object], state: dict[str, object],
-) -> dict[str, object]:
-    result = json.loads(json.dumps(feature))
+    feature: ContinuityFeatureDocument, data: dict[str, object],
+    state: ContinuityStateData,
+) -> ContinuityFeatureDocument:
+    result = deepcopy(feature)
     if "outcome" in data:
         result["outcome"] = _text(data["outcome"], "outcome", maximum=8192, multiline=True)
     criteria = data.get("criteria", [])
@@ -788,7 +930,7 @@ def _amend_feature(
 
 
 def _selected_feature(
-    state: dict[str, object], session_id: str, supplied: object,
+    state: ContinuityStateData, session_id: str, supplied: object,
 ) -> str:
     feature_id = supplied or state["session_features"].get(session_id) or state["default_feature_id"]
     if not isinstance(feature_id, str) or feature_id not in state["features"]:
@@ -807,11 +949,16 @@ def _id_list(value: object, name: str, prefix: str, allowed: set[str]) -> list[s
     return value
 
 
-def _criterion_ids(feature: dict[str, object]) -> set[str]:
+def _criterion_ids(feature: ContinuityFeatureDocument) -> set[str]:
     return {item["id"] for item in feature["criteria"]}
 
 
-def _by_id(values: list[dict[str, object]], value: object, prefix: str, name: str) -> dict[str, object]:
+_Record = TypeVar("_Record", ContinuityTaskDocument, ContinuityCriterionDocument)
+
+
+def _by_id(
+    values: list[_Record], value: object, prefix: str, name: str,
+) -> _Record:
     if not isinstance(value, str) or _ID.fullmatch(value) is None or value[0] != prefix:
         raise ContinuityError("INVALID_REQUEST", f"{name} is invalid")
     for item in values:
@@ -821,25 +968,17 @@ def _by_id(values: list[dict[str, object]], value: object, prefix: str, name: st
 
 
 def _new_id(
-    prefix: str, state: dict[str, object], allocated: set[str] | None = None,
+    prefix: str, state: ContinuityStateData, allocated: set[str] | None = None,
 ) -> str:
-    existing: set[str] = set()
-    if state:
-        existing.update(state.get("ids", []))
-        existing.update(state.get("features", {}))
-        existing.update(state.get("task_states", {}))
-        for key in ("attempts", "checks", "closures", "reopens"):
-            existing.update(
-                item.get("id") for item in state.get(key, [])
-                if type(item) is dict and isinstance(item.get("id"), str)
-            )
+    existing = set(state["ids"])
+    existing.update(state["features"])
+    existing.update(state["task_states"])
     for _ in range(100):
         candidate = f"{prefix}-{uuid4().hex}"
         if candidate not in existing and (allocated is None or candidate not in allocated):
             if allocated is not None:
                 allocated.add(candidate)
-            if state is not None and type(state.get("ids")) is list:
-                state["ids"].append(candidate)
+            state["ids"].append(candidate)
             return candidate
     raise ContinuityError("ID_ALLOCATION_FAILED", "could not allocate a collision-free identity")
 
@@ -879,8 +1018,8 @@ def _expect_revision(actual: int | None, expected: int) -> None:
         )
 
 
-def _copy_state(state: dict[str, object]) -> dict[str, object]:
-    return json.loads(json.dumps(state, ensure_ascii=False))
+def _copy_state(state: ContinuityStateData) -> ContinuityStateData:
+    return deepcopy(state)
 
 
 def _digest(value: object) -> str:

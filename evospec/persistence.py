@@ -7,12 +7,14 @@ import os
 import re
 import tempfile
 import threading
+from copy import deepcopy
+from importlib import import_module
 from contextlib import contextmanager
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
-from typing import Final, Protocol, TypeAlias, TypeVar
+from typing import Final, Protocol, TypeAlias, TypeVar, cast
 
 from .domain import (
     AgreementRecord,
@@ -99,6 +101,9 @@ from .domain import (
     SliceOutcomeReceipt,
     FeatureCompletionReceipt,
     FeatureReopenReceipt,
+    ContinuityPending,
+    ContinuityPendingWrite,
+    ContinuityStateData,
     TaskProgress,
     TerminalArchive,
     PendingIntake,
@@ -4572,7 +4577,7 @@ class ContinuityPersistence:
                 "legacy state.json and composed continuity cannot coexist; no migration or automatic mode switch is supported",
             )
 
-    def load(self) -> dict[str, object] | None:
+    def load(self) -> ContinuityStateData | None:
         marker = _artifact_path(self.__root, "continuity.json")
         self.__safe_document_path(".evospec/continuity.json")
         self.assert_legacy_absent()
@@ -4591,9 +4596,9 @@ class ContinuityPersistence:
                 "CORRUPT_CONTINUITY", "continuity.json cannot be recovered",
             ) from error
         validate_continuity_state(raw, repository_id=self.repository_id)
-        return raw
+        return cast(ContinuityStateData, cast(object, raw))
 
-    def check_documents(self, state: dict[str, object]) -> None:
+    def check_documents(self, state: ContinuityStateData) -> None:
         for relative, expected in state["documents"].items():
             actual = self.__document_hash(relative)
             if actual != expected:
@@ -4603,14 +4608,14 @@ class ContinuityPersistence:
                 )
 
     def commit(
-        self, current: dict[str, object], candidate: dict[str, object],
+        self, current: ContinuityStateData, candidate: ContinuityStateData,
         writes: dict[str, tuple[bytes, str | None]],
     ) -> None:
         if candidate["pending"] is not None:
             raise ContinuityError("INVALID_STATE", "candidate state cannot contain a pending journal")
-        next_state = json.loads(json.dumps(candidate, ensure_ascii=False))
+        next_state = deepcopy(candidate)
         documents = dict(current["documents"])
-        pending_writes: list[dict[str, object]] = []
+        pending_writes: list[ContinuityPendingWrite] = []
         for relative, (content, before_hash) in sorted(writes.items()):
             self.__safe_document_path(relative)
             if type(content) is not bytes or len(content) > 512 * 1024:
@@ -4637,14 +4642,25 @@ class ContinuityPersistence:
         validate_continuity_state(
             next_state, repository_id=self.repository_id, pending_state=True,
         )
-        journal = {
+        next_state_record: dict[str, object] = {}
+        next_state_record.update(next_state)
+        pending_record: ContinuityPending = {
+            "next_state": next_state_record,
+            "writes": pending_writes,
+        }
+        journal: ContinuityStateData = {
             **current,
-            "pending": {"next_state": next_state, "writes": pending_writes},
+            "pending": pending_record,
         }
         validate_continuity_state(journal, repository_id=self.repository_id)
         marker = _artifact_path(self.__root, "continuity.json")
         try:
-            _atomic_replace(marker, encode_json(journal), self.__operations, strict_directory=True)
+            _atomic_replace(
+                marker,
+                encode_json(cast(JsonValue, cast(object, journal))),
+                self.__operations,
+                strict_directory=True,
+            )
         except (AtomicFailure, RecoveryError) as error:
             raise ContinuityError(
                 "PUBLICATION_UNCERTAIN",
@@ -4652,12 +4668,16 @@ class ContinuityPersistence:
             ) from error
         self.recover_pending(journal)
 
-    def recover_pending(self, state: dict[str, object]) -> None:
+    def recover_pending(self, state: ContinuityStateData) -> None:
         pending = state["pending"]
-        if type(pending) is not dict:
+        if pending is None:
             raise ContinuityError("NO_RECOVERY", "there is no pending document transaction")
         self.assert_legacy_absent()
         next_state = pending["next_state"]
+        validate_continuity_state(
+            next_state, repository_id=self.repository_id, pending_state=True,
+        )
+        next_state = cast(ContinuityStateData, cast(object, next_state))
         for item in pending["writes"]:
             relative = item["path"]
             content = item["content"]
@@ -4687,13 +4707,15 @@ class ContinuityPersistence:
                     "RECOVERY_INCOMPLETE",
                     f"publication for {relative} remains journaled; reconcile again after inspecting it",
                 ) from error
-        final_state = json.loads(json.dumps(next_state, ensure_ascii=False))
+        final_state = deepcopy(next_state)
         final_state["pending"] = None
         validate_continuity_state(final_state, repository_id=self.repository_id)
         try:
             _atomic_replace(
                 _artifact_path(self.__root, "continuity.json"),
-                encode_json(final_state), self.__operations, strict_directory=True,
+                encode_json(cast(JsonValue, cast(object, final_state))),
+                self.__operations,
+                strict_directory=True,
             )
         except (AtomicFailure, RecoveryError) as error:
             raise ContinuityError(
@@ -4800,6 +4822,24 @@ class _StateStore:
     def recover(self) -> State:
         state, _, _ = self.recover_snapshot()
         return state
+
+    def composed_continuity(
+        self, operation: str, expected_revision: int | None,
+        session_id: str, data: dict[str, object],
+    ) -> dict[str, object]:
+        """Route composed mutations through persistence-owned file operations."""
+        execute_continuity = cast(
+            Callable[
+                [Path, str, int | None, str, dict[str, object], FileOperations],
+                dict[str, object],
+            ],
+            getattr(import_module(".continuity", __package__), "execute"),
+        )
+
+        return execute_continuity(
+            self.__root, operation, expected_revision, session_id, data,
+            self.__operations,
+        )
 
     def recover_snapshot(self) -> tuple[State, bool | None, int | None]:
         """Pair write readiness and the persisted schema with one recovered State."""

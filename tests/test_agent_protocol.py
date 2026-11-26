@@ -84,7 +84,7 @@ class AgentProtocolTests(unittest.TestCase):
             dir=os.environ.get("EVOSPEC_AC0_TEST_TMPDIR") or None,
         ) as temporary:
             root = Path(temporary)
-            request_data = {
+            request_data: dict[str, JsonValue] = {
                 "title": "Protocol Feature",
                 "outcome": "Persist a composed outcome.",
                 "criteria": [{

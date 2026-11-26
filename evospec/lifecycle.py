@@ -5,8 +5,59 @@ from __future__ import annotations
 from enum import StrEnum
 from hashlib import sha256
 import json
-from typing import Final, Protocol
+from collections.abc import Sequence
+from typing import Final, Protocol, TypedDict
 
+
+class _ContinuityCriterion(TypedDict):
+    id: str
+
+
+class ContinuityFeatureView(TypedDict):
+    criteria: Sequence[_ContinuityCriterion]
+
+
+class ContinuityTaskView(TypedDict):
+    id: str
+    title: str
+    description: str
+    increment_id: str | None
+    criteria_ids: Sequence[str]
+    depends_on: Sequence[str]
+
+
+class _ContinuityFeatureState(TypedDict):
+    status: str
+
+
+class _ContinuityCheck(TypedDict):
+    criterion_id: str
+    criterion_digest: str
+    exit_code: int
+    check_kind: str
+    check_target: str
+    output_sha256: str
+    task_id: str | None
+    reported_by_session_id: str
+    recorded_revision: int
+
+
+class _ContinuityAttempt(TypedDict):
+    task_id: str
+    attempt: int
+    status: str
+    result_status: str | None
+
+
+class _ContinuityExecution(TypedDict):
+    task_id: str
+
+
+class ContinuityStateView(TypedDict):
+    checks: Sequence[_ContinuityCheck]
+    attempts: Sequence[_ContinuityAttempt]
+    execution: _ContinuityExecution | None
+    paused_features: Sequence[str]
 
 class LifecycleState(StrEnum):
     PROPOSED = "PROPOSED"
@@ -231,7 +282,7 @@ def advance(
 
 
 def continuity_current_checks(
-    state: dict[str, object], feature: dict[str, object],
+    state: ContinuityStateView, feature: ContinuityFeatureView,
 ) -> dict[str, dict[str, object]]:
     """Project only receipts whose criterion digest still matches canonical text."""
     current = {
@@ -256,7 +307,9 @@ def continuity_current_checks(
 
 
 def continuity_task_status(
-    state: dict[str, object], feature: dict[str, object], task: dict[str, object],
+    state: ContinuityStateView,
+    feature: ContinuityFeatureView,
+    task: ContinuityTaskView,
 ) -> str:
     """Derive operational status; a report alone never completes a Task."""
     execution = state["execution"]
@@ -283,8 +336,10 @@ def continuity_task_status(
 
 
 def continuity_task_eligible(
-    state: dict[str, object], feature: dict[str, object],
-    tasks: list[dict[str, object]], task: dict[str, object],
+    state: ContinuityStateView,
+    feature: ContinuityFeatureView,
+    tasks: Sequence[ContinuityTaskView],
+    task: ContinuityTaskView,
 ) -> bool:
     """Require every dependency to be completed and the Task itself ready."""
     by_id = {item["id"]: item for item in tasks}
@@ -299,9 +354,11 @@ def continuity_task_eligible(
 
 
 def continuity_close_blockers(
-    state: dict[str, object], feature_id: str,
-    feature_state: dict[str, object], feature: dict[str, object],
-    tasks: list[dict[str, object]],
+    state: ContinuityStateView,
+    feature_id: str,
+    feature_state: _ContinuityFeatureState,
+    feature: ContinuityFeatureView,
+    tasks: Sequence[ContinuityTaskView],
 ) -> tuple[str, ...]:
     """Return objective closure blockers without treating reports as evidence."""
     blockers: list[str] = []

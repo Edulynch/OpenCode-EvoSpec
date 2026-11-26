@@ -6,6 +6,7 @@ import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 from .agent import (
     AcceptedSliceContext,
@@ -728,10 +729,13 @@ def execute(root: Path, payload: str) -> str:
         if action == "continuity":
             validate_action_request(request, "continuity")
             operation, expected_revision, session_id, data = parse_continuity_request(request)
+            workflow_data: dict[str, object] = {}
+            workflow_data.update(data)
+            continuity_result = WorkflowService.open(root).continuity(
+                operation, expected_revision, session_id, workflow_data,
+            )
             return _encode({
-                "continuity": WorkflowService.open(root).continuity(
-                    operation, expected_revision, session_id, data,
-                ),
+                "continuity": cast(JsonValue, continuity_result),
             })
         workflow = WorkflowService.open(root)
         if action == "autonomy_evaluate":
