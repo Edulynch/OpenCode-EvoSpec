@@ -5,21 +5,66 @@ import multiprocessing
 import os
 import threading
 import unittest
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, NotRequired, TypedDict, TypeGuard
 from unittest.mock import patch
 
 from evospec.continuity import ContinuityError, execute
 from evospec.continuity_documents import parse_all as parse_all_documents
+from evospec.domain import ContinuityStateData
 from evospec.input_fingerprint import InputFingerprintError
-from evospec.persistence import AtomicFailure, FileOperations, RecoveryError, StateStore
+from evospec.persistence import (
+    AtomicFailure,
+    ContinuityPersistence,
+    FileOperations,
+    RecoveryError,
+    StateStore,
+)
 from tests._tempdir import TemporaryDirectory
 
 
 class _IncrementView(TypedDict):
     id: str
+    title: str
+    outcome: str
+
+
+class _TaskView(TypedDict):
+    id: str
+    title: str
+    description: str
+    increment_id: str | None
+    criteria_ids: list[str]
+    depends_on: list[str]
+    status: str
+    attempts: int
+    eligible: bool
+
+
+class _CheckView(TypedDict):
+    fresh: bool
+    passed: bool
+    task_id: str | None
+    historical_passed: NotRequired[bool]
+    stale_reason: NotRequired[str]
+
+
+class _CriterionView(TypedDict):
+    id: str
+    description: str
+    check_kind: str
+    check_target: str
+    digest: str
+    check: _CheckView | None
+
+
+class _DecisionView(TypedDict):
+    id: str
+    question: str
+    decision: str
 
 
 class _ExecutionView(TypedDict):
@@ -30,17 +75,33 @@ class _FeatureView(TypedDict):
     id: str
     directory: str
     kind: str
+    title: str
+    outcome: str
     status: str
+    cycle: int
     paused: bool
     pause_reason: str | None
     increments: list[_IncrementView]
-    tasks: list[dict[str, object]]
-    criteria: list[dict[str, object]]
-    decisions: list[dict[str, object]]
+    tasks: list[_TaskView]
+    criteria: list[_CriterionView]
+    decisions: list[_DecisionView]
     detours: list[dict[str, object]]
     closure_history: list[object]
     reopen_history: list[object]
     plan: str
+
+
+class _DocumentConflictView(TypedDict):
+    feature_id: str
+    path: str
+    detail: str
+
+
+class _DocumentChangesView(TypedDict):
+    semantic: list[str]
+    format_notes: list[str]
+    generated: list[str]
+    identity_ref_conflicts: list[_DocumentConflictView]
 
 
 class _ContinuityView(TypedDict):
@@ -50,14 +111,10 @@ class _ContinuityView(TypedDict):
     selected_feature: _FeatureView | None
     execution: _ExecutionView | None
     input_snapshot_error: str | None
-
-
-class _CheckView(TypedDict):
-    fresh: bool
-    passed: bool
-    task_id: str | None
-    historical_passed: NotRequired[bool]
-    stale_reason: NotRequired[str]
+    selected_feature_id: NotRequired[str | None]
+    selection_scope: NotRequired[str]
+    features: NotRequired[list[_FeatureView]]
+    document_changes: NotRequired[_DocumentChangesView]
 
 
 def _record(value: object) -> TypeGuard[dict[str, object]]:
@@ -70,6 +127,10 @@ def _text(value: object) -> TypeGuard[str]:
 
 def _optional_text(value: object) -> TypeGuard[str | None]:
     return value is None or isinstance(value, str)
+
+
+def _text_list(value: object) -> TypeGuard[list[str]]:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
 def _check_view(value: object) -> TypeGuard[_CheckView]:
@@ -92,7 +153,7 @@ def _check_view(value: object) -> TypeGuard[_CheckView]:
     )
 
 
-def _criterion_check(criterion: dict[str, object]) -> _CheckView:
+def _criterion_check(criterion: _CriterionView) -> _CheckView:
     check = criterion.get("check")
     if not _check_view(check):
         raise AssertionError("expected a typed criterion check")
@@ -100,7 +161,50 @@ def _criterion_check(criterion: dict[str, object]) -> _CheckView:
 
 
 def _increment_view(value: object) -> TypeGuard[_IncrementView]:
-    return _record(value) and _text(value.get("id"))
+    return (
+        _record(value)
+        and _text(value.get("id"))
+        and _text(value.get("title"))
+        and _text(value.get("outcome"))
+    )
+
+
+def _task_view(value: object) -> TypeGuard[_TaskView]:
+    return (
+        _record(value)
+        and _text(value.get("id"))
+        and _text(value.get("title"))
+        and _text(value.get("description"))
+        and _optional_text(value.get("increment_id"))
+        and _text_list(value.get("criteria_ids"))
+        and _text_list(value.get("depends_on"))
+        and _text(value.get("status"))
+        and type(value.get("attempts")) is int
+        and isinstance(value.get("eligible"), bool)
+    )
+
+
+def _criterion_view(value: object) -> TypeGuard[_CriterionView]:
+    if not _record(value):
+        return False
+    check = value.get("check")
+    return (
+        _text(value.get("id"))
+        and _text(value.get("description"))
+        and _text(value.get("check_kind"))
+        and _text(value.get("check_target"))
+        and _text(value.get("digest"))
+        and (check is None or _check_view(check))
+    )
+
+
+def _decision_view(value: object) -> TypeGuard[_DecisionView]:
+    return (
+        _record(value)
+        and _text(value.get("id"))
+        and _text(value.get("question"))
+        and _text(value.get("decision"))
+    )
 
 
 def _execution_view(value: object) -> TypeGuard[_ExecutionView]:
@@ -111,8 +215,20 @@ def _record_views(value: object) -> TypeGuard[list[dict[str, object]]]:
     return isinstance(value, list) and all(_record(item) for item in value)
 
 
+def _task_views(value: object) -> TypeGuard[list[_TaskView]]:
+    return isinstance(value, list) and all(_task_view(item) for item in value)
+
+
 def _increment_views(value: object) -> TypeGuard[list[_IncrementView]]:
     return isinstance(value, list) and all(_increment_view(item) for item in value)
+
+
+def _criterion_views(value: object) -> TypeGuard[list[_CriterionView]]:
+    return isinstance(value, list) and all(_criterion_view(item) for item in value)
+
+
+def _decision_views(value: object) -> TypeGuard[list[_DecisionView]]:
+    return isinstance(value, list) and all(_decision_view(item) for item in value)
 
 
 def _feature_view(value: object) -> TypeGuard[_FeatureView]:
@@ -122,17 +238,46 @@ def _feature_view(value: object) -> TypeGuard[_FeatureView]:
         _text(value.get("id"))
         and _text(value.get("directory"))
         and _text(value.get("kind"))
+        and _text(value.get("title"))
+        and _text(value.get("outcome"))
         and _text(value.get("status"))
+        and type(value.get("cycle")) is int
         and isinstance(value.get("paused"), bool)
         and _optional_text(value.get("pause_reason"))
         and _increment_views(value.get("increments"))
-        and _record_views(value.get("tasks"))
-        and _record_views(value.get("criteria"))
-        and _record_views(value.get("decisions"))
+        and _task_views(value.get("tasks"))
+        and _criterion_views(value.get("criteria"))
+        and _decision_views(value.get("decisions"))
         and _record_views(value.get("detours"))
         and isinstance(value.get("closure_history"), list)
         and isinstance(value.get("reopen_history"), list)
         and _text(value.get("plan"))
+    )
+
+
+def _feature_views(value: object) -> TypeGuard[list[_FeatureView]]:
+    return isinstance(value, list) and all(_feature_view(item) for item in value)
+
+
+def _document_conflict_view(value: object) -> TypeGuard[_DocumentConflictView]:
+    return (
+        _record(value)
+        and _text(value.get("feature_id"))
+        and _text(value.get("path"))
+        and _text(value.get("detail"))
+    )
+
+
+def _document_changes_view(value: object) -> TypeGuard[_DocumentChangesView]:
+    if not _record(value):
+        return False
+    conflicts = value.get("identity_ref_conflicts")
+    return (
+        _text_list(value.get("semantic"))
+        and _text_list(value.get("format_notes"))
+        and _text_list(value.get("generated"))
+        and isinstance(conflicts, list)
+        and all(_document_conflict_view(item) for item in conflicts)
     )
 
 
@@ -145,6 +290,10 @@ def _continuity_view(value: object) -> _ContinuityView:
     selected_feature = value.get("selected_feature")
     execution = value.get("execution")
     input_snapshot_error = value.get("input_snapshot_error")
+    selected_feature_id = value.get("selected_feature_id")
+    selection_scope = value.get("selection_scope")
+    features = value.get("features")
+    document_changes = value.get("document_changes")
     if type(revision) is not int:
         raise AssertionError("expected integer continuity revision")
     if (
@@ -156,7 +305,7 @@ def _continuity_view(value: object) -> _ContinuityView:
         raise AssertionError("expected selected feature view")
     if execution is not None and not _execution_view(execution):
         raise AssertionError("expected execution view")
-    return {
+    result: _ContinuityView = {
         "revision": revision,
         "mode": mode,
         "status": status,
@@ -164,6 +313,51 @@ def _continuity_view(value: object) -> _ContinuityView:
         "execution": execution,
         "input_snapshot_error": input_snapshot_error,
     }
+    if "selected_feature_id" in value:
+        if not _optional_text(selected_feature_id):
+            raise AssertionError("expected optional selected Feature ID")
+        result["selected_feature_id"] = selected_feature_id
+    if "selection_scope" in value:
+        if not _text(selection_scope):
+            raise AssertionError("expected selection scope")
+        result["selection_scope"] = selection_scope
+    if "features" in value:
+        if not _feature_views(features):
+            raise AssertionError("expected Feature views")
+        result["features"] = features
+    if "document_changes" in value:
+        if not _document_changes_view(document_changes):
+            raise AssertionError("expected document change view")
+        result["document_changes"] = document_changes
+    return result
+
+
+def _document_changes(result: _ContinuityView) -> _DocumentChangesView:
+    changes = result.get("document_changes")
+    if changes is None:
+        raise AssertionError("expected continuity document diagnostics")
+    return changes
+
+
+def _features(result: _ContinuityView) -> list[_FeatureView]:
+    features = result.get("features")
+    if features is None:
+        raise AssertionError("expected continuity Feature list")
+    return features
+
+
+def _stale_reason(check: _CheckView) -> str:
+    reason = check.get("stale_reason")
+    if reason is None:
+        raise AssertionError("expected a stale-check reason")
+    return reason
+
+
+def _historical_passed(check: _CheckView) -> bool:
+    passed = check.get("historical_passed")
+    if passed is None:
+        raise AssertionError("expected historical check status")
+    return passed
 
 
 def _selected_feature(result: _ContinuityView) -> _FeatureView:
@@ -236,12 +430,14 @@ def spec_request(title: str = "Three increment Feature") -> dict[str, object]:
     }
 
 
-def _rewrite_as_legacy_fixture(root: Path) -> dict[str, object]:
+def _rewrite_as_legacy_fixture(root: Path) -> ContinuityStateData:
+    store = ContinuityPersistence(root)
+    root = store.root
+    state = store.load()
+    if state is None:
+        raise AssertionError("expected initialized continuity state")
     state_path = root / ".evospec" / "continuity.json"
-    state: dict[str, Any] = json.loads(state_path.read_text(encoding="utf-8"))
     documents = state["documents"]
-    if not isinstance(documents, dict):
-        raise AssertionError("expected a document index")
     for feature_id, feature_state in state["features"].items():
         parsed = parse_all_documents(root, state, feature_id)
         directory = feature_state["directory"]
@@ -254,7 +450,8 @@ def _rewrite_as_legacy_fixture(root: Path) -> dict[str, object]:
             },
         }
         for name, value in values.items():
-            relative = f"specs/{directory}/{name}.md"
+            relative_path = PurePosixPath("specs", directory, f"{name}.md")
+            relative = relative_path.as_posix()
             if relative not in documents:
                 continue
             body = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
@@ -267,7 +464,7 @@ def _rewrite_as_legacy_fixture(root: Path) -> dict[str, object]:
                 "```\n"
                 "<!-- evospec-data:end -->\n"
             ).encode("utf-8")
-            (root / Path(relative)).write_bytes(content)
+            root.joinpath(*relative_path.parts).write_bytes(content)
             documents[relative] = sha256(content).hexdigest()
     state.pop("semantic_digests", None)
     state.pop("identity_metadata", None)
@@ -323,10 +520,13 @@ class ContinuityTests(unittest.TestCase):
 
     def call(
         self, root: Path, operation: str, revision: int | None,
-        session: str = "ses_ac0_primary_123", data: dict[str, object] | None = None,
+        session: str = "ses_ac0_primary_123", data: Mapping[str, object] | None = None,
         operations: FileOperations | None = None,
     ) -> _ContinuityView:
-        return _continuity_view(execute(root, operation, revision, session, data, operations))
+        payload = None if data is None else dict(data)
+        return _continuity_view(
+            execute(root, operation, revision, session, payload, operations),
+        )
 
     def input_snapshot(self, root: Path, revision: int) -> dict[str, object]:
         result = execute(root, "input_snapshot", revision, "ses_ac0_primary_123")
@@ -353,8 +553,8 @@ class ContinuityTests(unittest.TestCase):
         }
 
     def record_check(
-        self, root: Path, revision: int, task: dict[str, object],
-        criterion: dict[str, object],
+        self, root: Path, revision: int, task: _TaskView,
+        criterion: _CriterionView,
     ) -> _ContinuityView:
         before = self.input_snapshot(root, revision)
         after = self.input_snapshot(root, revision)
@@ -371,7 +571,7 @@ class ContinuityTests(unittest.TestCase):
         })
 
     def report_success(
-        self, root: Path, result: _ContinuityView, task: dict[str, object],
+        self, root: Path, result: _ContinuityView, task: _TaskView,
     ) -> _ContinuityView:
         started = self.call(root, "implement", result["revision"], data={
             "task_id": task["id"], "phase": "begin",
@@ -472,14 +672,14 @@ class ContinuityTests(unittest.TestCase):
                 path.relative_to(root): path.read_bytes()
                 for path in root.rglob("*") if path.is_file()
             }
-            proposed = execute(root, "status", None, "ses_ac0_primary_123")
+            proposed = self.call(root, "status", None)
             after_status = {
                 path.relative_to(root): path.read_bytes()
                 for path in root.rglob("*") if path.is_file()
             }
             self.assertEqual(before_status, after_status)
             self.assertEqual(proposed["status"], "DOCUMENT_RECONCILIATION_REQUIRED")
-            changes = proposed["document_changes"]
+            changes = _document_changes(proposed)
             self.assertEqual(
                 set(changes["semantic"]),
                 {
@@ -488,7 +688,7 @@ class ContinuityTests(unittest.TestCase):
                 },
             )
             self.assertEqual(changes["identity_ref_conflicts"], [])
-            self.assertEqual(proposed["features"], [])
+            self.assertEqual(_features(proposed), [])
 
             reconciled = self.call(root, "reconcile", proposed["revision"], data={
                 "feature_id": feature["id"],
@@ -501,7 +701,7 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(new_task["title"], "Implement filtered search")
             stale = _criterion_check(adopted["criteria"][0])
             self.assertFalse(stale["fresh"])
-            self.assertEqual(stale["stale_reason"], "criterion_changed")
+            self.assertEqual(_stale_reason(stale), "criterion_changed")
             self.assertEqual(new_task["status"], "READY")
 
             started = self.call(root, "implement", reconciled["revision"], data={
@@ -540,12 +740,12 @@ class ContinuityTests(unittest.TestCase):
                 for path in root.rglob("*") if path.is_file()
             }
 
-            proposed = execute(root, "status", None, "ses_ac0_primary_123")
+            proposed = self.call(root, "status", None)
 
             self.assertEqual(proposed["status"], "DOCUMENT_RECONCILIATION_REQUIRED")
             self.assertEqual(proposed["revision"], initial["revision"])
             self.assertEqual(
-                proposed["document_changes"]["semantic"],
+                _document_changes(proposed)["semantic"],
                 [f"specs/{feature['directory']}/plan.md"],
             )
             self.assertEqual(before_status, {
@@ -560,7 +760,7 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(_selected_feature(reconciled)["plan"], "Build the first path, then add the filter.")
             self.assertEqual(plan_path.read_text(encoding="utf-8"), authored)
             self.assertEqual(
-                execute(root, "status", None, "ses_ac0_primary_123")["document_changes"]["semantic"],
+                _document_changes(self.call(root, "status", None))["semantic"],
                 [],
             )
 
@@ -628,9 +828,9 @@ class ContinuityTests(unittest.TestCase):
             selected_default = self.call(root, "use", second["revision"], data={
                 "feature_id": first_feature["id"], "scope": "worktree",
             })
-            session_status = execute(root, "status", None, "ses_ac0_primary_123")
-            self.assertEqual(session_status["selected_feature_id"], second_feature["id"])
-            self.assertEqual(session_status["selection_scope"], "session")
+            session_status = self.call(root, "status", None)
+            self.assertEqual(session_status.get("selected_feature_id"), second_feature["id"])
+            self.assertEqual(session_status.get("selection_scope"), "session")
             self.assertIn(" — OPEN — worktree default", index_entry(first_feature["id"]))
             self.assertNotIn("worktree default", index_entry(second_feature["id"]))
 
@@ -754,12 +954,12 @@ class ContinuityTests(unittest.TestCase):
             }
             revision_before_status = first["revision"]
 
-            proposed = execute(root, "status", None, "ses_ac0_primary_123")
+            proposed = self.call(root, "status", None)
 
             self.assertEqual(proposed["revision"], revision_before_status)
             self.assertEqual(proposed["status"], "DOCUMENT_RECONCILIATION_REQUIRED")
             self.assertEqual(
-                set(proposed["document_changes"]["semantic"]),
+                set(_document_changes(proposed)["semantic"]),
                 {
                     f"specs/{feature['directory']}/spec.md",
                     f"specs/{feature['directory']}/tasks.md",
@@ -853,17 +1053,17 @@ class ContinuityTests(unittest.TestCase):
                 path.relative_to(root): path.read_bytes()
                 for path in root.rglob("*") if path.is_file()
             }
-            note_status = execute(root, "status", None, "ses_ac0_primary_123")
+            note_status = self.call(root, "status", None)
             self.assertEqual(original_files, {
                 path.relative_to(root): path.read_bytes()
                 for path in root.rglob("*") if path.is_file()
             })
-            self.assertEqual(note_status["document_changes"]["semantic"], [])
+            self.assertEqual(_document_changes(note_status)["semantic"], [])
             self.assertEqual(
-                note_status["document_changes"]["format_notes"],
+                _document_changes(note_status)["format_notes"],
                 [f"specs/{feature['directory']}/spec.md"],
             )
-            self.assertEqual(note_status["document_changes"]["generated"], [])
+            self.assertEqual(_document_changes(note_status)["generated"], [])
             noted = self.call(root, "reconcile", note_status["revision"], data={
                 "feature_id": feature["id"],
             })
@@ -882,19 +1082,19 @@ class ContinuityTests(unittest.TestCase):
                 path.relative_to(root): path.read_bytes()
                 for path in root.rglob("*") if path.is_file()
             }
-            checkbox_status = execute(root, "status", None, "ses_ac0_primary_123")
+            checkbox_status = self.call(root, "status", None)
             self.assertEqual(before_checkbox_status, {
                 path.relative_to(root): path.read_bytes()
                 for path in root.rglob("*") if path.is_file()
             })
-            self.assertEqual(checkbox_status["document_changes"]["semantic"], [])
-            self.assertEqual(checkbox_status["document_changes"]["format_notes"], [])
+            self.assertEqual(_document_changes(checkbox_status)["semantic"], [])
+            self.assertEqual(_document_changes(checkbox_status)["format_notes"], [])
             self.assertEqual(
-                checkbox_status["document_changes"]["generated"],
+                _document_changes(checkbox_status)["generated"],
                 [f"specs/{feature['directory']}/tasks.md"],
             )
             self.assertEqual(
-                checkbox_status["selected_feature"]["tasks"][0]["status"],
+                _selected_feature(checkbox_status)["tasks"][0]["status"],
                 "READY",
             )
             refreshed = self.call(root, "reconcile", checkbox_status["revision"], data={
@@ -903,9 +1103,7 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(_selected_feature(refreshed)["tasks"][0]["status"], "READY")
             self.assertIn(f"- [ ] `{task_id}`", tasks_path.read_text(encoding="utf-8"))
             self.assertEqual(
-                execute(root, "status", None, "ses_ac0_primary_123")[
-                    "document_changes"
-                ]["generated"],
+                _document_changes(self.call(root, "status", None))["generated"],
                 [],
             )
 
@@ -960,12 +1158,12 @@ class ContinuityTests(unittest.TestCase):
                     path.relative_to(root): path.read_bytes()
                     for path in root.rglob("*") if path.is_file()
                 }
-                projected = execute(root, "status", None, "ses_ac0_primary_123")
+                projected = self.call(root, "status", None)
                 self.assertEqual(
                     projected["status"], "DOCUMENT_CONFLICT",
                 )
-                self.assertTrue(projected["document_changes"]["identity_ref_conflicts"])
-                self.assertEqual(projected["features"], [])
+                self.assertTrue(_document_changes(projected)["identity_ref_conflicts"])
+                self.assertEqual(_features(projected), [])
                 self.assertEqual(before, {
                     path.relative_to(root): path.read_bytes()
                     for path in root.rglob("*") if path.is_file()
@@ -1004,7 +1202,7 @@ class ContinuityTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            proposed = execute(root, "status", None, "ses_ac0_primary_123")
+            proposed = self.call(root, "status", None)
             self.assertEqual(proposed["status"], "DOCUMENT_RECONCILIATION_REQUIRED")
             before = {
                 path.relative_to(root): path.read_bytes()
@@ -1034,7 +1232,7 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(len(current["closure_history"]), 1)
             self.assertEqual(len(current["reopen_history"]), 1)
             self.assertEqual(
-                _criterion_check(current["criteria"][0])["stale_reason"],
+                _stale_reason(_criterion_check(current["criteria"][0])),
                 "criterion_changed",
             )
             self.assertIn(
@@ -1188,9 +1386,9 @@ class ContinuityTests(unittest.TestCase):
                 for path in root.rglob("*") if path.is_file()
             })
 
-            upgraded = execute(
+            upgraded = _continuity_view(execute(
                 root, "upgrade_markdown", revision, "ses_ac0_primary_123",
-            )
+            ))
             self.assertEqual(upgraded["revision"], revision + 1)
             saved = json.loads(
                 (root / ".evospec" / "continuity.json").read_text(encoding="utf-8"),
@@ -1199,12 +1397,13 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(saved["attempts"], legacy_attempts)
             self.assertEqual(saved["execution"], legacy_execution)
             self.assertEqual(saved["closures"], legacy_closures)
+            upgraded_features = _features(upgraded)
             first_after = next(
-                item for item in upgraded["features"]
+                item for item in upgraded_features
                 if item["id"] == feature["id"]
             )
             second_after = next(
-                item for item in upgraded["features"]
+                item for item in upgraded_features
                 if item["id"] == second_feature["id"]
             )
             self.assertEqual(first_after["status"], "CLOSED")
@@ -1212,15 +1411,15 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(second_after["tasks"][0]["status"], "OUTCOME_UNKNOWN")
             legacy_check = _criterion_check(first_after["criteria"][0])
             self.assertFalse(legacy_check["fresh"])
-            self.assertTrue(legacy_check["historical_passed"])
-            self.assertEqual(legacy_check["stale_reason"], "task_changed")
+            self.assertTrue(_historical_passed(legacy_check))
+            self.assertEqual(_stale_reason(legacy_check), "task_changed")
             for path in (root / "specs").glob("*/*.md"):
                 self.assertNotIn(b"<!-- evospec-data:start -->", path.read_bytes())
 
     def test_legacy_upgrade_refuses_dirty_or_mixed_markdown_sources(self) -> None:
         for source_kind in ("dirty", "mixed"):
             with self.subTest(source_kind=source_kind), self._temp() as temporary:
-                root = Path(temporary)
+                root = ContinuityPersistence(Path(temporary)).root
                 initial = self.call(root, "specify", 0, data={
                     **spec_request("Legacy safety"),
                     "increments": [],
@@ -1239,13 +1438,17 @@ class ContinuityTests(unittest.TestCase):
                     from evospec.continuity_documents import render_document
 
                     parsed = parse_all_documents(root, legacy, feature["id"])
+                    spec = parsed.get("spec")
+                    if not _record(spec):
+                        raise AssertionError("expected parsed legacy Feature document")
                     content = render_document(
-                        "spec", parsed["spec"], legacy, feature["id"], parsed["spec"],
+                        "spec", spec, legacy, feature["id"], spec,
                     ).encode("utf-8")
                     spec_path.write_bytes(content)
-                    legacy["documents"][
-                        f"specs/{feature['directory']}/spec.md"
-                    ] = sha256(content).hexdigest()
+                    relative = PurePosixPath(
+                        "specs", feature["directory"], "spec.md",
+                    ).as_posix()
+                    legacy["documents"][relative] = sha256(content).hexdigest()
                     (root / ".evospec" / "continuity.json").write_text(
                         json.dumps(
                             legacy, ensure_ascii=False, sort_keys=True,

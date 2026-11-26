@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from hashlib import sha256
 from pathlib import Path
-from typing import cast
+from typing import NotRequired, TypedDict, cast
 
 from .domain import (
+    ContinuityCheck,
     ContinuityError,
     ContinuityCriterionDocument,
     ContinuityDecisionDocument,
     ContinuityFeatureDocument,
+    ContinuityInputScope,
     ContinuityIncrementDocument,
     ContinuityPlanDocument,
     ContinuityStateData,
@@ -38,6 +41,41 @@ _NOTES_START = "<!-- evospec-notes:start -->"
 _NOTES_END = "<!-- evospec-notes:end -->"
 _FEATURE = re.compile(r"^<!-- evospec-feature: (F-[0-9a-f]{32}) -->\r?$", re.M)
 _DOCUMENT_NAMES = {"spec": "spec", "plan": "plan", "tasks": "tasks", "decisions": "decisions"}
+
+
+class _ContinuityCheckView(TypedDict):
+    criterion_id: str
+    criterion_digest: str
+    exit_code: int
+    check_kind: str
+    check_target: str
+    output_sha256: str
+    task_id: str | None
+    reported_by_session_id: str
+    recorded_revision: int
+    observed_input_scope: NotRequired[dict[str, str]]
+
+
+def _continuity_check_view(check: ContinuityCheck) -> _ContinuityCheckView:
+    view: _ContinuityCheckView = {
+        "criterion_id": check["criterion_id"],
+        "criterion_digest": check["criterion_digest"],
+        "exit_code": check["exit_code"],
+        "check_kind": check["check_kind"],
+        "check_target": check["check_target"],
+        "output_sha256": check["output_sha256"],
+        "task_id": check["task_id"],
+        "reported_by_session_id": check["reported_by_session_id"],
+        "recorded_revision": check["recorded_revision"],
+    }
+    observed = check.get("observed_input_scope")
+    if observed is not None:
+        view["observed_input_scope"] = {
+            "policy_id": observed["policy_id"],
+            "policy_digest": observed["policy_digest"],
+            "fingerprint": observed["fingerprint"],
+        }
+    return view
 
 
 def initial_documents(
@@ -99,7 +137,7 @@ def plan_write(
 
 def tasks_write(
     root: Path, state: ContinuityStateData, feature_id: str,
-    tasks: list[dict[str, object]], feature: dict[str, object],
+    tasks: list[ContinuityTaskDocument], feature: dict[str, object],
 ) -> dict[str, tuple[bytes, str | None]]:
     relative = f"specs/{state['features'][feature_id]['directory']}/tasks.md"
     value: dict[str, object] = {"feature_id": feature_id, "tasks": tasks}
@@ -112,11 +150,11 @@ def tasks_write(
         except ContinuityError:
             current = []
         new_ids = [item["id"] for item in current]
-        requested_ids = [item["id"] for item in cast(list[ContinuityTaskDocument], cast(object, tasks))]
+        requested_ids = [item["id"] for item in tasks]
         if requested_ids[:len(new_ids)] == new_ids:
-            additions = cast(list[dict[str, object]], cast(object, tasks))[len(new_ids):]
+            additions = tasks[len(new_ids):]
             rendered = _append_task_definitions(original, additions)
-        elif current == cast(list[ContinuityTaskDocument], cast(object, tasks)):
+        elif current == tasks:
             rendered = original
         else:
             rendered = render_document("tasks", value, state, feature_id, feature)
@@ -288,7 +326,7 @@ def _validate_decision_list(decisions: list[object], relative: str) -> None:
 
 def parse_all(
     root: Path, state: ContinuityStateData, feature_id: str,
-    input_snapshot: dict[str, str] | None = None,
+    input_snapshot: ContinuityInputScope | None = None,
 ) -> dict[str, object]:
     """Read semantic Markdown, its digest and generated-region discrepancies."""
     relative_paths = {
@@ -325,6 +363,7 @@ def parse_all(
             "DOCUMENT_DIVERGED",
             f"{relative_paths['tasks']} has dangling, wrong-kind, duplicate, or cyclic references",
         ) from error
+    task_documents = cast(list[ContinuityTaskDocument], cast(object, tasks))
     plan_value = parsed["plan"] or {"feature_id": feature_id, "plan": ""}
     decisions_value = parsed["decisions"] or {"feature_id": feature_id, "decisions": []}
     if (
@@ -338,7 +377,7 @@ def parse_all(
     _validate_decision_list(cast(list[object], decisions_value.get("decisions", [])), relative_paths["decisions"])
     values: dict[str, object] = {
         "spec": feature,
-        "tasks": cast(list[dict[str, object]], cast(object, tasks)),
+        "tasks": cast(list[dict[str, object]], cast(object, task_documents)),
         "plan": plan_value,
         "decisions": cast(list[dict[str, object]], decisions_value["decisions"]),
     }
@@ -371,7 +410,7 @@ def parse_all(
             )
             expected = _generated_checklist(
                 checklist_state, feature_id, cast(dict[str, object], values["spec"]),
-                cast(list[dict[str, object]], values["tasks"]),
+                task_documents,
             )
             generated[relative] = _generated_content(text) == expected
     values["bytes_digests"] = bytes_digests
@@ -417,7 +456,7 @@ def replace_aliases(content: bytes, aliases: dict[str, str]) -> bytes:
 
 def refresh_generated_checklist(
     content: bytes, state: ContinuityStateData, feature_id: str,
-    feature: dict[str, object], tasks: list[dict[str, object]],
+    feature: dict[str, object], tasks: list[ContinuityTaskDocument],
 ) -> bytes:
     try:
         text = content.decode("utf-8")
@@ -583,10 +622,13 @@ def _sections(lines: list[str], relative: str) -> dict[str, list[str]]:
     for line in lines[1:]:
         match = re.fullmatch(r"## ([^\r\n]+?)\s*", line)
         if match:
-            current = match.group(1)
-            if current in sections:
+            section = match.group(1)
+            if section is None:
+                raise ContinuityError("DOCUMENT_DIVERGED", f"{relative} has an invalid section")
+            current = section
+            if section in sections:
                 raise ContinuityError("DOCUMENT_DIVERGED", f"{relative} has duplicate {current} sections")
-            sections[current] = []
+            sections[section] = []
         elif current is not None:
             sections[current].append(line)
         elif line.strip() and not line.startswith("<!-- evospec-feature:"):
@@ -855,13 +897,19 @@ def _read_legacy_document(content: str, relative: str, feature_id: str) -> dict[
 
 def _generated_checklist(
     state: ContinuityStateData, feature_id: str, feature: dict[str, object],
-    tasks: list[dict[str, object]] | list[ContinuityTaskDocument],
+    tasks: Sequence[ContinuityTaskDocument],
 ) -> str:
+    input_snapshot = cast(ContinuityInputScope | None, state.get("input_snapshot"))
     view_state: ContinuityStateView = {
-        "checks": tuple(state["checks"]), "attempts": tuple(state["attempts"]),
+        "checks": tuple(_continuity_check_view(check) for check in state["checks"]),
+        "attempts": tuple(state["attempts"]),
         "execution": None if state["execution"] is None else {"task_id": state["execution"]["task_id"]},
         "paused_features": tuple(state["paused_features"]),
-        "input_snapshot": cast(dict[str, str] | None, state.get("input_snapshot")),
+        "input_snapshot": None if input_snapshot is None else {
+            "policy_id": input_snapshot["policy_id"],
+            "policy_digest": input_snapshot["policy_digest"],
+            "fingerprint": input_snapshot["fingerprint"],
+        },
     }
     criteria = cast(list[ContinuityCriterionDocument], feature["criteria"])
     view_feature: ContinuityFeatureView = {"criteria": tuple(criteria)}
@@ -873,14 +921,14 @@ def _generated_checklist(
             "criteria_ids": tuple(item["criteria_ids"]),
             "depends_on": tuple(item["depends_on"]),
         }
-        for item in cast(list[ContinuityTaskDocument], cast(object, tasks))
+        for item in tasks
     )
     lines = [
         _GENERATED_START,
         "## Checklist (derived; checkboxes do not record progress)",
         "",
     ]
-    for item in cast(list[ContinuityTaskDocument], cast(object, tasks)):
+    for item in tasks:
         view_task: ContinuityTaskView = {
             "id": item["id"], "title": item["title"], "description": item["description"],
             "increment_id": item["increment_id"], "criteria_ids": tuple(item["criteria_ids"]),
@@ -892,11 +940,11 @@ def _generated_checklist(
     return "\n".join(lines)
 
 
-def _task_definition(task: dict[str, object]) -> str:
+def _task_definition(task: ContinuityTaskDocument) -> str:
     increment = task["increment_id"] or "none"
     criteria = ", ".join(f"`{item}`" for item in task["criteria_ids"])
     dependencies = ", ".join(f"`{item}`" for item in task["depends_on"]) or "none"
-    description = cast(str, task["description"])
+    description = task["description"]
     indented = "\n".join("  " + line if line else "" for line in description.splitlines())
     return (
         f"### `{task['id']}` — {task['title']}\n"
@@ -907,7 +955,7 @@ def _task_definition(task: dict[str, object]) -> str:
     )
 
 
-def _append_task_definitions(original: str, tasks: list[dict[str, object]]) -> str:
+def _append_task_definitions(original: str, tasks: list[ContinuityTaskDocument]) -> str:
     if not tasks:
         return original
     rendered = "\n".join(_task_definition(task) for task in tasks)

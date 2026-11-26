@@ -4632,7 +4632,9 @@ class ContinuityPersistence:
         next_state = deepcopy(candidate)
         documents = dict(candidate["documents"])
         pending_writes: list[ContinuityPendingWrite] = []
-        observed = dict(current["documents"]) if read_set is None else dict(read_set)
+        observed: dict[str, str | None] = (
+            dict(current["documents"]) if read_set is None else dict(read_set)
+        )
         for relative, (content, before_hash) in sorted(writes.items()):
             self.__safe_document_path(relative)
             if type(content) is not bytes or len(content) > 512 * 1024:

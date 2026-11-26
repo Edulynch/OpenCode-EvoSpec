@@ -167,7 +167,7 @@ def _render_task_write(
             cast(object, {**state, "input_snapshot": input_snapshot}),
         )
     return _write_tasks(
-        root, render_state, feature_id, _plain_records(tasks), _plain_record(feature),
+        root, render_state, feature_id, tasks, _plain_record(feature),
     )
 
 
@@ -902,7 +902,7 @@ def _publish_mutation(
     session_id: str,
 ) -> dict[str, object]:
     candidate["revision"] = state["revision"] + 1
-    read_set = {
+    read_set: dict[str, str | None] = {
         path: digest for path, digest in state["documents"].items()
     }
     _refresh_document_metadata(candidate, writes)
@@ -1221,7 +1221,8 @@ def _reconcile_documents(
         updated = _replace_document_aliases(content, aliases)
         if name == "tasks":
             updated = _refresh_generated_checklist(
-                updated, checklist_state, feature_id, feature, tasks,
+                updated, checklist_state, feature_id, feature,
+                cast(list[ContinuityTaskDocument], cast(object, tasks)),
             )
         writes[relative] = (updated, observed_digest)
     read_set["specs/README.md"] = _file_digest(store.root / "specs" / "README.md")
