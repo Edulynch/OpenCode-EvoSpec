@@ -161,6 +161,7 @@ SEMANTIC_REQUEST_OBJECTIVE_SCHEMA: Final = 21
 PROVISIONAL_SLICE_SCHEMA: Final = 22
 D4_PROVISIONAL_SLICE_SCHEMA: Final = 23
 D5_PROVISIONAL_SLICE_SCHEMA: Final = 24
+_CONTINUITY_RECOVERY_MAX_BYTES: Final = 4 * 1024 * 1024
 _D4_LIFECYCLE_OPERATIONS: Final = frozenset((
     "lifecycle", "review", "verification", "convergence", "accepted_terminal_archive",
 ))
@@ -4549,6 +4550,18 @@ def _atomic_replace(
             raise AtomicFailure("publication durability is uncertain after replacement") from error
 
 
+def _encode_recoverable_continuity(
+    state: ContinuityStateData, description: str,
+) -> bytes:
+    encoded = encode_json(cast(JsonValue, cast(object, state)))
+    if len(encoded) > _CONTINUITY_RECOVERY_MAX_BYTES:
+        raise ContinuityError(
+            "LIMIT_EXCEEDED",
+            f"serialized continuity {description} exceeds its 4 MiB recovery bound",
+        )
+    return encoded
+
+
 class ContinuityPersistence:
     """Shared-lock state and recoverable Markdown publication for composed work."""
 
@@ -4584,11 +4597,13 @@ class ContinuityPersistence:
         if not marker.exists():
             return None
         try:
-            if marker.stat().st_size > 4 * 1024 * 1024:
+            with marker.open("rb") as handle:
+                encoded = handle.read(_CONTINUITY_RECOVERY_MAX_BYTES + 1)
+            if len(encoded) > _CONTINUITY_RECOVERY_MAX_BYTES:
                 raise ContinuityError(
                     "CORRUPT_CONTINUITY", "continuity.json exceeds its recovery bound",
                 )
-            raw = decode_json(marker.read_text(encoding="utf-8"))
+            raw = decode_json(encoded.decode("utf-8"))
         except ContinuityError:
             raise
         except (OSError, UnicodeDecodeError, DecodeError, RecursionError) as error:
@@ -4642,6 +4657,7 @@ class ContinuityPersistence:
         validate_continuity_state(
             next_state, repository_id=self.repository_id, pending_state=True,
         )
+        _ = _encode_recoverable_continuity(next_state, "state")
         next_state_record: dict[str, object] = {}
         next_state_record.update(next_state)
         pending_record: ContinuityPending = {
@@ -4653,11 +4669,12 @@ class ContinuityPersistence:
             "pending": pending_record,
         }
         validate_continuity_state(journal, repository_id=self.repository_id)
+        journal_bytes = _encode_recoverable_continuity(journal, "recovery journal")
         marker = _artifact_path(self.__root, "continuity.json")
         try:
             _atomic_replace(
                 marker,
-                encode_json(cast(JsonValue, cast(object, journal))),
+                journal_bytes,
                 self.__operations,
                 strict_directory=True,
             )
@@ -4669,6 +4686,8 @@ class ContinuityPersistence:
         self.recover_pending(journal)
 
     def recover_pending(self, state: ContinuityStateData) -> None:
+        validate_continuity_state(state, repository_id=self.repository_id)
+        _ = _encode_recoverable_continuity(state, "recovery journal")
         pending = state["pending"]
         if pending is None:
             raise ContinuityError("NO_RECOVERY", "there is no pending document transaction")
@@ -4678,6 +4697,11 @@ class ContinuityPersistence:
             next_state, repository_id=self.repository_id, pending_state=True,
         )
         next_state = cast(ContinuityStateData, cast(object, next_state))
+        final_state = deepcopy(next_state)
+        final_state["pending"] = None
+        validate_continuity_state(final_state, repository_id=self.repository_id)
+        final_state_bytes = _encode_recoverable_continuity(final_state, "state")
+        prepared_writes: list[tuple[str, Path, bytes]] = []
         for item in pending["writes"]:
             relative = item["path"]
             content = item["content"]
@@ -4700,6 +4724,8 @@ class ContinuityPersistence:
                     "DOCUMENT_DIVERGED",
                     f"{relative} no longer matches either journal version; manual reconciliation is required",
                 )
+            prepared_writes.append((relative, destination, data))
+        for relative, destination, data in prepared_writes:
             try:
                 _atomic_replace(destination, data, self.__operations, strict_directory=True)
             except (AtomicFailure, RecoveryError) as error:
@@ -4707,13 +4733,10 @@ class ContinuityPersistence:
                     "RECOVERY_INCOMPLETE",
                     f"publication for {relative} remains journaled; reconcile again after inspecting it",
                 ) from error
-        final_state = deepcopy(next_state)
-        final_state["pending"] = None
-        validate_continuity_state(final_state, repository_id=self.repository_id)
         try:
             _atomic_replace(
                 _artifact_path(self.__root, "continuity.json"),
-                encode_json(cast(JsonValue, cast(object, final_state))),
+                final_state_bytes,
                 self.__operations,
                 strict_directory=True,
             )

@@ -4,42 +4,71 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
-from typing import Final, TypeVar
+from typing import Final, NotRequired, TypeVar, TypedDict, cast
 from uuid import uuid4
-from collections.abc import Mapping
 
 from .continuity_documents import (
     decisions_write as _write_decisions,
+)
+from .continuity_documents import (
     feature_document_writes as _writes_for_feature,
+)
+from .continuity_documents import (
     index_write as _index_write,
+)
+from .continuity_documents import (
     initial_documents as _build_initial_documents,
+)
+from .continuity_documents import (
     new_directory as _new_directory,
+)
+from .continuity_documents import (
     plan_write as _write_plan,
+)
+from .continuity_documents import (
     read_decisions as _read_decisions,
+)
+from .continuity_documents import (
     read_feature as _read_feature,
+)
+from .continuity_documents import (
     read_plan as _read_plan,
+)
+from .continuity_documents import (
     read_tasks as _read_tasks,
+)
+from .continuity_documents import (
     spec_write as _write_spec,
+)
+from .continuity_documents import (
     tasks_write as _write_tasks,
 )
 from .domain import (
+    CONTINUITY_INPUT_POLICY_DIGEST,
+    CONTINUITY_INPUT_POLICY_ID,
     ContinuityAttempt,
     ContinuityCheck,
     ContinuityClosure,
     ContinuityCriterionDocument,
     ContinuityDecisionDocument,
     ContinuityDetour,
+    ContinuityError,
     ContinuityExecution,
     ContinuityFeatureDocument,
     ContinuityFeatureIndex,
     ContinuityIncrementDocument,
+    ContinuityInputScope,
     ContinuityReopen,
     ContinuityStateData,
     ContinuityTaskDocument,
-    ContinuityError,
+)
+from .input_fingerprint import (
+    InputFingerprintError,
+    repository_input_snapshot,
 )
 from .lifecycle import (
     ContinuityFeatureView,
@@ -64,10 +93,23 @@ _MAX_INCREMENTS = 100
 _MAX_DECISIONS = 1000
 _COMMANDS = frozenset((
     "specify", "clarify", "plan", "tasks", "implement", "use", "change",
-    "status", "verify", "pause", "resume", "close",
+    "status", "input_snapshot", "verify", "pause", "resume", "close",
 ))
 
 _DocumentRecord = TypeVar("_DocumentRecord", bound=Mapping[str, object])
+
+
+class _ContinuityCheckView(TypedDict):
+    criterion_id: str
+    criterion_digest: str
+    exit_code: int
+    check_kind: str
+    check_target: str
+    output_sha256: str
+    task_id: str | None
+    reported_by_session_id: str
+    recorded_revision: int
+    observed_input_scope: NotRequired[dict[str, str]]
 
 
 def _plain_record(record: Mapping[str, object]) -> dict[str, object]:
@@ -96,9 +138,80 @@ def _render_task_write(
     root: Path, state: ContinuityStateData, feature_id: str,
     tasks: list[ContinuityTaskDocument], feature: ContinuityFeatureDocument,
 ) -> dict[str, tuple[bytes, str | None]]:
+    try:
+        input_snapshot = _continuity_input_scope(root, state)
+    except ContinuityError:
+        render_state = state
+    else:
+        render_state = cast(
+            ContinuityStateData,
+            cast(object, {**state, "input_snapshot": input_snapshot}),
+        )
     return _write_tasks(
-        root, state, feature_id, _plain_records(tasks), _plain_record(feature),
+        root, render_state, feature_id, _plain_records(tasks), _plain_record(feature),
     )
+
+
+def _continuity_input_scope(
+    root: Path, state: ContinuityStateData,
+) -> ContinuityInputScope:
+    """Hash root inputs; omit only Git, Core state, and Core-owned projections."""
+    try:
+        snapshot = repository_input_snapshot(root, state["repository_id"])
+    except InputFingerprintError as error:
+        raise ContinuityError("INPUT_SNAPSHOT_UNAVAILABLE", str(error)) from error
+    excluded = set(state["documents"]) | {"specs/README.md"}
+    excluded_directories = {
+        path.rsplit("/", 1)[0]
+        for path in excluded
+        if path.startswith("specs/") and path.count("/") == 2
+    }
+    payload = {
+        "policy_id": CONTINUITY_INPUT_POLICY_ID,
+        "policy_digest": CONTINUITY_INPUT_POLICY_DIGEST,
+        "repository_id": state["repository_id"],
+        "files": [
+            [path, digest]
+            for path, digest in snapshot.file_sha256
+            if path not in excluded
+        ],
+        "directories": [
+            path for path in snapshot.directory_paths
+            if path not in excluded_directories
+        ],
+    }
+    fingerprint = sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return {
+        "policy_id": CONTINUITY_INPUT_POLICY_ID,
+        "policy_digest": CONTINUITY_INPUT_POLICY_DIGEST,
+        "fingerprint": fingerprint,
+    }
+
+
+def _input_scope_argument(value: object, name: str) -> ContinuityInputScope:
+    if type(value) is not dict:
+        raise ContinuityError("INVALID_REQUEST", f"{name} is not a valid Core input snapshot")
+    if set(value) != {"policy_id", "policy_digest", "fingerprint"}:
+        raise ContinuityError("INVALID_REQUEST", f"{name} is not a valid Core input snapshot")
+    policy_id = value.get("policy_id")
+    policy_digest = value.get("policy_digest")
+    fingerprint = value.get("fingerprint")
+    if (
+        not isinstance(policy_id, str)
+        or policy_id != CONTINUITY_INPUT_POLICY_ID
+        or not isinstance(policy_digest, str)
+        or policy_digest != CONTINUITY_INPUT_POLICY_DIGEST
+        or not isinstance(fingerprint, str)
+        or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+    ):
+        raise ContinuityError("INVALID_REQUEST", f"{name} is not a valid Core input snapshot")
+    return {
+        "policy_id": CONTINUITY_INPUT_POLICY_ID,
+        "policy_digest": CONTINUITY_INPUT_POLICY_DIGEST,
+        "fingerprint": fingerprint,
+    }
 
 
 def _render_decision_write(
@@ -126,13 +239,21 @@ def _render_spec_write(
     return _write_spec(root, state, feature_id, _plain_record(feature))
 
 
-def _continuity_state_view(state: ContinuityStateData) -> ContinuityStateView:
+def _continuity_state_view(
+    state: ContinuityStateData,
+    input_snapshot: ContinuityInputScope | None = None,
+) -> ContinuityStateView:
     execution = state["execution"]
     return {
-        "checks": tuple(state["checks"]),
+        "checks": tuple(_continuity_check_view(check) for check in state["checks"]),
         "attempts": tuple(state["attempts"]),
         "execution": None if execution is None else {"task_id": execution["task_id"]},
         "paused_features": tuple(state["paused_features"]),
+        "input_snapshot": None if input_snapshot is None else {
+            "policy_id": input_snapshot["policy_id"],
+            "policy_digest": input_snapshot["policy_digest"],
+            "fingerprint": input_snapshot["fingerprint"],
+        },
     }
 
 
@@ -151,6 +272,28 @@ def _continuity_task_view(task: ContinuityTaskDocument) -> ContinuityTaskView:
         "criteria_ids": tuple(task["criteria_ids"]),
         "depends_on": tuple(task["depends_on"]),
     }
+
+
+def _continuity_check_view(check: ContinuityCheck) -> _ContinuityCheckView:
+    view: _ContinuityCheckView = {
+        "criterion_id": check["criterion_id"],
+        "criterion_digest": check["criterion_digest"],
+        "exit_code": check["exit_code"],
+        "check_kind": check["check_kind"],
+        "check_target": check["check_target"],
+        "output_sha256": check["output_sha256"],
+        "task_id": check["task_id"],
+        "reported_by_session_id": check["reported_by_session_id"],
+        "recorded_revision": check["recorded_revision"],
+    }
+    observed = check.get("observed_input_scope")
+    if observed is not None:
+        view["observed_input_scope"] = {
+            "policy_id": observed["policy_id"],
+            "policy_digest": observed["policy_digest"],
+            "fingerprint": observed["fingerprint"],
+        }
+    return view
 
 
 def execute(
@@ -198,6 +341,13 @@ def execute(
             return _project(store, recovered, session_id)
         if operation not in ("status", "tasks", "use"):
             store.check_documents(state)
+        if operation == "input_snapshot":
+            _keys(data, set())
+            _expect_revision(expected_revision, state["revision"])
+            return {
+                "mode": "COMPOSED", "revision": state["revision"],
+                "input_snapshot": _continuity_input_scope(root, state),
+            }
         if operation in ("status", "tasks") and not data:
             return _project(store, state, session_id)
         if operation == "use" and not data:
@@ -383,8 +533,12 @@ def _mutate(
                 )
             if feature_id in candidate["paused_features"]:
                 raise ContinuityError("FEATURE_PAUSED", "resume the selected Feature before dispatch")
+            try:
+                input_snapshot = _continuity_input_scope(root, candidate)
+            except ContinuityError:
+                input_snapshot = None
             if not continuity_task_eligible(
-                _continuity_state_view(candidate),
+                _continuity_state_view(candidate, input_snapshot),
                 _continuity_feature_view(feature),
                 tuple(_continuity_task_view(item) for item in tasks),
                 _continuity_task_view(task),
@@ -438,6 +592,7 @@ def _mutate(
         _keys(data, {
             "feature_id", "criterion_id", "exit_code", "output_sha256",
             "check_kind", "check_target", "task_id",
+            "input_snapshot_before", "input_snapshot_after",
         })
         # The OpenCode tool supplies result fields only after it runs an allow-listed test.
         criterion = _by_id(feature["criteria"], data.get("criterion_id"), "C", "criterion_id")
@@ -454,15 +609,30 @@ def _mutate(
             raise ContinuityError("STALE_CRITERION", "check target differs from the current criterion")
         if candidate["execution"] is not None:
             raise ContinuityError("EXECUTION_BUSY", "reconcile the in-flight Task before verifying")
-        task_id = _text(data.get("task_id", ""), "task_id", maximum=256, allow_empty=True)
-        if task_id:
-            _by_id(tasks, task_id, "T", "task_id")
+        task_id = _text(data.get("task_id"), "task_id", maximum=256)
+        task = _by_id(tasks, task_id, "T", "task_id")
+        if criterion["id"] not in task["criteria_ids"]:
+            raise ContinuityError(
+                "INVALID_REQUEST", "verification Task must be linked to the current criterion",
+            )
+        input_before = _input_scope_argument(
+            data.get("input_snapshot_before"), "input_snapshot_before",
+        )
+        input_after = _input_scope_argument(
+            data.get("input_snapshot_after"), "input_snapshot_after",
+        )
+        current_input = _continuity_input_scope(root, state)
+        if input_before != input_after or input_before != current_input:
+            raise ContinuityError(
+                "STALE_INPUT", "repository inputs changed before the check receipt was admitted",
+            )
         check: ContinuityCheck = {
             "criterion_id": criterion["id"], "criterion_digest": _digest(criterion),
             "check_kind": criterion["check_kind"], "check_target": criterion["check_target"],
             "exit_code": exit_code, "output_sha256": output_digest,
-            "reported_by_session_id": session_id, "task_id": task_id or None,
+            "reported_by_session_id": session_id, "task_id": task_id,
             "recorded_revision": state["revision"] + 1,
+            "observed_input_scope": current_input,
         }
         candidate["checks"].append(check)
         writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
@@ -570,13 +740,22 @@ def _mutate(
 
     elif operation == "close":
         _keys(data, {"feature_id"})
+        try:
+            current_input_snapshot = _continuity_input_scope(root, state)
+        except ContinuityError as error:
+            current_input_snapshot = None
+            input_snapshot_error = str(error)
+        else:
+            input_snapshot_error = None
         blockers = continuity_close_blockers(
-            _continuity_state_view(state),
+            _continuity_state_view(state, current_input_snapshot),
             feature_id,
             {"status": candidate["features"][feature_id]["status"]},
             _continuity_feature_view(feature),
             tuple(_continuity_task_view(item) for item in tasks),
         )
+        if input_snapshot_error is not None:
+            blockers = (*blockers, f"current input snapshot is unavailable: {input_snapshot_error}")
         if blockers:
             raise ContinuityError("CLOSE_BLOCKED", "; ".join(blockers))
         feature_state = candidate["features"][feature_id]
@@ -648,6 +827,15 @@ def _mutate(
     else:
         raise ContinuityError("INVALID_OPERATION", "unsupported continuity operation")
 
+    if operation == "verify":
+        observed_input_scope = candidate["checks"][-1].get("observed_input_scope")
+        if (
+            observed_input_scope is None
+            or _continuity_input_scope(root, state) != observed_input_scope
+        ):
+            raise ContinuityError(
+                "STALE_INPUT", "repository inputs changed before the check receipt was committed",
+            )
     return _publish_mutation(store, state, candidate, writes, session_id)
 
 
@@ -694,6 +882,13 @@ def _project(
             "status": "DOCUMENT_DIVERGED", "detail": str(error),
             "features": sorted(state["features"]),
         }
+    try:
+        input_snapshot = _continuity_input_scope(root, state)
+    except ContinuityError as error:
+        input_snapshot = None
+        input_snapshot_error = str(error)
+    else:
+        input_snapshot_error = None
     selected = state["session_features"].get(session_id) or state["default_feature_id"]
     feature_views: list[dict[str, object]] = []
     result: dict[str, object] = {
@@ -704,13 +899,18 @@ def _project(
         "features": feature_views,
         "execution": state["execution"],
     }
+    if input_snapshot_error is not None:
+        result["input_snapshot_error"] = input_snapshot_error
     for feature_id in sorted(state["features"]):
         feature = _read_feature(root, state, feature_id)
         tasks = _read_tasks(root, state, feature_id)
         feature_state = state["features"][feature_id]
-        continuity_state = _continuity_state_view(state)
+        continuity_state = _continuity_state_view(state, input_snapshot)
         continuity_feature = _continuity_feature_view(feature)
-        current_checks = continuity_current_checks(continuity_state, continuity_feature)
+        task_views = tuple(_continuity_task_view(item) for item in tasks)
+        current_checks = continuity_current_checks(
+            continuity_state, continuity_feature, tasks=task_views,
+        )
         task_projection: list[dict[str, object]] = []
         for task in tasks:
             continuity_task = _continuity_task_view(task)
@@ -721,9 +921,7 @@ def _project(
                 **task, "status": status,
                 "attempts": state["task_states"][task["id"]]["attempts"],
                 "eligible": continuity_task_eligible(
-                    continuity_state, continuity_feature,
-                    tuple(_continuity_task_view(item) for item in tasks),
-                    continuity_task,
+                    continuity_state, continuity_feature, task_views, continuity_task,
                 ),
             })
         feature_view: dict[str, object] = {
@@ -733,7 +931,10 @@ def _project(
             "cycle": feature_state["cycle"], "criteria": [
                 {
                     **criterion, "digest": _digest(criterion),
-                    "check": current_checks.get(criterion["id"]),
+                    "check": current_checks.get(criterion["id"]) or
+                    _continuity_historical_check(
+                        state, criterion, input_snapshot, task_views,
+                    ),
                 }
                 for criterion in feature["criteria"]
             ],
@@ -771,6 +972,51 @@ def _next_task(feature: object) -> str | None:
         ),
         None,
     )
+
+
+def _continuity_historical_check(
+    state: ContinuityStateData, criterion: ContinuityCriterionDocument,
+    input_snapshot: ContinuityInputScope | None,
+    tasks: tuple[ContinuityTaskView, ...],
+) -> dict[str, object] | None:
+    receipt = next(
+        (
+            item for item in reversed(state["checks"])
+            if item["criterion_id"] == criterion["id"]
+        ),
+        None,
+    )
+    if receipt is None:
+        return None
+    observed = receipt.get("observed_input_scope")
+    if receipt["criterion_digest"] != _digest(criterion):
+        stale_reason = "criterion_changed"
+    elif observed is None:
+        stale_reason = "legacy_receipt"
+    elif input_snapshot is None:
+        stale_reason = "input_snapshot_unavailable"
+    elif observed != input_snapshot:
+        stale_reason = "input_changed"
+    elif not any(
+        task["id"] == receipt["task_id"]
+        and criterion["id"] in task["criteria_ids"]
+        for task in tasks
+    ):
+        stale_reason = "task_not_current"
+    else:
+        return None
+    return {
+        "passed": False, "fresh": False,
+        "historical_passed": receipt["exit_code"] == 0,
+        "exit_code": receipt["exit_code"],
+        "check_kind": receipt["check_kind"],
+        "check_target": receipt["check_target"],
+        "output_sha256": receipt["output_sha256"],
+        "task_id": receipt["task_id"],
+        "reported_by_session_id": receipt["reported_by_session_id"],
+        "recorded_revision": receipt["recorded_revision"],
+        "stale_reason": stale_reason,
+    }
 
 
 def _active_attempt(state: ContinuityStateData) -> ContinuityAttempt:

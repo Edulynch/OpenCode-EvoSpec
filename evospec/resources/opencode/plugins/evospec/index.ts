@@ -2067,6 +2067,35 @@ function continuityValue(text) {
   return response.continuity
 }
 
+function canonicalContinuityInputSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot) ||
+      Object.keys(snapshot).sort().join(",") !== "fingerprint,policy_digest,policy_id" ||
+      typeof snapshot.policy_id !== "string" || !snapshot.policy_id.trim() ||
+      !/^[0-9a-f]{64}$/.test(snapshot.policy_digest || "") ||
+      !/^[0-9a-f]{64}$/.test(snapshot.fingerprint || "")) {
+    throw new Error("Core did not return a complete canonical continuity input snapshot")
+  }
+  return snapshot
+}
+
+async function continuityInputSnapshot(runtime, expectedRevision, sessionID, context, root) {
+  const current = continuityValue(await rawExecuteRequest(
+    runtime,
+    continuityRequest("input_snapshot", expectedRevision, sessionID),
+    context,
+    root,
+  ))
+  if (current.revision !== expectedRevision) {
+    throw new Error("STALE_REVISION: Core authority changed while continuity inputs were being fingerprinted")
+  }
+  return canonicalContinuityInputSnapshot(current.input_snapshot)
+}
+
+function taskLinksCriterion(feature, taskID, criterionID) {
+  return feature?.tasks?.some((task) =>
+    task.id === taskID && Array.isArray(task.criteria_ids) && task.criteria_ids.includes(criterionID)) === true
+}
+
 function continuityWrites(operation, data) {
   if (["specify", "clarify", "plan", "change", "pause", "resume", "close"].includes(operation)) return true
   if (operation === "use") return Object.keys(data).length > 0
@@ -2141,8 +2170,13 @@ async function executeContinuity(runtime, args, context) {
   const feature = requested.features?.find((item) =>
     item.id === (data.feature_id ?? requested.selected_feature_id))
   const criterion = feature?.criteria?.find((item) => item.id === data.criterion_id)
+  const taskID = data.task_id
   if (!feature || !criterion || feature.status !== "OPEN" || requested.execution !== null) {
     throw new Error("Continuity verification is stale, ambiguous, closed, or blocked by an unresolved Task attempt")
+  }
+  if (typeof taskID !== "string" || !taskID.trim() ||
+      !taskLinksCriterion(feature, taskID, criterion.id)) {
+    throw new Error("Continuity verification requires a current Task linked to the selected criterion")
   }
   if (args.expected_revision !== undefined && args.expected_revision !== null &&
       args.expected_revision !== requested.revision) {
@@ -2165,9 +2199,13 @@ async function executeContinuity(runtime, args, context) {
   if (fresh.revision !== requested.revision || fresh.execution !== null ||
       freshCriterion?.digest !== criterion.digest ||
       freshCriterion?.check_kind !== criterion.check_kind ||
-      freshCriterion?.check_target !== criterion.check_target) {
+      freshCriterion?.check_target !== criterion.check_target ||
+      !taskLinksCriterion(freshFeature, taskID, criterion.id)) {
     throw new Error("STALE_REVISION: Core authority changed while continuity permission was pending")
   }
+  const inputSnapshotBefore = await continuityInputSnapshot(
+    runtime, fresh.revision, requester.sessionID, context, root,
+  )
   const result = await spawnCommand(command, root, context)
   if (!Number.isInteger(result.exitStatus) || result.exitStatus < 0 || result.exitStatus > 255) {
     throw new Error("Continuity check did not return a supported process exit code")
@@ -2189,6 +2227,17 @@ async function executeContinuity(runtime, args, context) {
       checkedCriterion?.check_target !== criterion.check_target) {
     throw new Error("STALE_REVISION: Core authority changed while the continuity check was running")
   }
+  if (!taskLinksCriterion(checkedFeature, taskID, criterion.id)) {
+    throw new Error("STALE_REVISION: the verification Task is no longer linked to the criterion")
+  }
+  const inputSnapshotAfter = await continuityInputSnapshot(
+    runtime, checked.revision, requester.sessionID, context, root,
+  )
+  if (inputSnapshotBefore.policy_id !== inputSnapshotAfter.policy_id ||
+      inputSnapshotBefore.policy_digest !== inputSnapshotAfter.policy_digest ||
+      inputSnapshotBefore.fingerprint !== inputSnapshotAfter.fingerprint) {
+    throw new Error("STALE_INPUT: repository inputs changed while the continuity check was running")
+  }
   const outputDigest = createHash("sha256").update(`${result.output}\n${result.error}`).digest("hex")
   const recorded = await rawExecuteRequest(
     runtime,
@@ -2199,7 +2248,9 @@ async function executeContinuity(runtime, args, context) {
       check_target: criterion.check_target,
       exit_code: result.exitStatus,
       output_sha256: outputDigest,
-      ...(data.task_id === undefined ? {} : { task_id: data.task_id }),
+      task_id: taskID,
+      input_snapshot_before: inputSnapshotBefore,
+      input_snapshot_after: inputSnapshotAfter,
     }),
     context,
     root,

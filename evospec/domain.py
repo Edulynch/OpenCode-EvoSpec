@@ -2,26 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import StrEnum
-from hashlib import sha256
 import json
-from pathlib import PurePosixPath
 import re
 import unicodedata
 from collections.abc import Hashable, Iterable
-from typing import Literal, NewType, NoReturn, TypedDict, cast
+from dataclasses import dataclass, field
+from enum import StrEnum
+from hashlib import sha256
+from pathlib import PurePosixPath
+from typing import Literal, NewType, NoReturn, NotRequired, TypedDict, cast
 
-from .lifecycle import (
-    Classification,
-    LifecycleError,
-    LifecycleState,
-    Phase,
-    ReviewVerdict,
-    TERMINAL_STATES,
-    can_converge,
-    validate_context_state,
-)
 from .input_fingerprint import (
     COVERAGE_CONTRACT_VERSION,
     INPUT_POLICY_DIGEST,
@@ -33,8 +23,18 @@ from .input_fingerprint import (
     R3B_APPROVAL_POLICY_TEXT,
     TEST_ADMISSION_POLICY_DIGEST,
     TEST_ADMISSION_POLICY_ID,
-    TEST_ENVIRONMENT_PROFILE_ID,
     TEST_ENVIRONMENT_PROFILE_DIGEST,
+    TEST_ENVIRONMENT_PROFILE_ID,
+)
+from .lifecycle import (
+    TERMINAL_STATES,
+    Classification,
+    LifecycleError,
+    LifecycleState,
+    Phase,
+    ReviewVerdict,
+    can_converge,
+    validate_context_state,
 )
 from .request_scoped_objective import (
     OBJECTIVE_TEST_KIND,
@@ -4952,6 +4952,39 @@ class ContinuityExecution(TypedDict):
     status: str
 
 
+CONTINUITY_INPUT_POLICY_ID = "continuity-root-input-v1"
+_CONTINUITY_INPUT_POLICY = {
+    "version": CONTINUITY_INPUT_POLICY_ID,
+    "base_policy": [INPUT_POLICY_ID, INPUT_POLICY_DIGEST],
+    "coverage": "all regular files and directories, tracked, ignored or untracked",
+    "base_excluded_root_entries": [".git", ".evospec"],
+    "excluded_outputs": [
+        "specs/README.md",
+        "exact paths in the current continuity state.documents map",
+        "Feature directories containing those tracked projections",
+    ],
+    "scope_digest": [
+        "sorted normalized relative file path and content SHA-256",
+        "sorted normalized relative directory path and presence",
+    ],
+    "scan_safety": "base policy bounds, stable double scan and unsafe-entry rejection",
+}
+CONTINUITY_INPUT_POLICY_DIGEST = sha256(
+    json.dumps(
+        _CONTINUITY_INPUT_POLICY,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
+
+
+class ContinuityInputScope(TypedDict):
+    policy_id: str
+    policy_digest: str
+    fingerprint: str
+
+
 class ContinuityCheck(TypedDict):
     criterion_id: str
     criterion_digest: str
@@ -4962,6 +4995,7 @@ class ContinuityCheck(TypedDict):
     reported_by_session_id: str
     task_id: str | None
     recorded_revision: int
+    observed_input_scope: NotRequired[ContinuityInputScope]
 
 
 class ContinuityCriterionDigest(TypedDict):
@@ -5168,14 +5202,18 @@ def validate_continuity_state(
     ):
         invalid("Task attempt counters disagree with history")
 
+    legacy_check_fields = {
+        "criterion_id", "criterion_digest", "check_kind", "check_target",
+        "exit_code", "output_sha256", "reported_by_session_id", "task_id",
+        "recorded_revision",
+    }
     for check in checks:
         if (
             type(check) is not dict
-            or set(check) != {
-                "criterion_id", "criterion_digest", "check_kind", "check_target",
-                "exit_code", "output_sha256", "reported_by_session_id", "task_id",
-                "recorded_revision",
-            }
+            or set(check) not in (
+                legacy_check_fields,
+                legacy_check_fields | {"observed_input_scope"},
+            )
             or not isinstance(check["criterion_id"], str)
             or _CONTINUITY_ID.fullmatch(check["criterion_id"]) is None
             or check["criterion_id"][0] != "C"
@@ -5195,10 +5233,28 @@ def validate_continuity_state(
                     or check["task_id"] not in counters
                 )
             )
+            or (
+                "observed_input_scope" in check
+                and check["task_id"] is None
+            )
             or type(check["recorded_revision"]) is not int
             or not 1 <= check["recorded_revision"] <= revision
         ):
             invalid("criterion check history is invalid")
+        if "observed_input_scope" in check:
+            scope = check["observed_input_scope"]
+            if (
+                type(scope) is not dict
+                or set(scope) != {"policy_id", "policy_digest", "fingerprint"}
+                or not isinstance(scope["policy_id"], str)
+                or not scope["policy_id"].strip()
+                or len(scope["policy_id"]) > 128
+                or not isinstance(scope["policy_digest"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", scope["policy_digest"]) is None
+                or not isinstance(scope["fingerprint"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", scope["fingerprint"]) is None
+            ):
+                invalid("criterion check input scope is invalid")
 
     if any(
         not isinstance(path, str) or _CONTINUITY_DOC.fullmatch(path) is None

@@ -8,9 +8,11 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, TypeGuard, TypedDict
+from typing import Any, NotRequired, TypedDict, TypeGuard
+from unittest.mock import patch
 
 from evospec.continuity import ContinuityError, execute
+from evospec.input_fingerprint import InputFingerprintError
 from evospec.persistence import AtomicFailure, FileOperations, RecoveryError, StateStore
 from tests._tempdir import TemporaryDirectory
 
@@ -46,6 +48,15 @@ class _ContinuityView(TypedDict):
     status: str | None
     selected_feature: _FeatureView | None
     execution: _ExecutionView | None
+    input_snapshot_error: str | None
+
+
+class _CheckView(TypedDict):
+    fresh: bool
+    passed: bool
+    task_id: str | None
+    historical_passed: NotRequired[bool]
+    stale_reason: NotRequired[str]
 
 
 def _record(value: object) -> TypeGuard[dict[str, object]]:
@@ -58,6 +69,33 @@ def _text(value: object) -> TypeGuard[str]:
 
 def _optional_text(value: object) -> TypeGuard[str | None]:
     return value is None or isinstance(value, str)
+
+
+def _check_view(value: object) -> TypeGuard[_CheckView]:
+    if not _record(value):
+        return False
+    fresh = value.get("fresh")
+    passed = value.get("passed")
+    task_id = value.get("task_id")
+    historical_passed = value.get("historical_passed")
+    stale_reason = value.get("stale_reason")
+    return (
+        isinstance(fresh, bool)
+        and isinstance(passed, bool)
+        and _optional_text(task_id)
+        and (
+            "historical_passed" not in value
+            or isinstance(historical_passed, bool)
+        )
+        and ("stale_reason" not in value or isinstance(stale_reason, str))
+    )
+
+
+def _criterion_check(criterion: dict[str, object]) -> _CheckView:
+    check = criterion.get("check")
+    if not _check_view(check):
+        raise AssertionError("expected a typed criterion check")
+    return check
 
 
 def _increment_view(value: object) -> TypeGuard[_IncrementView]:
@@ -105,9 +143,13 @@ def _continuity_view(value: object) -> _ContinuityView:
     status = value.get("status")
     selected_feature = value.get("selected_feature")
     execution = value.get("execution")
+    input_snapshot_error = value.get("input_snapshot_error")
     if type(revision) is not int:
         raise AssertionError("expected integer continuity revision")
-    if not _optional_text(mode) or not _optional_text(status):
+    if (
+        not _optional_text(mode) or not _optional_text(status)
+        or not _optional_text(input_snapshot_error)
+    ):
         raise AssertionError("expected optional text continuity fields")
     if selected_feature is not None and not _feature_view(selected_feature):
         raise AssertionError("expected selected feature view")
@@ -119,6 +161,7 @@ def _continuity_view(value: object) -> _ContinuityView:
         "status": status,
         "selected_feature": selected_feature,
         "execution": execution,
+        "input_snapshot_error": input_snapshot_error,
     }
 
 
@@ -217,6 +260,59 @@ class ContinuityTests(unittest.TestCase):
         operations: FileOperations | None = None,
     ) -> _ContinuityView:
         return _continuity_view(execute(root, operation, revision, session, data, operations))
+
+    def input_snapshot(self, root: Path, revision: int) -> dict[str, object]:
+        result = execute(root, "input_snapshot", revision, "ses_ac0_primary_123")
+        if not _record(result):
+            self.fail("expected a Core input snapshot response")
+        snapshot = result.get("input_snapshot")
+        if not _record(snapshot):
+            self.fail("expected a Core input snapshot")
+        policy_id = snapshot.get("policy_id")
+        policy_digest = snapshot.get("policy_digest")
+        fingerprint = snapshot.get("fingerprint")
+        if not _text(policy_id):
+            self.fail("expected a Core input snapshot policy ID")
+        if not _text(policy_digest):
+            self.fail("expected a Core input snapshot policy digest")
+        if not _text(fingerprint):
+            self.fail("expected a Core input snapshot fingerprint")
+        if set(snapshot) != {"policy_id", "policy_digest", "fingerprint"}:
+            self.fail("expected the exact Core input snapshot fields")
+        return {
+            "policy_id": policy_id,
+            "policy_digest": policy_digest,
+            "fingerprint": fingerprint,
+        }
+
+    def record_check(
+        self, root: Path, revision: int, task: dict[str, object],
+        criterion: dict[str, object],
+    ) -> _ContinuityView:
+        before = self.input_snapshot(root, revision)
+        after = self.input_snapshot(root, revision)
+        self.assertEqual(before, after)
+        return self.call(root, "verify", revision, data={
+            "criterion_id": criterion["id"],
+            "check_kind": criterion["check_kind"],
+            "check_target": criterion["check_target"],
+            "exit_code": 0,
+            "output_sha256": sha256(b"passing check").hexdigest(),
+            "task_id": task["id"],
+            "input_snapshot_before": before,
+            "input_snapshot_after": after,
+        })
+
+    def report_success(
+        self, root: Path, result: _ContinuityView, task: dict[str, object],
+    ) -> _ContinuityView:
+        started = self.call(root, "implement", result["revision"], data={
+            "task_id": task["id"], "phase": "begin",
+        })
+        return self.call(root, "implement", started["revision"], data={
+            "task_id": task["id"], "phase": "report",
+            "result": "SUCCEEDED", "report": "Implementation is complete.",
+        })
 
     def test_specify_writes_stable_composed_markdown_and_reads_without_writing(self) -> None:
         with self._temp() as temporary:
@@ -508,11 +604,12 @@ class ContinuityTests(unittest.TestCase):
                 self.call(root, "close", result["revision"])
             self.assertEqual(raised.exception.code, "CLOSE_BLOCKED")
 
-            result = self.call(root, "verify", result["revision"], data={
-                "criterion_id": criterion["id"], "check_kind": criterion["check_kind"],
-                "check_target": criterion["check_target"], "exit_code": 0,
-                "output_sha256": sha256(b"passing check").hexdigest(), "task_id": task["id"],
-            })
+            result = self.record_check(root, result["revision"], task, criterion)
+            verified = _selected_feature(result)
+            verified_check = _criterion_check(verified["criteria"][0])
+            self.assertTrue(verified_check["fresh"])
+            self.assertTrue(verified_check["passed"])
+            self.assertEqual(verified["tasks"][0]["status"], "COMPLETED")
             result = self.call(root, "close", result["revision"])
             self.assertEqual(_selected_feature(result)["status"], "CLOSED")
             self.assertEqual(len(_selected_feature(result)["closure_history"]), 1)
@@ -534,7 +631,11 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(feature["status"], "OPEN")
             self.assertEqual(len(feature["closure_history"]), 1)
             self.assertEqual(len(feature["reopen_history"]), 1)
-            self.assertIsNone(feature["criteria"][0]["check"])
+            changed_check = _criterion_check(feature["criteria"][0])
+            self.assertFalse(changed_check["fresh"])
+            self.assertEqual(
+                changed_check.get("stale_reason"), "criterion_changed",
+            )
             with self.assertRaises(ContinuityError) as raised:
                 self.call(root, "close", result["revision"])
             self.assertEqual(raised.exception.code, "CLOSE_BLOCKED")
@@ -542,6 +643,215 @@ class ContinuityTests(unittest.TestCase):
                 (root / ".evospec" / "continuity.json").read_text(encoding="utf-8")
             )["checks"])
             self.assertEqual(receipt_count, 1)
+
+    def test_input_snapshot_is_read_only_and_preserves_the_exact_revision(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            result = self.call(root, "specify", 0, data=spec_request())
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+
+            snapshot = execute(
+                root, "input_snapshot", result["revision"], "ses_ac0_primary_123",
+            )
+
+            after = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            self.assertEqual(snapshot["revision"], result["revision"])
+            input_snapshot = snapshot.get("input_snapshot")
+            if not _record(input_snapshot):
+                self.fail("expected a Core input snapshot")
+            self.assertEqual(
+                set(input_snapshot),
+                {"policy_id", "policy_digest", "fingerprint"},
+            )
+            self.assertEqual(before, after)
+
+            changed = self.call(root, "plan", result["revision"], data={"plan": "Updated plan"})
+            with self.assertRaises(ContinuityError) as raised:
+                self.input_snapshot(root, result["revision"])
+            self.assertEqual(raised.exception.code, "STALE_REVISION")
+            self.assertEqual(changed["revision"], result["revision"] + 1)
+
+    def test_historical_receipt_shape_remains_readable_but_never_counts_as_fresh(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            result = self.call(root, "specify", 0, data={
+                **spec_request("Legacy receipt"),
+                "increments": [],
+                "tasks": [{"title": "Implement behavior", "criteria": [0]}],
+            })
+            feature = _selected_feature(result)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            result = self.report_success(root, result, task)
+            result = self.record_check(root, result["revision"], task, criterion)
+            state_path = root / ".evospec" / "continuity.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["checks"][0].pop("observed_input_scope")
+            state_path.write_text(
+                json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+
+            current = self.call(root, "status", None)
+            feature = _selected_feature(current)
+            check = _criterion_check(feature["criteria"][0])
+            self.assertFalse(check["fresh"])
+            self.assertFalse(check["passed"])
+            self.assertTrue(check.get("historical_passed"))
+            self.assertEqual(check.get("stale_reason"), "legacy_receipt")
+            self.assertEqual(feature["tasks"][0]["status"], "REPORTED")
+
+    def test_unavailable_input_snapshot_keeps_history_but_fails_freshness_closed(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            result = self.call(root, "specify", 0, data={
+                **spec_request("Unavailable snapshot"),
+                "increments": [],
+                "tasks": [{"title": "Implement behavior", "criteria": [0]}],
+            })
+            feature = _selected_feature(result)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            result = self.report_success(root, result, task)
+            result = self.record_check(root, result["revision"], task, criterion)
+
+            with patch(
+                "evospec.continuity.repository_input_snapshot",
+                side_effect=InputFingerprintError("fixture input scan failure"),
+            ):
+                current = self.call(root, "status", None)
+            feature = _selected_feature(current)
+            check = _criterion_check(feature["criteria"][0])
+            self.assertFalse(check["fresh"])
+            self.assertFalse(check["passed"])
+            self.assertTrue(check.get("historical_passed"))
+            self.assertEqual(check.get("stale_reason"), "input_snapshot_unavailable")
+            input_snapshot_error = current["input_snapshot_error"]
+            if input_snapshot_error is None:
+                self.fail("expected the input snapshot scan error")
+            self.assertIn("fixture input scan failure", input_snapshot_error)
+            self.assertEqual(feature["tasks"][0]["status"], "REPORTED")
+
+    def test_verify_rejects_different_before_and_after_input_snapshots(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            result = self.call(root, "specify", 0, data={
+                **spec_request("Changing inputs"),
+                "increments": [],
+                "tasks": [{"title": "Implement behavior", "criteria": [0]}],
+            })
+            feature = _selected_feature(result)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            implementation = root / "implementation.py"
+            implementation.write_text("value = 1\n", encoding="utf-8")
+            result = self.report_success(root, result, task)
+            before = self.input_snapshot(root, result["revision"])
+            implementation.write_text("value = 2\n", encoding="utf-8")
+            after = self.input_snapshot(root, result["revision"])
+            state_path = root / ".evospec" / "continuity.json"
+            state_before = state_path.read_bytes()
+
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "verify", result["revision"], data={
+                    "criterion_id": criterion["id"],
+                    "check_kind": criterion["check_kind"],
+                    "check_target": criterion["check_target"],
+                    "exit_code": 0,
+                    "output_sha256": sha256(b"passing check").hexdigest(),
+                    "task_id": task["id"],
+                    "input_snapshot_before": before,
+                    "input_snapshot_after": after,
+                })
+
+            self.assertEqual(raised.exception.code, "STALE_INPUT")
+            self.assertEqual(state_path.read_bytes(), state_before)
+
+    def test_implementation_input_change_invalidates_a_passing_check(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            result = self.call(root, "specify", 0, data={
+                **spec_request("Implementation freshness"),
+                "increments": [],
+                "tasks": [{"title": "Implement behavior", "criteria": [0]}],
+            })
+            feature = _selected_feature(result)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            implementation = root / "src" / "implementation.py"
+            implementation.parent.mkdir()
+            implementation.write_text("value = 1\n", encoding="utf-8")
+
+            result = self.report_success(root, result, task)
+            result = self.record_check(root, result["revision"], task, criterion)
+            implementation.write_text("value = 2\n", encoding="utf-8")
+
+            current = self.call(root, "status", None)
+            feature = _selected_feature(current)
+            check = _criterion_check(feature["criteria"][0])
+            self.assertFalse(check["fresh"])
+            self.assertFalse(check["passed"])
+            self.assertEqual(feature["tasks"][0]["status"], "REPORTED")
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "close", current["revision"])
+            self.assertEqual(raised.exception.code, "CLOSE_BLOCKED")
+
+    def test_test_bytes_change_invalidates_a_passing_check_under_the_same_descriptor(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            result = self.call(root, "specify", 0, data={
+                **spec_request("Test freshness"),
+                "increments": [],
+                "tasks": [{"title": "Implement behavior", "criteria": [0]}],
+            })
+            feature = _selected_feature(result)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            test_file = root / "tests" / "test_sample.py"
+            test_file.parent.mkdir()
+            test_file.write_text("def test_value(): assert 1 == 1\n", encoding="utf-8")
+
+            result = self.report_success(root, result, task)
+            result = self.record_check(root, result["revision"], task, criterion)
+            test_file.write_text("def test_value(): assert 1 == 2\n", encoding="utf-8")
+
+            current = self.call(root, "status", None)
+            feature = _selected_feature(current)
+            check = _criterion_check(feature["criteria"][0])
+            self.assertFalse(check["fresh"])
+            self.assertFalse(check["passed"])
+            self.assertEqual(feature["tasks"][0]["status"], "REPORTED")
+
+    def test_new_task_does_not_inherit_an_existing_criterion_check(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            result = self.call(root, "specify", 0, data={
+                **spec_request("Task-bound freshness"),
+                "increments": [],
+                "tasks": [{"title": "First task", "criteria": [0]}],
+            })
+            feature = _selected_feature(result)
+            first_task, criterion = feature["tasks"][0], feature["criteria"][0]
+            result = self.report_success(root, result, first_task)
+            result = self.record_check(root, result["revision"], first_task, criterion)
+
+            result = self.call(root, "tasks", result["revision"], data={
+                "task_title": "Second task",
+                "criteria_ids": [criterion["id"]],
+                "depends_on": [],
+            })
+            new_task = _selected_feature(result)["tasks"][-1]
+            result = self.report_success(root, result, new_task)
+            feature = _selected_feature(self.call(root, "status", None))
+            self.assertEqual(feature["tasks"][-1]["status"], "REPORTED")
+            self.assertEqual(
+                _criterion_check(feature["criteria"][0])["task_id"], first_task["id"],
+            )
+
+            result = self.record_check(root, result["revision"], new_task, criterion)
+            feature = _selected_feature(result)
+            self.assertEqual(feature["tasks"][-1]["status"], "COMPLETED")
 
     def test_recovery_journal_resumes_partial_document_publication_without_overwriting_manual_edits(self) -> None:
         with self._temp() as temporary:

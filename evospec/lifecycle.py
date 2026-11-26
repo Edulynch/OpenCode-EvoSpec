@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
-from hashlib import sha256
 import json
 from collections.abc import Sequence
-from typing import Final, Protocol, TypedDict
+from enum import StrEnum
+from hashlib import sha256
+from typing import Final, NotRequired, Protocol, TypedDict
 
 
 class _ContinuityCriterion(TypedDict):
@@ -40,6 +40,7 @@ class _ContinuityCheck(TypedDict):
     task_id: str | None
     reported_by_session_id: str
     recorded_revision: int
+    observed_input_scope: NotRequired[dict[str, str]]
 
 
 class _ContinuityAttempt(TypedDict):
@@ -58,6 +59,7 @@ class ContinuityStateView(TypedDict):
     attempts: Sequence[_ContinuityAttempt]
     execution: _ContinuityExecution | None
     paused_features: Sequence[str]
+    input_snapshot: NotRequired[dict[str, str] | None]
 
 class LifecycleState(StrEnum):
     PROPOSED = "PROPOSED"
@@ -283,18 +285,39 @@ def advance(
 
 def continuity_current_checks(
     state: ContinuityStateView, feature: ContinuityFeatureView,
+    *,
+    tasks: Sequence[ContinuityTaskView] | None = None,
+    task_id: str | None = None,
 ) -> dict[str, dict[str, object]]:
-    """Project only receipts whose criterion digest still matches canonical text."""
+    """Project only receipts scoped to the current criterion, Task and inputs."""
+    input_scope = state.get("input_snapshot")
+    if not isinstance(input_scope, dict):
+        return {}
     current = {
         item["id"]: _continuity_digest(item)
         for item in feature["criteria"]
     }
+    task_criteria = None if tasks is None else {
+        item["id"]: set(item["criteria_ids"]) for item in tasks
+    }
     latest: dict[str, dict[str, object]] = {}
     for receipt in state["checks"]:
         criterion_id = receipt.get("criterion_id")
-        if criterion_id in current and receipt.get("criterion_digest") == current[criterion_id]:
+        receipt_task_id = receipt.get("task_id")
+        if (
+            criterion_id in current
+            and receipt.get("criterion_digest") == current[criterion_id]
+            and receipt.get("observed_input_scope") == input_scope
+            and isinstance(receipt_task_id, str)
+            and (task_id is None or receipt_task_id == task_id)
+            and (
+                task_criteria is None
+                or criterion_id in task_criteria.get(receipt_task_id, set())
+            )
+        ):
             latest[criterion_id] = {
                 "passed": receipt.get("exit_code") == 0,
+                "fresh": True,
                 "exit_code": receipt.get("exit_code"),
                 "check_kind": receipt.get("check_kind"),
                 "check_target": receipt.get("check_target"),
@@ -329,7 +352,7 @@ def continuity_task_status(
         return "REPORTED"
     if last["status"] not in ("REPORTED", "RECONCILED_COMPLETE"):
         return "READY"
-    checks = continuity_current_checks(state, feature)
+    checks = continuity_current_checks(state, feature, task_id=task["id"])
     if all(checks.get(identity, {}).get("passed") for identity in task["criteria_ids"]):
         return "COMPLETED"
     return "REPORTED"
@@ -343,7 +366,6 @@ def continuity_task_eligible(
 ) -> bool:
     """Require every dependency to be completed and the Task itself ready."""
     by_id = {item["id"]: item for item in tasks}
-    checks = continuity_current_checks(state, feature)
     if any(
         dependency not in by_id
         or continuity_task_status(state, feature, by_id[dependency]) != "COMPLETED"
@@ -366,7 +388,7 @@ def continuity_close_blockers(
         blockers.append("a checkpointed Task has an unknown outcome")
     if feature_id in state["paused_features"]:
         blockers.append("paused work must be explicitly resumed before closure")
-    checks = continuity_current_checks(state, feature)
+    checks = continuity_current_checks(state, feature, tasks=tasks)
     missing = [
         item["id"] for item in feature["criteria"]
         if not checks.get(item["id"], {}).get("passed")
