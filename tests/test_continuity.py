@@ -1955,6 +1955,193 @@ class ContinuityTests(unittest.TestCase):
                     self.assertEqual(state_after_continue["attempts"][-1]["attempt"], 2)
                     self.assertEqual(_execution(continued)["task_id"], task["id"])
 
+    def test_checkpoint_drift_reconcile_preserves_pending_detour_until_explicit_result(self) -> None:
+        with self._temp() as temporary:
+            root = ContinuityPersistence(Path(temporary)).root
+            session_a = "ses_ac0_primary_123"
+            session_b = "ses_ac0_restarted_789"
+            created = self.call(root, "specify", 0, session_a, {
+                **spec_request("Checkpoint with a pending detour"),
+                "increments": [],
+                "tasks": [{"title": "Resume the checkpoint", "criteria": [0]}],
+                "plan": "",
+            })
+            feature = _selected_feature(created)
+            feature_id = feature["id"]
+            task_id = feature["tasks"][0]["id"]
+
+            started = self.call(root, "implement", created["revision"], session_a, {
+                "task_id": task_id, "phase": "begin",
+                "report": "Checkpoint before the related detour.",
+            })
+            paused = self.call(root, "pause", started["revision"], session_a, {
+                "reason": "Inspect a related dependency before continuing.",
+                "detour_kind": "RELATED",
+                "detour_title": "Inspect the dependency",
+                "return_task_id": task_id,
+            })
+            marker = root / ".evospec" / "continuity.json"
+            state_before = json.loads(marker.read_text(encoding="utf-8"))
+            checkpoint_attempt = state_before["attempts"][0]
+            pending_detour = state_before["detours"][0]
+            detour_decision = next(
+                item for item in _selected_feature(paused)["decisions"]
+                if item["id"] == pending_detour["id"]
+            )
+            ids_before = set(state_before["ids"])
+            self.assertEqual(paused["revision"], 3)
+            self.assertEqual(checkpoint_attempt["status"], "STARTED")
+            self.assertEqual(checkpoint_attempt["checkpoint"], "Checkpoint before the related detour.")
+            self.assertIsNone(pending_detour["result"])
+            self.assertEqual(pending_detour["return_task_id"], task_id)
+            self.assertEqual(state_before["paused_features"], [feature_id])
+
+            spec_path = root / "specs" / feature["directory"] / "spec.md"
+            original_spec = spec_path.read_text(encoding="utf-8")
+            human_spec = original_spec.replace(
+                "Deliver the complete user-visible outcome.",
+                "Deliver the outcome with a human-authored refinement.",
+            )
+            self.assertNotEqual(human_spec, original_spec)
+            spec_path.write_text(human_spec, encoding="utf-8")
+            human_spec_bytes = spec_path.read_bytes()
+            markdown_before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*.md")
+            }
+
+            # Session B observes the same revision, but must not combine the
+            # state-only checkpoint reconciliation with the detour result.
+            status_b = self.call(root, "status", None, session_b)
+            self.assertEqual(status_b["status"], "DOCUMENT_RECONCILIATION_REQUIRED")
+            self.assertEqual(status_b["revision"], paused["revision"])
+            marker_before_reconcile = marker.read_bytes()
+            checkpoint_reconcile = {
+                "task_id": task_id,
+                "reconcile": "INCOMPLETE",
+                "evidence_ref": "manual-review:checkpoint-outcome",
+            }
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "resume", status_b["revision"], session_b, {
+                    **checkpoint_reconcile,
+                    "detour_summary": "Do not record a detour result in state-only recovery.",
+                })
+            self.assertEqual(raised.exception.code, "DOCUMENT_DIVERGED")
+            self.assertEqual(marker.read_bytes(), marker_before_reconcile)
+            self.assertEqual(markdown_before, {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*.md")
+            })
+
+            # State-only reconciliation resolves only the checkpoint. It must
+            # leave the human edit and the paused detour byte/state-identical.
+            state_only_operations = TrackReplacements()
+            state_only = self.call(
+                root, "resume", status_b["revision"], session_b,
+                checkpoint_reconcile, operations=state_only_operations,
+            )
+            self.assertEqual(state_only["revision"], paused["revision"] + 1)
+            self.assertFalse(any(path.suffix == ".md" for path in state_only_operations.targets))
+            state_after_checkpoint = json.loads(marker.read_text(encoding="utf-8"))
+            reconciled_attempt = state_after_checkpoint["attempts"][0]
+            self.assertIsNone(state_after_checkpoint["execution"])
+            self.assertEqual(len(state_after_checkpoint["attempts"]), 1)
+            self.assertEqual(reconciled_attempt["task_id"], task_id)
+            self.assertEqual(reconciled_attempt["attempt"], checkpoint_attempt["attempt"])
+            self.assertEqual(reconciled_attempt["session_id"], session_a)
+            self.assertEqual(reconciled_attempt["checkpoint"], checkpoint_attempt["checkpoint"])
+            self.assertEqual(reconciled_attempt["status"], "RECONCILED_INCOMPLETE")
+            self.assertEqual(reconciled_attempt["evidence_ref"], checkpoint_reconcile["evidence_ref"])
+            self.assertEqual(state_after_checkpoint["detours"], state_before["detours"])
+            self.assertEqual(state_after_checkpoint["paused_features"], [feature_id])
+            self.assertEqual(state_after_checkpoint["ids"], state_before["ids"])
+            self.assertEqual(state_after_checkpoint["checks"], [])
+            self.assertEqual(state_after_checkpoint["documents"], state_before["documents"])
+            self.assertEqual(markdown_before, {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*.md")
+            })
+
+            # Document adoption is a separate explicit revision and still
+            # cannot unpause the Feature or consume the pending detour.
+            reconciled = self.call(root, "reconcile", state_only["revision"], session_b, {
+                "feature_id": feature_id,
+            })
+            self.assertEqual(reconciled["revision"], state_only["revision"] + 1)
+            adopted_feature = _selected_feature(reconciled)
+            self.assertEqual(adopted_feature["outcome"], "Deliver the outcome with a human-authored refinement.")
+            self.assertTrue(adopted_feature["paused"])
+            self.assertEqual(adopted_feature["detours"], state_before["detours"])
+            self.assertEqual(adopted_feature["tasks"][0]["id"], task_id)
+            self.assertIsNone(adopted_feature["criteria"][0]["check"])
+            state_after_documents = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(state_after_documents["attempts"], state_after_checkpoint["attempts"])
+            self.assertEqual(state_after_documents["detours"], state_before["detours"])
+            self.assertEqual(state_after_documents["paused_features"], [feature_id])
+            self.assertEqual(state_after_documents["checks"], [])
+            self.assertEqual(set(state_after_documents["ids"]), ids_before)
+            self.assertEqual(spec_path.read_bytes(), human_spec_bytes)
+
+            marker_before_blocked_resume = marker.read_bytes()
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(
+                    root, "resume", reconciled["revision"], session_b,
+                    checkpoint_reconcile,
+                )
+            self.assertEqual(raised.exception.code, "DETOUR_OUTCOME_REQUIRED")
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "implement", reconciled["revision"], session_b, {
+                    "task_id": task_id, "phase": "begin",
+                })
+            self.assertEqual(raised.exception.code, "FEATURE_PAUSED")
+            self.assertEqual(marker.read_bytes(), marker_before_blocked_resume)
+            self.assertEqual(spec_path.read_bytes(), human_spec_bytes)
+
+            detour_evidence = (
+                "Dependency inspection confirmed compatibility "
+                "(evidence: manual-review:dependency-check-17)."
+            )
+            returned = self.call(root, "resume", reconciled["revision"], session_b, {
+                "detour_summary": detour_evidence,
+            })
+            returned_feature = _selected_feature(returned)
+            self.assertEqual(returned["revision"], reconciled["revision"] + 1)
+            self.assertFalse(returned_feature["paused"])
+            self.assertEqual(returned_feature["tasks"][0]["id"], task_id)
+            self.assertEqual(returned_feature["detours"][0]["id"], pending_detour["id"])
+            self.assertEqual(returned_feature["detours"][0]["return_task_id"], task_id)
+            self.assertEqual(returned_feature["detours"][0]["result"], detour_evidence)
+            self.assertIn(detour_decision, returned_feature["decisions"])
+            self.assertEqual(
+                returned_feature["detours"][0]["reported_by_session_id"], session_b,
+            )
+            self.assertEqual(
+                returned_feature["detours"][0]["resolved_revision"], returned["revision"],
+            )
+            self.assertIsNone(returned_feature["criteria"][0]["check"])
+            state_after_detour = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(state_after_detour["attempts"], state_after_documents["attempts"])
+            self.assertEqual(state_after_detour["checks"], [])
+            self.assertEqual(state_after_detour["paused_features"], [])
+            self.assertEqual(
+                set(state_after_detour["ids"]) - ids_before,
+                {returned_feature["decisions"][-1]["id"]},
+            )
+            self.assertEqual(spec_path.read_bytes(), human_spec_bytes)
+
+            resumed = self.call(root, "implement", returned["revision"], session_b, {
+                "task_id": task_id, "phase": "begin",
+            })
+            self.assertEqual(_execution(resumed)["task_id"], task_id)
+            final_state = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(len(final_state["attempts"]), 2)
+            self.assertEqual(final_state["attempts"][0], state_after_detour["attempts"][0])
+            self.assertEqual(final_state["attempts"][1]["attempt"], 2)
+            self.assertEqual(final_state["attempts"][1]["session_id"], session_b)
+            self.assertEqual(final_state["checks"], [])
+            self.assertIsNone(_selected_feature(resumed)["criteria"][0]["check"])
+            self.assertEqual(_selected_feature(resumed)["tasks"][0]["status"], "OUTCOME_UNKNOWN")
+
     def test_success_report_under_drift_remains_unverified_after_reconcile(self) -> None:
         with self._temp() as temporary:
             root = Path(temporary)

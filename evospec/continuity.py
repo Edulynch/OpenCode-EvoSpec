@@ -1124,15 +1124,21 @@ def _reconcile_attempt_state_only(
     owner = _task_owner(state, execution["task_id"])
     if data.get("feature_id") is not None and data.get("feature_id") != owner:
         raise ContinuityError("TASK_MISMATCH", "reconciliation must target the Feature owning the checkpointed Task")
-    if any(item["result"] is None for item in state["detours"]):
-        raise ContinuityError(
-            "DETOUR_OUTCOME_REQUIRED",
-            "reconcile the checkpointed Task first; after document reconciliation, resume the pending detour with its result",
-        )
     if data.get("detour_summary") is not None:
         raise ContinuityError(
             "DOCUMENT_DIVERGED",
             "state-only Task reconciliation cannot publish a detour decision; reconcile documents, then resume the detour",
+        )
+    pending_detours = [item for item in state["detours"] if item["result"] is None]
+    if pending_detours and (
+        owner is None
+        or len(pending_detours) != 1
+        or pending_detours[0]["feature_id"] != owner
+        or pending_detours[0]["return_task_id"] != execution["task_id"]
+    ):
+        raise ContinuityError(
+            "DETOUR_OUTCOME_REQUIRED",
+            "resolve unrelated pending detours separately; only preserve a detour returning to the checkpointed Task",
         )
     evidence_ref = _text(data.get("evidence_ref"), "evidence_ref", maximum=2048)
     candidate = _copy_state(state)
