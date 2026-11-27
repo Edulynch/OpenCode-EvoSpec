@@ -65,12 +65,15 @@ does not establish that every user journey has passed in a live OpenCode host.
   Seven Tasks are not evidence of three completed Increments, and live
   `--all` behavior is not demonstrated.
 
-### M3 — In-work visual change, bounded external detour, and affected evidence
+### M3 — In-work related visual request, bounded external detour, and affected evidence
 
-- The acceptance scenario changes the visible result during implementation
-  (the #72 example changes a button to blue), preserves a bounded related or
-  external detour, records the return Task and detour result, then returns to
-  the right work and reevaluates evidence affected by the change.
+- During one active mandate, the acceptance fixture injects the actual related
+  request “Antes cambia el botón de agregar a azul y luego sigue” at the exact
+  pending Task. It durably pauses before changing the app source, checks the
+  exact CSS property, records the result, resumes that same Task, and refreshes
+  affected evidence. This visual request is not an accepted Increment.
+- A separate external correction remains a distinct detour, with its own
+  observed file effect, exact return Task, and affected-evidence refresh.
 - Core records a durable pause and detour with a required return Task/result;
   an explicit pause remains paused until explicit resume, and a pending
   detour cannot be nested. This is bookkeeping, not cancellation or a sandbox
@@ -131,6 +134,68 @@ does not establish that every user journey has passed in a live OpenCode host.
   checks that direct Core path. It is deterministic fixture evidence, not a
   claim about every natural-language route in a live host.
 
+## AC1 — Mandate-bound composed continuity
+
+AC1 extends the existing schema-1 continuity writer; it does not add a second
+workflow engine, writer, scheduler, permission store, or per-increment schema.
+An explicit `implement --all` starts one revision-bound Core mandate with a
+stable ID, Feature ID, mode `ALL`, the accepted criterion and Increment IDs
+plus their current definition digests, source/recorded revisions, originating
+session, and an explicit `close_feature` flag (default `false`). The mandate
+is persisted through the existing transaction/journal before any task effect.
+Queue, begin, report, verification, scoped Task additions, detours, and recovery
+must carry that exact mandate ID while it is active. A Task attempt started
+under a mandate also records the mandate ID. Existing unmandated schema-1
+projects remain readable and retain their established behavior.
+
+The read-only mandate projection reports each bound criterion/check, Increment
+coverage and its Tasks, Task status/eligibility, missing Task IDs for an agreed
+Increment, the next eligible Task, active checkpoint and attempt history. It
+reports `FINISHED` only when every bound criterion has a current passing check,
+all scoped Tasks are complete, and every bound Increment has Task coverage and
+is finished; empty work is not completion. If accepted criterion/Increment
+definitions change, the old mandate becomes `STALE_SCOPE`; only after explicit
+Markdown reconciliation may a new mandate replace it by naming the exact old
+ID. A missing Task in an already-bound fourth (or later) Increment can be
+added using the same mandate ID. `close_feature` defaults false; `--all` never
+closes automatically, and `/evospec.close` remains a separate explicit Core
+operation subject to current checks.
+
+Task refinements/additions continue through the existing Core task operation
+or explicit Markdown reconciliation, preserving stable IDs and dependency
+validation. Core may record reasoned `BLOCKED`, `CANCELED`, and `REOPENED`
+events against the same Task ID with a reason and evidence reference. A
+canceled Task is not successful. Reopening preserves prior attempts/checks but
+requires a new checkpointed attempt and fresh linked check. An unresolved
+checkpoint must be explicitly reconciled before a Task lifecycle transition;
+a new session cannot retarget or report the original attempt.
+
+The packaged `/evospec.implement`, `/evospec.tasks`, `/evospec.resume`, and
+skill instructions describe the same loop and mandate ID propagation. Related
+and external detours continue to use existing pause/resume records: one
+outstanding detour at a time, exact return Task, an observed result, and no
+automatic host-cancellation inference. Criterion receipts remain bound to
+current Core snapshots, and repository-input changes require refreshing
+affected evidence.
+
+Deterministic Core regressions cover mandate creation/digests, the fourth
+Increment Task added later under the same ID, stale scope and exact replacement,
+task block/cancel/reopen and fresh-check requirements, and fresh-session
+unknown-outcome recovery without replay. The related-mandate regression
+[`test_related_mandate_detour_pauses_before_effect_and_returns_exact_task`](../tests/test_continuity.py)
+checks the durable pre-effect pause, blocked begin, result recording, affected
+check refresh, unchanged accepted scope, and exact return Task. The packaged
+integration fixture simulates one `--all` entry through the real packaged
+adapter, provider-neutral protocol, and Core against temporary application
+files; simulated host permission/session APIs and Node VM tests exercise
+create/list, persistence, completion, filtering, a functional delete-completed
+fourth Increment, the separate related blue-button request, an isolated
+external detour, and fresh-session interruption recovery. The fixture checks
+app store functions and button source, not browser rendering.
+This is composed application and adapter evidence only. It does not prove a
+live OpenCode session, native permission dialog, human approval, browser
+rendering, or authenticated identity.
+
 ## Cross-cutting mode, document, and persistence contract
 
 - `specify` is the explicit opt-in for a fresh root. A legacy
@@ -141,6 +206,7 @@ does not establish that every user journey has passed in a live OpenCode host.
 - `.evospec/continuity.json` (schema 1) owns operational state: revision,
   Feature directory/status/cycle, selection, Task-attempt state/history,
   active checkpoint, checks, close/reopen history, pauses, stable IDs,
+  the optional current implementation mandate and Task lifecycle-event history,
   semantic and byte digests, typed identity metadata, and any pending
   publication journal. It does not duplicate current Feature/plan/Task
   definitions.
@@ -225,7 +291,7 @@ The packaged OpenCode V2 integration exposes the dedicated
 | `/evospec.clarify` | `clarify` | Record a question and its decision. |
 | `/evospec.plan` | `plan` | Record the selected Feature's plan. |
 | `/evospec.tasks` | `tasks` | Read the queue or add a Task linked to current IDs. |
-| `/evospec.implement` | `implement` | Queue, checkpoint before effects, and report afterward; `--all` re-queries eligible Tasks dynamically. |
+| `/evospec.implement` | `implement` | Queue or start a revision-bound `ALL` mandate, checkpoint before effects, report afterward, and re-query scoped Tasks dynamically. |
 | `/evospec.use` | `use` | Read or change session/worktree Feature selection. |
 | `/evospec.change` | `change` | Amend a Feature or create a correction. |
 | `/evospec.status` | `status` | Read the composed projection; legacy fallback stays read-only. |

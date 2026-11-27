@@ -1068,6 +1068,7 @@ def _generated_checklist(
         "attempts": tuple(state["attempts"]),
         "execution": None if state["execution"] is None else {"task_id": state["execution"]["task_id"]},
         "paused_features": tuple(state["paused_features"]),
+        "task_events": tuple(state.get("task_events", ())),
         "input_snapshot": None if input_snapshot is None else {
             "policy_id": input_snapshot["policy_id"],
             "policy_digest": input_snapshot["policy_digest"],

@@ -2369,6 +2369,618 @@ assert(protocolRequests.filter((request) => request.operation === "input_snapsho
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_composed_all_plugin_executes_one_mandate_through_protocol_and_core(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with TemporaryDirectory(
+            prefix="evospec-ac1-composed-all-",
+            dir=os.environ.get("EVOSPEC_AC0_TEST_TMPDIR") or None,
+        ) as temporary:
+            root = Path(temporary)
+            tests = root / "tests"
+            tests.mkdir()
+            (root / "index.html").write_text(
+                '<!doctype html><button class="add-button">Add task</button>\n',
+                encoding="utf-8",
+            )
+            (root / "external-correction.txt").write_text(
+                "before isolated external correction\n", encoding="utf-8",
+            )
+            (tests / "app-test-helper.mjs").write_text(
+                '''import { readFileSync } from "node:fs"
+import vm from "node:vm"
+
+export function loadApp(storage = new Map()) {
+  const html = readFileSync(new URL("../index.html", import.meta.url), "utf8")
+  const match = /<script>([\\s\\S]*?)<\\/script>/.exec(html)
+  if (!match) throw new Error("the temporary app has no executable task store")
+  const context = vm.createContext({
+    localStorage: {
+      getItem: (key) => storage.has(key) ? storage.get(key) : null,
+      setItem: (key, value) => storage.set(key, String(value)),
+    },
+  })
+  vm.runInContext(match[1], context)
+  return context.taskApp
+}
+''',
+                encoding="utf-8",
+            )
+            test_sources = {
+                "create-list.test.mjs": '''import assert from "node:assert/strict"
+import test from "node:test"
+import { loadApp } from "./app-test-helper.mjs"
+
+test("tasks can be created and listed", () => {
+  const app = loadApp()
+  const id = app.add("Write the release note")
+  assert.equal(app.list().length, 1)
+  assert.equal(app.list()[0].id, id)
+  assert.equal(app.list()[0].title, "Write the release note")
+})
+''',
+                "persistence.test.mjs": '''import assert from "node:assert/strict"
+import test from "node:test"
+import { loadApp } from "./app-test-helper.mjs"
+
+test("tasks survive reload and malformed stored bytes fail closed", () => {
+  const storage = new Map()
+  const first = loadApp(storage)
+  first.add("Keep this task")
+  const reloaded = loadApp(storage)
+  assert.equal(reloaded.list()[0].title, "Keep this task")
+  storage.set("evospec-task-fixture", "{malformed")
+  assert.equal(loadApp(storage).list().length, 0)
+})
+''',
+                "complete.test.mjs": '''import assert from "node:assert/strict"
+import test from "node:test"
+import { loadApp } from "./app-test-helper.mjs"
+
+test("completion is retained after reload", () => {
+  const storage = new Map()
+  const app = loadApp(storage)
+  const id = app.add("Complete one task")
+  app.complete(id)
+  assert.equal(loadApp(storage).list()[0].completed, true)
+})
+''',
+                "filter.test.mjs": '''import assert from "node:assert/strict"
+import test from "node:test"
+import { loadApp } from "./app-test-helper.mjs"
+
+test("active and completed tasks can be filtered", () => {
+  const app = loadApp()
+  const active = app.add("Still active")
+  const completed = app.add("Already complete")
+  app.complete(completed)
+  assert.deepEqual(JSON.parse(JSON.stringify(app.list("active"))).map((item) => item.id), [active])
+  assert.deepEqual(JSON.parse(JSON.stringify(app.list("completed"))).map((item) => item.id), [completed])
+})
+''',
+                "delete-completed.test.mjs": '''import assert from "node:assert/strict"
+import test from "node:test"
+import { loadApp } from "./app-test-helper.mjs"
+
+test("completed tasks can be deleted without deleting active tasks", () => {
+  const app = loadApp()
+  const active = app.add("Still active")
+  const completed = app.add("Ready to delete")
+  app.complete(completed)
+  app.deleteCompleted()
+  assert.deepEqual(JSON.parse(JSON.stringify(app.list())).map((item) => item.id), [active])
+  assert.deepEqual(JSON.parse(JSON.stringify(app.list("completed"))), [])
+})
+''',
+                "blue-button.test.mjs": '''import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
+import test from "node:test"
+
+test("the Add button remains blue in the page source", () => {
+  const html = readFileSync("index.html", "utf8")
+  assert.match(html, /class="add-button"/)
+  assert.match(html, /\\.add-button\\s*\\{[^}]*background:\\s*#1565c0/i)
+})
+''',
+            }
+            for name, content in test_sources.items():
+                (tests / name).write_text(content, encoding="utf-8")
+            (root / "plugin.ts").write_text(_resources()[PLUGIN], encoding="utf-8")
+            (root / "continuation.mjs").write_text(_resources()[CONTINUATION], encoding="utf-8")
+            runner = root / "ac1-runner.ts"
+            runner.write_text(
+                '''import plugin from "./plugin.ts"
+
+const definitions = []
+const permissions = []
+const protocolRequests = []
+const pendingReads = []
+const checks = []
+const nativeSpawn = Bun.spawn.bind(Bun)
+const assert = (condition, message) => { if (!condition) throw new Error(message) }
+let activeSession = "ses-ac1-primary"
+let toolNumber = 0
+let denyNextPermission = false
+const tool = {
+  get context() {
+    const sessionID = activeSession
+    const number = ++toolNumber
+    return {
+      sessionID,
+      agent: "assistant",
+      messageID: `msg-${sessionID}`,
+      id: `tool-${number}`,
+      signal: new AbortController().signal,
+    }
+  },
+}
+const runtime = {
+  tool: {
+    transform: async (callback) => callback({
+      add: (definition) => definitions.push(definition),
+    }),
+    list: async () => definitions.map((definition) => ({ id: definition.name })),
+  },
+  session: {
+    get: async ({ sessionID }) => {
+      assert(sessionID === activeSession, "adapter uses the executing simulated session")
+      return { location: { directory: process.cwd() } }
+    },
+    hook: async () => {},
+  },
+  permission: {
+    assert: async (request) => {
+      permissions.push(request)
+      if (denyNextPermission) throw new Error("SIMULATED_HOST_DENIED")
+    },
+  },
+}
+Object.defineProperty(Bun, "spawn", {
+  value(command, options) {
+    if (options?.stdin !== undefined) {
+      const slot = protocolRequests.length
+      protocolRequests.push(null)
+      pendingReads.push(options.stdin.text().then((text) => {
+        protocolRequests[slot] = JSON.parse(text)
+      }))
+    }
+    if (Array.isArray(command) && command[1] === "--test") checks.push(command.at(-1))
+    return nativeSpawn(command, options)
+  },
+})
+await plugin.setup(runtime)
+const continuityTool = definitions.find((definition) => definition.name === "evospec_continuity")
+assert(continuityTool, "the real packaged composed adapter is registered")
+assert(continuityTool.input.properties.data.properties.phase.enum.includes("start"),
+  "the adapter schema exposes the one-time mandate start")
+const context = () => tool.context
+const call = async (operation, expectedRevision, data = {}) => {
+  const result = await continuityTool.execute({
+    operation,
+    ...(expectedRevision === undefined ? {} : { expected_revision: expectedRevision }),
+    data,
+  }, context())
+  const response = JSON.parse(result.content)
+  if (response.error) throw new Error(`${response.error.code}: ${response.error.detail}`)
+  const continuity = response.core?.continuity ?? response.continuity
+  assert(continuity && typeof continuity.revision === "number",
+    `the real provider-neutral protocol returned Core continuity for ${operation}`)
+  return continuity
+}
+const runFixtureTest = async (target) => {
+  const child = Bun.spawn(["node", "--test", target], {
+    stdout: "pipe", stderr: "pipe",
+  })
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+  ])
+  assert(exitCode === 0, `${target} failed: ${stdout}\n${stderr}`)
+  return stdout
+}
+denyNextPermission = true
+let deniedStart = false
+try {
+  await call("implement", 0, {
+    feature_id: "F-00000000000000000000000000000001",
+    phase: "start", mode: "ALL",
+  })
+} catch (error) {
+  deniedStart = String(error).includes("SIMULATED_HOST_DENIED")
+}
+denyNextPermission = false
+assert(deniedStart && protocolRequests.length === 0,
+  "simulated host denial stops before Core, mandate persistence, or fallback")
+const page = (storage, listBody, methods, buttonColor) => `<!doctype html>
+<html><head><style>.add-button { color: white; background: ${buttonColor}; }</style></head>
+<body><input data-evo-action="task-input"><button class="add-button" data-evo-action="add-task">Add task</button>
+<ul data-evo-task-list></ul><script>
+const KEY = "evospec-task-fixture";
+${storage}
+globalThis.taskApp = {
+  add(title) {
+    const tasks = readTasks();
+    const item = { id: String(tasks.length + 1), title, completed: false };
+    tasks.push(item);
+    saveTasks(tasks);
+    return item.id;
+  },
+  list(filter = "all") {
+    const tasks = readTasks();
+    ${listBody}
+  },
+  ${methods}
+};
+</script></body></html>
+`
+const memoryStore = `let memoryTasks = [];
+function readTasks() { return memoryTasks; }
+function saveTasks(tasks) { memoryTasks = tasks; }`
+const durableStore = `function readTasks() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(KEY) || "[]");
+    return Array.isArray(parsed) ? parsed.filter((task) =>
+      task && typeof task.id === "string" && typeof task.title === "string") : [];
+  } catch { return []; }
+}
+function saveTasks(tasks) { localStorage.setItem(KEY, JSON.stringify(tasks)); }`
+const noFilter = "return tasks"
+const filtered = `return filter === "active" ? tasks.filter((task) => !task.completed)
+      : filter === "completed" ? tasks.filter((task) => task.completed) : tasks`
+const noCompletion = ""
+const completion = `complete(id) {
+    saveTasks(readTasks().map((task) =>
+      task.id === id ? { ...task, completed: true } : task));
+  },`
+const deleteCompleted = `deleteCompleted() {
+    saveTasks(readTasks().filter((task) => !task.completed));
+  },`
+const appV1 = page(memoryStore, noFilter, noCompletion, "#888888")
+const appV2 = page(durableStore, noFilter, noCompletion, "#1565c0")
+const appV3 = page(durableStore, noFilter, completion, "#1565c0")
+const appV4 = page(durableStore, filtered, completion, "#1565c0")
+const appV5 = page(durableStore, filtered, completion + deleteCompleted, "#1565c0")
+
+const featureRequest = {
+  title: "Personal task list",
+  outcome: "Users can create and manage personal tasks through the Add control.",
+  criteria: [
+    { description: "Tasks can be created and listed.", check_kind: "node-test", check_target: "tests/create-list.test.mjs" },
+    { description: "Tasks survive reload and malformed stored data is handled.", check_kind: "node-test", check_target: "tests/persistence.test.mjs" },
+    { description: "Completed state is retained after reload.", check_kind: "node-test", check_target: "tests/complete.test.mjs" },
+    { description: "Active and completed tasks can be filtered.", check_kind: "node-test", check_target: "tests/filter.test.mjs" },
+    { description: "Completed tasks can be deleted without deleting active tasks.", check_kind: "node-test", check_target: "tests/delete-completed.test.mjs" },
+  ],
+  increments: [
+    { title: "Create and list", outcome: "Create task records and list them." },
+    { title: "Complete tasks", outcome: "Retain completion state." },
+    { title: "Filter tasks", outcome: "Separate active and completed tasks." },
+    { title: "Delete completed tasks", outcome: "Delete completed tasks while retaining active tasks." },
+  ],
+  tasks: [
+    { title: "Create and list tasks", description: "Implement the first app interaction.", increment_index: 0, criteria: [0], depends_on: [] },
+    { title: "Retain completed state", description: "Add completion after durable storage exists.", increment_index: 1, criteria: [2], depends_on: [0] },
+    { title: "Filter by completion", description: "Separate active and completed tasks.", increment_index: 2, criteria: [3], depends_on: [1] },
+  ],
+}
+let current = await call("specify", 0, featureRequest)
+const featureID = current.selected_feature.id
+const tasks = current.selected_feature.tasks
+const task1 = tasks[0]
+const task3 = tasks[1]
+const task4 = tasks[2]
+const criteria = current.selected_feature.criteria
+const increments = current.selected_feature.increments
+assert(increments.length === 4 && current.selected_feature.status === "OPEN",
+  "Core creates four agreed Increments without closing the Feature")
+assert(current.selected_feature.tasks.length === 3,
+  "the fourth agreed Increment initially has no Task")
+const permissionCountBeforeStart = permissions.length
+current = await call("implement", current.revision, {
+  feature_id: featureID, phase: "start", mode: "ALL",
+})
+const mandate = current.mandate
+assert(mandate && mandate.mode === "ALL" && mandate.close_feature === false,
+  "one explicit start persists the default-open ALL mandate")
+assert(mandate.criterion_ids.length === 5 && mandate.increment_ids.length === 4,
+  "the mandate binds every accepted criterion and all four accepted Increments")
+assert(mandate.missing_increment_task_ids.length === 1
+  && mandate.missing_increment_task_ids[0] === increments[3].id,
+  "status identifies the agreed fourth Increment that still needs a Task")
+const mandateID = mandate.id
+const permissionCountAfterStart = permissions.length
+const queued = await call("implement", current.revision, {
+  feature_id: featureID, mandate_id: mandateID, phase: "queue",
+})
+assert(queued.mandate.next_task === task1.id,
+  "read-only queue returns the exact first eligible Task")
+assert(permissions.length === permissionCountAfterStart
+  && permissionCountAfterStart === permissionCountBeforeStart + 1,
+  "only the explicit mandate start added a write permission request")
+
+const begin = async (taskID) => call("implement", current.revision, {
+  feature_id: featureID, task_id: taskID, mandate_id: mandateID, phase: "begin",
+})
+const report = async (taskID, revision, statement) => call("implement", revision, {
+  feature_id: featureID, task_id: taskID, mandate_id: mandateID,
+  phase: "report", result: "SUCCEEDED", report: statement,
+})
+const verify = async (taskID, criterion, revision) => {
+  const result = await call("verify", revision, {
+    feature_id: featureID, task_id: taskID, criterion_id: criterion.id,
+    mandate_id: mandateID,
+  })
+  assert(result.selected_feature.tasks.find((task) => task.id === taskID).status === "COMPLETED",
+    `fresh linked check completes ${taskID}`)
+  return result
+}
+let started = await begin(task1.id)
+assert(started.active_attempt.mandate_id === mandateID,
+  "the checkpoint is durable and linked to the exact mandate before effects")
+await Bun.write("index.html", appV1)
+current = await report(task1.id, started.revision, "Create/list behavior written to the temporary application.")
+current = await verify(task1.id, criteria[0], current.revision)
+assert(current.selected_feature.status === "OPEN",
+  "passing the first Task does not close the Feature")
+
+current = await call("tasks", current.revision, {
+  feature_id: featureID, mandate_id: mandateID,
+  task_title: "Harden local task persistence",
+  task_description: "A discovered technical Task: durable storage must tolerate malformed bytes.",
+  increment_id: increments[0].id, criteria_ids: [criteria[1].id],
+  depends_on: [task1.id],
+})
+const task2 = current.selected_feature.tasks.at(-1)
+assert(current.mandate.id === mandateID && task2.increment_id === increments[0].id,
+  "a discovered technical Task is added under the original mandate")
+assert(current.mandate.missing_increment_task_ids.length === 1
+  && current.mandate.missing_increment_task_ids[0] === increments[3].id,
+  "adding the discovered Task does not manufacture coverage for increment four")
+
+current = await call("pause", current.revision, {
+  feature_id: featureID, mandate_id: mandateID,
+  reason: "Apply one isolated external correction, then return to persistence.",
+  detour_kind: "EXTERNAL", detour_title: "External text correction",
+  return_task_id: task2.id,
+})
+await Bun.write("external-correction.txt", "isolated correction retained\\n")
+assert(await Bun.file("external-correction.txt").text() === "isolated correction retained\\n",
+  "the independent external correction has a real observed file effect")
+current = await call("resume", current.revision, {
+  feature_id: featureID, mandate_id: mandateID,
+  detour_summary: "Corrected only external-correction.txt; return to the persistence Task.",
+})
+assert(current.selected_feature.detours.at(-1).return_task_id === task2.id
+  && current.selected_feature.detours.at(-1).result.startsWith("Corrected only"),
+  "the external detour returns to its exact Task and retains its observed result")
+assert(current.features.length === 1,
+  "the external correction creates no fake Feature or Slice")
+assert(current.selected_feature.tasks.find((task) => task.id === task1.id).status === "REPORTED",
+  "the external file change stales the earlier linked check")
+current = await verify(task1.id, criteria[0], current.revision)
+assert(current.mandate.next_task === task2.id,
+  "rechecking affected evidence returns the exact technical Task to the queue")
+
+const relatedRequest = "Antes cambia el botón de agregar a azul y luego sigue"
+current = await call("pause", current.revision, {
+  feature_id: featureID, mandate_id: mandateID, reason: relatedRequest,
+  detour_kind: "RELATED", detour_title: relatedRequest,
+  return_task_id: task2.id,
+})
+const relatedDetour = current.selected_feature.detours.at(-1)
+assert(current.mandate.id === mandateID && current.mandate.status === "PAUSED"
+  && current.mandate.next_task === task2.id,
+  "the related request pauses the original mandate at its exact persistence Task")
+assert(current.active_attempt === null
+  && current.selected_feature.tasks.find((task) => task.id === task2.id).attempts === 0,
+  "the related pause is a pre-effect checkpoint, not a begun main Task")
+const relatedLedger = JSON.parse(await Bun.file(".evospec/continuity.json").text())
+const durableRelated = relatedLedger.detours.find((detour) => detour.id === relatedDetour.id)
+assert(relatedLedger.paused_features.includes(featureID)
+  && durableRelated.return_task_id === task2.id && durableRelated.result === null,
+  "Core durably records the pending related detour and exact return before effects")
+assert(current.features.length === 1
+  && current.selected_feature.increments.every((increment) =>
+    !/\\bblue\\b/i.test(`${increment.title} ${increment.outcome}`))
+  && current.selected_feature.criteria.every((criterion) =>
+    !/\\bblue\\b/i.test(criterion.description)),
+  "the new color request is not silently added to accepted Feature scope")
+const beforeRelatedEffect = await Bun.file("index.html").text()
+assert(beforeRelatedEffect.includes("background: #888888;"),
+  "the Add control is still gray at the durable pre-effect pause")
+const beforeBlockedBegin = await Bun.file(".evospec/continuity.json").text()
+let blockedWhilePaused = false
+try {
+  await begin(task2.id)
+} catch (error) {
+  blockedWhilePaused = String(error).includes("FEATURE_PAUSED")
+}
+assert(blockedWhilePaused
+  && await Bun.file(".evospec/continuity.json").text() === beforeBlockedBegin,
+  "the main Task cannot begin or advance while its Feature is paused")
+const changedButton = beforeRelatedEffect.replace(
+  ".add-button { color: white; background: #888888; }",
+  ".add-button { color: white; background: #1565c0; }",
+)
+assert(changedButton !== beforeRelatedEffect, "the requested CSS property was actually changed")
+await Bun.write("index.html", changedButton)
+const relatedBlueTest = await runFixtureTest("tests/blue-button.test.mjs")
+current = await call("resume", current.revision, {
+  feature_id: featureID, mandate_id: mandateID,
+  detour_summary: `${relatedRequest}; tests/blue-button.test.mjs passed with the exact #1565c0 background; return to ${task2.id}.`,
+})
+assert(current.selected_feature.detours.at(-1).return_task_id === task2.id
+  && current.selected_feature.detours.at(-1).result.includes("tests/blue-button.test.mjs passed")
+  && current.mandate.id === mandateID,
+  "the observed related result resumes the same mandate with its exact return Task")
+assert(current.features.length === 1
+  && current.selected_feature.tasks.find((task) => task.id === task2.id).attempts === 0,
+  "the related detour adds no Feature or Task and leaves persistence unstarted")
+const acceptedSpec = await Bun.file(`specs/${current.selected_feature.directory}/spec.md`).text()
+assert(!/\\bblue\\b/i.test(acceptedSpec),
+  "the requested color remains a related result, not a silent accepted-spec change")
+assert(relatedBlueTest.includes("#1565c0") || relatedBlueTest.includes("Add button remains blue"),
+  "the related result records the passing exact-property fixture output")
+current = await verify(task1.id, criteria[0], current.revision)
+assert(current.mandate.next_task === task2.id,
+  "after rechecking the CSS-affected criterion, the exact return Task remains next")
+
+started = await begin(task2.id)
+await Bun.write("index.html", appV2)
+current = await report(task2.id, started.revision, "Durable parsing and storage added.")
+current = await verify(task1.id, criteria[0], current.revision)
+current = await verify(task2.id, criteria[1], current.revision)
+
+assert(current.mandate.next_task === task3.id,
+  "Core advances through the second Increment only after current coverage")
+started = await begin(task3.id)
+await Bun.write("index.html", appV3)
+current = await report(task3.id, started.revision, "Completion state is now saved with each task.")
+current = await verify(task1.id, criteria[0], current.revision)
+current = await verify(task2.id, criteria[1], current.revision)
+current = await verify(task3.id, criteria[2], current.revision)
+
+assert(current.mandate.next_task === task4.id,
+  "Core advances through the third Increment after the completion check")
+started = await begin(task4.id)
+await Bun.write("index.html", appV4)
+current = await report(task4.id, started.revision, "Active/completed filtering is implemented.")
+current = await verify(task1.id, criteria[0], current.revision)
+current = await verify(task2.id, criteria[1], current.revision)
+current = await verify(task3.id, criteria[2], current.revision)
+current = await verify(task4.id, criteria[3], current.revision)
+assert(current.mandate.missing_increment_task_ids[0] === increments[3].id,
+  "the fourth Increment stays pending until an explicit scoped Task is added")
+
+current = await call("tasks", current.revision, {
+  feature_id: featureID, mandate_id: mandateID,
+  task_title: "Delete completed tasks",
+  task_description: "Delete completed tasks while retaining active tasks.",
+  increment_id: increments[3].id, criteria_ids: [criteria[4].id],
+  depends_on: [task4.id],
+})
+const task5 = current.selected_feature.tasks.at(-1)
+assert(task5.increment_id === increments[3].id
+  && current.mandate.missing_increment_task_ids.length === 0,
+  "the fourth-Increment Task is added later under the same mandate")
+const beforeCheckpoint = await call("implement", current.revision, {
+  feature_id: featureID, mandate_id: mandateID, phase: "queue",
+})
+assert(beforeCheckpoint.mandate.next_task === task5.id,
+  "the new fourth-Increment Task becomes the next eligible Task")
+started = await begin(task5.id)
+await Bun.write("index.html", appV5)
+const deletionTest = await runFixtureTest("tests/delete-completed.test.mjs")
+assert(deletionTest.includes("completed tasks can be deleted"),
+  "the fourth Increment has executable delete behavior before reconciliation")
+current = started
+
+activeSession = "ses-ac1-recovery"
+const recoveredStatus = await call("status", undefined)
+assert(recoveredStatus.mandate.id === mandateID
+  && recoveredStatus.mandate.status === "UNKNOWN_EFFECT"
+  && recoveredStatus.active_attempt.task_id === task5.id
+  && recoveredStatus.active_attempt.session_id === "ses-ac1-primary",
+  "a fresh session sees the exact original mode, scope, Task, checkpoint, and session")
+assert(recoveredStatus.selected_feature.tasks.find((task) => task.id === task5.id)
+  .attempt_history[0].mandate_id === mandateID,
+  "the original checkpoint attempt retains its mandate identity")
+let blockedRepeat = false
+try {
+  await begin(task5.id)
+} catch (error) {
+  blockedRepeat = String(error).includes("EXECUTION_BUSY")
+}
+assert(blockedRepeat, "a new session cannot replay an unresolved checkpoint")
+let blockedRetarget = false
+try {
+  await call("implement", recoveredStatus.revision, {
+    feature_id: featureID, task_id: task5.id, mandate_id: mandateID,
+    phase: "report", result: "SUCCEEDED", report: "Do not retarget the original session.",
+  })
+} catch (error) {
+  blockedRetarget = String(error).includes("OUTCOME_UNKNOWN")
+}
+assert(blockedRetarget, "a new session cannot report the original session's attempt")
+current = await call("resume", recoveredStatus.revision, {
+  feature_id: featureID, task_id: task5.id, mandate_id: mandateID,
+  reconcile: "COMPLETE", evidence_ref: "fixture:tests/delete-completed.test.mjs-passed",
+})
+assert(current.active_attempt === null
+  && current.selected_feature.tasks.find((task) => task.id === task5.id).status === "REPORTED",
+  "exact evidence reconciliation records the effect without claiming verification")
+current = await verify(task1.id, criteria[0], current.revision)
+current = await verify(task2.id, criteria[1], current.revision)
+current = await verify(task3.id, criteria[2], current.revision)
+current = await verify(task4.id, criteria[3], current.revision)
+current = await verify(task5.id, criteria[4], current.revision)
+const finalBlueTest = await runFixtureTest("tests/blue-button.test.mjs")
+assert(finalBlueTest.includes("Add button remains blue"),
+  "the final app version still passes the exact related CSS check")
+const finalStatus = await call("status", undefined)
+assert(finalStatus.mandate.id === mandateID && finalStatus.mandate.status === "FINISHED",
+  "all four Increments finish with current checks and completed scoped Tasks")
+assert(finalStatus.selected_feature.status === "OPEN"
+  && finalStatus.mandate.close_feature === false,
+  "the continuous mandate never closes its Feature implicitly")
+assert(finalStatus.selected_feature.tasks.map((task) => task.attempts)
+  .join(",") === "1,1,1,1,1",
+  "fresh-session reconciliation did not replay or duplicate any Task attempt")
+assert(finalStatus.selected_feature.detours[0].kind === "EXTERNAL"
+  && finalStatus.selected_feature.detours[0].return_task_id === task2.id
+  && finalStatus.selected_feature.detours[1].kind === "RELATED"
+  && finalStatus.selected_feature.detours[1].return_task_id === task2.id,
+  "the final status retains independent external and related detours to the exact Task")
+assert(finalStatus.selected_feature.criteria[4].description.includes("deleted")
+  && !finalStatus.selected_feature.increments.some((increment) =>
+    /\\bblue\\b/i.test(`${increment.title} ${increment.outcome}`)),
+  "the functional deletion Increment is accepted separately from the blue request")
+await Promise.all(pendingReads)
+const starts = protocolRequests.filter((request) =>
+  request.operation === "implement" && request.data.phase === "start")
+assert(starts.length === 1 && starts[0].data.feature_id === featureID
+  && starts[0].data.mode === "ALL",
+  "the entire composed run uses exactly one Feature-bound ALL start")
+const begins = protocolRequests.filter((request) =>
+  request.operation === "implement" && request.data.phase === "begin")
+assert(begins.length === 7
+  && new Set(begins.map((request) => request.data.task_id)).size === 5
+  && begins.filter((request) => request.data.task_id === task2.id).length === 2
+  && begins.filter((request) => request.data.task_id === task5.id).length === 2,
+  "five Tasks have one durable begin each; pause and recovery replays are rejected")
+assert(protocolRequests.filter((request) => request.operation === "verify").length === 17,
+  "each Task's check is recorded only after the latest input change")
+assert(protocolRequests.filter((request) =>
+  request.operation === "verify").every((request) => request.data.mandate_id === mandateID),
+  "every check preserves exact mandate binding")
+assert(checks.length === 20
+  && checks.filter((target) => target === "tests/blue-button.test.mjs").length === 2
+  && checks.filter((target) => target === "tests/delete-completed.test.mjs").length === 2
+  && checks.every((target) => target.startsWith("tests/")),
+  "all acceptance checks run only the bounded temporary Node test modules")
+const writeRequests = permissions.map((request) => ({
+  action: request.action,
+  resource: JSON.parse(request.resources[0]),
+}))
+assert(writeRequests.every(({ resource }) => resource.repository_root === process.cwd()),
+  "simulated permission requests are bound to the exact temporary project root")
+console.log("AC1 composed ALL adapter/Core fixture passed")
+''',
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            existing_pythonpath = environment.get("PYTHONPATH")
+            environment["PYTHONPATH"] = (
+                str(source_root)
+                if not existing_pythonpath
+                else str(source_root) + os.pathsep + existing_pythonpath
+            )
+            completed = subprocess.run(
+                ("bun", "run", str(runner)),
+                cwd=root, capture_output=True, text=True, check=False,
+                env=environment,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertIn("AC1 composed ALL adapter/Core fixture passed", completed.stdout)
+
     def test_v2_plugin_spawn_hides_windows_children_and_preserves_protocol_io(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

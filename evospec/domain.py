@@ -4876,6 +4876,7 @@ _CONTINUITY_FIELDS = frozenset((
 ))
 _CONTINUITY_SEMANTIC_FIELDS = _CONTINUITY_FIELDS | frozenset(("semantic_digests",))
 _CONTINUITY_IDENTITY_FIELDS = _CONTINUITY_SEMANTIC_FIELDS | frozenset(("identity_metadata",))
+_CONTINUITY_OPTIONAL_FIELDS = frozenset(("mandate", "task_events"))
 _CONTINUITY_ID = re.compile(r"^[FSTCD]-[0-9a-f]{32}$")
 _CONTINUITY_DIR = re.compile(r"^[0-9]{3,}-[a-z0-9]+(?:-[a-z0-9]+)*$")
 _CONTINUITY_DOC = re.compile(
@@ -4936,6 +4937,33 @@ class ContinuityTaskState(TypedDict):
     attempts: int
 
 
+class ContinuityMandateReference(TypedDict):
+    id: str
+    digest: str
+
+
+class ContinuityMandate(TypedDict):
+    id: str
+    feature_id: str
+    mode: str
+    criteria: list[ContinuityMandateReference]
+    increments: list[ContinuityMandateReference]
+    source_revision: int
+    recorded_revision: int
+    session_id: str
+    close_feature: bool
+
+
+class ContinuityTaskEvent(TypedDict):
+    task_id: str
+    event: str
+    reason: str
+    evidence_ref: str
+    session_id: str
+    recorded_revision: int
+    attempt_count: int
+
+
 class ContinuityAttempt(TypedDict):
     task_id: str
     attempt: int
@@ -4945,6 +4973,7 @@ class ContinuityAttempt(TypedDict):
     result: str | None
     result_status: str | None
     evidence_ref: str | None
+    mandate_id: NotRequired[str]
 
 
 class ContinuityExecution(TypedDict):
@@ -5076,6 +5105,8 @@ class ContinuityStateData(TypedDict):
     pending: ContinuityPending | None
     semantic_digests: NotRequired[dict[str, str]]
     identity_metadata: NotRequired[dict[str, ContinuityIdentityMetadata]]
+    mandate: NotRequired[ContinuityMandate]
+    task_events: NotRequired[list[ContinuityTaskEvent]]
 
 
 def validate_continuity_state(
@@ -5096,10 +5127,18 @@ def validate_continuity_state(
         except UnicodeEncodeError:
             return False
 
-    if type(value) is not dict or set(value) not in (
-        _CONTINUITY_FIELDS, _CONTINUITY_SEMANTIC_FIELDS,
-        _CONTINUITY_IDENTITY_FIELDS,
-    ):
+    allowed_fields = tuple(
+        fields | optional
+        for fields in (
+            _CONTINUITY_FIELDS, _CONTINUITY_SEMANTIC_FIELDS,
+            _CONTINUITY_IDENTITY_FIELDS,
+        )
+        for optional in (
+            frozenset(), frozenset(("mandate",)), frozenset(("task_events",)),
+            _CONTINUITY_OPTIONAL_FIELDS,
+        )
+    )
+    if type(value) is not dict or frozenset(value) not in allowed_fields:
         invalid("continuity state fields are not exact")
     state = cast(dict[str, object], cast(object, value))
     if (
@@ -5114,6 +5153,8 @@ def validate_continuity_state(
         or any(type(state[key]) is not list for key in (
             "attempts", "checks", "closures", "reopens", "paused_features", "detours", "ids",
         ))
+        or ("task_events" in state and type(state["task_events"]) is not list)
+        or ("mandate" in state and type(state["mandate"]) is not dict)
         or (state["execution"] is not None and type(state["execution"]) is not dict)
         or (state["pending"] is not None and type(state["pending"]) is not dict)
     ):
@@ -5139,6 +5180,8 @@ def validate_continuity_state(
     identity_metadata = cast(
         dict[str, object], state.get("identity_metadata", {}),
     )
+    mandate = state.get("mandate")
+    task_events = cast(list[object], state.get("task_events", []))
     ids = cast(list[object], state["ids"])
     revision = cast(int, state["revision"])
     pending = cast(dict[str, object] | None, state["pending"])
@@ -5195,10 +5238,16 @@ def validate_continuity_state(
     for attempt in attempts:
         if (
             type(attempt) is not dict
-            or set(attempt) != {
-                "task_id", "attempt", "status", "session_id", "checkpoint",
-                "result", "result_status", "evidence_ref",
-            }
+            or set(attempt) not in (
+                {
+                    "task_id", "attempt", "status", "session_id", "checkpoint",
+                    "result", "result_status", "evidence_ref",
+                },
+                {
+                    "task_id", "attempt", "status", "session_id", "checkpoint",
+                    "result", "result_status", "evidence_ref", "mandate_id",
+                },
+            )
             or not isinstance(attempt["task_id"], str)
             or attempt["task_id"] not in counters
             or type(attempt["attempt"]) is not int or attempt["attempt"] < 1
@@ -5213,6 +5262,13 @@ def validate_continuity_state(
                 None, "SUCCEEDED", "BLOCKED", "UNKNOWN", "COMPLETE", "INCOMPLETE",
             )
             or (attempt["evidence_ref"] is not None and not isinstance(attempt["evidence_ref"], str))
+            or (
+                "mandate_id" in attempt
+                and (
+                    not isinstance(attempt["mandate_id"], str)
+                    or re.fullmatch(r"D-[0-9a-f]{32}", attempt["mandate_id"]) is None
+                )
+            )
         ):
             invalid("Task attempt history is invalid")
         counters[attempt["task_id"]] += 1
@@ -5323,6 +5379,106 @@ def validate_continuity_state(
         for identity, record in identity_metadata.items()
     ):
         invalid("typed identity metadata is invalid")
+    if mandate is not None:
+        if (
+            type(mandate) is not dict
+            or set(mandate) != {
+                "id", "feature_id", "mode", "criteria", "increments",
+                "source_revision", "recorded_revision", "session_id", "close_feature",
+            }
+            or not isinstance(mandate["id"], str)
+            or re.fullmatch(r"D-[0-9a-f]{32}", mandate["id"]) is None
+            or mandate["id"] not in ids
+            or not isinstance(mandate["feature_id"], str)
+            or mandate["feature_id"] not in features
+            or mandate["mode"] != "ALL"
+            or type(mandate["criteria"]) is not list
+            or not mandate["criteria"]
+            or type(mandate["increments"]) is not list
+            or type(mandate["source_revision"]) is not int
+            or type(mandate["recorded_revision"]) is not int
+            or not 0 <= mandate["source_revision"] < mandate["recorded_revision"] <= revision
+            or mandate["recorded_revision"] != mandate["source_revision"] + 1
+            or not valid_text(mandate["session_id"], 256)
+            or type(mandate["close_feature"]) is not bool
+        ):
+            invalid("implementation mandate is invalid")
+        metadata_records = cast(
+            dict[str, dict[str, object]],
+            cast(object, identity_metadata),
+        )
+        for name, prefix in (("criteria", "C"), ("increments", "S")):
+            references = cast(list[object], mandate[name])
+            reference_ids: set[str] = set()
+            for reference in references:
+                reference_identity = (
+                    reference.get("id") if type(reference) is dict else None
+                )
+                metadata = (
+                    metadata_records.get(cast(str, reference_identity))
+                    if isinstance(reference_identity, str) else None
+                )
+                if (
+                    type(reference) is not dict
+                    or set(reference) != {"id", "digest"}
+                    or not isinstance(reference["id"], str)
+                    or _CONTINUITY_ID.fullmatch(reference["id"]) is None
+                    or reference["id"][0] != prefix
+                    or reference["id"] in reference_ids
+                    or not isinstance(reference["digest"], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", reference["digest"]) is None
+                    or metadata is None
+                    or metadata["feature_id"] != mandate["feature_id"]
+                    or metadata["kind"] != prefix
+                ):
+                    invalid("implementation mandate scope references are invalid")
+                reference_ids.add(cast(str, reference["id"]))
+    if task_events:
+        event_revisions: set[int] = set()
+        last_events: dict[str, dict[str, object]] = {}
+        previous_revision = 0
+        for event in task_events:
+            if (
+                type(event) is not dict
+                or set(event) != {
+                    "task_id", "event", "reason", "evidence_ref", "session_id",
+                    "recorded_revision", "attempt_count",
+                }
+                or not isinstance(event["task_id"], str)
+                or event["task_id"] not in counters
+                or event["event"] not in ("BLOCKED", "CANCELED", "REOPENED")
+                or not valid_text(event["reason"], 2048)
+                or not valid_text(event["evidence_ref"], 2048)
+                or not valid_text(event["session_id"], 256)
+                or type(event["recorded_revision"]) is not int
+                or not 1 <= event["recorded_revision"] <= revision
+                or event["recorded_revision"] in event_revisions
+                or event["recorded_revision"] <= previous_revision
+                or type(event["attempt_count"]) is not int
+                or not 0 <= event["attempt_count"] <= counters[event["task_id"]]
+            ):
+                invalid("Task lifecycle event is invalid")
+            previous = last_events.get(cast(str, event["task_id"]))
+            current_kind = cast(str, event["event"])
+            if previous is not None and event["attempt_count"] < previous["attempt_count"]:
+                invalid("Task lifecycle attempt counts cannot move backward")
+            if current_kind == "REOPENED":
+                if previous is None:
+                    if event["attempt_count"] < 1:
+                        invalid("Task reopening requires prior Task work")
+                elif previous["event"] not in ("BLOCKED", "CANCELED", "REOPENED"):
+                    invalid("Task reopening has no blocked, canceled, or completed predecessor")
+                elif previous["event"] == "REOPENED" and event["attempt_count"] <= previous["attempt_count"]:
+                    invalid("a reopened Task requires a new attempt before reopening again")
+            elif previous is not None and (
+                previous["event"] in ("BLOCKED", "CANCELED")
+                or previous["event"] == "REOPENED"
+                and event["attempt_count"] <= previous["attempt_count"]
+            ):
+                invalid("Task lifecycle event transition is invalid")
+            event_revisions.add(cast(int, event["recorded_revision"]))
+            previous_revision = cast(int, event["recorded_revision"])
+            last_events[cast(str, event["task_id"])] = cast(dict[str, object], event)
     detour_ids: set[str] = set()
     pending_detours = 0
     for detour in detours:
@@ -5466,6 +5622,8 @@ def validate_continuity_state(
         ), None)
         if active is None or active["status"] not in ("STARTED", "OUTCOME_UNKNOWN"):
             invalid("in-flight Task attempt does not match its history")
+        if mandate is not None and active.get("mandate_id") != mandate["id"]:
+            invalid("in-flight Task checkpoint is not bound to the current mandate")
 
     if pending is None:
         return
