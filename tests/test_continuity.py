@@ -1586,7 +1586,7 @@ class ContinuityTests(unittest.TestCase):
     def test_reconcile_ignores_unrelated_feature_drift_in_both_edit_orders(self) -> None:
         for unrelated_first in (True, False):
             with self.subTest(unrelated_first=unrelated_first), self._temp() as temporary:
-                root = Path(temporary)
+                root = ContinuityPersistence(Path(temporary)).root
                 first = self.call(root, "specify", 0, data={
                     **spec_request("Selected Feature"),
                     "increments": [],
