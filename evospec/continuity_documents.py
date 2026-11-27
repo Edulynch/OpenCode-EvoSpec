@@ -516,6 +516,169 @@ def index_write(
     return {relative: (original.encode("utf-8"), before)}
 
 
+def index_write_selected(
+    root: Path, state: ContinuityStateData, feature_id: str, title: str,
+) -> dict[str, tuple[bytes, str | None]]:
+    """Refresh one selected Feature row without reading or rewriting other rows."""
+    relative = "specs/README.md"
+    safe_document_path(root, relative)
+    path = root / Path(relative)
+    before = file_hash(path)
+    if before is None:
+        raise ContinuityError("DOCUMENT_DIVERGED", "specs/README.md has no delimited Feature index")
+    try:
+        original = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ContinuityError("DOCUMENT_DIVERGED", "specs/README.md cannot be read") from error
+    if (
+        original.count(_INDEX_START) != 1
+        or original.count(_INDEX_END) != 1
+        or original.index(_INDEX_START) > original.index(_INDEX_END)
+    ):
+        raise ContinuityError("DOCUMENT_DIVERGED", "specs/README.md has an incomplete or ambiguous EvoSpec index")
+    feature = state["features"].get(feature_id)
+    if feature is None:
+        raise ContinuityError("FEATURE_REQUIRED", "index refresh requires the selected Feature")
+    folder = feature["directory"]
+    default = " — worktree default" if feature_id == state["default_feature_id"] else ""
+    replacement = (
+        f"- [{title}]({folder}/spec.md) — `{feature_id}` — "
+        f"{feature['status']}{default}"
+    )
+    start = original.index(_INDEX_START) + len(_INDEX_START)
+    end = original.index(_INDEX_END)
+    block = original[start:end]
+    lines = block.splitlines(keepends=True)
+    matches = [
+        index for index, line in enumerate(lines)
+        if f"`{feature_id}`" in line.rstrip("\r\n")
+    ]
+    if len(matches) != 1:
+        raise ContinuityError(
+            "DOCUMENT_DIVERGED",
+            "specs/README.md must contain exactly one delimited row for the selected Feature",
+        )
+    row_index = matches[0]
+    old_row = lines[row_index].rstrip("\r\n")
+    expected_marker = f"]({folder}/spec.md) — `{feature_id}` — "
+    if not old_row.startswith("- [") or expected_marker not in old_row:
+        raise ContinuityError(
+            "DOCUMENT_DIVERGED",
+            "the selected Feature index row is malformed or points to another document",
+        )
+    ending = lines[row_index][len(old_row):]
+    lines[row_index] = replacement + ending
+    updated = original[:start] + "".join(lines) + original[end:]
+    return {relative: (updated.encode("utf-8"), before)}
+
+
+def pending_document_preservation_issue(
+    relative: str,
+    feature_id: str,
+    current: bytes,
+    intended: bytes,
+    *,
+    current_feature: dict[str, object] | None = None,
+    intended_feature: dict[str, object] | None = None,
+) -> str | None:
+    """Require a preserved third version to retain queued identities and references."""
+    name = relative.rsplit("/", 1)[-1][:-3]
+    if name not in _DOCUMENT_NAMES or _DATA_START.encode() in current or _DATA_END.encode() in current:
+        return "merge the queued canonical document into ordinary Markdown before preserving this path"
+    try:
+        actual = parse_document_content(current, relative, name, feature_id)
+        queued = parse_document_content(intended, relative, name, feature_id)
+        if name == "spec":
+            _validate_feature(actual)
+            _validate_feature(queued)
+            actual_criteria = cast(list[dict[str, object]], cast(object, actual["criteria"]))
+            actual_increments = cast(list[dict[str, object]], cast(object, actual["increments"]))
+            queued_criteria = cast(list[dict[str, object]], cast(object, queued["criteria"]))
+            queued_increments = cast(list[dict[str, object]], cast(object, queued["increments"]))
+            actual_ids = {
+                cast(str, item["id"])
+                for item in (*actual_criteria, *actual_increments)
+            }
+            queued_ids = {
+                cast(str, item["id"])
+                for item in (*queued_criteria, *queued_increments)
+            }
+            if not queued_ids <= actual_ids:
+                return "merge every queued criterion and increment ID into spec.md, then refresh status"
+        elif name == "tasks":
+            if current_feature is None or intended_feature is None:
+                return "restore valid Feature documents before preserving tasks.md"
+            if actual.get("feature_id") != feature_id or queued.get("feature_id") != feature_id:
+                return "repair the Feature reference in tasks.md, then refresh status"
+            actual_tasks = cast(list[object], actual["tasks"])
+            queued_tasks = cast(list[object], queued["tasks"])
+            _validate_tasks(actual_tasks, cast(ContinuityFeatureDocument, cast(object, current_feature)))
+            _validate_tasks(queued_tasks, cast(ContinuityFeatureDocument, cast(object, intended_feature)))
+            actual_by_id = {
+                cast(str, cast(dict[str, object], task)["id"]): cast(dict[str, object], task)
+                for task in actual_tasks
+            }
+            for item in queued_tasks:
+                queued_task = cast(dict[str, object], item)
+                preserved = actual_by_id.get(cast(str, queued_task["id"]))
+                if preserved is None or any(
+                    preserved[key] != queued_task[key]
+                    for key in ("increment_id", "criteria_ids", "depends_on")
+                ):
+                    return "merge every queued Task ID and its links into tasks.md, then refresh status"
+        elif name == "decisions":
+            queued_records = cast(list[object], queued["decisions"])
+            actual_records = cast(list[object], actual["decisions"])
+            _validate_decision_list(queued_records, relative)
+            _validate_decision_list(actual_records, relative)
+            actual_by_id = {
+                cast(str, cast(dict[str, object], item)["id"]): cast(dict[str, object], item)
+                for item in actual_records
+            }
+            if any(
+                actual_by_id.get(cast(str, cast(dict[str, object], item)["id"])) != item
+                for item in queued_records
+            ):
+                return "preserve every queued immutable decision ID and its exact content in decisions.md"
+        elif (
+            actual.get("feature_id") != feature_id
+            or queued.get("feature_id") != feature_id
+        ):
+            return "repair the Feature reference in this document, then refresh status"
+    except (ContinuityError, KeyError, TypeError, ValueError) as error:
+        return f"repair the current and queued Markdown definitions before preserving this path: {error}"
+    return None
+
+
+def pending_index_preservation_issue(
+    content: bytes, state: ContinuityStateData,
+) -> str | None:
+    """Require every next-state Feature to remain uniquely linked in the delimited index."""
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return "repair specs/README.md as UTF-8 and retain every queued Feature row"
+    if (
+        text.count(_INDEX_START) != 1
+        or text.count(_INDEX_END) != 1
+        or text.index(_INDEX_START) > text.index(_INDEX_END)
+    ):
+        return "restore one delimited EvoSpec index in specs/README.md before preserving it"
+    block = text[
+        text.index(_INDEX_START) + len(_INDEX_START):text.index(_INDEX_END)
+    ]
+    lines = block.splitlines()
+    for feature_id, feature in state["features"].items():
+        matches = [line for line in lines if f"`{feature_id}`" in line]
+        expected = f"]({feature['directory']}/spec.md) — `{feature_id}` — "
+        if len(matches) != 1 or not matches[0].startswith("- [") or expected not in matches[0]:
+            return (
+                f"merge the unique queued row for Feature {feature_id} into the delimited "
+                "specs/README.md index, then refresh status"
+            )
+    return None
+
+
 def new_directory(root: Path, title: str) -> tuple[str, int]:
     specs = root / "specs"
     ordinal = 1

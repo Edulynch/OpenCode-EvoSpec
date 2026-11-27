@@ -194,9 +194,25 @@ does not establish that every user journey has passed in a live OpenCode host.
   checks the serialized journal and final state, then validates every
   destination against its prior or intended digest before replacing any
   document. It resumes only missing writes and stops with
-  `DOCUMENT_DIVERGED` on a third version. Each managed Markdown write is
-  limited to 512 KiB. After incomplete or uncertain publication, reread
-  status and reconcile; do not infer success or blindly retry.
+  `DOCUMENT_DIVERGED` on a third version. For a conflict, read-only `status`
+  returns `publication_recovery` with an opaque `pubres-v1-<sha256>` token,
+  the complete exact `conflict_paths`, and previews for at most eight paths
+  (each capped at 4096 characters, with truncation and omission counts). Plain
+  `resume` never discards a third version. Only an explicit user choice to
+  preserve current bytes may use permissioned `resume` at that exact status
+  revision with both `publication_resolution` and the full exact unique
+  `preserve_current_paths` list (1–4001 paths). Core rechecks the token and
+  refuses a preserved document if queued IDs, links, or immutable decisions
+  would be lost; merge queued canonical Markdown first and refresh status.
+  Successful preservation drops only those paths from the pending write set
+  and retries remaining old/intended writes. It is not semantic acceptance,
+  verification, Task completion, or Feature closure; refresh status and
+  separately reconcile an explicitly requested human definition change with
+  the exact Feature ID. Never edit the operational JSON or infer/guess a token.
+  Each managed Markdown write is limited to 512 KiB. These Core recovery
+  behaviors and the adapter's ordinary permission route have deterministic
+  tests; they do not establish live OpenCode permission or native-host
+  qualification.
 
 ## OpenCode commands and protocol
 

@@ -2314,6 +2314,8 @@ const continuityData = object({
   reconcile: { type: "string", enum: ["COMPLETE", "INCOMPLETE"] },
   evidence_ref: string,
   detour_summary: string,
+  publication_resolution: { type: "string", pattern: "^pubres-v1-[0-9a-f]{64}$" },
+  preserve_current_paths: { type: "array", items: string, minItems: 1, maxItems: 4001 },
 }, [])
 
 const tools = [

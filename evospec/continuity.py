@@ -36,10 +36,19 @@ from .continuity_documents import (
     index_write as _index_write,
 )
 from .continuity_documents import (
+    index_write_selected as _index_write_selected,
+)
+from .continuity_documents import (
     initial_documents as _build_initial_documents,
 )
 from .continuity_documents import (
     new_directory as _new_directory,
+)
+from .continuity_documents import (
+    pending_document_preservation_issue as _pending_document_preservation_issue,
+)
+from .continuity_documents import (
+    pending_index_preservation_issue as _pending_index_preservation_issue,
 )
 from .continuity_documents import (
     plan_write as _write_plan,
@@ -350,18 +359,55 @@ def execute(
             )
         if state["pending"] is not None:
             if operation in ("status", "tasks", "use"):
-                return _project(store, state, session_id)
+                return _project_pending(store, state)
             if operation != "resume":
                 raise ContinuityError(
                     "RECOVERY_REQUIRED",
                     "a document publication is incomplete; use resume to reconcile its journal",
                 )
             _expect_revision(expected_revision, state["revision"])
+            if (
+                "publication_resolution" in data
+                or "preserve_current_paths" in data
+            ):
+                _keys(data, {"publication_resolution", "preserve_current_paths"})
+                _resolve_pending_publication(store, state, data)
+                recovered = store.load()
+                assert recovered is not None
+                return _project(store, recovered, session_id)
             store.recover_pending(state)
             recovered = store.load()
             assert recovered is not None
             return _project(store, recovered, session_id)
-        if operation not in ("status", "tasks", "use", "reconcile", "upgrade_markdown"):
+        if operation == "implement" and data.get("phase") == "report":
+            if _has_legacy_documents(root, state):
+                raise ContinuityError(
+                    "UPGRADE_REQUIRED",
+                    "legacy JSON-in-Markdown documents require explicit upgrade_markdown before reporting",
+                )
+            try:
+                store.check_documents(state)
+            except ContinuityError as error:
+                if error.code != "DOCUMENT_DIVERGED":
+                    raise
+                return _report_attempt_state_only(
+                    store, state, expected_revision, session_id, data,
+                )
+        elif operation == "resume" and data.get("reconcile") in ("COMPLETE", "INCOMPLETE"):
+            if _has_legacy_documents(root, state):
+                raise ContinuityError(
+                    "UPGRADE_REQUIRED",
+                    "legacy JSON-in-Markdown documents require explicit upgrade_markdown before reconciliation",
+                )
+            try:
+                store.check_documents(state)
+            except ContinuityError as error:
+                if error.code != "DOCUMENT_DIVERGED":
+                    raise
+                return _reconcile_attempt_state_only(
+                    store, state, expected_revision, session_id, data,
+                )
+        elif operation not in ("status", "tasks", "use", "reconcile", "upgrade_markdown"):
             store.check_documents(state)
         if (
             operation not in ("status", "tasks", "use", "input_snapshot", "upgrade_markdown")
@@ -1000,6 +1046,209 @@ def _has_legacy_documents(root: Path, state: ContinuityStateData) -> bool:
     return False
 
 
+def _project_pending(
+    store: ContinuityPersistence, state: ContinuityStateData,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "mode": "COMPOSED", "revision": state["revision"],
+        "status": "RECOVERY_REQUIRED", "next_action": "resume",
+        "execution": state["execution"],
+        "active_attempt": None if state["execution"] is None else _active_attempt(state),
+    }
+    recovery = store.pending_resolution_preview(state)
+    if recovery is not None:
+        result["publication_recovery"] = recovery
+        result["next_action"] = (
+            "inspect current and intended bytes; explicitly preserve every third-version path "
+            "or repair it, then refresh status"
+        )
+    return result
+
+
+def _report_attempt_state_only(
+    store: ContinuityPersistence, state: ContinuityStateData,
+    expected_revision: int | None, session_id: str, data: dict[str, object],
+) -> dict[str, object]:
+    _expect_revision(expected_revision, state["revision"])
+    _keys(data, {"feature_id", "task_id", "phase", "report", "result"})
+    execution = state["execution"]
+    if execution is None or execution["task_id"] != data.get("task_id"):
+        raise ContinuityError("NO_ACTIVE_ATTEMPT", "no matching checkpointed Task attempt exists")
+    if execution["session_id"] != session_id:
+        raise ContinuityError(
+            "OUTCOME_UNKNOWN",
+            "only the originating host session may report this checkpointed attempt",
+        )
+    owner = _task_owner(state, execution["task_id"])
+    if data.get("feature_id") is not None and data.get("feature_id") != owner:
+        raise ContinuityError("TASK_MISMATCH", "report must target the Feature owning the checkpointed Task")
+    if data.get("phase") != "report":
+        raise ContinuityError("INVALID_REQUEST", "state-only reporting accepts only phase=report")
+    result = data.get("result")
+    if result not in ("SUCCEEDED", "BLOCKED", "UNKNOWN"):
+        raise ContinuityError("INVALID_REQUEST", "result must be SUCCEEDED, BLOCKED, or UNKNOWN")
+    statement = _text(data.get("report"), "report", maximum=4096)
+    candidate = _copy_state(state)
+    entry = _active_attempt(candidate)
+    if entry["session_id"] != execution["session_id"]:
+        raise ContinuityError("CORRUPT_CONTINUITY", "checkpoint and Task attempt sessions do not match")
+    entry["result"] = statement
+    entry["result_status"] = result
+    entry["status"] = "REPORTED" if result != "UNKNOWN" else "OUTCOME_UNKNOWN"
+    if result != "UNKNOWN":
+        candidate["execution"] = None
+        entry["evidence_ref"] = (
+            f"session:{session_id}:task:{execution['task_id']}:attempt:{entry['attempt']}"
+        )
+    return _publish_state_only(store, state, candidate, session_id)
+
+
+def _reconcile_attempt_state_only(
+    store: ContinuityPersistence, state: ContinuityStateData,
+    expected_revision: int | None, session_id: str, data: dict[str, object],
+) -> dict[str, object]:
+    _expect_revision(expected_revision, state["revision"])
+    _keys(data, {
+        "feature_id", "reconcile", "task_id", "evidence_ref", "detour_summary",
+    })
+    execution = state["execution"]
+    if execution is None:
+        raise ContinuityError("NO_ACTIVE_ATTEMPT", "there is no unresolved Task attempt to reconcile")
+    if data.get("reconcile") not in ("COMPLETE", "INCOMPLETE"):
+        raise ContinuityError(
+            "OUTCOME_UNKNOWN_REQUIRES_RECONCILIATION",
+            "resume requires explicit COMPLETE or INCOMPLETE reconciliation with evidence_ref",
+        )
+    if data.get("task_id") != execution["task_id"]:
+        raise ContinuityError("TASK_MISMATCH", "reconciliation must name the exact checkpointed Task")
+    owner = _task_owner(state, execution["task_id"])
+    if data.get("feature_id") is not None and data.get("feature_id") != owner:
+        raise ContinuityError("TASK_MISMATCH", "reconciliation must target the Feature owning the checkpointed Task")
+    if any(item["result"] is None for item in state["detours"]):
+        raise ContinuityError(
+            "DETOUR_OUTCOME_REQUIRED",
+            "reconcile the checkpointed Task first; after document reconciliation, resume the pending detour with its result",
+        )
+    if data.get("detour_summary") is not None:
+        raise ContinuityError(
+            "DOCUMENT_DIVERGED",
+            "state-only Task reconciliation cannot publish a detour decision; reconcile documents, then resume the detour",
+        )
+    evidence_ref = _text(data.get("evidence_ref"), "evidence_ref", maximum=2048)
+    candidate = _copy_state(state)
+    entry = _active_attempt(candidate)
+    entry["status"] = (
+        "RECONCILED_COMPLETE"
+        if data["reconcile"] == "COMPLETE"
+        else "RECONCILED_INCOMPLETE"
+    )
+    entry["result_status"] = cast(str, data["reconcile"])
+    entry["evidence_ref"] = evidence_ref
+    entry["result"] = entry.get("result") or "Outcome reconciled explicitly after interruption"
+    candidate["execution"] = None
+    return _publish_state_only(store, state, candidate, session_id)
+
+
+def _publish_state_only(
+    store: ContinuityPersistence, state: ContinuityStateData,
+    candidate: ContinuityStateData, session_id: str,
+) -> dict[str, object]:
+    candidate["revision"] = state["revision"] + 1
+    store.commit(state, candidate, {}, read_set={})
+    saved = store.load()
+    assert saved is not None
+    return _project(store, saved, session_id)
+
+
+def _task_owner(state: ContinuityStateData, task_id: str) -> str | None:
+    metadata = state.get("identity_metadata", {}).get(task_id)
+    if (
+        metadata is None or metadata.get("kind") != "T"
+        or not metadata.get("active")
+    ):
+        return None
+    feature_id = metadata.get("feature_id")
+    return feature_id if isinstance(feature_id, str) and feature_id in state["features"] else None
+
+
+def _resolve_pending_publication(
+    store: ContinuityPersistence, state: ContinuityStateData,
+    data: dict[str, object],
+) -> None:
+    token = data.get("publication_resolution")
+    paths_value = data.get("preserve_current_paths")
+    if not isinstance(token, str) or re.fullmatch(r"pubres-v1-[0-9a-f]{64}", token) is None:
+        raise ContinuityError("INVALID_REQUEST", "publication_resolution must be the current status token")
+    if type(paths_value) is not list or any(not isinstance(path, str) for path in paths_value):
+        raise ContinuityError("INVALID_REQUEST", "preserve_current_paths must be a list of exact managed paths")
+    paths = cast(list[str], paths_value)
+    if not paths or len(paths) != len(set(paths)):
+        raise ContinuityError("INVALID_REQUEST", "preserve_current_paths must be nonempty and unique")
+    pending = state["pending"]
+    assert pending is not None
+    next_state = cast(ContinuityStateData, cast(object, pending["next_state"]))
+    writes = {item["path"]: item for item in pending["writes"]}
+    for relative in paths:
+        write = writes.get(relative)
+        if write is None:
+            continue
+        current = store.read_document_bytes(relative)
+        if current is None:
+            raise ContinuityError(
+                "PENDING_RESOLUTION_UNSAFE",
+                f"{relative} is missing; merge the queued document into ordinary Markdown and refresh status",
+            )
+        intended = write["content"].encode("utf-8")
+        if relative == "specs/README.md":
+            issue = _pending_index_preservation_issue(current, next_state)
+        else:
+            parts = relative.split("/")
+            if len(parts) != 3:
+                raise ContinuityError("UNSAFE_PATH", "publication resolution path is not a Feature document")
+            feature_matches = [
+                feature_id for feature_id, feature_state in next_state["features"].items()
+                if feature_state["directory"] == parts[1]
+            ]
+            if len(feature_matches) != 1:
+                raise ContinuityError("CORRUPT_CONTINUITY", "pending document has no unique Feature owner")
+            feature_id = feature_matches[0]
+            spec_path = f"specs/{parts[1]}/spec.md"
+            spec_write = writes.get(spec_path)
+            intended_spec = (
+                None if spec_write is None else spec_write["content"].encode("utf-8")
+            )
+            current_spec = store.read_document_bytes(spec_path)
+            if current_spec is None:
+                current_spec = intended_spec
+            if intended_spec is None:
+                intended_spec = current_spec
+
+            def parse_feature(content: bytes | None) -> dict[str, object] | None:
+                if content is None:
+                    return None
+                if b"<!-- evospec-data:" in content:
+                    return None
+                value = _parse_document_content(content, spec_path, "spec", feature_id)
+                return value
+
+            try:
+                current_feature = parse_feature(current_spec)
+                intended_feature = parse_feature(intended_spec)
+            except (ContinuityError, KeyError, TypeError, ValueError) as error:
+                raise ContinuityError(
+                    "PENDING_RESOLUTION_UNSAFE",
+                    f"{relative} cannot be safely preserved; merge valid Feature Markdown and refresh status: {error}",
+                ) from error
+            issue = _pending_document_preservation_issue(
+                relative, feature_id, current, intended,
+                current_feature=current_feature,
+                intended_feature=intended_feature,
+            )
+        if issue is not None:
+            raise ContinuityError("PENDING_RESOLUTION_UNSAFE", f"{relative}: {issue}")
+    store.resolve_pending_preserving_current(state, token, paths)
+
+
 def _reconcile_documents(
     store: ContinuityPersistence, state: ContinuityStateData,
     session_id: str, data: dict[str, object],
@@ -1131,18 +1380,7 @@ def _reconcile_documents(
         name: f"specs/{state['features'][feature_id]['directory']}/{name}.md"
         for name in ("spec", "plan", "tasks", "decisions")
     }
-    selected_prefix = f"specs/{state['features'][feature_id]['directory']}/"
     read_set: dict[str, str | None] = {}
-    for relative, expected in state["documents"].items():
-        if relative == "specs/README.md" or relative.startswith(selected_prefix):
-            continue
-        actual = _file_digest(store.root / Path(relative))
-        if actual != expected:
-            raise ContinuityError(
-                "DOCUMENT_DIVERGED",
-                f"{relative} changed outside the selected Feature; reconcile it separately",
-            )
-        read_set[relative] = actual
     baseline = state.get("semantic_digests", {})
     parsed_docs = {
         "spec": feature,
@@ -1226,7 +1464,9 @@ def _reconcile_documents(
             )
         writes[relative] = (updated, observed_digest)
     read_set["specs/README.md"] = _file_digest(store.root / "specs" / "README.md")
-    index_writes = _index_write(store.root, candidate, allow_external=True)
+    index_writes = _index_write_selected(
+        store.root, candidate, feature_id, cast(str, feature["title"]),
+    )
     writes.update(index_writes)
     candidate["documents"] = {
         path: digest for path, digest in candidate["documents"].items()
@@ -1368,6 +1608,8 @@ def _project(
                 else "DOCUMENT_RECONCILIATION_REQUIRED"
             ),
             "document_changes": document_changes,
+            "execution": state["execution"],
+            "active_attempt": None if state["execution"] is None else _active_attempt(state),
             "features": [],
             "selected_feature": None,
             "next_task": None,
