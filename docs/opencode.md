@@ -78,10 +78,22 @@ The source integration packages twelve composed continuity commands:
 8. `/evospec.status` — show composed status read-only, with a legacy read-only fallback.
 9. `/evospec.verify` — run one criterion's declared supported check and record its result.
 10. `/evospec.pause` — persist a pause and optional related/external detour.
-11. `/evospec.resume` — resume or explicitly reconcile an unresolved attempt.
+11. `/evospec.resume` — resume/recover, or explicitly reconcile Markdown edits or upgrade clean legacy JSON-in-Markdown.
 12. `/evospec.close` — request closure only when current checks and Tasks satisfy Core guards.
 
 Seven legacy commands remain: `/evospec.init`, `/evospec.start`, `/evospec.continue`, `/evospec.review`, `/evospec.converge`, `/evospec.context`, and `/evospec.doctor`. Composed and legacy authority are disjoint. `/evospec.status` and `/evospec.clarify` route only from Core's reported mode; they never migrate, initialize, or combine the stores. See the [composed MVP contract](ac0-consolidated-mvp.md) for schema, persistence, task/evidence distinctions, and limitations.
+
+Composed status/tasks are read-only projections. Status distinguishes semantic
+Markdown edits, formatting/notes drift, generated checklist drift, and
+identity/reference conflicts; proposed definitions are not reported as
+accepted state or evidence. To adopt a human edit, the caller must first read
+status, then make an explicit revision-bound `reconcile` call for the exact
+Feature. New IDs use typed aliases, removed IDs require exact `retire_ids`,
+and semantic edits to a closed Feature require its exact
+`reopen_feature_id`. The plugin routes both `reconcile` and the explicit
+clean-legacy `upgrade_markdown` transition through the same host write
+permission and provider-neutral Core protocol. Neither a tool call nor a
+permission result proves that a native prompt appeared or was approved.
 
 ### R2-C2: detect host delegation contract candidates, fail closed
 

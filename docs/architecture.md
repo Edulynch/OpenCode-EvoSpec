@@ -56,6 +56,21 @@ State is persisted locally with atomic publication operations. Recovery reads th
 
 Side work preserves the primary context. When side work ends, Core restores the saved primary context through a validated operation. A failed publication leaves the prior authoritative state in place. Paused work resumes only through the stored valid state and phase. Terminal work is reported, not reopened automatically.
 
+### Composed continuity and Markdown authority
+
+The separate, explicit composed-continuity mode uses ordinary Markdown for
+current Feature, criterion, Increment, Task, plan and decision definitions.
+Its schema-1 `.evospec/continuity.json` index retains operational lifecycle,
+stable IDs, semantic/byte digests, evidence freshness and a bounded recovery
+journal—not a second mutable Feature definition. `status` and `tasks` are pure
+projections. Human edits are adopted only by a revision-bound Core
+`reconcile`; identity retirement and closed-Feature reopening are explicit.
+Legacy JSON-in-Markdown is read-only until a clean source is upgraded through
+the explicit Core operation. Legacy `state.json` remains a separate authority
+and is never migrated automatically. See the [composed continuity contract](ac0-consolidated-mvp.md)
+for the document grammar, discrepancy categories, recovery limits and
+qualification boundary.
+
 ### Provisional Slice format (experimental fixture support)
 
 Schema 22 is a dedicated, experimental persistence format for provisional future-Slice proposals. It leaves the ordinary `SCHEMA = 15` default and schema 15–21 layouts unchanged. Canonical immutable revisions live under `.evospec/records/provisional-slices/`; exact State references and one current head per proposal are the sole authority. Recovery checks canonical IDs and digests, root and existing Feature-agreement binding, provenance shape, and a contiguous linear history. Unreferenced files are inert. The production package retains this model, serialization, validation, recovery, and ordinary-writer rejection, but has no D1 publication operation.

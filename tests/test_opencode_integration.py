@@ -67,6 +67,9 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn('"evospec_assessed_start"', plugin)
         self.assertIn('"evospec_continuation"', plugin)
         self.assertIn('"evospec_continuity"', plugin)
+        self.assertIn('"reconcile", "upgrade_markdown"', plugin)
+        self.assertIn("retire_ids: stringArray", plugin)
+        self.assertIn("reopen_feature_id: string", plugin)
         self.assertIn("evospec_continuity_verify", plugin)
         self.assertIn('continuityRequest("status"', plugin)
         self.assertIn("deriveContinuationDirective", plugin)
@@ -86,6 +89,17 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         resources = _resources()
         plugin = resources[PLUGIN]
         skill = resources[SKILL]
+        resume_command = resources[".opencode/commands/evospec.resume.md"]
+        for recovery_text in (resume_command, skill):
+            for detail in (
+                "publication_recovery",
+                "publication_resolution",
+                "preserve_current_paths",
+                "4001",
+            ):
+                self.assertIn(detail, recovery_text)
+        self.assertIn("not acceptance", resume_command)
+        self.assertIn("do not accept", skill)
 
         # The normal OpenCode context hook and skill discovery must recognize human questions.
         self.assertIn("¿dónde seguimos?", plugin)
@@ -2153,6 +2167,19 @@ const tool = definitions.find((definition) => definition.name === "evospec_conti
 assert(tool, "the composed typed tool is registered")
 assert(tool.input.additionalProperties === false, "the composed tool rejects undeclared arguments")
 assert(tool.input.properties.operation.enum.includes("verify"), "the composed operation surface is explicit")
+assert(tool.input.properties.operation.enum.includes("reconcile")
+  && tool.input.properties.operation.enum.includes("upgrade_markdown"),
+"the typed adapter exposes explicit Markdown reconciliation and legacy upgrade operations")
+assert(tool.input.properties.data.properties.retire_ids.type === "array"
+  && tool.input.properties.data.properties.reopen_feature_id.type === "string",
+"reconciliation inputs expose exact retire and reopen identities")
+assert(tool.input.properties.data.properties.publication_resolution.pattern
+  === "^pubres-v1-[0-9a-f]{64}$"
+  && tool.input.properties.data.properties.preserve_current_paths.type === "array"
+  && tool.input.properties.data.properties.preserve_current_paths.items.type === "string"
+  && tool.input.properties.data.properties.preserve_current_paths.minItems === 1
+  && tool.input.properties.data.properties.preserve_current_paths.maxItems === 4001,
+"pending-publication recovery exposes the exact Core token and bounded path-list shape")
 assert(tool.input.properties.data.properties.input_snapshot_before === undefined
   && tool.input.properties.data.properties.input_snapshot_after === undefined,
 "input snapshots are not caller-supplied tool arguments")
@@ -2274,12 +2301,63 @@ await Promise.all(pendingReads)
 assert(staleRejected, "Core revision drift during the test prevents receipt publication")
 assert(protocolRequests.filter((request) => request.operation === "verify").length === 1,
 "revision drift never creates another receipt")
+
+beginScenario(["reconcile"])
+await tool.execute({
+  operation: "reconcile",
+  expected_revision: coreRevision,
+  data: { feature_id: featureID, retire_ids: [] },
+}, context)
+await Promise.all(pendingReads)
+beginScenario(["upgrade_markdown"])
+await tool.execute({
+  operation: "upgrade_markdown",
+  expected_revision: coreRevision,
+  data: {},
+}, context)
+await Promise.all(pendingReads)
+const publicationResolution = "pubres-v1-" + "e".repeat(64)
+const preserveCurrentPaths = ["specs/001-feature/decisions.md"]
+beginScenario(["resume"])
+await tool.execute({
+  operation: "resume",
+  expected_revision: coreRevision,
+  data: {
+    publication_resolution: publicationResolution,
+    preserve_current_paths: preserveCurrentPaths,
+  },
+}, context)
+await Promise.all(pendingReads)
+assert(permissionRequests.length === 6
+  && permissionRequests[5].action === "evospec_continuity_write",
+"explicit publication resolution retains the existing host permission boundary")
+const recoveryPermission = JSON.parse(permissionRequests[5].resources[0])
+assert(recoveryPermission.repository_root === process.cwd()
+  && recoveryPermission.operation === "resume",
+"publication resolution permission is bound to the executing repository and operation")
+const recoveryRequest = protocolRequests[protocolRequests.length - 1]
+assert(recoveryRequest.action === "continuity"
+  && recoveryRequest.operation === "resume"
+  && recoveryRequest.expected_revision === coreRevision
+  && recoveryRequest.session_id === context.sessionID
+  && recoveryRequest.data.publication_resolution === publicationResolution
+  && JSON.stringify(recoveryRequest.data.preserve_current_paths)
+    === JSON.stringify(preserveCurrentPaths),
+"the adapter delegates the exact opaque resolution token and path list to Core")
+assert(permissionRequests.length === 6
+  && permissionRequests.slice(3, 5).every((request) => request.action === "evospec_continuity_write"),
+"reconcile and explicit legacy upgrade both pass through host write permission")
+assert(protocolRequests.slice(-3).map((request) => request.operation).join(",")
+  === "reconcile,upgrade_markdown,resume",
+"the typed plugin forwards document recovery operations through the provider-neutral protocol")
 assert(testCommands.length === 3, "each authorized scenario runs only its allow-listed command")
-assert(permissionRequests.length === 3, "each execution attempt passes through host permission")
+assert(permissionRequests.slice(0, 3).every((request) =>
+  request.action === "evospec_continuity_verify"),
+"each verification attempt passes through host permission")
 await Promise.all(pendingReads)
 assert(protocolRequests.map((request) => request.operation).join(",") ===
-  "status,status,status,status,input_snapshot,status,input_snapshot,verify,status,status,input_snapshot,status,input_snapshot,status,status,input_snapshot,status",
-"Core snapshots bracket each check after permission, and stale cases do not submit receipts")
+  "status,status,status,status,input_snapshot,status,input_snapshot,verify,status,status,input_snapshot,status,input_snapshot,status,status,input_snapshot,status,reconcile,upgrade_markdown,resume",
+"Core snapshots bracket each check after permission, stale cases do not submit receipts, and explicit document writes are routed")
 assert(protocolRequests.filter((request) => request.operation === "input_snapshot")
   .map((request) => request.expected_revision).join(",") === "10,10,11,11,11",
 "every pre/post snapshot is bound to the exact check revision")

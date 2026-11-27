@@ -15,16 +15,40 @@ from .continuity_documents import (
     decisions_write as _write_decisions,
 )
 from .continuity_documents import (
+    parse_document_content as _parse_document_content,
+)
+from .continuity_documents import (
+    parse_all as _parse_all_documents,
+)
+from .continuity_documents import (
+    replace_aliases as _replace_document_aliases,
+)
+from .continuity_documents import (
+    refresh_generated_checklist as _refresh_generated_checklist,
+)
+from .continuity_documents import (
+    semantic_digest_for_content as _semantic_digest_for_content,
+)
+from .continuity_documents import (
     feature_document_writes as _writes_for_feature,
 )
 from .continuity_documents import (
     index_write as _index_write,
 )
 from .continuity_documents import (
+    index_write_selected as _index_write_selected,
+)
+from .continuity_documents import (
     initial_documents as _build_initial_documents,
 )
 from .continuity_documents import (
     new_directory as _new_directory,
+)
+from .continuity_documents import (
+    pending_document_preservation_issue as _pending_document_preservation_issue,
+)
+from .continuity_documents import (
+    pending_index_preservation_issue as _pending_index_preservation_issue,
 )
 from .continuity_documents import (
     plan_write as _write_plan,
@@ -60,6 +84,7 @@ from .domain import (
     ContinuityExecution,
     ContinuityFeatureDocument,
     ContinuityFeatureIndex,
+    ContinuityIdentityMetadata,
     ContinuityIncrementDocument,
     ContinuityInputScope,
     ContinuityReopen,
@@ -86,6 +111,7 @@ from .persistence import (
 
 SCHEMA: Final = 1
 _ID = re.compile(r"^[FSTCD]-[0-9a-f]{32}$")
+_ALIAS = re.compile(r"^[CSTD]-[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 _MAX_FEATURES = 1000
 _MAX_TASKS = 1000
 _MAX_CRITERIA = 200
@@ -94,6 +120,7 @@ _MAX_DECISIONS = 1000
 _COMMANDS = frozenset((
     "specify", "clarify", "plan", "tasks", "implement", "use", "change",
     "status", "input_snapshot", "verify", "pause", "resume", "close",
+    "reconcile", "upgrade_markdown",
 ))
 
 _DocumentRecord = TypeVar("_DocumentRecord", bound=Mapping[str, object])
@@ -110,6 +137,7 @@ class _ContinuityCheckView(TypedDict):
     reported_by_session_id: str
     recorded_revision: int
     observed_input_scope: NotRequired[dict[str, str]]
+    task_digest: NotRequired[str]
 
 
 def _plain_record(record: Mapping[str, object]) -> dict[str, object]:
@@ -148,7 +176,7 @@ def _render_task_write(
             cast(object, {**state, "input_snapshot": input_snapshot}),
         )
     return _write_tasks(
-        root, render_state, feature_id, _plain_records(tasks), _plain_record(feature),
+        root, render_state, feature_id, tasks, _plain_record(feature),
     )
 
 
@@ -293,6 +321,9 @@ def _continuity_check_view(check: ContinuityCheck) -> _ContinuityCheckView:
             "policy_digest": observed["policy_digest"],
             "fingerprint": observed["fingerprint"],
         }
+    task_digest = check.get("task_digest")
+    if task_digest is not None:
+        view["task_digest"] = task_digest
     return view
 
 
@@ -328,19 +359,65 @@ def execute(
             )
         if state["pending"] is not None:
             if operation in ("status", "tasks", "use"):
-                return _project(store, state, session_id)
+                return _project_pending(store, state)
             if operation != "resume":
                 raise ContinuityError(
                     "RECOVERY_REQUIRED",
                     "a document publication is incomplete; use resume to reconcile its journal",
                 )
             _expect_revision(expected_revision, state["revision"])
+            if (
+                "publication_resolution" in data
+                or "preserve_current_paths" in data
+            ):
+                _keys(data, {"publication_resolution", "preserve_current_paths"})
+                _resolve_pending_publication(store, state, data)
+                recovered = store.load()
+                assert recovered is not None
+                return _project(store, recovered, session_id)
             store.recover_pending(state)
             recovered = store.load()
             assert recovered is not None
             return _project(store, recovered, session_id)
-        if operation not in ("status", "tasks", "use"):
+        if operation == "implement" and data.get("phase") == "report":
+            if _has_legacy_documents(root, state):
+                raise ContinuityError(
+                    "UPGRADE_REQUIRED",
+                    "legacy JSON-in-Markdown documents require explicit upgrade_markdown before reporting",
+                )
+            try:
+                store.check_documents(state)
+            except ContinuityError as error:
+                if error.code != "DOCUMENT_DIVERGED":
+                    raise
+                return _report_attempt_state_only(
+                    store, state, expected_revision, session_id, data,
+                )
+        elif operation == "resume" and data.get("reconcile") in ("COMPLETE", "INCOMPLETE"):
+            if _has_legacy_documents(root, state):
+                raise ContinuityError(
+                    "UPGRADE_REQUIRED",
+                    "legacy JSON-in-Markdown documents require explicit upgrade_markdown before reconciliation",
+                )
+            try:
+                store.check_documents(state)
+            except ContinuityError as error:
+                if error.code != "DOCUMENT_DIVERGED":
+                    raise
+                return _reconcile_attempt_state_only(
+                    store, state, expected_revision, session_id, data,
+                )
+        elif operation not in ("status", "tasks", "use", "reconcile", "upgrade_markdown"):
             store.check_documents(state)
+        if (
+            operation not in ("status", "tasks", "use", "input_snapshot", "upgrade_markdown")
+            and _has_legacy_documents(root, state)
+            and operation != "reconcile"
+        ):
+            raise ContinuityError(
+                "UPGRADE_REQUIRED",
+                "clean JSON-in-Markdown documents require explicit upgrade_markdown before writes",
+            )
         if operation == "input_snapshot":
             _keys(data, set())
             _expect_revision(expected_revision, state["revision"])
@@ -380,6 +457,7 @@ def _specify(
     state["revision"] = 1
     writes = _writes_for_feature(root, state, feature_id, docs, initial=True)
     writes.update(_index_write(root, state, new_feature=(feature_id, folder, record["title"])))
+    _refresh_document_metadata(state, writes)
     store.commit(_empty_state(root), state, writes)
     recovered = store.load()
     assert recovered is not None
@@ -394,6 +472,10 @@ def _mutate(
     if operation == "status":
         _keys(data, set())
         return _project(store, state, session_id)
+    if operation == "reconcile":
+        return _reconcile_documents(store, state, session_id, data)
+    if operation == "upgrade_markdown":
+        return _upgrade_markdown(store, state, session_id, data)
     if (operation == "tasks" and not data) or (operation == "use" and not data):
         return _project(store, state, session_id)
 
@@ -475,9 +557,27 @@ def _mutate(
         if scope not in ("session", "worktree"):
             raise ContinuityError("INVALID_REQUEST", "selection scope must be session or worktree")
         if scope == "worktree":
-            candidate["default_feature_id"] = feature_id
+            if candidate["default_feature_id"] != feature_id:
+                candidate["default_feature_id"] = feature_id
+                writes.update(_index_write(root, candidate))
         else:
             candidate["session_features"][session_id] = feature_id
+
+    elif (
+        candidate["features"][feature_id]["status"] == "CLOSED"
+        and operation not in ("change", "close")
+        and not (
+            operation == "implement"
+            and data.get("phase", "queue") == "queue"
+            and data.get("task_id") is None
+        )
+    ):
+        raise ContinuityError(
+            "REOPEN_INTENT_REQUIRED",
+            "mutations of a closed Feature require the explicit change operation "
+            "or reconcile with reopen_feature_id equal to this Feature ID; closure "
+            "history is retained",
+        )
 
     elif operation == "clarify":
         _keys(data, {"feature_id", "question", "decision"})
@@ -633,6 +733,7 @@ def _mutate(
             "reported_by_session_id": session_id, "task_id": task_id,
             "recorded_revision": state["revision"] + 1,
             "observed_input_scope": current_input,
+            "task_digest": _digest(task),
         }
         candidate["checks"].append(check)
         writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
@@ -774,6 +875,7 @@ def _mutate(
         feature_state["status"] = "CLOSED"
         writes.update(_render_spec_write(root, candidate, feature_id, feature))
         writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
+        writes.update(_index_write(root, candidate))
 
     elif operation == "change":
         _keys(data, {
@@ -820,6 +922,7 @@ def _mutate(
             candidate["reopens"].append(reopen)
             feature_state["cycle"] += 1
             feature_state["status"] = "OPEN"
+            writes.update(_index_write(root, candidate))
         writes.update(_render_spec_write(root, candidate, feature_id, changed))
         writes.update(_render_task_write(root, candidate, feature_id, tasks, changed))
         feature = changed
@@ -845,7 +948,11 @@ def _publish_mutation(
     session_id: str,
 ) -> dict[str, object]:
     candidate["revision"] = state["revision"] + 1
-    store.commit(state, candidate, writes)
+    read_set: dict[str, str | None] = {
+        path: digest for path, digest in state["documents"].items()
+    }
+    _refresh_document_metadata(candidate, writes)
+    store.commit(state, candidate, writes, read_set=read_set)
     saved = store.load()
     assert saved is not None
     return _project(store, saved, session_id)
@@ -860,7 +967,621 @@ def _empty_state(root: Path) -> ContinuityStateData:
         "execution": None, "checks": [], "closures": [], "reopens": [],
         "paused_features": [], "pause_reasons": {}, "detours": [],
         "documents": {}, "ids": [], "pending": None,
+        "semantic_digests": {}, "identity_metadata": {},
     }
+
+
+def _refresh_document_metadata(
+    state: ContinuityStateData,
+    writes: dict[str, tuple[bytes, str | None]],
+) -> None:
+    semantic_digests = dict(state.get("semantic_digests", {}))
+    identity_metadata = cast(
+        dict[str, ContinuityIdentityMetadata],
+        dict(state.get("identity_metadata", {})),
+    )
+    for relative, (content, _before) in writes.items():
+        if relative == "specs/README.md":
+            continue
+        name = relative.rsplit("/", 1)[-1][:-3]
+        directory = relative.split("/")[1]
+        feature_id = next(
+            (
+                identity for identity, entry in state["features"].items()
+                if entry["directory"] == directory
+            ),
+            None,
+        )
+        if feature_id is None:
+            raise ContinuityError("INVALID_DOCUMENT", "document has no owning Feature")
+        parsed = _parse_document_content(content, relative, name, feature_id)
+        semantic_digests[relative] = _semantic_digest_for_content(
+            content, relative, name, feature_id,
+        )
+        entities: list[tuple[str, str, str]] = []
+        if name == "spec":
+            entities.append((feature_id, "F", _digest(parsed)))
+            entities.extend(
+                (cast(str, item["id"]), "C", _digest(item))
+                for item in cast(list[dict[str, object]], parsed["criteria"])
+            )
+            entities.extend(
+                (cast(str, item["id"]), "S", _digest(item))
+                for item in cast(list[dict[str, object]], parsed["increments"])
+            )
+        elif name == "tasks":
+            entities.extend(
+                (cast(str, item["id"]), "T", _digest(item))
+                for item in cast(list[dict[str, object]], parsed["tasks"])
+            )
+        elif name == "decisions":
+            entities.extend(
+                (cast(str, item["id"]), "D", _digest(item))
+                for item in cast(list[dict[str, object]], parsed["decisions"])
+            )
+        ids = {identity for identity, _kind, _digest_value in entities}
+        kinds = {kind for _identity, kind, _digest_value in entities}
+        for identity, metadata in identity_metadata.items():
+            if metadata["feature_id"] == feature_id and metadata["kind"] in kinds:
+                metadata["active"] = identity in ids
+        for identity, kind, digest in entities:
+            identity_metadata[identity] = {
+                "feature_id": feature_id, "kind": kind,
+                "active": True, "digest": digest,
+            }
+    state["semantic_digests"] = semantic_digests
+    state["identity_metadata"] = identity_metadata
+
+
+def _has_legacy_documents(root: Path, state: ContinuityStateData) -> bool:
+    for relative in state["documents"]:
+        if relative == "specs/README.md":
+            continue
+        path = root / Path(relative)
+        if _file_digest(path) is None:
+            continue
+        content = path.read_bytes()
+        if b"<!-- evospec-data:start -->" in content or b"<!-- evospec-data:end -->" in content:
+            return True
+    return False
+
+
+def _project_pending(
+    store: ContinuityPersistence, state: ContinuityStateData,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "mode": "COMPOSED", "revision": state["revision"],
+        "status": "RECOVERY_REQUIRED", "next_action": "resume",
+        "execution": state["execution"],
+        "active_attempt": None if state["execution"] is None else _active_attempt(state),
+    }
+    recovery = store.pending_resolution_preview(state)
+    if recovery is not None:
+        result["publication_recovery"] = recovery
+        result["next_action"] = (
+            "inspect current and intended bytes; explicitly preserve every third-version path "
+            "or repair it, then refresh status"
+        )
+    return result
+
+
+def _report_attempt_state_only(
+    store: ContinuityPersistence, state: ContinuityStateData,
+    expected_revision: int | None, session_id: str, data: dict[str, object],
+) -> dict[str, object]:
+    _expect_revision(expected_revision, state["revision"])
+    _keys(data, {"feature_id", "task_id", "phase", "report", "result"})
+    execution = state["execution"]
+    if execution is None or execution["task_id"] != data.get("task_id"):
+        raise ContinuityError("NO_ACTIVE_ATTEMPT", "no matching checkpointed Task attempt exists")
+    if execution["session_id"] != session_id:
+        raise ContinuityError(
+            "OUTCOME_UNKNOWN",
+            "only the originating host session may report this checkpointed attempt",
+        )
+    owner = _task_owner(state, execution["task_id"])
+    if data.get("feature_id") is not None and data.get("feature_id") != owner:
+        raise ContinuityError("TASK_MISMATCH", "report must target the Feature owning the checkpointed Task")
+    if data.get("phase") != "report":
+        raise ContinuityError("INVALID_REQUEST", "state-only reporting accepts only phase=report")
+    result = data.get("result")
+    if result not in ("SUCCEEDED", "BLOCKED", "UNKNOWN"):
+        raise ContinuityError("INVALID_REQUEST", "result must be SUCCEEDED, BLOCKED, or UNKNOWN")
+    statement = _text(data.get("report"), "report", maximum=4096)
+    candidate = _copy_state(state)
+    entry = _active_attempt(candidate)
+    if entry["session_id"] != execution["session_id"]:
+        raise ContinuityError("CORRUPT_CONTINUITY", "checkpoint and Task attempt sessions do not match")
+    entry["result"] = statement
+    entry["result_status"] = result
+    entry["status"] = "REPORTED" if result != "UNKNOWN" else "OUTCOME_UNKNOWN"
+    if result != "UNKNOWN":
+        candidate["execution"] = None
+        entry["evidence_ref"] = (
+            f"session:{session_id}:task:{execution['task_id']}:attempt:{entry['attempt']}"
+        )
+    return _publish_state_only(store, state, candidate, session_id)
+
+
+def _reconcile_attempt_state_only(
+    store: ContinuityPersistence, state: ContinuityStateData,
+    expected_revision: int | None, session_id: str, data: dict[str, object],
+) -> dict[str, object]:
+    _expect_revision(expected_revision, state["revision"])
+    _keys(data, {
+        "feature_id", "reconcile", "task_id", "evidence_ref", "detour_summary",
+    })
+    execution = state["execution"]
+    if execution is None:
+        raise ContinuityError("NO_ACTIVE_ATTEMPT", "there is no unresolved Task attempt to reconcile")
+    if data.get("reconcile") not in ("COMPLETE", "INCOMPLETE"):
+        raise ContinuityError(
+            "OUTCOME_UNKNOWN_REQUIRES_RECONCILIATION",
+            "resume requires explicit COMPLETE or INCOMPLETE reconciliation with evidence_ref",
+        )
+    if data.get("task_id") != execution["task_id"]:
+        raise ContinuityError("TASK_MISMATCH", "reconciliation must name the exact checkpointed Task")
+    owner = _task_owner(state, execution["task_id"])
+    if data.get("feature_id") is not None and data.get("feature_id") != owner:
+        raise ContinuityError("TASK_MISMATCH", "reconciliation must target the Feature owning the checkpointed Task")
+    if data.get("detour_summary") is not None:
+        raise ContinuityError(
+            "DOCUMENT_DIVERGED",
+            "state-only Task reconciliation cannot publish a detour decision; reconcile documents, then resume the detour",
+        )
+    pending_detours = [item for item in state["detours"] if item["result"] is None]
+    if pending_detours and (
+        owner is None
+        or len(pending_detours) != 1
+        or pending_detours[0]["feature_id"] != owner
+        or pending_detours[0]["return_task_id"] != execution["task_id"]
+    ):
+        raise ContinuityError(
+            "DETOUR_OUTCOME_REQUIRED",
+            "resolve unrelated pending detours separately; only preserve a detour returning to the checkpointed Task",
+        )
+    evidence_ref = _text(data.get("evidence_ref"), "evidence_ref", maximum=2048)
+    candidate = _copy_state(state)
+    entry = _active_attempt(candidate)
+    entry["status"] = (
+        "RECONCILED_COMPLETE"
+        if data["reconcile"] == "COMPLETE"
+        else "RECONCILED_INCOMPLETE"
+    )
+    entry["result_status"] = cast(str, data["reconcile"])
+    entry["evidence_ref"] = evidence_ref
+    entry["result"] = entry.get("result") or "Outcome reconciled explicitly after interruption"
+    candidate["execution"] = None
+    return _publish_state_only(store, state, candidate, session_id)
+
+
+def _publish_state_only(
+    store: ContinuityPersistence, state: ContinuityStateData,
+    candidate: ContinuityStateData, session_id: str,
+) -> dict[str, object]:
+    candidate["revision"] = state["revision"] + 1
+    store.commit(state, candidate, {}, read_set={})
+    saved = store.load()
+    assert saved is not None
+    return _project(store, saved, session_id)
+
+
+def _task_owner(state: ContinuityStateData, task_id: str) -> str | None:
+    metadata = state.get("identity_metadata", {}).get(task_id)
+    if (
+        metadata is None or metadata.get("kind") != "T"
+        or not metadata.get("active")
+    ):
+        return None
+    feature_id = metadata.get("feature_id")
+    return feature_id if isinstance(feature_id, str) and feature_id in state["features"] else None
+
+
+def _resolve_pending_publication(
+    store: ContinuityPersistence, state: ContinuityStateData,
+    data: dict[str, object],
+) -> None:
+    token = data.get("publication_resolution")
+    paths_value = data.get("preserve_current_paths")
+    if not isinstance(token, str) or re.fullmatch(r"pubres-v1-[0-9a-f]{64}", token) is None:
+        raise ContinuityError("INVALID_REQUEST", "publication_resolution must be the current status token")
+    if type(paths_value) is not list or any(not isinstance(path, str) for path in paths_value):
+        raise ContinuityError("INVALID_REQUEST", "preserve_current_paths must be a list of exact managed paths")
+    paths = cast(list[str], paths_value)
+    if not paths or len(paths) != len(set(paths)):
+        raise ContinuityError("INVALID_REQUEST", "preserve_current_paths must be nonempty and unique")
+    pending = state["pending"]
+    assert pending is not None
+    next_state = cast(ContinuityStateData, cast(object, pending["next_state"]))
+    writes = {item["path"]: item for item in pending["writes"]}
+    for relative in paths:
+        write = writes.get(relative)
+        if write is None:
+            continue
+        current = store.read_document_bytes(relative)
+        if current is None:
+            raise ContinuityError(
+                "PENDING_RESOLUTION_UNSAFE",
+                f"{relative} is missing; merge the queued document into ordinary Markdown and refresh status",
+            )
+        intended = write["content"].encode("utf-8")
+        if relative == "specs/README.md":
+            issue = _pending_index_preservation_issue(current, next_state)
+        else:
+            parts = relative.split("/")
+            if len(parts) != 3:
+                raise ContinuityError("UNSAFE_PATH", "publication resolution path is not a Feature document")
+            feature_matches = [
+                feature_id for feature_id, feature_state in next_state["features"].items()
+                if feature_state["directory"] == parts[1]
+            ]
+            if len(feature_matches) != 1:
+                raise ContinuityError("CORRUPT_CONTINUITY", "pending document has no unique Feature owner")
+            feature_id = feature_matches[0]
+            spec_path = f"specs/{parts[1]}/spec.md"
+            spec_write = writes.get(spec_path)
+            intended_spec = (
+                None if spec_write is None else spec_write["content"].encode("utf-8")
+            )
+            current_spec = store.read_document_bytes(spec_path)
+            if current_spec is None:
+                current_spec = intended_spec
+            if intended_spec is None:
+                intended_spec = current_spec
+
+            def parse_feature(content: bytes | None) -> dict[str, object] | None:
+                if content is None:
+                    return None
+                if b"<!-- evospec-data:" in content:
+                    return None
+                value = _parse_document_content(content, spec_path, "spec", feature_id)
+                return value
+
+            try:
+                current_feature = parse_feature(current_spec)
+                intended_feature = parse_feature(intended_spec)
+            except (ContinuityError, KeyError, TypeError, ValueError) as error:
+                raise ContinuityError(
+                    "PENDING_RESOLUTION_UNSAFE",
+                    f"{relative} cannot be safely preserved; merge valid Feature Markdown and refresh status: {error}",
+                ) from error
+            issue = _pending_document_preservation_issue(
+                relative, feature_id, current, intended,
+                current_feature=current_feature,
+                intended_feature=intended_feature,
+            )
+        if issue is not None:
+            raise ContinuityError("PENDING_RESOLUTION_UNSAFE", f"{relative}: {issue}")
+    store.resolve_pending_preserving_current(state, token, paths)
+
+
+def _reconcile_documents(
+    store: ContinuityPersistence, state: ContinuityStateData,
+    session_id: str, data: dict[str, object],
+) -> dict[str, object]:
+    _keys(data, {"feature_id", "retire_ids", "reopen_feature_id"})
+    feature_id = data.get("feature_id")
+    if not isinstance(feature_id, str) or feature_id not in state["features"]:
+        raise ContinuityError(
+            "FEATURE_REQUIRED", "reconcile requires the exact current Feature ID",
+        )
+    if _has_legacy_documents(store.root, state):
+        raise ContinuityError(
+            "UPGRADE_REQUIRED",
+            "JSON-in-Markdown documents are not human authority; use explicit upgrade_markdown first",
+        )
+    try:
+        parsed = _parse_all_documents(store.root, state, feature_id)
+    except (ContinuityError, ValueError, TypeError, KeyError) as error:
+        if isinstance(error, ContinuityError):
+            raise
+        raise ContinuityError("DOCUMENT_CONFLICT", "edited Feature documents are ambiguous or invalid") from error
+    candidate = _copy_state(state)
+    metadata = candidate.get("identity_metadata")
+    if not isinstance(metadata, dict) or not metadata:
+        raise ContinuityError(
+            "UPGRADE_REQUIRED", "typed identity metadata is missing; upgrade clean composed Markdown first",
+        )
+    identity_metadata = cast(dict[str, ContinuityIdentityMetadata], metadata)
+    aliases: dict[str, str] = {}
+    declarations: list[tuple[str, dict[str, object], str]] = []
+    feature = cast(dict[str, object], parsed["spec"])
+    tasks = cast(list[dict[str, object]], parsed["tasks"])
+    decisions = cast(list[dict[str, object]], parsed["decisions"])
+    declarations.extend(
+        (cast(str, item["id"]), item, "C")
+        for item in cast(list[dict[str, object]], feature["criteria"])
+    )
+    declarations.extend(
+        (cast(str, item["id"]), item, "S")
+        for item in cast(list[dict[str, object]], feature["increments"])
+    )
+    declarations.extend((cast(str, item["id"]), item, "T") for item in tasks)
+    declarations.extend((cast(str, item["id"]), item, "D") for item in decisions)
+    if feature.get("id") != feature_id:
+        raise ContinuityError("IDENTITY_CONFLICT", "edited specification changed its Feature identity")
+    for identity, record, kind in declarations:
+        if _ID.fullmatch(identity):
+            prior = identity_metadata.get(identity)
+            if (
+                prior is None or prior["feature_id"] != feature_id
+                or prior["kind"] != kind or not prior["active"]
+            ):
+                raise ContinuityError(
+                    "IDENTITY_CONFLICT",
+                    f"{identity} is unknown, retired, or belongs to another Feature; use a new typed alias",
+                )
+            if kind == "D" and prior["digest"] != _digest(record):
+                raise ContinuityError(
+                    "DECISION_HISTORY_IMMUTABLE",
+                    f"decision {identity} is historical; append a new decision instead of editing it",
+                )
+        else:
+            if identity in aliases:
+                raise ContinuityError("IDENTITY_CONFLICT", f"author alias {identity} is declared more than once")
+            aliases[identity] = _new_id(kind, candidate)
+    for item in cast(list[dict[str, object]], feature["criteria"]):
+        item["id"] = aliases.get(cast(str, item["id"]), item["id"])
+    for item in cast(list[dict[str, object]], feature["increments"]):
+        item["id"] = aliases.get(cast(str, item["id"]), item["id"])
+    for task in tasks:
+        task["id"] = aliases.get(cast(str, task["id"]), cast(str, task["id"]))
+        increment = task["increment_id"]
+        task["increment_id"] = None if increment is None else aliases.get(cast(str, increment), increment)
+        task["criteria_ids"] = [
+            aliases.get(cast(str, item), cast(str, item))
+            for item in cast(list[object], task["criteria_ids"])
+        ]
+        task["depends_on"] = [
+            aliases.get(cast(str, item), cast(str, item))
+            for item in cast(list[object], task["depends_on"])
+        ]
+    for item in decisions:
+        item["id"] = aliases.get(cast(str, item["id"]), cast(str, item["id"]))
+
+    current_ids = {
+        cast(str, feature["id"]),
+        *(cast(str, item["id"]) for item in cast(list[dict[str, object]], feature["criteria"])),
+        *(cast(str, item["id"]) for item in cast(list[dict[str, object]], feature["increments"])),
+        *(cast(str, item["id"]) for item in tasks),
+        *(cast(str, item["id"]) for item in decisions),
+    }
+    prior_active = {
+        identity for identity, item in identity_metadata.items()
+        if item["feature_id"] == feature_id and item["active"]
+    }
+    retired = prior_active - current_ids
+    requested_retired = data.get("retire_ids", [])
+    if type(requested_retired) is not list or any(
+        not isinstance(item, str) or _ID.fullmatch(item) is None
+        for item in requested_retired
+    ) or len(requested_retired) != len(set(requested_retired)):
+        raise ContinuityError("INVALID_REQUEST", "retire_ids must be a unique list of exact stable IDs")
+    if set(requested_retired) != retired:
+        raise ContinuityError(
+            "RETIRE_IDS_REQUIRED",
+            "removed identities require the exact retire_ids list; identities are never inferred or reused",
+        )
+    if any(identity.startswith(("F-", "D-")) for identity in retired):
+        raise ContinuityError(
+            "IDENTITY_RETIREMENT_BLOCKED",
+            "Feature and decision history identities cannot be retired",
+        )
+    execution = candidate["execution"]
+    if execution is not None and execution["task_id"] in retired:
+        raise ContinuityError("EXECUTION_BUSY", "reconcile cannot retire the checkpointed Task")
+    if execution is not None:
+        raise ContinuityError(
+            "EXECUTION_BUSY", "resolve the checkpointed Task before reconciling semantic document edits",
+        )
+    for task in tasks:
+        task_id = cast(str, task["id"])
+        if task_id not in candidate["task_states"]:
+            if task_id in aliases.values():
+                candidate["task_states"][task_id] = {"attempts": 0}
+            else:
+                raise ContinuityError("CORRUPT_CONTINUITY", "current Task has no operational attempt counter")
+
+    paths = {
+        name: f"specs/{state['features'][feature_id]['directory']}/{name}.md"
+        for name in ("spec", "plan", "tasks", "decisions")
+    }
+    read_set: dict[str, str | None] = {}
+    baseline = state.get("semantic_digests", {})
+    parsed_docs = {
+        "spec": feature,
+        "plan": cast(dict[str, object], parsed["plan"]),
+        "tasks": {"feature_id": feature_id, "tasks": tasks},
+        "decisions": {"feature_id": feature_id, "decisions": decisions},
+    }
+    semantic_changed = any(
+        (
+            baseline.get(paths[name]) != _semantic_digest(name, cast(dict[str, object], value))
+        )
+        for name, value in parsed_docs.items()
+        if cast(dict[str, str | None], parsed["bytes_digests"]).get(paths[name]) is not None
+    ) or any(
+        baseline.get(paths[name]) is not None
+        and cast(dict[str, str | None], parsed["bytes_digests"]).get(paths[name]) is None
+        for name in ("plan", "decisions")
+    )
+    feature_state = candidate["features"][feature_id]
+    reopen_feature = data.get("reopen_feature_id")
+    if feature_state["status"] == "CLOSED" and semantic_changed:
+        if reopen_feature != feature_id:
+            raise ContinuityError(
+                "REOPEN_INTENT_REQUIRED",
+                "semantic edits to a closed Feature require reopen_feature_id to equal its exact Feature ID",
+            )
+        previous = next(
+            (
+                item for item in reversed(candidate["closures"])
+                if item["feature_id"] == feature_id and item["cycle"] == feature_state["cycle"]
+            ),
+            None,
+        )
+        if previous is None:
+            raise ContinuityError("CORRUPT_CONTINUITY", "closed Feature has no current closure receipt")
+        candidate["reopens"].append({
+            "feature_id": feature_id, "cycle": feature_state["cycle"] + 1,
+            "previous_closure_id": previous["id"], "session_id": session_id,
+        })
+        feature_state["cycle"] += 1
+        feature_state["status"] = "OPEN"
+    elif reopen_feature is not None:
+        raise ContinuityError(
+            "INVALID_REQUEST", "reopen_feature_id is accepted only for a closed Feature with semantic edits",
+        )
+
+    for identity in retired:
+        identity_metadata[identity]["active"] = False
+    candidate["identity_metadata"] = identity_metadata
+    present = cast(dict[str, str | None], parsed["bytes_digests"])
+    observed_semantics = cast(
+        dict[str, str | None], parsed["semantic_digests"],
+    )
+    writes: dict[str, tuple[bytes, str | None]] = {}
+    candidate["documents"] = dict(state["documents"])
+    semantic_digests = dict(state.get("semantic_digests", {}))
+    try:
+        reconcile_input_snapshot = _continuity_input_scope(store.root, candidate)
+    except ContinuityError:
+        reconcile_input_snapshot = None
+    checklist_state = cast(
+        ContinuityStateData,
+        cast(object, {**candidate, "input_snapshot": reconcile_input_snapshot}),
+    )
+    for name, relative in paths.items():
+        observed_digest = present[relative]
+        read_set[relative] = observed_digest
+        if observed_digest is None:
+            candidate["documents"].pop(relative, None)
+            semantic_digests.pop(relative, None)
+            continue
+        path = store.root / Path(relative)
+        content = path.read_bytes()
+        if sha256(content).hexdigest() != observed_digest:
+            raise ContinuityError("DOCUMENT_DIVERGED", f"{relative} changed while reconciliation was reading it")
+        updated = _replace_document_aliases(content, aliases)
+        if name == "tasks":
+            updated = _refresh_generated_checklist(
+                updated, checklist_state, feature_id, feature,
+                cast(list[ContinuityTaskDocument], cast(object, tasks)),
+            )
+        writes[relative] = (updated, observed_digest)
+    read_set["specs/README.md"] = _file_digest(store.root / "specs" / "README.md")
+    index_writes = _index_write_selected(
+        store.root, candidate, feature_id, cast(str, feature["title"]),
+    )
+    writes.update(index_writes)
+    candidate["documents"] = {
+        path: digest for path, digest in candidate["documents"].items()
+        if not (
+            path.startswith(f"specs/{state['features'][feature_id]['directory']}/")
+            and path.rsplit("/", 1)[-1] in ("spec.md", "plan.md", "tasks.md", "decisions.md")
+            and present.get(path) is None
+        )
+    }
+    candidate["semantic_digests"] = semantic_digests
+    _refresh_document_metadata(candidate, writes)
+    candidate["revision"] = state["revision"] + 1
+    document_drift = any(
+        present.get(relative) != state["documents"].get(relative)
+        or observed_semantics.get(relative) != state.get("semantic_digests", {}).get(relative)
+        for relative in paths.values()
+    ) or read_set["specs/README.md"] != state["documents"].get("specs/README.md")
+    if not document_drift and not semantic_changed:
+        raise ContinuityError("NO_DOCUMENT_CHANGES", "the selected documents already match Core state")
+    store.commit(state, candidate, writes, read_set=read_set)
+    saved = store.load()
+    assert saved is not None
+    return _project(store, saved, session_id)
+
+
+def _upgrade_markdown(
+    store: ContinuityPersistence, state: ContinuityStateData,
+    session_id: str, data: dict[str, object],
+) -> dict[str, object]:
+    _keys(data, set())
+    store.check_documents(state)
+    if not _has_legacy_documents(store.root, state):
+        if state.get("identity_metadata") and state.get("semantic_digests"):
+            return _project(store, state, session_id)
+        raise ContinuityError("UPGRADE_UNSAFE", "upgrade requires clean JSON-in-Markdown source documents")
+    candidate = _copy_state(state)
+    writes: dict[str, tuple[bytes, str | None]] = {}
+    for feature_id, feature_state in state["features"].items():
+        directory = feature_state["directory"]
+        expected = {
+            f"specs/{directory}/{name}.md"
+            for name in ("spec", "tasks", "plan", "decisions")
+        }
+        if not {path for path in state["documents"] if path.startswith(f"specs/{directory}/")} <= expected:
+            raise ContinuityError("UPGRADE_UNSAFE", "legacy Feature has unexpected managed documents")
+        required = {f"specs/{directory}/spec.md", f"specs/{directory}/tasks.md"}
+        if not required <= set(state["documents"]):
+            raise ContinuityError("UPGRADE_UNSAFE", "legacy Feature is missing required documents")
+        legacy_paths = [
+            path for path in expected
+            if path in state["documents"]
+        ]
+        if any(
+            not (store.root / Path(path)).is_file()
+            or b"<!-- evospec-data:start -->" not in (store.root / Path(path)).read_bytes()
+            or b"<!-- evospec-data:end -->" not in (store.root / Path(path)).read_bytes()
+            for path in legacy_paths
+        ):
+            raise ContinuityError(
+                "UPGRADE_UNSAFE", "mixed or malformed Markdown format; no document was overwritten",
+            )
+        feature = _read_feature(store.root, state, feature_id)
+        tasks = _read_tasks(store.root, state, feature_id)
+        plan = _read_plan(store.root, state, feature_id)["plan"]
+        decisions = _read_decisions(store.root, state, feature_id)
+        docs = _initial_documents(
+            cast(ContinuityFeatureDocument, feature),
+            tasks,
+            plan,
+        )
+        if f"specs/{directory}/plan.md" in state["documents"]:
+            docs["plan"] = {"feature_id": feature_id, "plan": plan}
+        if (
+            f"specs/{directory}/decisions.md" in state["documents"]
+            or decisions
+        ):
+            docs["decisions"] = {
+                "feature_id": feature_id,
+                "decisions": _plain_records(decisions),
+            }
+        writes.update(_writes_for_feature(store.root, state, feature_id, docs))
+    _refresh_document_metadata(candidate, writes)
+    candidate["revision"] = state["revision"] + 1
+    store.commit(
+        state, candidate, writes,
+        read_set={path: digest for path, digest in state["documents"].items()},
+    )
+    saved = store.load()
+    assert saved is not None
+    return _project(store, saved, session_id)
+
+
+def _semantic_digest(name: str, value: dict[str, object]) -> str:
+    return sha256(
+        (name + "\0" + json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )).encode("utf-8")
+    ).hexdigest()
+
+
+def _file_digest(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ContinuityError("UNSAFE_PATH", f"{path.name} is not a regular file")
+        return sha256(path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise ContinuityError("DOCUMENT_UNREADABLE", f"{path.name} cannot be read") from error
 
 
 def _project(
@@ -873,22 +1594,32 @@ def _project(
         }
     root = store.root
     try:
-        store.check_documents(state)
-    except ContinuityError as error:
-        if error.code != "DOCUMENT_DIVERGED":
-            raise
-        return {
-            "mode": "COMPOSED", "revision": state["revision"],
-            "status": "DOCUMENT_DIVERGED", "detail": str(error),
-            "features": sorted(state["features"]),
-        }
-    try:
         input_snapshot = _continuity_input_scope(root, state)
     except ContinuityError as error:
         input_snapshot = None
         input_snapshot_error = str(error)
     else:
         input_snapshot_error = None
+    document_changes = _document_diagnostics(root, state, input_snapshot)
+    parsed_documents = cast(
+        dict[str, dict[str, object]],
+        document_changes.pop("_parsed_documents", {}),
+    )
+    if document_changes["identity_ref_conflicts"] or document_changes["semantic"]:
+        return {
+            "mode": "COMPOSED", "revision": state["revision"],
+            "status": (
+                "DOCUMENT_CONFLICT"
+                if document_changes["identity_ref_conflicts"]
+                else "DOCUMENT_RECONCILIATION_REQUIRED"
+            ),
+            "document_changes": document_changes,
+            "execution": state["execution"],
+            "active_attempt": None if state["execution"] is None else _active_attempt(state),
+            "features": [],
+            "selected_feature": None,
+            "next_task": None,
+        }
     selected = state["session_features"].get(session_id) or state["default_feature_id"]
     feature_views: list[dict[str, object]] = []
     result: dict[str, object] = {
@@ -898,12 +1629,14 @@ def _project(
         "selection_scope": "session" if session_id in state["session_features"] else "worktree",
         "features": feature_views,
         "execution": state["execution"],
+        "document_changes": document_changes,
     }
     if input_snapshot_error is not None:
         result["input_snapshot_error"] = input_snapshot_error
     for feature_id in sorted(state["features"]):
-        feature = _read_feature(root, state, feature_id)
-        tasks = _read_tasks(root, state, feature_id)
+        parsed = parsed_documents[feature_id]
+        feature = cast(ContinuityFeatureDocument, parsed["spec"])
+        tasks = cast(list[ContinuityTaskDocument], parsed["tasks"])
         feature_state = state["features"][feature_id]
         continuity_state = _continuity_state_view(state, input_snapshot)
         continuity_feature = _continuity_feature_view(feature)
@@ -915,7 +1648,7 @@ def _project(
         for task in tasks:
             continuity_task = _continuity_task_view(task)
             status = continuity_task_status(
-                continuity_state, continuity_feature, continuity_task,
+                continuity_state, continuity_feature, continuity_task, task_views,
             )
             task_projection.append({
                 **task, "status": status,
@@ -939,8 +1672,8 @@ def _project(
                 for criterion in feature["criteria"]
             ],
             "increments": feature["increments"], "tasks": task_projection,
-            "plan": _read_plan(root, state, feature_id)["plan"],
-            "decisions": _read_decisions(root, state, feature_id),
+            "plan": cast(dict[str, object], parsed["plan"])["plan"],
+            "decisions": parsed["decisions"],
             "paused": feature_id in state["paused_features"],
             "pause_reason": state["pause_reasons"].get(feature_id),
             "detours": [
@@ -974,6 +1707,130 @@ def _next_task(feature: object) -> str | None:
     )
 
 
+def _document_diagnostics(
+    root: Path, state: ContinuityStateData,
+    input_snapshot: ContinuityInputScope | None,
+) -> dict[str, object]:
+    semantic: set[str] = set()
+    format_notes: set[str] = set()
+    generated: set[str] = set()
+    conflicts: list[dict[str, str]] = []
+    parsed_documents: dict[str, dict[str, object]] = {}
+    semantic_baseline = state.get("semantic_digests", {})
+    identity_metadata = state.get("identity_metadata", {})
+    for feature_id in sorted(state["features"]):
+        try:
+            parsed = _parse_all_documents(
+                root, state, feature_id, input_snapshot,
+            )
+        except ContinuityError as error:
+            conflicts.append({
+                "feature_id": feature_id,
+                "path": state["features"][feature_id]["directory"],
+                "detail": str(error),
+            })
+            continue
+        parsed_documents[feature_id] = parsed
+        feature = cast(dict[str, object], parsed["spec"])
+        identities: list[tuple[str, str]] = [(feature_id, "F")]
+        identities.extend(
+            (cast(str, item["id"]), "C")
+            for item in cast(list[dict[str, object]], feature["criteria"])
+        )
+        identities.extend(
+            (cast(str, item["id"]), "S")
+            for item in cast(list[dict[str, object]], feature["increments"])
+        )
+        identities.extend(
+            (cast(str, item["id"]), "T")
+            for item in cast(list[dict[str, object]], parsed["tasks"])
+        )
+        identities.extend(
+            (cast(str, item["id"]), "D")
+            for item in cast(list[dict[str, object]], parsed["decisions"])
+        )
+        if identity_metadata:
+            for identity, kind in identities:
+                if _ID.fullmatch(identity):
+                    metadata = identity_metadata.get(identity)
+                    if (
+                        metadata is None or metadata["feature_id"] != feature_id
+                        or metadata["kind"] != kind or not metadata["active"]
+                    ):
+                        conflicts.append({
+                            "feature_id": feature_id,
+                            "path": state["features"][feature_id]["directory"],
+                            "detail": (
+                                f"{identity} is unknown, retired, or belongs to another "
+                                "Feature or identity kind"
+                            ),
+                        })
+                elif (
+                    _ALIAS.fullmatch(identity) is None
+                    or not identity.startswith(kind + "-")
+                ):
+                    conflicts.append({
+                        "feature_id": feature_id,
+                        "path": state["features"][feature_id]["directory"],
+                        "detail": f"{identity} is not a stable identity or typed author alias",
+                    })
+        byte_digests = cast(dict[str, str | None], parsed["bytes_digests"])
+        semantic_digests = cast(dict[str, str | None], parsed["semantic_digests"])
+        generated_current = cast(dict[str, bool], parsed["generated_current"])
+        for relative, actual in byte_digests.items():
+            expected_bytes = state["documents"].get(relative)
+            expected_semantics = semantic_baseline.get(relative)
+            actual_semantics = semantic_digests[relative]
+            if actual != expected_bytes:
+                if expected_semantics is None and expected_bytes is None:
+                    semantic.add(relative)
+                elif expected_semantics is None:
+                    conflicts.append({
+                        "feature_id": feature_id, "path": relative,
+                        "detail": "semantic baseline is unavailable; use explicit upgrade_markdown or inspect the legacy source",
+                    })
+                elif actual_semantics != expected_semantics:
+                    semantic.add(relative)
+                elif generated_current.get(relative) is not False:
+                    format_notes.add(relative)
+            elif (
+                expected_semantics is not None
+                and actual_semantics != expected_semantics
+            ):
+                semantic.add(relative)
+            if relative in generated_current and not generated_current[relative]:
+                generated.add(relative)
+    readme = "specs/README.md"
+    try:
+        readme_path = root / Path(readme)
+        actual_readme_digest = _file_digest(readme_path)
+        actual_readme = (
+            readme_path.read_bytes() if actual_readme_digest is not None else None
+        )
+        expected_readme = state["documents"].get(readme)
+        if actual_readme_digest != expected_readme:
+            if actual_readme is not None and expected_readme is not None:
+                format_notes.add(readme)
+            try:
+                expected_generated = _index_write(root, state, allow_external=True)[readme][0]
+            except ContinuityError as error:
+                conflicts.append({"feature_id": "", "path": readme, "detail": str(error)})
+            else:
+                if actual_readme != expected_generated:
+                    generated.add(readme)
+                elif actual_readme is not None:
+                    format_notes.add(readme)
+    except OSError as error:
+        conflicts.append({"feature_id": "", "path": readme, "detail": f"{readme} cannot be read: {error}"})
+    return {
+        "semantic": sorted(semantic),
+        "format_notes": sorted(format_notes),
+        "generated": sorted(generated),
+        "identity_ref_conflicts": conflicts,
+        "_parsed_documents": parsed_documents,
+    }
+
+
 def _continuity_historical_check(
     state: ContinuityStateData, criterion: ContinuityCriterionDocument,
     input_snapshot: ContinuityInputScope | None,
@@ -989,8 +1846,17 @@ def _continuity_historical_check(
     if receipt is None:
         return None
     observed = receipt.get("observed_input_scope")
+    current_task = next(
+        (item for item in tasks if item["id"] == receipt["task_id"]),
+        None,
+    )
     if receipt["criterion_digest"] != _digest(criterion):
         stale_reason = "criterion_changed"
+    elif (
+        current_task is None
+        or receipt.get("task_digest") != _digest(current_task)
+    ):
+        stale_reason = "task_changed"
     elif observed is None:
         stale_reason = "legacy_receipt"
     elif input_snapshot is None:

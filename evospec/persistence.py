@@ -4622,15 +4622,176 @@ class ContinuityPersistence:
                     f"{relative} changed outside Core; preserve it and reconcile manually",
                 )
 
+    def read_document_bytes(self, relative: str) -> bytes | None:
+        """Read one bounded managed document through the persistence path guard."""
+        path = self.__safe_document_path(relative)
+        if not path.exists():
+            return None
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise ContinuityError("UNSAFE_PATH", f"{path.name} is not a regular file")
+            with path.open("rb") as handle:
+                content = handle.read(512 * 1024 + 1)
+        except ContinuityError:
+            raise
+        except OSError as error:
+            raise ContinuityError("DOCUMENT_UNREADABLE", f"{path.name} cannot be read") from error
+        if len(content) > 512 * 1024:
+            raise ContinuityError("LIMIT_EXCEEDED", f"{relative} exceeds the document size limit")
+        return content
+
+    def pending_resolution_preview(
+        self, state: ContinuityStateData,
+    ) -> dict[str, object] | None:
+        """Project bounded third-version diagnostics without changing the journal."""
+        token, current, digests, conflicts = self.__pending_resolution_snapshot(state)
+        if not conflicts:
+            return None
+
+        def preview(content: bytes | None) -> tuple[str | None, bool]:
+            if content is None:
+                return "<missing>", False
+            text = content.decode("utf-8", errors="replace")
+            return text[:4096], len(text) > 4096
+
+        pending = state["pending"]
+        assert pending is not None
+        writes = {item["path"]: item for item in pending["writes"]}
+        visible: list[dict[str, object]] = []
+        for relative in conflicts[:8]:
+            current_preview, current_truncated = preview(current[relative])
+            write = writes.get(relative)
+            intended = None if write is None else write["content"].encode("utf-8")
+            intended_preview, intended_truncated = preview(intended)
+            visible.append({
+                "path": relative,
+                "current": current_preview,
+                "intended": intended_preview,
+                "current_truncated": current_truncated,
+                "intended_truncated": intended_truncated,
+            })
+        return {
+            "token": token,
+            "conflict_paths": conflicts,
+            "conflicts": visible,
+            "omitted_conflicts": max(0, len(conflicts) - len(visible)),
+        }
+
+    def resolve_pending_preserving_current(
+        self, state: ContinuityStateData, token: str, paths: list[str],
+    ) -> None:
+        """Rejournal explicit current-byte preservation, then recover remaining writes."""
+        snapshot_token, _current, _current_digests, conflicts = (
+            self.__pending_resolution_snapshot(state)
+        )
+        if token != snapshot_token:
+            raise ContinuityError(
+                "STALE_PUBLICATION_RESOLUTION",
+                "publication bytes changed; reread status and use its current resolution token",
+            )
+        if (
+            not paths or len(paths) > 4001 or len(paths) != len(set(paths))
+            or set(paths) != set(conflicts)
+        ):
+            raise ContinuityError(
+                "INVALID_REQUEST",
+                "preserve_current_paths must name every current third-version path exactly once",
+            )
+
+        # Reobserve every affected byte immediately before replacing the journal.
+        fresh_token, _fresh_current, fresh_digests, fresh_conflicts = (
+            self.__pending_resolution_snapshot(state)
+        )
+        if fresh_token != token or fresh_conflicts != conflicts:
+            raise ContinuityError(
+                "STALE_PUBLICATION_RESOLUTION",
+                "publication bytes changed while resolving; reread status for a fresh token",
+            )
+        pending = state["pending"]
+        if pending is None:
+            raise ContinuityError("NO_RECOVERY", "there is no pending document transaction")
+        replacement = deepcopy(state)
+        replacement_pending = cast(
+            ContinuityPending,
+            cast(object, deepcopy(pending)),
+        )
+        selected = set(paths)
+        replacement_pending["writes"] = [
+            item for item in replacement_pending["writes"]
+            if item["path"] not in selected
+        ]
+        read_set = dict(replacement_pending.get("read_set", {}))
+        for relative in paths:
+            read_set[relative] = fresh_digests[relative]
+        replacement_pending["read_set"] = read_set
+        replacement["pending"] = replacement_pending
+        validate_continuity_state(replacement, repository_id=self.repository_id)
+        journal_bytes = _encode_recoverable_continuity(
+            replacement, "recovery journal",
+        )
+        marker = _artifact_path(self.__root, "continuity.json")
+        try:
+            _atomic_replace(
+                marker, journal_bytes, self.__operations, strict_directory=True,
+            )
+        except (AtomicFailure, RecoveryError) as error:
+            raise ContinuityError(
+                "PUBLICATION_UNCERTAIN",
+                "replacement recovery journal publication is uncertain; reread status before retrying",
+            ) from error
+        self.recover_pending(replacement)
+
+    def __pending_resolution_snapshot(
+        self, state: ContinuityStateData,
+    ) -> tuple[str, dict[str, bytes | None], dict[str, str | None], list[str]]:
+        validate_continuity_state(state, repository_id=self.repository_id)
+        pending = state["pending"]
+        if pending is None:
+            raise ContinuityError("NO_RECOVERY", "there is no pending document transaction")
+        writes = {item["path"]: item for item in pending["writes"]}
+        read_set = pending.get("read_set", {})
+        affected = sorted(set(writes) | set(read_set))
+        current: dict[str, bytes | None] = {}
+        digests: dict[str, str | None] = {}
+        conflicts: list[str] = []
+        for relative in affected:
+            content = self.read_document_bytes(relative)
+            digest = None if content is None else sha256(content).hexdigest()
+            current[relative] = content
+            digests[relative] = digest
+            write = writes.get(relative)
+            expected = read_set.get(
+                relative, None if write is None else write["before"],
+            )
+            intended = None if write is None else write["sha256"]
+            if digest != expected and digest != intended:
+                conflicts.append(relative)
+        material = json.dumps(
+            {
+                "revision": state["revision"],
+                "pending": pending,
+                "current": [[path, digests[path]] for path in affected],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        token = "pubres-v1-" + sha256(material).hexdigest()
+        return token, current, digests, conflicts
+
     def commit(
         self, current: ContinuityStateData, candidate: ContinuityStateData,
         writes: dict[str, tuple[bytes, str | None]],
+        *, read_set: dict[str, str | None] | None = None,
     ) -> None:
         if candidate["pending"] is not None:
             raise ContinuityError("INVALID_STATE", "candidate state cannot contain a pending journal")
         next_state = deepcopy(candidate)
-        documents = dict(current["documents"])
+        documents = dict(candidate["documents"])
         pending_writes: list[ContinuityPendingWrite] = []
+        observed: dict[str, str | None] = (
+            dict(current["documents"]) if read_set is None else dict(read_set)
+        )
         for relative, (content, before_hash) in sorted(writes.items()):
             self.__safe_document_path(relative)
             if type(content) is not bytes or len(content) > 512 * 1024:
@@ -4640,6 +4801,13 @@ class ContinuityPersistence:
             except UnicodeDecodeError as error:
                 raise ContinuityError("INVALID_DOCUMENT", f"{relative} is not UTF-8") from error
             actual_hash = self.__document_hash(relative)
+            if relative not in observed:
+                observed[relative] = before_hash
+            if actual_hash != observed[relative]:
+                raise ContinuityError(
+                    "DOCUMENT_DIVERGED",
+                    f"{relative} changed after it was read; reread and reconcile before writing",
+                )
             digest = sha256(content).hexdigest()
             if actual_hash != before_hash and actual_hash != digest:
                 raise ContinuityError(
@@ -4651,6 +4819,17 @@ class ContinuityPersistence:
                 "path": relative, "before": before_hash,
                 "content": text, "sha256": digest,
             })
+        for relative, expected in observed.items():
+            actual = self.__document_hash(relative)
+            intended = next(
+                (item["sha256"] for item in pending_writes if item["path"] == relative),
+                None,
+            )
+            if actual != expected and actual != intended:
+                raise ContinuityError(
+                    "DOCUMENT_DIVERGED",
+                    f"{relative} changed after it was read; state was not published",
+                )
         next_state["documents"] = documents
         next_state["revision"] = candidate["revision"]
         next_state["pending"] = None
@@ -4663,6 +4842,7 @@ class ContinuityPersistence:
         pending_record: ContinuityPending = {
             "next_state": next_state_record,
             "writes": pending_writes,
+            "read_set": observed,
         }
         journal: ContinuityStateData = {
             **current,
@@ -4701,6 +4881,23 @@ class ContinuityPersistence:
         final_state["pending"] = None
         validate_continuity_state(final_state, repository_id=self.repository_id)
         final_state_bytes = _encode_recoverable_continuity(final_state, "state")
+        read_set = pending.get("read_set", {})
+        if not isinstance(read_set, dict):
+            raise ContinuityError("CORRUPT_CONTINUITY", "recovery read set is invalid")
+        for relative, expected in read_set.items():
+            actual = self.__document_hash(relative)
+            intended = next(
+                (
+                    item["sha256"] for item in pending["writes"]
+                    if item["path"] == relative
+                ),
+                None,
+            )
+            if actual != expected and actual != intended:
+                raise ContinuityError(
+                    "DOCUMENT_DIVERGED",
+                    f"{relative} changed before document publication; manual reconciliation is required",
+                )
         prepared_writes: list[tuple[str, Path, bytes]] = []
         for item in pending["writes"]:
             relative = item["path"]
@@ -4726,6 +4923,20 @@ class ContinuityPersistence:
                 )
             prepared_writes.append((relative, destination, data))
         for relative, destination, data in prepared_writes:
+            actual = self.__document_hash(relative)
+            item = next(
+                (entry for entry in pending["writes"] if entry["path"] == relative),
+                None,
+            )
+            if item is None:
+                raise ContinuityError("CORRUPT_CONTINUITY", "recovery write disappeared")
+            if actual == item["sha256"]:
+                continue
+            if actual != item["before"]:
+                raise ContinuityError(
+                    "DOCUMENT_DIVERGED",
+                    f"{relative} changed immediately before replacement; manual reconciliation is required",
+                )
             try:
                 _atomic_replace(destination, data, self.__operations, strict_directory=True)
             except (AtomicFailure, RecoveryError) as error:
@@ -4733,6 +4944,22 @@ class ContinuityPersistence:
                     "RECOVERY_INCOMPLETE",
                     f"publication for {relative} remains journaled; reconcile again after inspecting it",
                 ) from error
+        # Keep the final check: a noncooperating editor can race the preflight
+        # while a multi-document journal is being applied.
+        for relative, expected in read_set.items():
+            actual = self.__document_hash(relative)
+            intended = next(
+                (
+                    item["sha256"] for item in pending["writes"]
+                    if item["path"] == relative
+                ),
+                None,
+            )
+            if actual != expected and actual != intended:
+                raise ContinuityError(
+                    "DOCUMENT_DIVERGED",
+                    f"{relative} changed before state publication; manual reconciliation is required",
+                )
         try:
             _atomic_replace(
                 _artifact_path(self.__root, "continuity.json"),

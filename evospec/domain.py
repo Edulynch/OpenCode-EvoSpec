@@ -4874,6 +4874,8 @@ _CONTINUITY_FIELDS = frozenset((
     "execution", "checks", "closures", "reopens", "paused_features",
     "pause_reasons", "detours", "documents", "ids", "pending",
 ))
+_CONTINUITY_SEMANTIC_FIELDS = _CONTINUITY_FIELDS | frozenset(("semantic_digests",))
+_CONTINUITY_IDENTITY_FIELDS = _CONTINUITY_SEMANTIC_FIELDS | frozenset(("identity_metadata",))
 _CONTINUITY_ID = re.compile(r"^[FSTCD]-[0-9a-f]{32}$")
 _CONTINUITY_DIR = re.compile(r"^[0-9]{3,}-[a-z0-9]+(?:-[a-z0-9]+)*$")
 _CONTINUITY_DOC = re.compile(
@@ -4996,6 +4998,7 @@ class ContinuityCheck(TypedDict):
     task_id: str | None
     recorded_revision: int
     observed_input_scope: NotRequired[ContinuityInputScope]
+    task_digest: NotRequired[str]
 
 
 class ContinuityCriterionDigest(TypedDict):
@@ -5041,6 +5044,14 @@ class ContinuityPendingWrite(TypedDict):
 class ContinuityPending(TypedDict):
     next_state: dict[str, object]
     writes: list[ContinuityPendingWrite]
+    read_set: NotRequired[dict[str, str | None]]
+
+
+class ContinuityIdentityMetadata(TypedDict):
+    feature_id: str
+    kind: str
+    active: bool
+    digest: str
 
 
 class ContinuityStateData(TypedDict):
@@ -5063,6 +5074,8 @@ class ContinuityStateData(TypedDict):
     documents: dict[str, str]
     ids: list[str]
     pending: ContinuityPending | None
+    semantic_digests: NotRequired[dict[str, str]]
+    identity_metadata: NotRequired[dict[str, ContinuityIdentityMetadata]]
 
 
 def validate_continuity_state(
@@ -5083,7 +5096,10 @@ def validate_continuity_state(
         except UnicodeEncodeError:
             return False
 
-    if type(value) is not dict or set(value) != _CONTINUITY_FIELDS:
+    if type(value) is not dict or set(value) not in (
+        _CONTINUITY_FIELDS, _CONTINUITY_SEMANTIC_FIELDS,
+        _CONTINUITY_IDENTITY_FIELDS,
+    ):
         invalid("continuity state fields are not exact")
     state = cast(dict[str, object], cast(object, value))
     if (
@@ -5117,6 +5133,12 @@ def validate_continuity_state(
     pause_reasons = cast(dict[str, object], state["pause_reasons"])
     detours = cast(list[object], state["detours"])
     document_map = cast(dict[str, object], state["documents"])
+    semantic_map = cast(
+        dict[str, object], state.get("semantic_digests", {}),
+    )
+    identity_metadata = cast(
+        dict[str, object], state.get("identity_metadata", {}),
+    )
     ids = cast(list[object], state["ids"])
     revision = cast(int, state["revision"])
     pending = cast(dict[str, object] | None, state["pending"])
@@ -5208,11 +5230,14 @@ def validate_continuity_state(
         "recorded_revision",
     }
     for check in checks:
+        check_fields = set(check) if type(check) is dict else set()
         if (
             type(check) is not dict
-            or set(check) not in (
+            or check_fields not in (
                 legacy_check_fields,
                 legacy_check_fields | {"observed_input_scope"},
+                legacy_check_fields | {"task_digest"},
+                legacy_check_fields | {"observed_input_scope", "task_digest"},
             )
             or not isinstance(check["criterion_id"], str)
             or _CONTINUITY_ID.fullmatch(check["criterion_id"]) is None
@@ -5239,6 +5264,14 @@ def validate_continuity_state(
             )
             or type(check["recorded_revision"]) is not int
             or not 1 <= check["recorded_revision"] <= revision
+            or (
+                "task_digest" in check
+                and (
+                    not isinstance(check["task_digest"], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", check["task_digest"]) is None
+                    or check["task_id"] is None
+                )
+            )
         ):
             invalid("criterion check history is invalid")
         if "observed_input_scope" in check:
@@ -5262,6 +5295,13 @@ def validate_continuity_state(
         for path, digest in document_map.items()
     ):
         invalid("document digest index is invalid")
+    if type(semantic_map) is not dict or any(
+        not isinstance(path, str) or _CONTINUITY_DOC.fullmatch(path) is None
+        or path not in document_map
+        or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        for path, digest in semantic_map.items()
+    ):
+        invalid("semantic document digest index is invalid")
     if any(not isinstance(item, str) or _CONTINUITY_ID.fullmatch(item) is None for item in ids):
         invalid("stable identity registry is invalid")
     if (
@@ -5269,6 +5309,20 @@ def validate_continuity_state(
         or any(item not in ids for item in (*features.keys(), *task_states.keys()))
     ):
         invalid("stable identity registry is invalid")
+    if type(identity_metadata) is not dict or any(
+        not isinstance(identity, str) or _CONTINUITY_ID.fullmatch(identity) is None
+        or identity not in ids or type(record) is not dict
+        or set(record) != {"feature_id", "kind", "active", "digest"}
+        or not isinstance(record.get("feature_id"), str)
+        or record.get("feature_id") not in features
+        or not isinstance(record.get("kind"), str)
+        or record.get("kind") != identity[0]
+        or type(record.get("active")) is not bool
+        or not isinstance(record.get("digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", cast(str, record.get("digest"))) is None
+        for identity, record in identity_metadata.items()
+    ):
+        invalid("typed identity metadata is invalid")
     detour_ids: set[str] = set()
     pending_detours = 0
     for detour in detours:
@@ -5415,7 +5469,9 @@ def validate_continuity_state(
 
     if pending is None:
         return
-    if type(pending) is not dict or set(pending) != {"next_state", "writes"}:
+    if type(pending) is not dict or set(pending) not in (
+        {"next_state", "writes"}, {"next_state", "writes", "read_set"},
+    ):
         invalid("recovery journal is invalid")
     pending_record = cast(dict[str, object], cast(object, pending))
     next_state_value = pending_record["next_state"]
@@ -5428,6 +5484,19 @@ def validate_continuity_state(
         invalid("recovery journal next state is inconsistent")
     next_state = cast(dict[str, object], cast(object, next_state_value))
     writes = cast(list[object], writes_value)
+    read_set_value = pending_record.get("read_set", {})
+    if type(read_set_value) is not dict or any(
+        not isinstance(path, str) or _CONTINUITY_DOC.fullmatch(path) is None
+        or (
+            digest is not None
+            and (
+                not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            )
+        )
+        for path, digest in cast(dict[str, object], read_set_value).items()
+    ):
+        invalid("recovery journal read set is invalid")
     validate_continuity_state(
         next_state, repository_id=repository_id, pending_state=True,
     )
