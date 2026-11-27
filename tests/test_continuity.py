@@ -73,6 +73,11 @@ class _ExecutionView(TypedDict):
     task_id: str
 
 
+class _MandateIncrementView(TypedDict):
+    id: str
+    task_ids: list[str]
+
+
 class _FeatureView(TypedDict):
     id: str
     directory: str
@@ -152,6 +157,18 @@ def _optional_text(value: object) -> TypeGuard[str | None]:
 
 def _text_list(value: object) -> TypeGuard[list[str]]:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _mandate_increment_view(value: object) -> TypeGuard[_MandateIncrementView]:
+    return (
+        _record(value)
+        and _text(value.get("id"))
+        and _text_list(value.get("task_ids"))
+    )
+
+
+def _mandate_increment_views(value: object) -> TypeGuard[list[_MandateIncrementView]]:
+    return isinstance(value, list) and all(_mandate_increment_view(item) for item in value)
 
 
 def _digest_map(value: object) -> TypeGuard[dict[str, str | None]]:
@@ -444,6 +461,20 @@ def _mandate(result: _ContinuityView) -> dict[str, object]:
     if value is None:
         raise AssertionError("expected a composed implementation mandate")
     return value
+
+
+def _mandate_id(result: _ContinuityView) -> str:
+    mandate_id = _mandate(result).get("id")
+    if not _text(mandate_id):
+        raise AssertionError("expected a composed implementation mandate ID")
+    return mandate_id
+
+
+def _mandate_increments(result: _ContinuityView) -> list[_MandateIncrementView]:
+    increments = _mandate(result).get("increments")
+    if not _mandate_increment_views(increments):
+        raise AssertionError("expected typed mandate increments")
+    return increments
 
 
 def _stable_feature_ids(feature: _FeatureView) -> tuple[str, ...]:
@@ -2218,8 +2249,11 @@ class ContinuityTests(unittest.TestCase):
         with self._temp() as temporary:
             root = Path(temporary)
             request = spec_request("Four increment mandate")
+            increments = request.get("increments")
+            if not _record_views(increments):
+                self.fail("expected the fixture's increment requests")
             request["increments"] = [
-                *request["increments"],
+                *increments,
                 {"title": "Increment 4", "outcome": "Persist the useful result."},
             ]
             created = self.call(root, "specify", 0, data=request)
@@ -2234,7 +2268,7 @@ class ContinuityTests(unittest.TestCase):
                 "feature_id": feature["id"], "phase": "start", "mode": "ALL",
             })
             mandate = _mandate(started)
-            mandate_id = mandate["id"]
+            mandate_id = _mandate_id(started)
             self.assertEqual(started["revision"], created["revision"] + 1)
             self.assertEqual(mandate["mode"], "ALL")
             self.assertEqual(mandate["feature_id"], feature["id"])
@@ -2288,7 +2322,10 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(added_mandate["id"], mandate_id)
             self.assertEqual(added_mandate["missing_increment_task_ids"], [])
             self.assertEqual(
-                next(item for item in added_mandate["increments"] if item["id"] == fourth["id"])["task_ids"],
+                next(
+                    item for item in _mandate_increments(added)
+                    if item["id"] == fourth["id"]
+                )["task_ids"],
                 [_selected_feature(added)["tasks"][-1]["id"]],
             )
             self.assertEqual(added_mandate["next_task"], feature["tasks"][0]["id"])
@@ -2364,7 +2401,7 @@ class ContinuityTests(unittest.TestCase):
             started = self.call(root, "implement", created["revision"], data={
                 "feature_id": feature["id"], "phase": "start", "mode": "ALL",
             })
-            mandate_id = _mandate(started)["id"]
+            mandate_id = _mandate_id(started)
             tasks_path = root / "specs" / feature["directory"] / "tasks.md"
             content = tasks_path.read_text(encoding="utf-8")
             task_a_start = content.index(f"### `{task_a['id']}` — Task A\n")
@@ -2405,7 +2442,7 @@ class ContinuityTests(unittest.TestCase):
             started = self.call(root, "implement", created["revision"], data={
                 "feature_id": feature["id"], "phase": "start", "mode": "ALL",
             })
-            mandate_id = _mandate(started)["id"]
+            mandate_id = _mandate_id(started)
             begun = self.call(root, "implement", started["revision"], data={
                 "feature_id": feature["id"], "task_id": task["id"],
                 "phase": "begin", "mandate_id": mandate_id,
@@ -2514,7 +2551,7 @@ class ContinuityTests(unittest.TestCase):
             )
             self.assertEqual(state["attempts"][1]["mandate_id"], mandate_id)
             self.assertEqual(
-                reopened_again["mandate"]["status"], "PENDING",
+                _mandate(reopened_again)["status"], "PENDING",
                 "reopening does not pass the Task or satisfy the mandate",
             )
 
@@ -2537,7 +2574,7 @@ class ContinuityTests(unittest.TestCase):
             started = self.call(root, "implement", created["revision"], session_a, {
                 "feature_id": feature["id"], "phase": "start", "mode": "ALL",
             })
-            mandate_id = _mandate(started)["id"]
+            mandate_id = _mandate_id(started)
             checkpointed = self.call(root, "implement", started["revision"], session_a, {
                 "feature_id": feature["id"], "task_id": first_task["id"],
                 "phase": "begin", "mandate_id": mandate_id,
@@ -2551,7 +2588,8 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(recovered_mandate["status"], "UNKNOWN_EFFECT")
             self.assertIsNone(recovered_mandate["next_task"])
             active_attempt = recovered_status.get("active_attempt")
-            self.assertIsNotNone(active_attempt)
+            if active_attempt is None:
+                self.fail("expected the persisted Task attempt checkpoint")
             self.assertEqual(active_attempt["task_id"], first_task["id"])
             self.assertEqual(
                 active_attempt["checkpoint"], "Checkpoint before simulated host effects.",
@@ -2559,7 +2597,10 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(active_attempt["session_id"], session_a)
             projected_task = _selected_feature(recovered_status)["tasks"][0]
             self.assertEqual(projected_task["status"], "OUTCOME_UNKNOWN")
-            self.assertEqual(projected_task["attempt_history"][0]["mandate_id"], mandate_id)
+            attempt_history = projected_task.get("attempt_history")
+            if attempt_history is None:
+                self.fail("expected the projected Task attempt history")
+            self.assertEqual(attempt_history[0]["mandate_id"], mandate_id)
 
             for phase_data, expected_code in (
                 (
@@ -2781,7 +2822,7 @@ class ContinuityTests(unittest.TestCase):
             started = self.call(root, "implement", created["revision"], data={
                 "feature_id": feature_id, "phase": "start", "mode": "ALL",
             })
-            mandate_id = _mandate(started)["id"]
+            mandate_id = _mandate_id(started)
             attempt = self.call(root, "implement", started["revision"], data={
                 "feature_id": feature_id, "task_id": task1["id"],
                 "mandate_id": mandate_id, "phase": "begin",
@@ -2876,8 +2917,8 @@ class ContinuityTests(unittest.TestCase):
             )
             self.assertEqual(resumed["execution"], None)
             self.assertEqual(resumed_feature["tasks"][2]["attempts"], 0)
-            self.assertEqual(len(resumed["features"]), 1)
-            self.assertEqual(resumed["features"][0]["id"], feature_id)
+            self.assertEqual(len(_features(resumed)), 1)
+            self.assertEqual(_features(resumed)[0]["id"], feature_id)
 
             refreshed = self.record_check(
                 root, resumed["revision"], task1, criterion,

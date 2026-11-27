@@ -1966,7 +1966,7 @@ def _implementation_projection(
     linked_tasks: dict[str, list[str]] = {identity: [] for identity in criterion_ids}
     for task, task_view in zip(tasks, task_views, strict=True):
         status = continuity_task_status(current_state, current_feature, task_view, task_views)
-        projection = {
+        projection: dict[str, object] = {
             "id": task["id"], "increment_id": task["increment_id"],
             "status": status,
             "eligible": continuity_task_eligible(

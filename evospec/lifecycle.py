@@ -384,8 +384,8 @@ def continuity_task_status(
         state, feature, tasks=tasks, task_id=task["id"],
     )
     if latest_event is not None and latest_event["event"] == "REOPENED" and any(
-        type(check.get("recorded_revision")) is int
-        and check["recorded_revision"] <= latest_event["recorded_revision"]
+        type(recorded_revision := check.get("recorded_revision")) is int
+        and recorded_revision <= latest_event["recorded_revision"]
         for check in checks.values()
     ):
         return "REPORTED"

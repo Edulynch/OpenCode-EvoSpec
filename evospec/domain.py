@@ -5435,7 +5435,7 @@ def validate_continuity_state(
                 reference_ids.add(cast(str, reference["id"]))
     if task_events:
         event_revisions: set[int] = set()
-        last_events: dict[str, dict[str, object]] = {}
+        last_events: dict[str, tuple[str, int]] = {}
         previous_revision = 0
         for event in task_events:
             if (
@@ -5460,25 +5460,27 @@ def validate_continuity_state(
                 invalid("Task lifecycle event is invalid")
             previous = last_events.get(cast(str, event["task_id"]))
             current_kind = cast(str, event["event"])
-            if previous is not None and event["attempt_count"] < previous["attempt_count"]:
+            if previous is not None and event["attempt_count"] < previous[1]:
                 invalid("Task lifecycle attempt counts cannot move backward")
             if current_kind == "REOPENED":
                 if previous is None:
                     if event["attempt_count"] < 1:
                         invalid("Task reopening requires prior Task work")
-                elif previous["event"] not in ("BLOCKED", "CANCELED", "REOPENED"):
+                elif previous[0] not in ("BLOCKED", "CANCELED", "REOPENED"):
                     invalid("Task reopening has no blocked, canceled, or completed predecessor")
-                elif previous["event"] == "REOPENED" and event["attempt_count"] <= previous["attempt_count"]:
+                elif previous[0] == "REOPENED" and event["attempt_count"] <= previous[1]:
                     invalid("a reopened Task requires a new attempt before reopening again")
             elif previous is not None and (
-                previous["event"] in ("BLOCKED", "CANCELED")
-                or previous["event"] == "REOPENED"
-                and event["attempt_count"] <= previous["attempt_count"]
+                previous[0] in ("BLOCKED", "CANCELED")
+                or previous[0] == "REOPENED"
+                and event["attempt_count"] <= previous[1]
             ):
                 invalid("Task lifecycle event transition is invalid")
             event_revisions.add(cast(int, event["recorded_revision"]))
             previous_revision = cast(int, event["recorded_revision"])
-            last_events[cast(str, event["task_id"])] = cast(dict[str, object], event)
+            last_events[cast(str, event["task_id"])] = (
+                cast(str, event["event"]), cast(int, event["attempt_count"]),
+            )
     detour_ids: set[str] = set()
     pending_detours = 0
     for detour in detours:
