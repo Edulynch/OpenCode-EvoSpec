@@ -4876,7 +4876,9 @@ _CONTINUITY_FIELDS = frozenset((
 ))
 _CONTINUITY_SEMANTIC_FIELDS = _CONTINUITY_FIELDS | frozenset(("semantic_digests",))
 _CONTINUITY_IDENTITY_FIELDS = _CONTINUITY_SEMANTIC_FIELDS | frozenset(("identity_metadata",))
-_CONTINUITY_OPTIONAL_FIELDS = frozenset(("mandate", "task_events"))
+_CONTINUITY_OPTIONAL_FIELDS = frozenset((
+    "mandate", "mandates", "mandate_history", "task_events",
+))
 _CONTINUITY_ID = re.compile(r"^[FSTCD]-[0-9a-f]{32}$")
 _CONTINUITY_DIR = re.compile(r"^[0-9]{3,}-[a-z0-9]+(?:-[a-z0-9]+)*$")
 _CONTINUITY_DOC = re.compile(
@@ -4952,6 +4954,7 @@ class ContinuityMandate(TypedDict):
     recorded_revision: int
     session_id: str
     close_feature: bool
+    outcome_digest: NotRequired[str]
 
 
 class ContinuityTaskEvent(TypedDict):
@@ -5028,6 +5031,7 @@ class ContinuityCheck(TypedDict):
     recorded_revision: int
     observed_input_scope: NotRequired[ContinuityInputScope]
     task_digest: NotRequired[str]
+    mandate_id: NotRequired[str]
 
 
 class ContinuityCriterionDigest(TypedDict):
@@ -5106,6 +5110,8 @@ class ContinuityStateData(TypedDict):
     semantic_digests: NotRequired[dict[str, str]]
     identity_metadata: NotRequired[dict[str, ContinuityIdentityMetadata]]
     mandate: NotRequired[ContinuityMandate]
+    mandates: NotRequired[dict[str, ContinuityMandate]]
+    mandate_history: NotRequired[list[ContinuityMandate]]
     task_events: NotRequired[list[ContinuityTaskEvent]]
 
 
@@ -5127,18 +5133,12 @@ def validate_continuity_state(
         except UnicodeEncodeError:
             return False
 
-    allowed_fields = tuple(
-        fields | optional
-        for fields in (
-            _CONTINUITY_FIELDS, _CONTINUITY_SEMANTIC_FIELDS,
-            _CONTINUITY_IDENTITY_FIELDS,
-        )
-        for optional in (
-            frozenset(), frozenset(("mandate",)), frozenset(("task_events",)),
-            _CONTINUITY_OPTIONAL_FIELDS,
-        )
-    )
-    if type(value) is not dict or frozenset(value) not in allowed_fields:
+    if type(value) is not dict or (
+        frozenset(value) - _CONTINUITY_OPTIONAL_FIELDS
+    ) not in (
+        _CONTINUITY_FIELDS, _CONTINUITY_SEMANTIC_FIELDS,
+        _CONTINUITY_IDENTITY_FIELDS,
+    ):
         invalid("continuity state fields are not exact")
     state = cast(dict[str, object], cast(object, value))
     if (
@@ -5155,6 +5155,12 @@ def validate_continuity_state(
         ))
         or ("task_events" in state and type(state["task_events"]) is not list)
         or ("mandate" in state and type(state["mandate"]) is not dict)
+        or ("mandates" in state and type(state["mandates"]) is not dict)
+        or ("mandate_history" in state and type(state["mandate_history"]) is not list)
+        or (
+            "mandate" in state
+            and ("mandates" in state or "mandate_history" in state)
+        )
         or (state["execution"] is not None and type(state["execution"]) is not dict)
         or (state["pending"] is not None and type(state["pending"]) is not dict)
     ):
@@ -5235,6 +5241,7 @@ def validate_continuity_state(
         ):
             invalid("Task attempt counters are invalid")
         counters[task_id] = 0
+    attempt_mandate_ids: set[str] = set()
     for attempt in attempts:
         if (
             type(attempt) is not dict
@@ -5271,6 +5278,8 @@ def validate_continuity_state(
             )
         ):
             invalid("Task attempt history is invalid")
+        if "mandate_id" in attempt:
+            attempt_mandate_ids.add(cast(str, attempt["mandate_id"]))
         counters[attempt["task_id"]] += 1
         if attempt["attempt"] != counters[attempt["task_id"]]:
             invalid("Task attempt numbering is not contiguous")
@@ -5285,16 +5294,14 @@ def validate_continuity_state(
         "exit_code", "output_sha256", "reported_by_session_id", "task_id",
         "recorded_revision",
     }
+    optional_check_fields = {"observed_input_scope", "task_digest", "mandate_id"}
+    check_mandate_ids: set[str] = set()
     for check in checks:
         check_fields = set(check) if type(check) is dict else set()
         if (
             type(check) is not dict
-            or check_fields not in (
-                legacy_check_fields,
-                legacy_check_fields | {"observed_input_scope"},
-                legacy_check_fields | {"task_digest"},
-                legacy_check_fields | {"observed_input_scope", "task_digest"},
-            )
+            or not legacy_check_fields <= check_fields
+            or not check_fields <= legacy_check_fields | optional_check_fields
             or not isinstance(check["criterion_id"], str)
             or _CONTINUITY_ID.fullmatch(check["criterion_id"]) is None
             or check["criterion_id"][0] != "C"
@@ -5328,8 +5335,18 @@ def validate_continuity_state(
                     or check["task_id"] is None
                 )
             )
+            or (
+                "mandate_id" in check
+                and (
+                    not isinstance(check["mandate_id"], str)
+                    or re.fullmatch(r"D-[0-9a-f]{32}", check["mandate_id"]) is None
+                    or check["mandate_id"] not in ids
+                )
+            )
         ):
             invalid("criterion check history is invalid")
+        if "mandate_id" in check:
+            check_mandate_ids.add(cast(str, check["mandate_id"]))
         if "observed_input_scope" in check:
             scope = check["observed_input_scope"]
             if (
@@ -5379,36 +5396,50 @@ def validate_continuity_state(
         for identity, record in identity_metadata.items()
     ):
         invalid("typed identity metadata is invalid")
-    if mandate is not None:
+    mandate_ids: set[str] = set()
+    metadata_records = cast(
+        dict[str, dict[str, object]],
+        cast(object, identity_metadata),
+    )
+
+    def validate_mandate(record: object) -> dict[str, object]:
+        required = {
+            "id", "feature_id", "mode", "criteria", "increments",
+            "source_revision", "recorded_revision", "session_id", "close_feature",
+        }
         if (
-            type(mandate) is not dict
-            or set(mandate) != {
-                "id", "feature_id", "mode", "criteria", "increments",
-                "source_revision", "recorded_revision", "session_id", "close_feature",
-            }
-            or not isinstance(mandate["id"], str)
-            or re.fullmatch(r"D-[0-9a-f]{32}", mandate["id"]) is None
-            or mandate["id"] not in ids
-            or not isinstance(mandate["feature_id"], str)
-            or mandate["feature_id"] not in features
-            or mandate["mode"] != "ALL"
-            or type(mandate["criteria"]) is not list
-            or not mandate["criteria"]
-            or type(mandate["increments"]) is not list
-            or type(mandate["source_revision"]) is not int
-            or type(mandate["recorded_revision"]) is not int
-            or not 0 <= mandate["source_revision"] < mandate["recorded_revision"] <= revision
-            or mandate["recorded_revision"] != mandate["source_revision"] + 1
-            or not valid_text(mandate["session_id"], 256)
-            or type(mandate["close_feature"]) is not bool
+            type(record) is not dict
+            or set(record) not in (required, required | {"outcome_digest"})
         ):
             invalid("implementation mandate is invalid")
-        metadata_records = cast(
-            dict[str, dict[str, object]],
-            cast(object, identity_metadata),
-        )
+        mandate_record = cast(dict[str, object], record)
+        if (
+            not isinstance(mandate_record["id"], str)
+            or re.fullmatch(r"D-[0-9a-f]{32}", mandate_record["id"]) is None
+            or mandate_record["id"] not in ids
+            or not isinstance(mandate_record["feature_id"], str)
+            or mandate_record["feature_id"] not in features
+            or mandate_record["mode"] != "ALL"
+            or type(mandate_record["criteria"]) is not list
+            or not mandate_record["criteria"]
+            or type(mandate_record["increments"]) is not list
+            or type(mandate_record["source_revision"]) is not int
+            or type(mandate_record["recorded_revision"]) is not int
+            or not 0 <= mandate_record["source_revision"] < mandate_record["recorded_revision"] <= revision
+            or mandate_record["recorded_revision"] != mandate_record["source_revision"] + 1
+            or not valid_text(mandate_record["session_id"], 256)
+            or type(mandate_record["close_feature"]) is not bool
+            or (
+                "outcome_digest" in mandate_record
+                and (
+                    not isinstance(mandate_record["outcome_digest"], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", mandate_record["outcome_digest"]) is None
+                )
+            )
+        ):
+            invalid("implementation mandate is invalid")
         for name, prefix in (("criteria", "C"), ("increments", "S")):
-            references = cast(list[object], mandate[name])
+            references = cast(list[object], mandate_record[name])
             reference_ids: set[str] = set()
             for reference in references:
                 reference_identity = (
@@ -5428,11 +5459,45 @@ def validate_continuity_state(
                     or not isinstance(reference["digest"], str)
                     or re.fullmatch(r"[0-9a-f]{64}", reference["digest"]) is None
                     or metadata is None
-                    or metadata["feature_id"] != mandate["feature_id"]
+                    or metadata["feature_id"] != mandate_record["feature_id"]
                     or metadata["kind"] != prefix
                 ):
                     invalid("implementation mandate scope references are invalid")
                 reference_ids.add(cast(str, reference["id"]))
+        identity = cast(str, mandate_record["id"])
+        if identity in mandate_ids:
+            invalid("implementation mandate history has duplicate IDs")
+        mandate_ids.add(identity)
+        return mandate_record
+
+    legacy_mandate = state.get("mandate")
+    if legacy_mandate is not None:
+        validate_mandate(legacy_mandate)
+    current_mandates_value = state.get("mandates", {})
+    current_mandates = cast(dict[str, object], current_mandates_value)
+    mandate_revisions_by_feature: dict[str, int] = {}
+    for feature_id, record in current_mandates.items():
+        checked_mandate = validate_mandate(record)
+        if feature_id not in features or checked_mandate["feature_id"] != feature_id:
+            invalid("current implementation mandate is not indexed by its Feature")
+    mandate_history = cast(list[object], state.get("mandate_history", []))
+    # Replacement order spans Features; creation revisions only order each Feature's chain.
+    for record in mandate_history:
+        checked_mandate = validate_mandate(record)
+        feature_id = cast(str, checked_mandate["feature_id"])
+        recorded_revision = cast(int, checked_mandate["recorded_revision"])
+        if recorded_revision <= mandate_revisions_by_feature.get(feature_id, 0):
+            invalid("implementation mandate history is not Feature revision ordered")
+        mandate_revisions_by_feature[feature_id] = recorded_revision
+    for feature_id, record in current_mandates.items():
+        checked_mandate = cast(dict[str, object], record)
+        if (
+            cast(int, checked_mandate["recorded_revision"])
+            <= mandate_revisions_by_feature.get(feature_id, 0)
+        ):
+            invalid("current implementation mandate does not follow its Feature history")
+    if not attempt_mandate_ids <= mandate_ids or not check_mandate_ids <= mandate_ids:
+        invalid("attempt or check references an unknown implementation mandate")
     if task_events:
         event_revisions: set[int] = set()
         last_events: dict[str, tuple[str, int]] = {}
@@ -5624,8 +5689,26 @@ def validate_continuity_state(
         ), None)
         if active is None or active["status"] not in ("STARTED", "OUTCOME_UNKNOWN"):
             invalid("in-flight Task attempt does not match its history")
-        if mandate is not None and active.get("mandate_id") != mandate["id"]:
-            invalid("in-flight Task checkpoint is not bound to the current mandate")
+        owner = identity_metadata.get(execution["task_id"])
+        owner_feature = (
+            owner.get("feature_id") if isinstance(owner, dict) else None
+        )
+        current_mandate: dict[str, object] | None = None
+        if isinstance(owner_feature, str):
+            candidate_mandate = current_mandates.get(owner_feature)
+            if isinstance(candidate_mandate, dict):
+                current_mandate = candidate_mandate
+        if (
+            current_mandate is None
+            and isinstance(legacy_mandate, dict)
+            and legacy_mandate.get("feature_id") == owner_feature
+        ):
+            current_mandate = cast(dict[str, object], cast(object, legacy_mandate))
+        if (
+            current_mandate is not None
+            and active.get("mandate_id") != current_mandate.get("id")
+        ):
+            invalid("in-flight Task checkpoint is not bound to its Feature mandate")
 
     if pending is None:
         return

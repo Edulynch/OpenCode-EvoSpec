@@ -99,14 +99,28 @@ permission result proves that a native prompt appeared or was approved.
 
 An explicit `/evospec.implement --all` begins with one revision-bound Core
 `implement` call using `phase: "start"`, the exact Feature ID, and `mode: "ALL"`.
-Core persists one stable mandate containing that Feature's current criterion
-and Increment identities/digests; `close_feature` defaults to false. Queue,
-checkpoint, report, verification, scoped Task addition, detour, and recovery
-calls carry the same mandate ID. Re-read status after each result and follow
-Core's next-Task projection; an empty queue is not completion, and the fourth
-or a later accepted Increment can receive a Task under the existing mandate.
-Scope edits require explicit Markdown reconciliation and an exact replacement
-of the stale mandate. `/evospec.implement --all` never closes the Feature.
+Core persists one current mandate per Feature, binding its normative Feature
+Outcome, criterion definitions, and Increment IDs and Outcomes; replaced
+mandates remain in history. Session-local Feature selection chooses the
+selected mandate, while status retains each Feature's mandate. This does not
+allow parallel execution: one unresolved Task checkpoint remains global to the
+worktree and blocks another start or semantic document reconciliation. A
+mandate on Feature A alone does not redirect or replace Feature B's mandate.
+`close_feature` defaults to false. Queue, checkpoint, report, verification,
+scoped Task addition, detour, and recovery calls carry the exact Feature and
+that Feature's mandate ID. Re-read status after each result and follow Core's
+next-Task projection; an empty queue is not completion, and the fourth or a
+later accepted Increment can receive a Task under the existing mandate.
+Display titles, notes, formatting, and technical plan refinements do not stale
+a mandate; a plan refinement can be tied to its stable Increment ID but cannot
+expand its normative Outcome. A changed Feature Outcome, criterion definition,
+or Increment Outcome stales the mandate even if IDs remain unchanged. Reconcile
+the Markdown, then explicitly replace by naming the exact stale mandate ID;
+prior attempt/check attribution remains in history. A legacy mandate without
+the normative Outcome binding is stale for new effects, but an already
+checkpointed Task may be reported/reconciled only against its exact Feature,
+mandate, Task, and evidence before explicit replacement. `/evospec.implement
+--all` never closes the Feature.
 
 Core checkpoints a Task before effects. A fresh session may inspect the
 checkpoint but cannot report or replay the originating attempt; it must
@@ -117,12 +131,13 @@ are reasoned same-Task lifecycle events; cancellation is not success, and a
 reopened Task needs a new attempt and fresh linked check. Verification remains
 bound to Core's current repository-input snapshots.
 
-The deterministic AC1 adapter fixture drives one continuous mandate through
-the actual packaged adapter, provider-neutral protocol, and Core against a
-temporary app root. It simulates OpenCode sessions and permission callbacks
-and uses Node VM tests for app behavior; it does not run a live model, OpenCode
-session, native permission dialog, or browser. See the AC1 contract and fixture
-limits in [the consolidated continuity document](ac0-consolidated-mvp.md).
+The deterministic AC1 adapter fixture drives four functional Increments and
+an exact-ID technical plan refinement through the actual packaged adapter,
+provider-neutral protocol, and Core against a temporary app root. It simulates
+OpenCode sessions and permission callbacks and uses Node VM tests for app
+behavior; it does not run a live model, OpenCode session, native permission
+dialog, or browser. See the AC1 contract and fixture limits in
+[the consolidated continuity document](ac0-consolidated-mvp.md).
 
 ### R2-C2: detect host delegation contract candidates, fail closed
 

@@ -41,6 +41,7 @@ class _ContinuityCheck(TypedDict):
     reported_by_session_id: str
     recorded_revision: int
     observed_input_scope: NotRequired[dict[str, str]]
+    mandate_id: NotRequired[str]
 
 
 class _ContinuityAttempt(TypedDict):
@@ -330,6 +331,7 @@ def continuity_current_checks(
                 or criterion_id in task_criteria.get(receipt_task_id, set())
             )
         ):
+            mandate_id = receipt.get("mandate_id")
             latest[criterion_id] = {
                 "passed": receipt.get("exit_code") == 0,
                 "fresh": True,
@@ -340,6 +342,10 @@ def continuity_current_checks(
                 "task_id": receipt.get("task_id"),
                 "reported_by_session_id": receipt.get("reported_by_session_id"),
                 "recorded_revision": receipt.get("recorded_revision"),
+                **(
+                    {"mandate_id": mandate_id}
+                    if isinstance(mandate_id, str) else {}
+                ),
             }
     return latest
 

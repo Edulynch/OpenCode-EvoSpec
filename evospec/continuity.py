@@ -141,6 +141,7 @@ class _ContinuityCheckView(TypedDict):
     recorded_revision: int
     observed_input_scope: NotRequired[dict[str, str]]
     task_digest: NotRequired[str]
+    mandate_id: NotRequired[str]
 
 
 def _plain_record(record: Mapping[str, object]) -> dict[str, object]:
@@ -328,6 +329,9 @@ def _continuity_check_view(check: ContinuityCheck) -> _ContinuityCheckView:
     task_digest = check.get("task_digest")
     if task_digest is not None:
         view["task_digest"] = task_digest
+    mandate_id = check.get("mandate_id")
+    if mandate_id is not None:
+        view["mandate_id"] = mandate_id
     return view
 
 
@@ -720,15 +724,19 @@ def _mutate(
                 raise ContinuityError(
                     "FEATURE_PAUSED", "resume the selected Feature before starting a mandate",
                 )
-            current_mandate = candidate.get("mandate")
+            current_mandate = _feature_mandate(candidate, feature_id)
             replace_id = data.get("replace_mandate_id")
             if current_mandate is not None:
                 if (
                     current_mandate["feature_id"] == feature_id
                     and _mandate_scope_matches(current_mandate, feature)
                     and current_mandate["close_feature"] == close_feature
-                    and replace_id is None
                 ):
+                    if replace_id not in (None, current_mandate["id"]):
+                        raise ContinuityError(
+                            "MANDATE_MISMATCH",
+                            "replacement must name the current mandate for this Feature",
+                        )
                     return _project(store, state, session_id)
                 if replace_id != current_mandate["id"]:
                     raise ContinuityError(
@@ -755,6 +763,7 @@ def _mutate(
                 raise ContinuityError(
                     "MANDATE_MISMATCH", "there is no current mandate with that replacement ID",
                 )
+            current_mandates = _mutable_mandates(candidate)
             mandate_id = _new_id("D", candidate)
             new_mandate: ContinuityMandate = {
                 "id": mandate_id, "feature_id": feature_id, "mode": "ALL",
@@ -763,14 +772,23 @@ def _mutate(
                     for item in feature["criteria"]
                 ],
                 "increments": [
-                    {"id": item["id"], "digest": _digest(item)}
+                    {
+                        "id": item["id"],
+                        "digest": _digest({
+                            "id": item["id"], "outcome": item["outcome"],
+                        }),
+                    }
                     for item in feature["increments"]
                 ],
                 "source_revision": state["revision"],
                 "recorded_revision": state["revision"] + 1,
                 "session_id": session_id, "close_feature": close_feature,
+                "outcome_digest": _digest(feature["outcome"]),
             }
-            candidate["mandate"] = new_mandate
+            if current_mandate is not None:
+                candidate.setdefault("mandate_history", []).append(current_mandate)
+            current_mandates[feature_id] = new_mandate
+            candidate["mandates"] = current_mandates
             return _publish_state_only(store, state, candidate, session_id)
         if phase == "queue" and task_id is None:
             _validate_mandate_request(
@@ -778,8 +796,14 @@ def _mutate(
             )
             return _project(store, state, session_id)
         task = _by_id(tasks, task_id, "T", "task_id")
+        execution = candidate["execution"]
         mandate = _validate_mandate_request(
             candidate, feature_id, data, feature, tasks,
+            allow_unbound_recovery=(
+                phase == "report"
+                and execution is not None
+                and execution["task_id"] == task["id"]
+            ),
         )
         if mandate is not None and not _mandate_allows_task(mandate, task):
             raise ContinuityError(
@@ -906,6 +930,8 @@ def _mutate(
             "observed_input_scope": current_input,
             "task_digest": _digest(task),
         }
+        if mandate is not None:
+            check["mandate_id"] = mandate["id"]
         candidate["checks"].append(check)
         writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
 
@@ -968,11 +994,16 @@ def _mutate(
             "feature_id", "reconcile", "task_id", "evidence_ref", "detour_summary",
             "mandate_id",
         })
-        mandate = _validate_mandate_request(
-            candidate, feature_id, data, feature, tasks,
-        )
         execution = candidate["execution"]
         reconcile = data.get("reconcile")
+        mandate = _validate_mandate_request(
+            candidate, feature_id, data, feature, tasks,
+            allow_unbound_recovery=(
+                execution is not None
+                and reconcile in ("COMPLETE", "INCOMPLETE")
+                and data.get("task_id") == execution["task_id"]
+            ),
+        )
         pending_detour = _pending_detour(candidate, feature_id)
         detour_result: str | None = None
         if pending_detour is not None:
@@ -1273,7 +1304,13 @@ def _project_pending(
         "mode": "COMPOSED", "revision": state["revision"],
         "status": "RECOVERY_REQUIRED", "next_action": "resume",
         "execution": state["execution"],
-        "active_attempt": None if state["execution"] is None else _active_attempt(state),
+        "execution_feature_id": _task_owner(
+            state, state["execution"]["task_id"],
+        ) if state["execution"] is not None else None,
+        "active_attempt": (
+            None if state["execution"] is None
+            else _active_attempt_projection(state)
+        ),
     }
     recovery = store.pending_resolution_preview(state)
     if recovery is not None:
@@ -1293,18 +1330,21 @@ def _report_attempt_state_only(
     _keys(data, {
         "feature_id", "task_id", "phase", "report", "result", "mandate_id",
     })
-    mandate = _require_mandate_id(state, None, data)
     execution = state["execution"]
     if execution is None or execution["task_id"] != data.get("task_id"):
         raise ContinuityError("NO_ACTIVE_ATTEMPT", "no matching checkpointed Task attempt exists")
+    owner = _task_owner(state, execution["task_id"])
+    mandate = _require_mandate_id(state, owner, data)
+    active_attempt = _active_attempt(state)
+    if mandate is not None and active_attempt.get("mandate_id") != mandate["id"]:
+        raise ContinuityError(
+            "MANDATE_MISMATCH", "the checkpoint was not started under this Feature mandate",
+        )
     if execution["session_id"] != session_id:
         raise ContinuityError(
             "OUTCOME_UNKNOWN",
             "only the originating host session may report this checkpointed attempt",
         )
-    owner = _task_owner(state, execution["task_id"])
-    if mandate is not None and owner != mandate["feature_id"]:
-        raise ContinuityError("FEATURE_MISMATCH", "report Task is outside the active mandate Feature")
     if data.get("feature_id") is not None and data.get("feature_id") != owner:
         raise ContinuityError("TASK_MISMATCH", "report must target the Feature owning the checkpointed Task")
     if data.get("phase") != "report":
@@ -1348,7 +1388,14 @@ def _reconcile_attempt_state_only(
     if data.get("task_id") != execution["task_id"]:
         raise ContinuityError("TASK_MISMATCH", "reconciliation must name the exact checkpointed Task")
     owner = _task_owner(state, execution["task_id"])
-    _require_mandate_id(state, owner, data)
+    mandate = _require_mandate_id(state, owner, data)
+    if (
+        mandate is not None
+        and _active_attempt(state).get("mandate_id") != mandate["id"]
+    ):
+        raise ContinuityError(
+            "MANDATE_MISMATCH", "the checkpoint was not started under this Feature mandate",
+        )
     if data.get("feature_id") is not None and data.get("feature_id") != owner:
         raise ContinuityError("TASK_MISMATCH", "reconciliation must target the Feature owning the checkpointed Task")
     if data.get("detour_summary") is not None:
@@ -1404,30 +1451,66 @@ def _task_owner(state: ContinuityStateData, task_id: str) -> str | None:
     return feature_id if isinstance(feature_id, str) and feature_id in state["features"] else None
 
 
+def _feature_mandate(
+    state: ContinuityStateData, feature_id: str,
+) -> ContinuityMandate | None:
+    mandates = state.get("mandates")
+    if mandates is not None:
+        return mandates.get(feature_id)
+    legacy = state.get("mandate")
+    return legacy if legacy is not None and legacy["feature_id"] == feature_id else None
+
+
+def _current_mandates(
+    state: ContinuityStateData,
+) -> dict[str, ContinuityMandate]:
+    current = dict(state.get("mandates", {}))
+    legacy = state.get("mandate")
+    if legacy is not None:
+        current.setdefault(legacy["feature_id"], legacy)
+    return current
+
+
+def _mutable_mandates(
+    state: ContinuityStateData,
+) -> dict[str, ContinuityMandate]:
+    current = _current_mandates(state)
+    cast(dict[str, object], cast(object, state)).pop("mandate", None)
+    state["mandates"] = current
+    state.setdefault("mandate_history", [])
+    return current
+
+
 def _validate_mandate_request(
     state: ContinuityStateData, feature_id: str, data: dict[str, object],
     feature: ContinuityFeatureDocument, tasks: list[ContinuityTaskDocument],
-    *, check_scope: bool = True,
+    *, check_scope: bool = True, allow_unbound_recovery: bool = False,
 ) -> ContinuityMandate | None:
-    mandate = state.get("mandate")
+    mandate = _feature_mandate(state, feature_id)
     supplied = data.get("mandate_id")
     if mandate is None:
         if supplied is not None:
-            raise ContinuityError("MANDATE_REQUIRED", "there is no active implementation mandate")
+            if any(item["id"] == supplied for item in _current_mandates(state).values()):
+                raise ContinuityError(
+                    "FEATURE_MISMATCH",
+                    "the supplied mandate belongs to a different Feature",
+                )
+            raise ContinuityError("MANDATE_REQUIRED", "there is no active implementation mandate for this Feature")
         return None
     if supplied != mandate["id"]:
         raise ContinuityError(
-            "MANDATE_MISMATCH", "the exact active Core mandate ID is required",
+            "MANDATE_MISMATCH", "the exact current Core mandate ID for this Feature is required",
         )
-    if feature_id != mandate["feature_id"]:
-        raise ContinuityError(
-            "FEATURE_MISMATCH", "implementation must target the Feature bound to its mandate",
-        )
-    if check_scope:
+    if check_scope and not allow_unbound_recovery:
+        if "outcome_digest" not in mandate:
+            raise ContinuityError(
+                "MANDATE_STALE_SCOPE",
+                "legacy mandate has no normative Feature Outcome binding; reconcile and explicitly replace it before new effects",
+            )
         if not _mandate_scope_matches(mandate, feature):
             raise ContinuityError(
                 "MANDATE_STALE_SCOPE",
-                "accepted criterion or Increment definitions changed; explicitly reconcile and start a new mandate",
+                "accepted Feature Outcome, criterion, or Increment outcome changed; explicitly reconcile and start a new mandate",
             )
         increment_ids = {item["id"] for item in mandate["increments"]}
         criterion_ids = {item["id"] for item in mandate["criteria"]}
@@ -1449,10 +1532,22 @@ def _require_mandate_id(
     state: ContinuityStateData, feature_id: str | None,
     data: dict[str, object],
 ) -> ContinuityMandate | None:
-    mandate = state.get("mandate")
     supplied = data.get("mandate_id")
+    mandate = (
+        _feature_mandate(state, feature_id)
+        if feature_id is not None
+        else next(
+            (item for item in _current_mandates(state).values() if item["id"] == supplied),
+            None,
+        )
+    )
     if mandate is None:
         if supplied is not None:
+            if any(item["id"] == supplied for item in _current_mandates(state).values()):
+                raise ContinuityError(
+                    "FEATURE_MISMATCH",
+                    "the supplied mandate belongs to a different Feature",
+                )
             raise ContinuityError("MANDATE_REQUIRED", "there is no active implementation mandate")
         return None
     if supplied != mandate["id"]:
@@ -1891,12 +1986,16 @@ def _mandate_scope_matches(
 ) -> bool:
     return (
         feature["id"] == mandate["feature_id"]
+        and mandate.get("outcome_digest") == _digest(feature["outcome"])
         and mandate["criteria"] == [
             {"id": item["id"], "digest": _digest(item)}
             for item in feature["criteria"]
         ]
         and mandate["increments"] == [
-            {"id": item["id"], "digest": _digest(item)}
+            {
+                "id": item["id"],
+                "digest": _digest({"id": item["id"], "outcome": item["outcome"]}),
+            }
             for item in feature["increments"]
         ]
     )
@@ -1915,6 +2014,7 @@ def _implementation_projection(
         "recorded_revision": mandate["recorded_revision"],
         "started_by_session_id": mandate["session_id"],
         "close_feature": mandate["close_feature"],
+        "outcome_digest": mandate.get("outcome_digest"),
         "criteria_scope": mandate["criteria"],
         "increments_scope": mandate["increments"],
         "criterion_ids": [item["id"] for item in mandate["criteria"]],
@@ -1924,7 +2024,11 @@ def _implementation_projection(
     if feature is None or tasks is None or not _mandate_scope_matches(mandate, feature):
         view.update({
             "status": "STALE_SCOPE",
-            "stale_reason": "accepted definitions are unavailable or changed",
+            "stale_reason": (
+                "legacy mandate has no normative Feature Outcome binding"
+                if "outcome_digest" not in mandate
+                else "accepted Outcome, criterion, or Increment definition is unavailable or changed"
+            ),
             "coverage": {
                 "criteria_total": len(mandate["criteria"]), "criteria_passing": 0,
                 "tasks_total": 0, "tasks_completed": 0,
@@ -2041,7 +2145,11 @@ def _implementation_projection(
     ]
     passing_count = sum(item["status"] == "PASSING" for item in criteria)
     execution = state["execution"]
-    if execution is not None:
+    execution_owner = (
+        None if execution is None
+        else _task_owner(state, execution["task_id"])
+    )
+    if execution is not None and execution_owner == mandate["feature_id"]:
         status = "UNKNOWN_EFFECT"
     elif mandate["feature_id"] in state["paused_features"]:
         status = "PAUSED"
@@ -2068,6 +2176,8 @@ def _implementation_projection(
     else:
         status = "PENDING"
 
+    if execution is not None and execution_owner != mandate["feature_id"]:
+        next_task = None
     view.update({
         "status": status, "criteria": criteria, "increments": increments,
         "tasks": task_projection, "next_task": next_task,
@@ -2108,9 +2218,16 @@ def _project(
         dict[str, dict[str, object]],
         document_changes.pop("_parsed_documents", {}),
     )
+    selected = state["session_features"].get(session_id) or state["default_feature_id"]
+    mandate_history = list(state.get("mandate_history", []))
     if document_changes["identity_ref_conflicts"] or document_changes["semantic"]:
-        mandate = state.get("mandate")
-        return {
+        selected_mandate = (
+            None if selected is None else _feature_mandate(state, selected)
+        )
+        selected_documents = (
+            None if selected is None else parsed_documents.get(selected)
+        )
+        result: dict[str, object] = {
             "mode": "COMPOSED", "revision": state["revision"],
             "status": (
                 "DOCUMENT_CONFLICT"
@@ -2119,17 +2236,34 @@ def _project(
             ),
             "document_changes": document_changes,
             "execution": state["execution"],
-            "active_attempt": None if state["execution"] is None else _active_attempt(state),
+            "execution_feature_id": (
+                None if state["execution"] is None
+                else _task_owner(state, state["execution"]["task_id"])
+            ),
+            "active_attempt": (
+                None if state["execution"] is None
+                else _active_attempt_projection(state)
+            ),
             "features": [],
+            "selected_feature_id": selected,
             "selected_feature": None,
             "next_task": None,
-            **({
-                "mandate": _implementation_projection(
-                    state, mandate, None, None, input_snapshot,
-                ),
-            } if mandate is not None else {}),
+            "mandate_history": mandate_history,
         }
-    selected = state["session_features"].get(session_id) or state["default_feature_id"]
+        if selected_mandate is not None:
+            selected_feature = (
+                None if selected_documents is None
+                else cast(ContinuityFeatureDocument, selected_documents["spec"])
+            )
+            selected_tasks = (
+                None if selected_documents is None
+                else cast(list[ContinuityTaskDocument], selected_documents["tasks"])
+            )
+            result["mandate"] = _implementation_projection(
+                state, selected_mandate, selected_feature, selected_tasks,
+                input_snapshot,
+            )
+        return result
     feature_views: list[dict[str, object]] = []
     result: dict[str, object] = {
         "mode": "COMPOSED", "revision": state["revision"],
@@ -2138,8 +2272,16 @@ def _project(
         "selection_scope": "session" if session_id in state["session_features"] else "worktree",
         "features": feature_views,
         "execution": state["execution"],
-        "active_attempt": None if state["execution"] is None else _active_attempt(state),
+        "execution_feature_id": (
+            None if state["execution"] is None
+            else _task_owner(state, state["execution"]["task_id"])
+        ),
+        "active_attempt": (
+            None if state["execution"] is None
+            else _active_attempt_projection(state)
+        ),
         "document_changes": document_changes,
+        "mandate_history": mandate_history,
     }
     if input_snapshot_error is not None:
         result["input_snapshot_error"] = input_snapshot_error
@@ -2209,30 +2351,38 @@ def _project(
                 item for item in state["reopens"] if item["feature_id"] == feature_id
             ],
         }
+        feature_mandate = _feature_mandate(state, feature_id)
+        if feature_mandate is not None:
+            feature_view["mandate"] = _implementation_projection(
+                state, feature_mandate, feature, tasks, input_snapshot,
+            )
         feature_views.append(feature_view)
     selected_feature = next(
         (feature for feature in feature_views if feature["id"] == selected), None
     )
     result["selected_feature"] = selected_feature
-    mandate = state.get("mandate")
-    if mandate is None:
+    selected_mandate = (
+        None if selected is None else _feature_mandate(state, selected)
+    )
+    if selected_mandate is None:
         result["next_task"] = _next_task(selected_feature)
     else:
-        mandate_feature = parsed_documents.get(mandate["feature_id"])
+        mandate_documents = parsed_documents.get(selected_mandate["feature_id"])
         implementation = _implementation_projection(
-            state, mandate,
-            None if mandate_feature is None else cast(
-                ContinuityFeatureDocument, mandate_feature["spec"],
+            state, selected_mandate,
+            None if mandate_documents is None else cast(
+                ContinuityFeatureDocument, mandate_documents["spec"],
             ),
-            None if mandate_feature is None else cast(
-                list[ContinuityTaskDocument], mandate_feature["tasks"],
+            None if mandate_documents is None else cast(
+                list[ContinuityTaskDocument], mandate_documents["tasks"],
             ),
             input_snapshot,
         )
         result["mandate"] = implementation
         result["next_task"] = (
             implementation["next_task"]
-            if selected == mandate["feature_id"] else None
+            if selected == selected_mandate["feature_id"]
+            and state["execution"] is None else None
         )
     return result
 
@@ -2413,6 +2563,7 @@ def _continuity_historical_check(
         stale_reason = "task_not_current"
     else:
         return None
+    mandate_id = receipt.get("mandate_id")
     return {
         "passed": False, "fresh": False,
         "historical_passed": receipt["exit_code"] == 0,
@@ -2424,6 +2575,10 @@ def _continuity_historical_check(
         "reported_by_session_id": receipt["reported_by_session_id"],
         "recorded_revision": receipt["recorded_revision"],
         "stale_reason": stale_reason,
+        **(
+            {"mandate_id": mandate_id}
+            if isinstance(mandate_id, str) else {}
+        ),
     }
 
 
@@ -2435,6 +2590,16 @@ def _active_attempt(state: ContinuityStateData) -> ContinuityAttempt:
         if attempt["task_id"] == execution["task_id"] and attempt["attempt"] == execution["attempt"]:
             return attempt
     raise ContinuityError("CORRUPT_CONTINUITY", "active Task attempt is missing from history")
+
+
+def _active_attempt_projection(state: ContinuityStateData) -> dict[str, object]:
+    attempt = dict(_active_attempt(state))
+    execution = state["execution"]
+    assert execution is not None
+    owner = _task_owner(state, execution["task_id"])
+    if owner is not None:
+        attempt["feature_id"] = owner
+    return attempt
 
 
 def _pending_detour(

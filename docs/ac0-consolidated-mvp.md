@@ -138,28 +138,43 @@ does not establish that every user journey has passed in a live OpenCode host.
 
 AC1 extends the existing schema-1 continuity writer; it does not add a second
 workflow engine, writer, scheduler, permission store, or per-increment schema.
-An explicit `implement --all` starts one revision-bound Core mandate with a
-stable ID, Feature ID, mode `ALL`, the accepted criterion and Increment IDs
-plus their current definition digests, source/recorded revisions, originating
-session, and an explicit `close_feature` flag (default `false`). The mandate
-is persisted through the existing transaction/journal before any task effect.
-Queue, begin, report, verification, scoped Task additions, detours, and recovery
-must carry that exact mandate ID while it is active. A Task attempt started
-under a mandate also records the mandate ID. Existing unmandated schema-1
-projects remain readable and retain their established behavior.
+An explicit `implement --all` starts one revision-bound Core mandate for the
+exact Feature, with a stable ID, mode `ALL`, the normative Feature Outcome
+digest, each criterion ID and definition digest, each Increment ID and
+normative Outcome digest, source/recorded revisions, originating session, and
+an explicit `close_feature` flag (default `false`). Schema 1 stores one current
+mandate per Feature and retains replaced mandates in history; it uses the
+existing transaction/journal and adds no second writer or scheduler. Session-
+local Feature selection chooses which mandate appears as the selected
+projection, while the feature list retains each Feature's own mandate. This
+does not permit parallel Task execution: there is still only one unresolved
+Task checkpoint for the worktree. Queue, begin, report, verification, scoped
+Task additions, detours, and recovery must carry the exact Feature and its
+current mandate ID. A Task attempt and its check record that mandate ID.
+Unmandated schema-1 projects remain readable and keep their established
+behavior. A legacy mandate without a normative Feature Outcome digest is
+readable but `STALE_SCOPE`: only an exact report or recovery for an already
+checkpointed Feature/mandate/Task, with the appropriate originating session or
+reconciliation evidence, can preserve that attempt; explicitly replace the
+legacy mandate before any new effects.
 
 The read-only mandate projection reports each bound criterion/check, Increment
 coverage and its Tasks, Task status/eligibility, missing Task IDs for an agreed
 Increment, the next eligible Task, active checkpoint and attempt history. It
 reports `FINISHED` only when every bound criterion has a current passing check,
 all scoped Tasks are complete, and every bound Increment has Task coverage and
-is finished; empty work is not completion. If accepted criterion/Increment
-definitions change, the old mandate becomes `STALE_SCOPE`; only after explicit
-Markdown reconciliation may a new mandate replace it by naming the exact old
-ID. A missing Task in an already-bound fourth (or later) Increment can be
-added using the same mandate ID. `close_feature` defaults false; `--all` never
-closes automatically, and `/evospec.close` remains a separate explicit Core
-operation subject to current checks.
+is finished; empty work is not completion. Display-title changes, notes,
+formatting, and technical `plan.md` refinements do not change mandate scope.
+A plan refinement can name the exact stable Increment ID it develops, but it
+does not authorize a new normative outcome. A changed Feature Outcome,
+criterion definition, or Increment Outcome makes the old mandate
+`STALE_SCOPE` even when stable IDs are unchanged; only after explicit Markdown
+reconciliation may a new mandate replace it by naming the exact old ID.
+Replacement retains prior attempt/check attribution and mandate history. A
+missing Task in an already-bound fourth (or later) Increment can be added using
+the same mandate ID. `close_feature` defaults false; `--all` never closes
+automatically, and `/evospec.close` remains a separate explicit Core operation
+subject to current checks.
 
 Task refinements/additions continue through the existing Core task operation
 or explicit Markdown reconciliation, preserving stable IDs and dependency
@@ -178,20 +193,23 @@ automatic host-cancellation inference. Criterion receipts remain bound to
 current Core snapshots, and repository-input changes require refreshing
 affected evidence.
 
-Deterministic Core regressions cover mandate creation/digests, the fourth
-Increment Task added later under the same ID, stale scope and exact replacement,
-task block/cancel/reopen and fresh-check requirements, and fresh-session
-unknown-outcome recovery without replay. The related-mandate regression
+Deterministic Core regressions cover per-Feature mandates and session selection
+with one global unresolved checkpoint, the fourth Increment Task added later
+under the same ID, stale Feature/criterion/Increment Outcomes and exact
+replacement, non-normative title/notes/format/plan edits, legacy-mandate exact
+recovery, task block/cancel/reopen and fresh-check requirements, and
+fresh-session unknown-outcome recovery without replay. The related-mandate regression
 [`test_related_mandate_detour_pauses_before_effect_and_returns_exact_task`](../tests/test_continuity.py)
 checks the durable pre-effect pause, blocked begin, result recording, affected
 check refresh, unchanged accepted scope, and exact return Task. The packaged
 integration fixture simulates one `--all` entry through the real packaged
 adapter, provider-neutral protocol, and Core against temporary application
 files; simulated host permission/session APIs and Node VM tests exercise
-create/list, persistence, completion, filtering, a functional delete-completed
-fourth Increment, the separate related blue-button request, an isolated
-external detour, and fresh-session interruption recovery. The fixture checks
-app store functions and button source, not browser rendering.
+create/list, persistence, completion, filtering, an exact-ID technical
+refinement of an admitted Increment consumed by Task work, a functional
+delete-completed fourth Increment, the separate related blue-button request,
+an isolated external detour, and fresh-session interruption recovery. The
+fixture checks app store functions and button source, not browser rendering.
 This is composed application and adapter evidence only. It does not prove a
 live OpenCode session, native permission dialog, human approval, browser
 rendering, or authenticated identity.
@@ -206,8 +224,9 @@ rendering, or authenticated identity.
 - `.evospec/continuity.json` (schema 1) owns operational state: revision,
   Feature directory/status/cycle, selection, Task-attempt state/history,
   active checkpoint, checks, close/reopen history, pauses, stable IDs,
-  the optional current implementation mandate and Task lifecycle-event history,
-  semantic and byte digests, typed identity metadata, and any pending
+  per-Feature current implementation mandates and replacement history, Task
+  lifecycle-event history, semantic and byte digests, typed identity metadata,
+  and any pending
   publication journal. It does not duplicate current Feature/plan/Task
   definitions.
 - Ordinary Markdown is the direct human authority under

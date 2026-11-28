@@ -54,6 +54,7 @@ class _ContinuityCheckView(TypedDict):
     reported_by_session_id: str
     recorded_revision: int
     observed_input_scope: NotRequired[dict[str, str]]
+    mandate_id: NotRequired[str]
 
 
 def _continuity_check_view(check: ContinuityCheck) -> _ContinuityCheckView:
@@ -75,6 +76,9 @@ def _continuity_check_view(check: ContinuityCheck) -> _ContinuityCheckView:
             "policy_digest": observed["policy_digest"],
             "fingerprint": observed["fingerprint"],
         }
+    mandate_id = check.get("mandate_id")
+    if mandate_id is not None:
+        view["mandate_id"] = mandate_id
     return view
 
 

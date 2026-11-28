@@ -2695,6 +2695,17 @@ assert(queued.mandate.next_task === task1.id,
 assert(permissions.length === permissionCountAfterStart
   && permissionCountAfterStart === permissionCountBeforeStart + 1,
   "only the explicit mandate start added a write permission request")
+const technicalPlan = `Increment ${increments[0].id} — technical refinement 2:
+Use a bounded JSON parse around local storage reads; keep valid records and return an empty list for malformed storage.`
+current = await call("plan", current.revision, {
+  feature_id: featureID, plan: technicalPlan,
+})
+assert(current.selected_feature.plan.includes(increments[0].id)
+  && current.selected_feature.plan.includes("bounded JSON parse")
+  && current.mandate.id === mandateID
+  && current.mandate.status === mandate.status
+  && current.mandate.status !== "STALE_SCOPE",
+  "an exact-reference technical plan refinement is non-normative and keeps the same mandate")
 
 const begin = async (taskID) => call("implement", current.revision, {
   feature_id: featureID, task_id: taskID, mandate_id: mandateID, phase: "begin",
@@ -2822,6 +2833,11 @@ assert(relatedBlueTest.includes("#1565c0") || relatedBlueTest.includes("Add butt
 current = await verify(task1.id, criteria[0], current.revision)
 assert(current.mandate.next_task === task2.id,
   "after rechecking the CSS-affected criterion, the exact return Task remains next")
+const task2Plan = current.selected_feature.plan
+assert(task2Plan.includes(`Increment ${increments[0].id}`)
+  && task2Plan.includes("bounded JSON parse")
+  && appV2.includes("catch { return []; }"),
+  "the task consumes the exact Increment refinement and implements its malformed-storage fallback")
 
 started = await begin(task2.id)
 await Bun.write("index.html", appV2)
@@ -2933,29 +2949,148 @@ assert(finalStatus.selected_feature.criteria[4].description.includes("deleted")
   && !finalStatus.selected_feature.increments.some((increment) =>
     /\\bblue\\b/i.test(`${increment.title} ${increment.outcome}`)),
   "the functional deletion Increment is accepted separately from the blue request")
+
+activeSession = "ses-ac1-independent"
+let featureBState = await call("specify", finalStatus.revision, {
+  title: "Independent Feature B",
+  outcome: "Users can review a separate set of work.",
+  criteria: [
+    { description: "The first item can be reviewed.", check_kind: "node-test", check_target: "tests/create-list.test.mjs" },
+    { description: "The second item can be reviewed.", check_kind: "node-test", check_target: "tests/persistence.test.mjs" },
+  ],
+  increments: [
+    { title: "Review first item", outcome: "Review the first item." },
+    { title: "Review second item", outcome: "Review the second item." },
+  ],
+  tasks: [
+    { title: "Review the first item", description: "Record the first review.", increment_index: 0, criteria: [0], depends_on: [] },
+    { title: "Review the second item", description: "Record the second review.", increment_index: 1, criteria: [1], depends_on: [0] },
+  ],
+  plan: "Review the two items in order.",
+})
+const featureB = featureBState.selected_feature
+const taskB1 = featureB.tasks[0]
+const taskB2 = featureB.tasks[1]
+featureBState = await call("implement", featureBState.revision, {
+  feature_id: featureB.id, phase: "start", mode: "ALL",
+})
+const mandateBID = featureBState.mandate.id
+const beginB = await call("implement", featureBState.revision, {
+  feature_id: featureB.id, task_id: taskB1.id,
+  mandate_id: mandateBID, phase: "begin",
+})
+const reportB = await call("implement", beginB.revision, {
+  feature_id: featureB.id, task_id: taskB1.id,
+  mandate_id: mandateBID, phase: "report",
+  result: "SUCCEEDED", report: "Feature B first review is implemented.",
+})
+const checksBeforeBVerify = checks.length
+const verifiedB = await call("verify", reportB.revision, {
+  feature_id: featureB.id, task_id: taskB1.id,
+  criterion_id: featureB.criteria[0].id, mandate_id: mandateBID,
+})
+assert(verifiedB.selected_feature.id === featureB.id
+  && verifiedB.selected_feature.tasks.find((task) => task.id === taskB1.id).status === "COMPLETED",
+  "the packaged verify route records B's check against B's linked Task")
+assert(permissions.at(-1).action === "evospec_continuity_verify"
+  && checks.length === checksBeforeBVerify + 1
+  && checks.at(-1) === featureB.criteria[0].check_target,
+  "Feature B verification uses the existing host permission route")
+
+const featureBSpecPath = `specs/${featureB.directory}/spec.md`
+const featureBSpec = await Bun.file(featureBSpecPath).text()
+const revisedOutcomeB = "Users can review a materially revised separate set of work."
+assert(featureBSpec.includes(featureB.outcome), "the fixture contains B's original normative Outcome")
+await Bun.write(featureBSpecPath, featureBSpec.replace(featureB.outcome, revisedOutcomeB))
+const driftedB = await call("status", undefined)
+assert(driftedB.status === "DOCUMENT_RECONCILIATION_REQUIRED"
+  && driftedB.document_changes.semantic.includes(featureBSpecPath),
+  "Outcome-only drift reaches the packaged reconciliation route for B's exact spec")
+const reconciledB = await call("reconcile", driftedB.revision, {
+  feature_id: featureB.id, mandate_id: mandateBID,
+})
+assert(reconciledB.selected_feature.id === featureB.id
+  && reconciledB.mandate.id === mandateBID
+  && reconciledB.mandate.status === "STALE_SCOPE",
+  "the packaged reconcile route requires and retains B's exact mandate after Outcome drift")
+let oldBAuthorityRejected = false
+try {
+  await call("implement", reconciledB.revision, {
+    feature_id: featureB.id, task_id: taskB2.id,
+    mandate_id: mandateBID, phase: "begin",
+  })
+} catch (error) {
+  oldBAuthorityRejected = String(error).includes("MANDATE_STALE_SCOPE")
+}
+assert(oldBAuthorityRejected,
+  "material Outcome drift rejects new effects under B's old pending mandate")
+const replacedB = await call("implement", reconciledB.revision, {
+  feature_id: featureB.id, phase: "start", mode: "ALL",
+  replace_mandate_id: mandateBID,
+})
+const replacementBID = replacedB.mandate.id
+assert(replacementBID !== mandateBID && replacedB.mandate.status === "PENDING",
+  "only the explicit exact-ID replacement grants work under B's revised Outcome")
+
+activeSession = "ses-ac1-primary"
+const returnedA = await call("status", undefined)
+const returnedBView = returnedA.features.find((feature) => feature.id === featureB.id)
+assert(returnedA.selected_feature.id === featureID
+  && returnedA.mandate.id === mandateID
+  && returnedA.mandate.status === "FINISHED"
+  && returnedBView.mandate.id === replacementBID,
+  "returning to A preserves its original mandate while B retains its own replacement")
 await Promise.all(pendingReads)
+const bVerifyRequest = protocolRequests.findLast((request) =>
+  request.operation === "verify" && request.data.feature_id === featureB.id)
+const bReconcileRequest = protocolRequests.findLast((request) =>
+  request.operation === "reconcile" && request.data.feature_id === featureB.id)
+const bReplacementRequest = protocolRequests.findLast((request) =>
+  request.operation === "implement" && request.data.replace_mandate_id === mandateBID)
+assert(bVerifyRequest.data.task_id === taskB1.id
+  && bVerifyRequest.data.mandate_id === mandateBID
+  && bReconcileRequest.data.mandate_id === mandateBID
+  && bReplacementRequest.data.feature_id === featureB.id,
+  "the real adapter forwards B's exact Feature, Task, check, mandate, and replacement identities")
+const multiFeatureLedger = JSON.parse(await Bun.file(".evospec/continuity.json").text())
+assert(multiFeatureLedger.mandates[featureID].id === mandateID
+  && multiFeatureLedger.mandates[featureB.id].id === replacementBID
+  && multiFeatureLedger.mandate_history.length === 1
+  && multiFeatureLedger.mandate_history[0].id === mandateBID
+  && multiFeatureLedger.mandate_history[0].feature_id === featureB.id
+  && multiFeatureLedger.attempts.find((attempt) => attempt.task_id === taskB1.id).mandate_id === mandateBID
+  && multiFeatureLedger.checks.find((check) => check.task_id === taskB1.id).mandate_id === mandateBID,
+  "B's replacement preserves its own attempt/check history and does not replace or absorb A's mandate")
 const starts = protocolRequests.filter((request) =>
   request.operation === "implement" && request.data.phase === "start")
-assert(starts.length === 1 && starts[0].data.feature_id === featureID
-  && starts[0].data.mode === "ALL",
-  "the entire composed run uses exactly one Feature-bound ALL start")
+assert(starts.length === 3
+  && starts[0].data.feature_id === featureID
+  && starts[0].data.mode === "ALL"
+  && starts[1].data.feature_id === featureB.id
+  && starts[1].data.mode === "ALL"
+  && starts[2].data.feature_id === featureB.id
+  && starts[2].data.replace_mandate_id === mandateBID,
+  "the composed run starts A and B independently, then explicitly replaces only B")
 const begins = protocolRequests.filter((request) =>
   request.operation === "implement" && request.data.phase === "begin")
-assert(begins.length === 7
-  && new Set(begins.map((request) => request.data.task_id)).size === 5
+assert(begins.length === 9
+  && new Set(begins.map((request) => request.data.task_id)).size === 7
   && begins.filter((request) => request.data.task_id === task2.id).length === 2
-  && begins.filter((request) => request.data.task_id === task5.id).length === 2,
-  "five Tasks have one durable begin each; pause and recovery replays are rejected")
-assert(protocolRequests.filter((request) => request.operation === "verify").length === 17,
+  && begins.filter((request) => request.data.task_id === task5.id).length === 2
+  && begins.filter((request) => request.data.task_id === taskB1.id).length === 1
+  && begins.filter((request) => request.data.task_id === taskB2.id).length === 1,
+  "the original Tasks and Feature B retain distinct durable attempt routes")
+const verifyRequests = protocolRequests.filter((request) => request.operation === "verify")
+assert(verifyRequests.length === 18,
   "each Task's check is recorded only after the latest input change")
-assert(protocolRequests.filter((request) =>
-  request.operation === "verify").every((request) => request.data.mandate_id === mandateID),
-  "every check preserves exact mandate binding")
-assert(checks.length === 20
-  && checks.filter((target) => target === "tests/blue-button.test.mjs").length === 2
+assert(verifyRequests.every((request) =>
+  (request.data.feature_id === featureID && request.data.mandate_id === mandateID)
+  || (request.data.feature_id === featureB.id && request.data.mandate_id === mandateBID)),
+  "every check preserves its own exact Feature and mandate binding")
+assert(checks.filter((target) => target === "tests/blue-button.test.mjs").length === 2
   && checks.filter((target) => target === "tests/delete-completed.test.mjs").length === 2
   && checks.every((target) => target.startsWith("tests/")),
-  "all acceptance checks run only the bounded temporary Node test modules")
+  "all acceptance checks run only bounded temporary Node tests")
 const writeRequests = permissions.map((request) => ({
   action: request.action,
   resource: JSON.parse(request.resources[0]),

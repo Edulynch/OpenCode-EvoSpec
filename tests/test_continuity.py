@@ -52,6 +52,7 @@ class _CheckView(TypedDict):
     task_id: str | None
     historical_passed: NotRequired[bool]
     stale_reason: NotRequired[str]
+    mandate_id: NotRequired[str]
 
 
 class _CriterionView(TypedDict):
@@ -97,6 +98,7 @@ class _FeatureView(TypedDict):
     reopen_history: list[object]
     plan: str
     task_events: NotRequired[list[dict[str, object]]]
+    mandate: NotRequired[dict[str, object]]
 
 
 class _DocumentConflictView(TypedDict):
@@ -141,6 +143,8 @@ class _ContinuityView(TypedDict):
     publication_recovery: NotRequired[_PublicationRecoveryView]
     mandate: NotRequired[dict[str, object]]
     active_attempt: NotRequired[dict[str, object] | None]
+    execution_feature_id: NotRequired[str | None]
+    mandate_history: NotRequired[list[dict[str, object]]]
 
 
 def _record(value: object) -> TypeGuard[dict[str, object]]:
@@ -364,6 +368,8 @@ def _continuity_view(value: object) -> _ContinuityView:
     publication_recovery = value.get("publication_recovery")
     mandate = value.get("mandate")
     active_attempt = value.get("active_attempt")
+    execution_feature_id = value.get("execution_feature_id")
+    mandate_history = value.get("mandate_history")
     if type(revision) is not int:
         raise AssertionError("expected integer continuity revision")
     if (
@@ -411,6 +417,14 @@ def _continuity_view(value: object) -> _ContinuityView:
         if active_attempt is not None and not _record(active_attempt):
             raise AssertionError("expected an optional active Task attempt")
         result["active_attempt"] = active_attempt
+    if "execution_feature_id" in value:
+        if not _optional_text(execution_feature_id):
+            raise AssertionError("expected an optional unresolved execution owner")
+        result["execution_feature_id"] = execution_feature_id
+    if "mandate_history" in value:
+        if not _record_views(mandate_history):
+            raise AssertionError("expected attributable mandate history")
+        result["mandate_history"] = mandate_history
     return result
 
 
@@ -2283,15 +2297,19 @@ class ContinuityTests(unittest.TestCase):
             saved = json.loads(
                 (root / ".evospec" / "continuity.json").read_text(encoding="utf-8"),
             )
-            stored_mandate = saved["mandate"]
+            stored_mandate = saved["mandates"][feature["id"]]
             self.assertEqual(
                 stored_mandate["criteria"][0]["digest"],
                 saved["identity_metadata"][feature["criteria"][0]["id"]]["digest"],
             )
             self.assertEqual(stored_mandate["increments"][3]["id"], fourth["id"])
-            self.assertEqual(stored_mandate["increments"][3]["digest"], saved[
-                "identity_metadata"
-            ][fourth["id"]]["digest"])
+            self.assertEqual(
+                stored_mandate["increments"][3]["digest"],
+                sha256(json.dumps(
+                    {"id": fourth["id"], "outcome": fourth["outcome"]},
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                ).encode("utf-8")).hexdigest(),
+            )
 
             repeated = self.call(root, "implement", started["revision"], data={
                 "feature_id": feature["id"], "phase": "start", "mode": "ALL",
@@ -2383,6 +2401,643 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(new_mandate["source_revision"], reconciled["revision"])
             self.assertEqual(new_mandate["status"], "PENDING")
             self.assertEqual(restarted["revision"], reconciled["revision"] + 1)
+
+    def test_feature_mandates_can_be_replaced_in_reverse_creation_order(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            session_a, session_b = "ses_ac1_history_a", "ses_ac1_history_b"
+            created_a = self.call(
+                root, "specify", 0, session_a, spec_request("History Feature A"),
+            )
+            feature_a = _selected_feature(created_a)
+            created_b = self.call(
+                root, "specify", created_a["revision"], session_b,
+                spec_request("History Feature B"),
+            )
+            feature_b = _selected_feature(created_b)
+            task_a, task_b = feature_a["tasks"][0], feature_b["tasks"][0]
+            criterion_a, criterion_b = feature_a["criteria"][0], feature_b["criteria"][0]
+
+            started_a = self.call(root, "implement", created_b["revision"], session_a, {
+                "feature_id": feature_a["id"], "phase": "start", "mode": "ALL",
+            })
+            mandate_a_id = _mandate_id(started_a)
+            started_b = self.call(root, "implement", started_a["revision"], session_b, {
+                "feature_id": feature_b["id"], "phase": "start", "mode": "ALL",
+            })
+            mandate_b_id = _mandate_id(started_b)
+            recorded_a = _mandate(started_a)["recorded_revision"]
+            recorded_b = _mandate(started_b)["recorded_revision"]
+            if type(recorded_a) is not int or type(recorded_b) is not int:
+                self.fail("expected integer mandate creation revisions")
+            self.assertLess(recorded_a, recorded_b)
+
+            revision = started_b["revision"]
+            for feature, task, criterion, mandate_id, session in (
+                (feature_a, task_a, criterion_a, mandate_a_id, session_a),
+                (feature_b, task_b, criterion_b, mandate_b_id, session_b),
+            ):
+                begun = self.call(root, "implement", revision, session, {
+                    "feature_id": feature["id"], "task_id": task["id"],
+                    "mandate_id": mandate_id, "phase": "begin",
+                })
+                reported = self.call(root, "implement", begun["revision"], session, {
+                    "feature_id": feature["id"], "task_id": task["id"],
+                    "mandate_id": mandate_id, "phase": "report",
+                    "result": "SUCCEEDED", "report": f"Completed {feature['title']}.",
+                })
+                checked = self.record_check(
+                    root, reported["revision"], task, criterion,
+                    mandate_id=mandate_id, session=session,
+                    feature_id=feature["id"],
+                )
+                revision = checked["revision"]
+
+            for feature, outcome in (
+                (feature_a, "Feature A has a materially revised outcome."),
+                (feature_b, "Feature B has a materially revised outcome."),
+            ):
+                spec_path = root / "specs" / feature["directory"] / "spec.md"
+                spec_path.write_text(
+                    spec_path.read_text(encoding="utf-8").replace(
+                        "Deliver the complete user-visible outcome.", outcome,
+                    ),
+                    encoding="utf-8",
+                )
+
+            reconciled: dict[str, _ContinuityView] = {}
+            for feature, mandate_id, session in (
+                (feature_b, mandate_b_id, session_b),
+                (feature_a, mandate_a_id, session_a),
+            ):
+                drifted = self.call(root, "status", None, session)
+                self.assertEqual(drifted["status"], "DOCUMENT_RECONCILIATION_REQUIRED")
+                self.assertEqual(_mandate_id(drifted), mandate_id)
+                self.assertEqual(_mandate(drifted)["status"], "STALE_SCOPE")
+                reconciled[feature["id"]] = self.call(
+                    root, "reconcile", drifted["revision"], session, {
+                        "feature_id": feature["id"], "mandate_id": mandate_id,
+                    },
+                )
+                self.assertEqual(_mandate_id(reconciled[feature["id"]]), mandate_id)
+                self.assertEqual(
+                    _mandate(reconciled[feature["id"]])["status"], "STALE_SCOPE",
+                )
+
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "implement", reconciled[feature_a["id"]]["revision"], session_b, {
+                    "feature_id": feature_b["id"], "task_id": feature_b["tasks"][1]["id"],
+                    "mandate_id": mandate_b_id, "phase": "begin",
+                })
+            self.assertEqual(raised.exception.code, "MANDATE_STALE_SCOPE")
+
+            replaced_b = self.call(root, "implement", reconciled[feature_a["id"]]["revision"], session_b, {
+                "feature_id": feature_b["id"], "phase": "start", "mode": "ALL",
+                "replace_mandate_id": mandate_b_id,
+            })
+            new_mandate_b_id = _mandate_id(replaced_b)
+            replaced_a = self.call(root, "implement", replaced_b["revision"], session_a, {
+                "feature_id": feature_a["id"], "phase": "start", "mode": "ALL",
+                "replace_mandate_id": mandate_a_id,
+            })
+            new_mandate_a_id = _mandate_id(replaced_a)
+
+            saved = json.loads(
+                (root / ".evospec" / "continuity.json").read_text(encoding="utf-8"),
+            )
+            history = saved["mandate_history"]
+            self.assertEqual(
+                [item["id"] for item in history], [mandate_b_id, mandate_a_id],
+            )
+            self.assertEqual(
+                [item["feature_id"] for item in history],
+                [feature_b["id"], feature_a["id"]],
+            )
+            self.assertEqual(
+                set(saved["mandates"]), {feature_a["id"], feature_b["id"]},
+            )
+            self.assertEqual(saved["mandates"][feature_a["id"]]["id"], new_mandate_a_id)
+            self.assertEqual(saved["mandates"][feature_b["id"]]["id"], new_mandate_b_id)
+            attempts_by_task = {item["task_id"]: item for item in saved["attempts"]}
+            checks_by_task = {item["task_id"]: item for item in saved["checks"]}
+            self.assertEqual(attempts_by_task[task_a["id"]]["mandate_id"], mandate_a_id)
+            self.assertEqual(attempts_by_task[task_b["id"]]["mandate_id"], mandate_b_id)
+            self.assertEqual(checks_by_task[task_a["id"]]["mandate_id"], mandate_a_id)
+            self.assertEqual(checks_by_task[task_b["id"]]["mandate_id"], mandate_b_id)
+            self.assertEqual(
+                {item["id"] for item in history[0]["criteria"]},
+                {item["id"] for item in feature_b["criteria"]},
+            )
+            self.assertEqual(
+                {item["id"] for item in history[1]["criteria"]},
+                {item["id"] for item in feature_a["criteria"]},
+            )
+            self.assertEqual(
+                {item["id"] for item in history[0]["increments"]},
+                {item["id"] for item in feature_b["increments"]},
+            )
+            self.assertEqual(
+                {item["id"] for item in history[1]["increments"]},
+                {item["id"] for item in feature_a["increments"]},
+            )
+
+    def test_feature_mandates_are_local_while_unknown_execution_stays_global(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            session_a = "ses_ac1_feature_a"
+            session_b = "ses_ac1_feature_b"
+            recovery_session = "ses_ac1_feature_recovery"
+
+            def one_increment_request(title: str) -> dict[str, object]:
+                request = spec_request(title)
+                increments = request.get("increments")
+                tasks = request.get("tasks")
+                if (
+                    not _record_views(increments) or not increments
+                    or not _record_views(tasks) or not tasks
+                ):
+                    raise AssertionError("expected the fixture's Increment and Task requests")
+                request["increments"] = [increments[0]]
+                request["tasks"] = [tasks[0]]
+                return request
+
+            created_a = self.call(
+                root, "specify", 0, session_a, one_increment_request("Feature A"),
+            )
+            feature_a = _selected_feature(created_a)
+            created_b = self.call(
+                root, "specify", created_a["revision"], session_b,
+                one_increment_request("Feature B"),
+            )
+            feature_b = _selected_feature(created_b)
+            task_a, criterion_a = feature_a["tasks"][0], feature_a["criteria"][0]
+            task_b, criterion_b = feature_b["tasks"][0], feature_b["criteria"][0]
+
+            started_a = self.call(root, "implement", created_b["revision"], session_a, {
+                "feature_id": feature_a["id"], "phase": "start", "mode": "ALL",
+            })
+            mandate_a_id = _mandate_id(started_a)
+            paused_a = self.call(root, "pause", started_a["revision"], session_a, {
+                "feature_id": feature_a["id"], "mandate_id": mandate_a_id,
+                "reason": "Keep Feature A paused while Feature B is completed.",
+            })
+            self.assertEqual(_mandate(paused_a)["status"], "PAUSED")
+
+            feature_b_spec = root / "specs" / feature_b["directory"] / "spec.md"
+            original_b_spec = feature_b_spec.read_text(encoding="utf-8")
+            feature_b_spec.write_text(
+                original_b_spec.replace(
+                    "Deliver the complete user-visible outcome.",
+                    "Deliver Feature B's independently revised outcome.",
+                ),
+                encoding="utf-8",
+            )
+            b_status = self.call(root, "status", None, session_b)
+            self.assertEqual(b_status["status"], "DOCUMENT_RECONCILIATION_REQUIRED")
+            reconciled_b = self.call(root, "reconcile", b_status["revision"], session_b, {
+                "feature_id": feature_b["id"],
+            })
+            selected_a = self.call(root, "status", None, session_a)
+            self.assertEqual(_mandate_id(selected_a), mandate_a_id)
+            self.assertEqual(_mandate(selected_a)["status"], "PAUSED")
+
+            started_b = self.call(root, "implement", reconciled_b["revision"], session_b, {
+                "feature_id": feature_b["id"], "phase": "start", "mode": "ALL",
+            })
+            mandate_b_id = _mandate_id(started_b)
+            begun_b = self.call(root, "implement", started_b["revision"], session_b, {
+                "feature_id": feature_b["id"], "task_id": task_b["id"],
+                "mandate_id": mandate_b_id, "phase": "begin",
+            })
+            reported_b = self.call(root, "implement", begun_b["revision"], session_b, {
+                "feature_id": feature_b["id"], "task_id": task_b["id"],
+                "mandate_id": mandate_b_id, "phase": "report",
+                "result": "SUCCEEDED", "report": "Feature B work completed.",
+            })
+            checked_b = self.record_check(
+                root, reported_b["revision"], task_b, criterion_b,
+                mandate_id=mandate_b_id, session=session_b,
+                feature_id=feature_b["id"],
+            )
+            self.assertEqual(_mandate(checked_b)["status"], "FINISHED")
+            self.assertEqual(_mandate_id(self.call(root, "status", None, session_a)), mandate_a_id)
+
+            resumed_a = self.call(root, "resume", checked_b["revision"], session_a, {
+                "feature_id": feature_a["id"], "mandate_id": mandate_a_id,
+            })
+            self.assertEqual(_mandate(resumed_a)["id"], mandate_a_id)
+            self.assertEqual(_mandate(resumed_a)["status"], "PENDING")
+            checkpointed_a = self.call(root, "implement", resumed_a["revision"], session_a, {
+                "feature_id": feature_a["id"], "task_id": task_a["id"],
+                "mandate_id": mandate_a_id, "phase": "begin",
+                "report": "Feature A checkpoint before simulated effects.",
+            })
+            self.assertEqual(checkpointed_a.get("execution_feature_id"), feature_a["id"])
+            active_attempt = checkpointed_a.get("active_attempt")
+            self.assertIsNotNone(active_attempt)
+            assert active_attempt is not None
+            self.assertEqual(active_attempt["feature_id"], feature_a["id"])
+            self.assertEqual(active_attempt["task_id"], task_a["id"])
+            self.assertEqual(active_attempt["mandate_id"], mandate_a_id)
+
+            blocked_attempts: tuple[tuple[str, dict[str, object], str], ...] = (
+                (
+                    "implement",
+                    {
+                        "feature_id": feature_b["id"], "task_id": task_b["id"],
+                        "mandate_id": mandate_b_id, "phase": "begin",
+                    },
+                    "EXECUTION_BUSY",
+                ),
+                (
+                    "implement",
+                    {
+                        "feature_id": feature_b["id"], "phase": "start",
+                        "mode": "ALL", "replace_mandate_id": mandate_b_id,
+                    },
+                    "EXECUTION_BUSY",
+                ),
+                (
+                    "implement",
+                    {
+                        "feature_id": feature_a["id"], "phase": "start",
+                        "mode": "ALL", "replace_mandate_id": mandate_a_id,
+                    },
+                    "EXECUTION_BUSY",
+                ),
+            )
+            for operation, data, expected in blocked_attempts:
+                with self.assertRaises(ContinuityError) as raised:
+                    self.call(
+                        root, operation, checkpointed_a["revision"], session_b, data,
+                    )
+                self.assertEqual(raised.exception.code, expected)
+
+            selected_while_a_unknown = self.call(
+                root, "status", None, session_a,
+            )
+            self.assertEqual(selected_while_a_unknown.get("selected_feature_id"), feature_a["id"])
+            self.assertEqual(selected_while_a_unknown.get("execution_feature_id"), feature_a["id"])
+            self.assertEqual(
+                _mandate(selected_while_a_unknown)["status"], "UNKNOWN_EFFECT",
+            )
+            feature_b_view = next(
+                item for item in _features(selected_while_a_unknown)
+                if item["id"] == feature_b["id"]
+            )
+            feature_b_mandate = feature_b_view.get("mandate")
+            self.assertIsNotNone(feature_b_mandate)
+            assert feature_b_mandate is not None
+            self.assertEqual(feature_b_mandate["id"], mandate_b_id)
+            self.assertEqual(feature_b_mandate["status"], "FINISHED")
+
+            b_plan = root / "specs" / feature_b["directory"] / "plan.md"
+            b_plan.write_text(
+                b_plan.read_text(encoding="utf-8")
+                .replace("Build each increment in order", "Refine Feature B's plan"),
+                encoding="utf-8",
+            )
+            drifted_b = self.call(root, "status", None, session_b)
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "reconcile", drifted_b["revision"], session_b, {
+                    "feature_id": feature_b["id"], "mandate_id": mandate_b_id,
+                })
+            self.assertEqual(raised.exception.code, "EXECUTION_BUSY")
+
+            for task_id, supplied_mandate, expected in (
+                (task_a["id"], None, "MANDATE_MISMATCH"),
+                (task_b["id"], mandate_a_id, "TASK_MISMATCH"),
+            ):
+                data: dict[str, object] = {
+                    "feature_id": feature_a["id"], "task_id": task_id,
+                    "reconcile": "COMPLETE", "evidence_ref": "fixture:observed-a",
+                }
+                if supplied_mandate is not None:
+                    data["mandate_id"] = supplied_mandate
+                with self.assertRaises(ContinuityError) as raised:
+                    self.call(
+                        root, "resume", checkpointed_a["revision"],
+                        recovery_session, data,
+                    )
+                self.assertEqual(raised.exception.code, expected)
+
+            recovered_a = self.call(
+                root, "resume", checkpointed_a["revision"], recovery_session, {
+                    "feature_id": feature_a["id"], "task_id": task_a["id"],
+                    "mandate_id": mandate_a_id, "reconcile": "COMPLETE",
+                    "evidence_ref": "fixture:observed-a",
+                },
+            )
+            self.assertIsNone(recovered_a.get("active_attempt"))
+            reconciled_b_plan = self.call(
+                root, "reconcile", recovered_a["revision"], session_b, {
+                    "feature_id": feature_b["id"], "mandate_id": mandate_b_id,
+                },
+            )
+            self.assertEqual(_mandate(reconciled_b_plan)["id"], mandate_b_id)
+            self.assertEqual(_mandate(reconciled_b_plan)["status"], "FINISHED")
+
+            checked_a = self.record_check(
+                root, reconciled_b_plan["revision"], task_a, criterion_a,
+                mandate_id=mandate_a_id, session=session_a,
+                feature_id=feature_a["id"],
+            )
+            returned_a = self.call(root, "status", None, session_a)
+            returned_b = self.call(root, "status", None, session_b)
+            self.assertEqual(_selected_feature(returned_a)["id"], feature_a["id"])
+            self.assertEqual(_mandate_id(returned_a), mandate_a_id)
+            self.assertEqual(_mandate(returned_a)["status"], "FINISHED")
+            self.assertEqual(_selected_feature(returned_b)["id"], feature_b["id"])
+            self.assertEqual(_mandate_id(returned_b), mandate_b_id)
+            self.assertEqual(_mandate(returned_b)["status"], "FINISHED")
+            repeated_a = self.call(root, "implement", returned_a["revision"], session_a, {
+                "feature_id": feature_a["id"], "phase": "start", "mode": "ALL",
+                "replace_mandate_id": mandate_a_id,
+            })
+            self.assertEqual(repeated_a["revision"], returned_a["revision"])
+            self.assertEqual(_mandate_id(repeated_a), mandate_a_id)
+
+            saved = json.loads(
+                (root / ".evospec" / "continuity.json").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                {feature_a["id"], feature_b["id"]}, set(saved["mandates"]),
+            )
+            self.assertEqual(saved["mandates"][feature_a["id"]]["id"], mandate_a_id)
+            self.assertEqual(saved["mandates"][feature_b["id"]]["id"], mandate_b_id)
+            self.assertEqual(
+                [item["mandate_id"] for item in saved["attempts"]],
+                [mandate_b_id, mandate_a_id],
+            )
+            self.assertEqual(
+                {item["mandate_id"] for item in saved["checks"]},
+                {mandate_a_id, mandate_b_id},
+            )
+            recovered_attempt = next(
+                item for item in saved["attempts"] if item["task_id"] == task_a["id"]
+            )
+            self.assertEqual(recovered_attempt["status"], "RECONCILED_COMPLETE")
+            self.assertEqual(recovered_attempt["mandate_id"], mandate_a_id)
+            self.assertEqual(recovered_attempt["evidence_ref"], "fixture:observed-a")
+
+    def test_mandate_binds_normative_outcomes_but_allows_titles_notes_and_plan_refinement(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            created = self.call(root, "specify", 0, data=spec_request())
+            feature = _selected_feature(created)
+            criterion = feature["criteria"][0]
+            task = feature["tasks"][0]
+            first_increment = feature["increments"][0]
+            started = self.call(root, "implement", created["revision"], data={
+                "feature_id": feature["id"], "phase": "start", "mode": "ALL",
+            })
+            original_mandate_id = _mandate_id(started)
+            checkpointed = self.call(root, "implement", started["revision"], data={
+                "feature_id": feature["id"], "task_id": task["id"],
+                "mandate_id": original_mandate_id, "phase": "begin",
+            })
+            reported = self.call(root, "implement", checkpointed["revision"], data={
+                "feature_id": feature["id"], "task_id": task["id"],
+                "mandate_id": original_mandate_id, "phase": "report",
+                "result": "SUCCEEDED", "report": "The first Task effect completed.",
+            })
+            checked = self.record_check(
+                root, reported["revision"], task, criterion,
+                mandate_id=original_mandate_id, feature_id=feature["id"],
+            )
+
+            spec_path = root / "specs" / feature["directory"] / "spec.md"
+            original_spec = spec_path.read_text(encoding="utf-8")
+            titled_spec = original_spec.replace(
+                "# Three increment Feature", "# Display title changed",
+            ).replace(
+                f"**{first_increment['title']}**", "**Renamed increment for display**",
+            ).replace(
+                "<!-- evospec-notes:start -->\n<!-- evospec-notes:end -->",
+                "<!-- evospec-notes:start -->\nThese notes are non-normative.\n<!-- evospec-notes:end -->",
+            ).replace("\n", "\r\n")
+            spec_path.write_bytes(titled_spec.encode("utf-8"))
+            title_status = self.call(root, "status", None)
+            self.assertEqual(title_status["status"], "DOCUMENT_RECONCILIATION_REQUIRED")
+            self.assertEqual(_mandate_id(title_status), original_mandate_id)
+            self.assertEqual(_mandate(title_status)["status"], "PENDING")
+            reconciled_titles = self.call(root, "reconcile", title_status["revision"], data={
+                "feature_id": feature["id"], "mandate_id": original_mandate_id,
+            })
+            titled_feature = _selected_feature(reconciled_titles)
+            self.assertEqual(titled_feature["title"], "Display title changed")
+            self.assertEqual(titled_feature["increments"][0]["id"], first_increment["id"])
+            self.assertEqual(_mandate_id(reconciled_titles), original_mandate_id)
+            self.assertEqual(_mandate(reconciled_titles)["status"], "PENDING")
+
+            normalized_spec = spec_path.read_text(encoding="utf-8").replace(
+                "\r\n", "\n",
+            ).replace(
+                "These notes are non-normative.",
+                "Formatting and notes do not change the accepted Outcome.",
+            )
+            spec_path.write_bytes(normalized_spec.encode("utf-8"))
+            format_status = self.call(root, "status", None)
+            document_changes = format_status.get("document_changes")
+            self.assertIsNotNone(document_changes)
+            assert document_changes is not None
+            self.assertIn(
+                f"specs/{feature['directory']}/spec.md",
+                document_changes["format_notes"],
+            )
+            reconciled_format = self.call(
+                root, "reconcile", format_status["revision"], data={
+                    "feature_id": feature["id"], "mandate_id": original_mandate_id,
+                },
+            )
+            self.assertEqual(_mandate_id(reconciled_format), original_mandate_id)
+            self.assertEqual(_mandate(reconciled_format)["status"], "PENDING")
+
+            technical_plan = (
+                f"Increment `{first_increment['id']}` — technical refinement 2:\n"
+                "Use a bounded JSON parse around local storage reads; keep valid "
+                "records and return an empty list for malformed storage."
+            )
+            refined_plan = self.call(root, "plan", reconciled_format["revision"], data={
+                "feature_id": feature["id"], "plan": technical_plan,
+            })
+            self.assertIn(first_increment["id"], _selected_feature(refined_plan)["plan"])
+            self.assertIn("bounded JSON parse", _selected_feature(refined_plan)["plan"])
+            self.assertEqual(_mandate_id(refined_plan), original_mandate_id)
+            self.assertEqual(_mandate(refined_plan)["status"], "PENDING")
+            self.assertEqual(
+                [item["id"] for item in _mandate_increments(refined_plan)],
+                [item["id"] for item in feature["increments"]],
+            )
+
+            current_spec = spec_path.read_text(encoding="utf-8")
+            spec_path.write_text(
+                current_spec.replace(
+                    "Deliver the complete user-visible outcome.",
+                    "Deliver the revised normative Feature outcome.",
+                ),
+                encoding="utf-8",
+            )
+            outcome_status = self.call(root, "status", None)
+            self.assertEqual(_mandate(outcome_status)["status"], "STALE_SCOPE")
+            reconciled_outcome = self.call(
+                root, "reconcile", outcome_status["revision"], data={
+                    "feature_id": feature["id"],
+                    "mandate_id": original_mandate_id,
+                },
+            )
+            self.assertEqual(_mandate(reconciled_outcome)["status"], "STALE_SCOPE")
+            self.assertEqual(
+                _criterion_check(
+                    _selected_feature(reconciled_outcome)["criteria"][0]
+                ).get("mandate_id"),
+                original_mandate_id,
+            )
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "implement", reconciled_outcome["revision"], data={
+                    "feature_id": feature["id"], "task_id": task["id"],
+                    "mandate_id": original_mandate_id, "phase": "begin",
+                })
+            self.assertEqual(raised.exception.code, "MANDATE_STALE_SCOPE")
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "implement", reconciled_outcome["revision"], data={
+                    "feature_id": feature["id"], "phase": "start", "mode": "ALL",
+                })
+            self.assertEqual(raised.exception.code, "MANDATE_ACTIVE")
+            replaced_outcome = self.call(root, "implement", reconciled_outcome["revision"], data={
+                "feature_id": feature["id"], "phase": "start", "mode": "ALL",
+                "replace_mandate_id": original_mandate_id,
+            })
+            outcome_mandate_id = _mandate_id(replaced_outcome)
+            self.assertNotEqual(outcome_mandate_id, original_mandate_id)
+            self.assertEqual(_mandate(replaced_outcome)["status"], "PENDING")
+
+            current_spec = spec_path.read_text(encoding="utf-8")
+            spec_path.write_text(
+                current_spec.replace(
+                    first_increment["outcome"],
+                    "A changed normative Increment outcome requiring new authority.",
+                ),
+                encoding="utf-8",
+            )
+            increment_status = self.call(root, "status", None)
+            self.assertEqual(_mandate(increment_status)["status"], "STALE_SCOPE")
+            reconciled_increment = self.call(
+                root, "reconcile", increment_status["revision"], data={
+                    "feature_id": feature["id"], "mandate_id": outcome_mandate_id,
+                },
+            )
+            self.assertEqual(_mandate(reconciled_increment)["status"], "STALE_SCOPE")
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "implement", reconciled_increment["revision"], data={
+                    "feature_id": feature["id"], "phase": "start", "mode": "ALL",
+                })
+            self.assertEqual(raised.exception.code, "MANDATE_ACTIVE")
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "implement", reconciled_increment["revision"], data={
+                    "feature_id": feature["id"], "task_id": task["id"],
+                    "mandate_id": outcome_mandate_id, "phase": "begin",
+                })
+            self.assertEqual(raised.exception.code, "MANDATE_STALE_SCOPE")
+            replaced_increment = self.call(
+                root, "implement", reconciled_increment["revision"], data={
+                    "feature_id": feature["id"], "phase": "start", "mode": "ALL",
+                    "replace_mandate_id": outcome_mandate_id,
+                },
+            )
+            self.assertNotEqual(_mandate_id(replaced_increment), outcome_mandate_id)
+            saved = json.loads(
+                (root / ".evospec" / "continuity.json").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                [item["id"] for item in saved["mandate_history"]],
+                [original_mandate_id, outcome_mandate_id],
+            )
+            self.assertEqual(
+                saved["checks"][0]["mandate_id"], original_mandate_id,
+                "old check provenance remains unchanged after exact replacements",
+            )
+            self.assertEqual(saved["attempts"][0]["task_id"], task["id"])
+            self.assertEqual(saved["attempts"][0]["mandate_id"], original_mandate_id)
+            self.assertEqual(saved["attempts"][0]["status"], "REPORTED")
+
+    def test_legacy_unbound_mandate_keeps_exact_unknown_recovery_and_history(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            created = self.call(root, "specify", 0, data={
+                **spec_request("Legacy unbound mandate"),
+                "increments": [],
+                "tasks": [{"title": "Legacy checkpoint", "criteria": [0]}],
+                "plan": "",
+            })
+            feature = _selected_feature(created)
+            task = feature["tasks"][0]
+            started = self.call(root, "implement", created["revision"], data={
+                "feature_id": feature["id"], "phase": "start", "mode": "ALL",
+            })
+            mandate_id = _mandate_id(started)
+            checkpointed = self.call(root, "implement", started["revision"], data={
+                "feature_id": feature["id"], "task_id": task["id"],
+                "mandate_id": mandate_id, "phase": "begin",
+            })
+
+            state_path = root / ".evospec" / "continuity.json"
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy_mandate = saved.pop("mandates").pop(feature["id"])
+            legacy_mandate.pop("outcome_digest")
+            saved.pop("mandate_history")
+            saved["mandate"] = legacy_mandate
+            state_path.write_text(
+                json.dumps(saved, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+
+            recovered_status = self.call(root, "status", None, "ses_ac1_legacy_recovery")
+            self.assertEqual(_mandate(recovered_status)["id"], mandate_id)
+            self.assertEqual(_mandate(recovered_status)["status"], "STALE_SCOPE")
+            self.assertEqual(recovered_status.get("execution_feature_id"), feature["id"])
+            legacy_active_attempt = recovered_status.get("active_attempt")
+            self.assertIsNotNone(legacy_active_attempt)
+            assert legacy_active_attempt is not None
+            self.assertEqual(legacy_active_attempt["mandate_id"], mandate_id)
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "implement", checkpointed["revision"], data={
+                    "feature_id": feature["id"], "task_id": task["id"],
+                    "mandate_id": mandate_id, "phase": "begin",
+                })
+            self.assertEqual(raised.exception.code, "MANDATE_STALE_SCOPE")
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "resume", checkpointed["revision"], "ses_ac1_legacy_recovery", {
+                    "feature_id": feature["id"], "task_id": task["id"],
+                    "reconcile": "INCOMPLETE", "evidence_ref": "fixture:legacy-observation",
+                })
+            self.assertEqual(raised.exception.code, "MANDATE_MISMATCH")
+
+            exact_recovery = self.call(
+                root, "resume", checkpointed["revision"], "ses_ac1_legacy_recovery", {
+                    "feature_id": feature["id"], "task_id": task["id"],
+                    "mandate_id": mandate_id, "reconcile": "INCOMPLETE",
+                    "evidence_ref": "fixture:legacy-observation",
+                },
+            )
+            self.assertIsNone(exact_recovery.get("active_attempt"))
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "implement", exact_recovery["revision"], data={
+                    "feature_id": feature["id"], "phase": "start", "mode": "ALL",
+                })
+            self.assertEqual(raised.exception.code, "MANDATE_ACTIVE")
+            replacement = self.call(root, "implement", exact_recovery["revision"], data={
+                "feature_id": feature["id"], "phase": "start", "mode": "ALL",
+                "replace_mandate_id": mandate_id,
+            })
+            self.assertNotEqual(_mandate_id(replacement), mandate_id)
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("mandate", saved)
+            self.assertEqual(saved["mandate_history"], [legacy_mandate])
+            self.assertEqual(saved["attempts"][0]["mandate_id"], mandate_id)
+            self.assertEqual(
+                saved["attempts"][0]["evidence_ref"], "fixture:legacy-observation",
+            )
 
     def test_cyclic_markdown_task_dependencies_remain_conflicted_under_a_mandate(self) -> None:
         with self._temp() as temporary:
@@ -2866,7 +3521,7 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(stored_detour["return_task_id"], return_task["id"])
             self.assertIsNone(stored_detour["result"])
             self.assertEqual(
-                before_effect["mandate"]["id"], mandate_id,
+                before_effect["mandates"][feature_id]["id"], mandate_id,
                 "the accepted mandate is durably paused before the related effect",
             )
 
