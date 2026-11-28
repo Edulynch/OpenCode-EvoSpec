@@ -10,7 +10,7 @@ description: Use for EvoSpec project work, natural-language status or resume que
 
 When the user asks "¿dónde seguimos?", "¿en qué quedamos?", "what were we doing?", or otherwise requests the current project context, activate this skill automatically. The user need not name EvoSpec or invoke a command. Call only read operations: first `evospec_continuity` status for the executing session/worktree; if it reports no composed mode or legacy `MIXED_AUTHORITY`, call `evospec_context` for the legacy projection. A question about status is not a request to initialize, accept an agreement again, plan, execute, advance a lifecycle, change permissions, select work, or invoke `evospec_continuation`. Do not write to `.evospec` or any other file.
 
-Answer briefly in ordinary language using only the returned projection. In composed mode report the current Feature, optional Increments/Slices, Task status, criterion checks, paused/unknown outcomes, and next eligible Task. In legacy mode report Feature and Slice titles, known Task, and any `REPORTED_UNVERIFIED` checkpoint; an accepted Slice's initial checkpoint is not completed work. A report is not a check, a check is not acceptance, and neither implies closure. Do not invent criteria or evidence. Show technical IDs and revisions only when requested or needed to distinguish ambiguity.
+Answer briefly in ordinary language using only the returned projection. In composed mode report the current Feature, optional Increments/Slices, Task status, each criterion's returned evidence state (including verified/passing, failed, reported, stale, or pending), pending decisions, close blockers/readiness, any Core-provided failure/staleness reason, and the next eligible Task or supported next step. Keep status read-only. In legacy mode report Feature and Slice titles, known Task, and any `REPORTED_UNVERIFIED` checkpoint; an accepted Slice's initial checkpoint is not completed work. A report is not a check, a check is not acceptance, and neither implies closure. Do not invent criteria or evidence. Show technical IDs and revisions only when requested or needed to distinguish ambiguity; do not ask users to interpret hashes or digests.
 
 When no Task is active, inspect `work_queue` for accepted Slice details attached to parked items. List their available human titles and state as **inactive**; an accepted parked Task is not the current Task. If two or more valid items could resume, or the queue projection is incomplete, report the alternatives or limitation and ask only the clarification needed. Never select, reactivate, or modify a parked item from a status question. No agreement in the queue means no agreed Task title to invent.
 
@@ -38,7 +38,39 @@ Task definitions and dependencies remain in canonical Markdown, adopted only by 
 
 Before any effect, persist `implement/begin`; report only the observed result afterward. A missing or unknown outcome is never repeated blindly: a fresh session must read the same mandate, Feature, Task, checkpoint, attempt, report/evidence, remaining coverage, and next action, then reconcile the exact Task as `COMPLETE` or `INCOMPLETE` with evidence and the exact mandate ID. It cannot report or retarget the originating session's attempt. A pause is durable bookkeeping, not host cancellation. For a newly requested related change between Tasks, persist a `RELATED` pause before its effects with the exact next Task as return; reconcile any unresolved attempt first, do not begin main work while paused, record the observed detour result, resume with the same mandate, and rerun affected linked checks against current inputs. Do not silently add the detour to accepted Feature scope. Related/external detours are single-depth: preserve unrelated changes. Never infer cancellation, approval, or test evidence from model text or a permission result.
 
-Criterion checks are restricted to the criterion's allow-listed Python unittest module or Node test target. For `/evospec.verify`, provide the current revision, Feature ID, criterion ID, and ID of a Task linked to that criterion; never provide snapshots or a claimed result. After ordinary OpenCode permission, the plugin obtains the before/after `input_snapshot` values from Core at the same revision, runs only the allow-listed command, and submits those snapshots with the actual exit code and output digest. Core rechecks the current input scope and Task link when admitting the receipt. Missing/invalid snapshots, mismatched inputs, an unlinked Task, or revision drift fail closed and cannot produce a fresh pass. The Core-owned `continuity-root-input-v1` scope covers regular files and directory entries throughout the repository, including Git-ignored and untracked inputs, except root `.git`/`.evospec`, `specs/README.md`, exact managed-document paths in current continuity state, and directory entries for those managed Feature folders. The bounded scanner rejects unsafe or unstable inputs. This is trusted-local freshness evidence, not an OS sandbox or proof of every hidden dependency. Historical checks remain visible but count as current only while their criterion, Task link, and input scope still match. Reports, passing checks, Feature closure, and later reopening are distinct. `close` requires all current criteria to have passing checks and every Task to be complete, and reopens preserve earlier closure/check history. Host permission is independent from Feature acceptance; session IDs scope selection but do not authenticate a human. Local plugins, files, and test code are not an OS sandbox or protection against same-user code.
+Criterion checks are restricted to the criterion's allow-listed Python unittest module or Node test target. For `/evospec.verify`, provide the current revision, Feature ID, criterion ID, and ID of a Task linked to that criterion; include the active mandate ID when present, and never provide snapshots or a claimed executable result. After ordinary OpenCode permission, the plugin obtains the before/after `input_snapshot` values from Core at the same revision, runs only the allow-listed command, and submits those snapshots with the actual exit code and output digest. Core rechecks the current input scope and Task link when admitting the receipt. Missing/invalid snapshots, mismatched inputs, an unlinked Task, or revision drift fail closed and cannot produce a fresh pass. The Core-owned `continuity-root-input-v1` scope covers regular files and directory entries throughout the repository, including Git-ignored and untracked inputs, except root `.git`/`.evospec`, `specs/README.md`, exact managed-document paths in current continuity state, and directory entries for those managed Feature folders. The bounded scanner rejects unsafe or unstable inputs. This is trusted-local freshness evidence, not an OS sandbox or proof of every hidden dependency. Historical checks remain visible but count as current only while their criterion, Task link, and input scope still match. A report, passing check, explicit review decision, Feature acceptance, closure, and reopening are separate lifecycle records. `accept` does not close; `close` requires an exact current acceptance plus all current criteria and Task gates, and `reopen` preserves earlier closure/check history while beginning a new cycle. Host permission is independent from Feature acceptance; session IDs scope selection but do not authenticate a human. Local plugins, files, and test code are not an OS sandbox or protection against same-user code.
+
+### AC2: explicit evidence and Feature decisions
+
+Use the current `status` projection to explain what is verified/passing, failed,
+reported, stale, or pending; include Core's pending decision, close blocker,
+and next step. Do not infer a status from an opaque identifier or digest.
+
+`artifact-present` means only that the exact target is a regular file; it says
+nothing about content or functionality. A `review` check records a nonblank
+report as `REPORTED`, not as a functional pass. If a review decision is needed,
+show the exact report and ask for the material `ACCEPTED` or `REJECTED` choice.
+Reread status, then use `review_decision` with the current revision and exact
+`feature_id`, `criterion_id`, `evidence_ref`, `decision`, and nonblank `reason`;
+include the active `mandate_id` when present. Never infer that choice from a
+report or host permission.
+
+When the user explicitly requests closure, use a current `acceptance_id` if
+status reports the acceptance as `CURRENT`. Otherwise, after all non-acceptance
+blockers are clear, call `accept` with the current revision, exact `feature_id`,
+reason reflecting the user's decision, and active `mandate_id` when present.
+Reread status, then call `close` at the new revision with the exact
+`feature_id`, `acceptance_id`, and active `mandate_id`. A mandate started with
+`close_feature: false` needs a later explicit close request. `true` carries a
+clear request made at start forward without asking again. Either way, intent,
+acceptance, and closure remain distinct; never close implicitly.
+
+For a closed Feature's semantic evolution, first call `reopen` at the current
+revision with its exact `feature_id` and a reason; reread status before making
+the requested change at the new revision. Reopening starts a new cycle and keeps
+prior closure/check history, while old-cycle evidence is not current for the new
+cycle. If any write is stale, refresh status and decide from the new projection
+instead of replaying.
 
 The legacy `/evospec.init`, `/evospec.start`, `/evospec.continue`, `/evospec.review`, `/evospec.converge`, `/evospec.context`, and `/evospec.doctor` commands remain separate. Existing legacy operations and composed operations never share state or silently authorize each other.
 

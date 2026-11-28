@@ -15,7 +15,10 @@ from unittest.mock import patch
 from evospec.continuity import ContinuityError, execute
 from evospec.continuity_documents import parse_all as parse_all_documents
 from evospec.domain import ContinuityStateData
-from evospec.input_fingerprint import InputFingerprintError
+from evospec.input_fingerprint import (
+    InputFingerprintError,
+    repository_input_snapshot,
+)
 from evospec.persistence import (
     AtomicFailure,
     ContinuityPersistence,
@@ -50,6 +53,14 @@ class _CheckView(TypedDict):
     fresh: bool
     passed: bool
     task_id: str | None
+    status: NotRequired[str]
+    source: NotRequired[str]
+    report: NotRequired[str]
+    artifact_present: NotRequired[bool]
+    artifact_sha256: NotRequired[str]
+    method: NotRequired[str]
+    descriptor: NotRequired[str]
+    evidence_ref: NotRequired[str]
     historical_passed: NotRequired[bool]
     stale_reason: NotRequired[str]
     mandate_id: NotRequired[str]
@@ -62,6 +73,8 @@ class _CriterionView(TypedDict):
     check_target: str
     digest: str
     check: _CheckView | None
+    evidence_status: NotRequired[str]
+    review_decision: NotRequired[dict[str, object]]
 
 
 class _DecisionView(TypedDict):
@@ -94,11 +107,15 @@ class _FeatureView(TypedDict):
     criteria: list[_CriterionView]
     decisions: list[_DecisionView]
     detours: list[dict[str, object]]
-    closure_history: list[object]
-    reopen_history: list[object]
+    closure_history: list[dict[str, object]]
+    reopen_history: list[dict[str, object]]
     plan: str
     task_events: NotRequired[list[dict[str, object]]]
     mandate: NotRequired[dict[str, object]]
+    acceptance: dict[str, object] | None
+    acceptance_history: list[dict[str, object]]
+    pending_review_decisions: list[dict[str, object]]
+    close_readiness: dict[str, object]
 
 
 class _DocumentConflictView(TypedDict):
@@ -295,8 +312,16 @@ def _feature_view(value: object) -> TypeGuard[_FeatureView]:
         and _criterion_views(value.get("criteria"))
         and _decision_views(value.get("decisions"))
         and _record_views(value.get("detours"))
-        and isinstance(value.get("closure_history"), list)
-        and isinstance(value.get("reopen_history"), list)
+        and _record_views(value.get("closure_history"))
+        and _record_views(value.get("reopen_history"))
+        and "acceptance" in value
+        and (
+            value.get("acceptance") is None
+            or _record(value.get("acceptance"))
+        )
+        and _record_views(value.get("acceptance_history"))
+        and _record_views(value.get("pending_review_decisions"))
+        and _record(value.get("close_readiness"))
         and _text(value.get("plan"))
     )
 
@@ -602,8 +627,27 @@ def _rewrite_as_legacy_fixture(root: Path) -> ContinuityStateData:
             documents[relative] = sha256(content).hexdigest()
     state.pop("semantic_digests", None)
     state.pop("identity_metadata", None)
+    state.pop("review_decisions", None)
+    state.pop("acceptances", None)
+    for closure in state["closures"]:
+        for key in ("acceptance_id", "basis_revision", "mandate_id"):
+            closure.pop(key, None)
+    for reopen in state["reopens"]:
+        for key in ("reason", "revision"):
+            reopen.pop(key, None)
     for check in state["checks"]:
         check.pop("task_digest", None)
+        for key in (
+            "feature_id", "feature_cycle", "purpose", "evidence_status",
+            "source", "evidence_ref", "input_snapshot_before", "input_snapshot_after",
+        ):
+            check.pop(key, None)
+    for attempt in state["attempts"]:
+        for key in (
+            "feature_id", "feature_cycle", "task_digest", "started_revision",
+            "reported_revision", "reported_by_session_id", "reported_input_scope",
+        ):
+            attempt.pop(key, None)
     state_path.write_text(
         json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
@@ -725,6 +769,36 @@ class ContinuityTests(unittest.TestCase):
             "task_id": task["id"], "phase": "report",
             "result": "SUCCEEDED", "report": "Implementation is complete.",
         })
+
+    def accept_feature(
+        self, root: Path, result: _ContinuityView, *,
+        mandate_id: str | None = None,
+        session: str = "ses_ac0_primary_123",
+    ) -> _ContinuityView:
+        feature = _selected_feature(result)
+        data: dict[str, object] = {
+            "feature_id": feature["id"],
+            "reason": "The current attributable evidence and completed work are accepted.",
+        }
+        if mandate_id is not None:
+            data["mandate_id"] = mandate_id
+        return self.call(root, "accept", result["revision"], session=session, data=data)
+
+    def close_accepted(
+        self, root: Path, accepted: _ContinuityView, *,
+        mandate_id: str | None = None,
+        session: str = "ses_ac0_primary_123",
+    ) -> _ContinuityView:
+        feature = _selected_feature(accepted)
+        acceptance = feature.get("acceptance")
+        if not _record(acceptance) or not _text(acceptance.get("id")):
+            self.fail("expected the current explicit Feature acceptance")
+        data: dict[str, object] = {
+            "feature_id": feature["id"], "acceptance_id": acceptance["id"],
+        }
+        if mandate_id is not None:
+            data["mandate_id"] = mandate_id
+        return self.call(root, "close", accepted["revision"], session=session, data=data)
 
     def test_specify_writes_stable_composed_markdown_and_reads_without_writing(self) -> None:
         with self._temp() as temporary:
@@ -860,7 +934,8 @@ class ContinuityTests(unittest.TestCase):
                 root, reported["revision"], new_task, adopted["criteria"][0],
             )
             self.assertEqual(_selected_feature(verified)["tasks"][0]["status"], "COMPLETED")
-            closed = self.call(root, "close", verified["revision"])
+            accepted = self.accept_feature(root, verified)
+            closed = self.close_accepted(root, accepted)
             self.assertEqual(_selected_feature(closed)["status"], "CLOSED")
             self.assertEqual(len(_selected_feature(closed)["closure_history"]), 1)
 
@@ -996,10 +1071,15 @@ class ContinuityTests(unittest.TestCase):
                 root, reported["revision"],
                 first_feature["tasks"][0], first_feature["criteria"][0],
             )
+            accepted = self.accept_feature(root, verified)
+            acceptance = _selected_feature(accepted).get("acceptance")
+            if not _record(acceptance) or not _text(acceptance.get("id")):
+                self.fail("expected an explicit acceptance before closure")
             close_operations = TrackReplacements()
             closed = self.call(
-                root, "close", verified["revision"], data={
+                root, "close", accepted["revision"], data={
                     "feature_id": first_feature["id"],
+                    "acceptance_id": acceptance["id"],
                 }, operations=close_operations,
             )
             self.assertIn(readme.resolve(), {
@@ -1169,7 +1249,8 @@ class ContinuityTests(unittest.TestCase):
                 _criterion_check(item)["fresh"] and _criterion_check(item)["passed"]
                 for item in complete_feature["criteria"]
             ))
-            closed = self.call(root, "close", completed["revision"])
+            accepted = self.accept_feature(root, completed)
+            closed = self.close_accepted(root, accepted)
             self.assertEqual(_selected_feature(closed)["status"], "CLOSED")
             self.assertEqual(len(_selected_feature(closed)["closure_history"]), 1)
 
@@ -1337,7 +1418,8 @@ class ContinuityTests(unittest.TestCase):
             verified = self.record_check(
                 root, reported["revision"], task, criterion,
             )
-            closed = self.call(root, "close", verified["revision"])
+            accepted = self.accept_feature(root, verified)
+            closed = self.close_accepted(root, accepted)
             folder = root / "specs" / feature["directory"]
             spec_path = folder / "spec.md"
             spec_path.write_text(
@@ -1364,9 +1446,20 @@ class ContinuityTests(unittest.TestCase):
                     path.relative_to(root): path.read_bytes()
                     for path in root.rglob("*") if path.is_file()
                 })
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "reconcile", closed["revision"], data={
+                    "feature_id": feature["id"],
+                    "reopen_feature_id": feature["id"],
+                })
+            self.assertEqual(raised.exception.code, "INVALID_REQUEST")
+            self.assertEqual(before, {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            })
             reopened = self.call(root, "reconcile", closed["revision"], data={
                 "feature_id": feature["id"],
                 "reopen_feature_id": feature["id"],
+                "reopen_reason": "The revised semantic document needs a new cycle.",
             })
             current = _selected_feature(reopened)
             self.assertEqual(current["status"], "OPEN")
@@ -1376,6 +1469,10 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(reopened_state["features"][feature["id"]]["cycle"], 2)
             self.assertEqual(len(current["closure_history"]), 1)
             self.assertEqual(len(current["reopen_history"]), 1)
+            self.assertEqual(
+                current["reopen_history"][0]["reason"],
+                "The revised semantic document needs a new cycle.",
+            )
             self.assertEqual(
                 _stale_reason(_criterion_check(current["criteria"][0])),
                 "criterion_changed",
@@ -1400,7 +1497,8 @@ class ContinuityTests(unittest.TestCase):
             verified = self.record_check(
                 root, reported["revision"], task, criterion,
             )
-            closed = self.call(root, "close", verified["revision"])
+            accepted = self.accept_feature(root, verified)
+            closed = self.close_accepted(root, accepted)
             folder = root / "specs" / feature["directory"]
             before_files = {
                 path.relative_to(root): path.read_bytes()
@@ -1415,6 +1513,12 @@ class ContinuityTests(unittest.TestCase):
                 ("tasks", {
                     "task_title": "Add an incomplete task",
                     "task_description": "This must not be published while closed.",
+                    "criteria_ids": [criterion["id"]],
+                }),
+                ("change", {
+                    "feature_id": feature["id"],
+                    "task_title": "Implicitly reopen",
+                    "task_description": "A semantic change is not reopen intent.",
                     "criteria_ids": [criterion["id"]],
                 }),
                 ("implement", {"task_id": task["id"], "phase": "begin"}),
@@ -1432,7 +1536,7 @@ class ContinuityTests(unittest.TestCase):
                 ) as raised:
                     self.call(root, operation, closed["revision"], data=data)
                 self.assertEqual(raised.exception.code, "REOPEN_INTENT_REQUIRED")
-                self.assertIn("reconcile", str(raised.exception))
+                self.assertIn("reopen", str(raised.exception))
                 self.assertEqual(before_files, {
                     path.relative_to(root): path.read_bytes()
                     for path in root.rglob("*") if path.is_file()
@@ -1461,14 +1565,18 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(len(closed_feature["closure_history"]), 1)
             self.assertEqual(closed_feature["reopen_history"], [])
 
-            reopened = self.call(root, "change", closed["revision"], data={
+            reopened = self.call(root, "reopen", closed["revision"], data={
+                "feature_id": feature["id"],
+                "reason": "A new follow-up Task is explicitly authorized.",
+            })
+            changed = self.call(root, "change", reopened["revision"], data={
                 "feature_id": feature["id"],
                 "outcome": "An explicitly reopened follow-up outcome.",
                 "task_title": "Implement the follow-up",
                 "task_description": "Continue in a new recorded cycle.",
                 "criteria_ids": [criterion["id"]],
             })
-            reopened_feature = _selected_feature(reopened)
+            reopened_feature = _selected_feature(changed)
             self.assertEqual(reopened_feature["status"], "OPEN")
             self.assertEqual(reopened_feature["cycle"], 2)
             self.assertEqual(len(reopened_feature["closure_history"]), 1)
@@ -1495,7 +1603,8 @@ class ContinuityTests(unittest.TestCase):
             verified = self.record_check(
                 root, reported["revision"], task, criterion,
             )
-            closed = self.call(root, "close", verified["revision"])
+            accepted = self.accept_feature(root, verified)
+            closed = self.close_accepted(root, accepted)
             second = self.call(root, "specify", closed["revision"], data={
                 **spec_request("Checkpointed legacy Feature"),
                 "increments": [],
@@ -2379,6 +2488,13 @@ class ContinuityTests(unittest.TestCase):
             stale = _mandate(reconciled)
             self.assertEqual(stale["id"], old_mandate["id"])
             self.assertEqual(stale["status"], "STALE_SCOPE")
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "accept", reconciled["revision"], data={
+                    "feature_id": feature["id"],
+                    "mandate_id": old_mandate["id"],
+                    "reason": "This must not accept a stale scope.",
+                })
+            self.assertEqual(raised.exception.code, "MANDATE_STALE_SCOPE")
             with self.assertRaises(ContinuityError) as raised:
                 self.call(root, "implement", reconciled["revision"], data={
                     "feature_id": feature["id"], "task_id": feature["tasks"][0]["id"],
@@ -3669,7 +3785,10 @@ class ContinuityTests(unittest.TestCase):
             })
             with self.assertRaises(ContinuityError) as raised:
                 self.call(root, "close", result["revision"])
-            self.assertEqual(raised.exception.code, "CLOSE_BLOCKED")
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_REQUIRED")
+            with self.assertRaises(ContinuityError) as raised:
+                self.accept_feature(root, result)
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_BLOCKED")
 
             result = self.record_check(root, result["revision"], task, criterion)
             verified = _selected_feature(result)
@@ -3677,11 +3796,12 @@ class ContinuityTests(unittest.TestCase):
             self.assertTrue(verified_check["fresh"])
             self.assertTrue(verified_check["passed"])
             self.assertEqual(verified["tasks"][0]["status"], "COMPLETED")
-            result = self.call(root, "close", result["revision"])
+            accepted = self.accept_feature(root, result)
+            result = self.close_accepted(root, accepted)
             self.assertEqual(_selected_feature(result)["status"], "CLOSED")
             self.assertEqual(len(_selected_feature(result)["closure_history"]), 1)
 
-            result = self.call(root, "change", result["revision"], data={
+            change_data: dict[str, object] = {
                 "feature_id": feature["id"],
                 "outcome": "A revised, reopened outcome.",
                 "criteria": [{
@@ -3693,7 +3813,15 @@ class ContinuityTests(unittest.TestCase):
                 "task_title": "Implement the changed criterion",
                 "task_description": "Keep old receipts immutable.",
                 "criteria_ids": [criterion["id"]],
+            }
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "change", result["revision"], data=change_data)
+            self.assertEqual(raised.exception.code, "REOPEN_INTENT_REQUIRED")
+            reopened = self.call(root, "reopen", result["revision"], data={
+                "feature_id": feature["id"],
+                "reason": "The follow-up outcome needs a new Feature cycle.",
             })
+            result = self.call(root, "change", reopened["revision"], data=change_data)
             feature = _selected_feature(result)
             self.assertEqual(feature["status"], "OPEN")
             self.assertEqual(len(feature["closure_history"]), 1)
@@ -3704,12 +3832,655 @@ class ContinuityTests(unittest.TestCase):
                 changed_check.get("stale_reason"), "criterion_changed",
             )
             with self.assertRaises(ContinuityError) as raised:
-                self.call(root, "close", result["revision"])
-            self.assertEqual(raised.exception.code, "CLOSE_BLOCKED")
+                self.accept_feature(root, result)
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_BLOCKED")
             receipt_count = len(json.loads(
                 (root / ".evospec" / "continuity.json").read_text(encoding="utf-8")
             )["checks"])
             self.assertEqual(receipt_count, 1)
+
+    def test_artifact_presence_is_core_observed_exact_and_freshness_bound(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            result = self.call(root, "specify", 0, data={
+                **spec_request("Artifact evidence"),
+                "criteria": [
+                    {
+                        "description": "The release manifest exists.",
+                        "check_kind": "artifact-present",
+                        "check_target": "dist/manifest.json",
+                    },
+                    {
+                        "description": "The integration report exists.",
+                        "check_kind": "artifact-present",
+                        "check_target": "dist/integration.json",
+                    },
+                ],
+                "increments": [],
+                "tasks": [{
+                    "title": "Produce the release outputs",
+                    "criteria": [0, 1],
+                }],
+            })
+            feature = _selected_feature(result)
+            task = feature["tasks"][0]
+            criterion = feature["criteria"][0]
+            data = {
+                "criterion_id": criterion["id"],
+                "check_kind": criterion["check_kind"],
+                "check_target": criterion["check_target"],
+                "task_id": task["id"],
+            }
+            state_path = root / ".evospec" / "continuity.json"
+            before = state_path.read_bytes()
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "verify", result["revision"], data={
+                    **data, "artifact_present": True,
+                })
+            self.assertEqual(raised.exception.code, "INVALID_REQUEST")
+            self.assertEqual(state_path.read_bytes(), before)
+
+            missing = self.call(root, "verify", result["revision"], data=data)
+            feature = _selected_feature(missing)
+            failed = _criterion_check(feature["criteria"][0])
+            self.assertEqual(failed.get("status"), "FAILED")
+            self.assertFalse(failed["passed"])
+            self.assertEqual(failed.get("source"), "CORE_OBSERVED")
+            self.assertFalse(failed.get("artifact_present"))
+            self.assertNotIn("artifact_sha256", failed)
+            self.assertEqual(
+                feature["criteria"][1]["check"],
+                None,
+                "one artifact observation cannot satisfy another criterion",
+            )
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))["checks"][0]
+            self.assertEqual(persisted["evidence_status"], "FAILED")
+            self.assertEqual(persisted["feature_id"], feature["id"])
+            self.assertEqual(persisted["feature_cycle"], feature["cycle"])
+            self.assertEqual(persisted["purpose"], criterion["description"])
+            self.assertEqual(persisted["input_snapshot_before"], persisted["observed_input_scope"])
+            self.assertEqual(persisted["input_snapshot_after"], persisted["observed_input_scope"])
+            self.assertNotIn("exit_code", persisted)
+            self.assertNotIn("output_sha256", persisted)
+
+            artifact = root / "dist" / "manifest.json"
+            artifact.parent.mkdir()
+            artifact.write_text('{"release": true}\n', encoding="utf-8")
+            stale = self.call(root, "status", None)
+            stale_check = _criterion_check(_selected_feature(stale)["criteria"][0])
+            self.assertEqual(stale_check.get("status"), "STALE")
+            self.assertFalse(stale_check["fresh"])
+            self.assertEqual(stale_check.get("stale_reason"), "input_changed")
+
+            verified = self.call(root, "verify", stale["revision"], data=data)
+            verified_feature = _selected_feature(verified)
+            receipt = _criterion_check(verified_feature["criteria"][0])
+            self.assertEqual(receipt.get("status"), "VERIFIED")
+            self.assertTrue(receipt["fresh"])
+            self.assertTrue(receipt["passed"])
+            self.assertTrue(receipt.get("artifact_present"))
+            self.assertEqual(receipt.get("artifact_sha256"), sha256(artifact.read_bytes()).hexdigest())
+            self.assertEqual(receipt.get("method"), "artifact-present")
+            self.assertEqual(receipt.get("descriptor"), "dist/manifest.json")
+
+    def test_artifact_descriptor_rejects_traversal_and_core_paths(self) -> None:
+        for target in (
+            "../outside.txt", "/outside.txt", r"dist\report.json",
+            ".evospec/continuity.json", ".git/config",
+        ):
+            with self.subTest(target=target), self._temp() as temporary:
+                with self.assertRaises(ContinuityError) as raised:
+                    self.call(Path(temporary), "specify", 0, data={
+                        **spec_request("Unsafe artifact descriptor"),
+                        "criteria": [{
+                            "description": "This target must be rejected.",
+                            "check_kind": "artifact-present",
+                            "check_target": target,
+                        }],
+                    })
+                self.assertEqual(raised.exception.code, "INVALID_REQUEST")
+
+    def test_malformed_artifact_receipt_is_rejected_on_read(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            artifact = root / "dist" / "manifest.json"
+            artifact.parent.mkdir()
+            artifact.write_text('{"ok": true}\n', encoding="utf-8")
+            result = self.call(root, "specify", 0, data={
+                **spec_request("Malformed artifact history"),
+                "criteria": [{
+                    "description": "The manifest exists.",
+                    "check_kind": "artifact-present",
+                    "check_target": "dist/manifest.json",
+                }],
+                "increments": [],
+                "tasks": [{"title": "Produce the manifest", "criteria": [0]}],
+            })
+            feature = _selected_feature(result)
+            criterion, task = feature["criteria"][0], feature["tasks"][0]
+            self.call(root, "verify", result["revision"], data={
+                "criterion_id": criterion["id"],
+                "check_kind": criterion["check_kind"],
+                "check_target": criterion["check_target"],
+                "task_id": task["id"],
+            })
+            state_path = root / ".evospec" / "continuity.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["checks"][0]["check_target"] = "../outside.json"
+            state_path.write_text(
+                json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ContinuityError) as raised:
+                ContinuityPersistence(root).load()
+            self.assertEqual(raised.exception.code, "CORRUPT_CONTINUITY")
+
+    def test_review_reports_remain_reported_and_descriptive_methods_do_not_execute(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            result = self.call(root, "specify", 0, data={
+                **spec_request("Review is not a functional check"),
+                "criteria": [{
+                    "description": "A reviewer considers the implementation safe.",
+                    "check_kind": "review",
+                    "check_target": "Human review of the implementation",
+                }],
+                "increments": [],
+                "tasks": [{"title": "Implement the behavior", "criteria": [0]}],
+            })
+            feature = _selected_feature(result)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            reported = self.call(root, "verify", result["revision"], data={
+                "criterion_id": criterion["id"],
+                "check_kind": "review",
+                "check_target": criterion["check_target"],
+                "task_id": task["id"],
+                "report": "Reviewer says the change looks safe.",
+            })
+            check = _criterion_check(_selected_feature(reported)["criteria"][0])
+            self.assertEqual(check.get("status"), "REPORTED")
+            self.assertFalse(check["passed"])
+            self.assertEqual(check.get("source"), "CALLER_REPORTED")
+            self.assertEqual(check.get("report"), "Reviewer says the change looks safe.")
+            self.assertNotIn("exit_code", check)
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "close", reported["revision"])
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_REQUIRED")
+            self.assertTrue(
+                _selected_feature(reported)["pending_review_decisions"][0]["decision_required"],
+            )
+            with self.assertRaises(ContinuityError) as raised:
+                self.accept_feature(root, reported)
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_BLOCKED")
+
+            descriptive = self.call(root, "specify", reported["revision"], data={
+                **spec_request("Descriptive functional method"),
+                "criteria": [{
+                    "description": "The user-visible behavior works.",
+                    "check_kind": "functional",
+                    "check_target": "Exercise the documented user journey",
+                }],
+                "increments": [],
+                "tasks": [{"title": "Implement the behavior", "criteria": [0]}],
+            })
+            feature = _selected_feature(descriptive)
+            criterion = feature["criteria"][0]
+            task = feature["tasks"][0]
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "verify", descriptive["revision"], data={
+                    "criterion_id": criterion["id"],
+                    "check_kind": "functional",
+                    "check_target": criterion["check_target"],
+                    "task_id": task["id"],
+                    "exit_code": 0,
+                    "output_sha256": sha256(b"pretend functional pass").hexdigest(),
+                })
+            self.assertEqual(raised.exception.code, "UNSUPPORTED_EVIDENCE_METHOD")
+
+    def test_explicit_acceptance_closes_with_either_mandate_close_intent(self) -> None:
+        for close_feature in (False, True):
+            with self.subTest(close_feature=close_feature), self._temp() as temporary:
+                root = Path(temporary)
+                created = self.call(root, "specify", 0, data={
+                    **spec_request(f"Explicit acceptance {close_feature}"),
+                    "increments": [],
+                    "tasks": [{"title": "Complete the accepted Task", "criteria": [0]}],
+                })
+                feature = _selected_feature(created)
+                task, criterion = feature["tasks"][0], feature["criteria"][0]
+                started = self.call(root, "implement", created["revision"], data={
+                    "feature_id": feature["id"], "phase": "start", "mode": "ALL",
+                    "close_feature": close_feature,
+                })
+                mandate_id = _mandate_id(started)
+                began = self.call(root, "implement", started["revision"], data={
+                    "feature_id": feature["id"], "task_id": task["id"],
+                    "phase": "begin", "mandate_id": mandate_id,
+                })
+                reported = self.call(root, "implement", began["revision"], data={
+                    "feature_id": feature["id"], "task_id": task["id"],
+                    "phase": "report", "result": "SUCCEEDED",
+                    "report": "The Task result is caller-reported.",
+                    "mandate_id": mandate_id,
+                })
+                verified = self.record_check(
+                    root, reported["revision"], task, criterion,
+                    mandate_id=mandate_id, feature_id=feature["id"],
+                )
+                current = _selected_feature(verified)
+                self.assertIsNone(current["acceptance"])
+                self.assertEqual(current["close_readiness"]["status"], "ACCEPTANCE_REQUIRED")
+                with self.assertRaises(ContinuityError) as raised:
+                    self.call(root, "close", verified["revision"], data={
+                        "feature_id": feature["id"], "mandate_id": mandate_id,
+                    })
+                self.assertEqual(raised.exception.code, "ACCEPTANCE_REQUIRED")
+                self.assertEqual(self.call(root, "status", None)["revision"], verified["revision"])
+
+                accepted = self.accept_feature(root, verified, mandate_id=mandate_id)
+                acceptance = _selected_feature(accepted)["acceptance"]
+                if not _record(acceptance):
+                    self.fail("expected a revision-bound explicit acceptance")
+                acceptance_criteria = acceptance.get("criteria")
+                acceptance_tasks = acceptance.get("tasks")
+                if (
+                    not _record_views(acceptance_criteria)
+                    or not acceptance_criteria
+                    or not _record_views(acceptance_tasks)
+                    or not acceptance_tasks
+                ):
+                    self.fail("expected acceptance evidence for criteria and Tasks")
+                self.assertEqual(acceptance["status"], "CURRENT")
+                self.assertEqual(acceptance["feature_id"], feature["id"])
+                self.assertEqual(acceptance["cycle"], 1)
+                self.assertEqual(acceptance["mandate_id"], mandate_id)
+                self.assertEqual(acceptance["basis_revision"], verified["revision"])
+                self.assertEqual(acceptance["revision"], accepted["revision"])
+                self.assertEqual(acceptance["session_id"], "ses_ac0_primary_123")
+                self.assertEqual(
+                    acceptance_criteria[0].get("check_ref"),
+                    _criterion_check(
+                        _selected_feature(verified)["criteria"][0],
+                    ).get("evidence_ref"),
+                )
+                attempt_history = _selected_feature(verified)["tasks"][0].get(
+                    "attempt_history",
+                )
+                if (
+                    not isinstance(attempt_history, list)
+                    or not attempt_history
+                    or not _record(attempt_history[-1])
+                ):
+                    self.fail("expected a completed Task attempt in the projection")
+                self.assertEqual(
+                    acceptance_tasks[0].get("evidence_ref"),
+                    attempt_history[-1].get("evidence_ref"),
+                )
+
+                closed = self.close_accepted(
+                    root, accepted, mandate_id=mandate_id,
+                )
+                closed_feature = _selected_feature(closed)
+                self.assertEqual(closed_feature["status"], "CLOSED")
+                closed_acceptance = closed_feature["acceptance"]
+                if not _record(closed_acceptance):
+                    self.fail("expected the closure to consume its acceptance")
+                self.assertEqual(closed_acceptance.get("status"), "CONSUMED")
+                persisted = json.loads(
+                    (root / ".evospec" / "continuity.json").read_text(encoding="utf-8"),
+                )
+                self.assertEqual(persisted["mandates"][feature["id"]]["id"], mandate_id)
+                self.assertEqual(persisted["mandates"][feature["id"]]["close_feature"], close_feature)
+                self.assertEqual(len(persisted.get("mandate_history", [])), 0)
+                self.assertEqual(persisted["task_states"][task["id"]]["attempts"], 1)
+                closure = persisted["closures"][-1]
+                self.assertEqual(closure["acceptance_id"], acceptance["id"])
+                self.assertEqual(closure["mandate_id"], mandate_id)
+                self.assertEqual(closure["basis_revision"], verified["revision"])
+
+    def test_acceptance_is_explicit_for_no_mandate_and_stales_after_new_evidence(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            result = self.call(root, "specify", 0, data={
+                **spec_request("No mandate acceptance"),
+                "increments": [],
+                "tasks": [{"title": "Complete the Task", "criteria": [0]}],
+            })
+            feature = _selected_feature(result)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            result = self.report_success(root, result, task)
+            verified = self.record_check(root, result["revision"], task, criterion)
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "close", verified["revision"], data={
+                    "feature_id": feature["id"],
+                })
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_REQUIRED")
+
+            accepted = self.accept_feature(root, verified)
+            first_acceptance = _selected_feature(accepted)["acceptance"]
+            if not _record(first_acceptance):
+                self.fail("expected an explicit baseline acceptance")
+            self.assertIsNone(first_acceptance["mandate_id"])
+            self.assertEqual(first_acceptance["status"], "CURRENT")
+            updated_evidence = self.record_check(
+                root, accepted["revision"],
+                _selected_feature(accepted)["tasks"][0],
+                _selected_feature(accepted)["criteria"][0],
+            )
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "close", updated_evidence["revision"], data={
+                    "feature_id": feature["id"],
+                    "acceptance_id": first_acceptance["id"],
+                })
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_STALE")
+
+            current_acceptance = self.accept_feature(root, updated_evidence)
+            closed = self.close_accepted(root, current_acceptance)
+            state = json.loads(
+                (root / ".evospec" / "continuity.json").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(len(state["acceptances"]), 2)
+            self.assertEqual(
+                state["closures"][-1]["acceptance_id"],
+                state["acceptances"][-1]["id"],
+            )
+            self.assertEqual(_selected_feature(closed)["status"], "CLOSED")
+
+    def test_accept_requires_an_explicit_feature_id_without_mutating_state(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            result = self.call(root, "specify", 0, data={
+                **spec_request("Explicit acceptance target"),
+                "increments": [],
+                "tasks": [{"title": "Complete the Task", "criteria": [0]}],
+            })
+            feature = _selected_feature(result)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            reported = self.report_success(root, result, task)
+            verified = self.record_check(
+                root, reported["revision"], task, criterion,
+            )
+            state_path = root / ".evospec" / "continuity.json"
+            before = state_path.read_bytes()
+
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "accept", verified["revision"], data={
+                    "reason": "The current work is accepted.",
+                })
+
+            self.assertEqual(raised.exception.code, "FEATURE_REQUIRED")
+            self.assertEqual(state_path.read_bytes(), before)
+            self.assertEqual(self.call(root, "status", None)["revision"], verified["revision"])
+
+            accepted = self.accept_feature(root, verified)
+            acceptance = _selected_feature(accepted).get("acceptance")
+            if not _record(acceptance):
+                self.fail("expected a recorded explicit acceptance")
+            self.assertEqual(acceptance["feature_id"], feature["id"])
+            closed = self.close_accepted(root, accepted)
+            self.assertEqual(_selected_feature(closed)["status"], "CLOSED")
+
+    def test_close_rechecks_accepted_input_at_commit_admission(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            fixture = root / "src" / "close-guard.txt"
+            fixture.parent.mkdir()
+            fixture.write_text("accepted input\n", encoding="utf-8")
+            result = self.call(root, "specify", 0, data={
+                **spec_request("Close input guard"),
+                "increments": [],
+                "tasks": [{"title": "Complete the guarded Task", "criteria": [0]}],
+            })
+            feature = _selected_feature(result)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            reported = self.report_success(root, result, task)
+            verified = self.record_check(
+                root, reported["revision"], task, criterion,
+            )
+            accepted = self.accept_feature(root, verified)
+            acceptance = _selected_feature(accepted)["acceptance"]
+            if not _record(acceptance):
+                self.fail("expected a recorded explicit acceptance")
+            state_path = root / ".evospec" / "continuity.json"
+            state_before = state_path.read_bytes()
+            managed_before = {
+                path.relative_to(root): path.read_bytes()
+                for path in (root / "specs").rglob("*") if path.is_file()
+            }
+            snapshot_calls = 0
+
+            def change_input_after_close_evaluation(
+                scan_root: Path, repository_id: str,
+            ):
+                nonlocal snapshot_calls
+                snapshot_calls += 1
+                snapshot = repository_input_snapshot(scan_root, repository_id)
+                if snapshot_calls == 2:
+                    fixture.write_text("changed after close evaluation\n", encoding="utf-8")
+                return snapshot
+
+            with patch(
+                "evospec.continuity.repository_input_snapshot",
+                side_effect=change_input_after_close_evaluation,
+            ):
+                with self.assertRaises(ContinuityError) as raised:
+                    self.close_accepted(root, accepted)
+
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_STALE")
+            self.assertEqual(snapshot_calls, 3)
+            self.assertEqual(fixture.read_text(encoding="utf-8"), "changed after close evaluation\n")
+            self.assertEqual(state_path.read_bytes(), state_before)
+            self.assertEqual(
+                managed_before,
+                {
+                    path.relative_to(root): path.read_bytes()
+                    for path in (root / "specs").rglob("*") if path.is_file()
+                },
+            )
+            persisted = json.loads(state_before)
+            self.assertEqual(persisted["features"][feature["id"]]["status"], "OPEN")
+            self.assertEqual(persisted["closures"], [])
+            self.assertEqual(len(persisted["acceptances"]), 1)
+            self.assertEqual(len(persisted["attempts"]), 1)
+            self.assertEqual(len(persisted["checks"]), 1)
+            self.assertEqual(self.call(root, "status", None)["revision"], accepted["revision"])
+
+            fixture.write_text("accepted input\n", encoding="utf-8")
+            snapshot_calls = 0
+
+            def unavailable_at_commit_admission(
+                scan_root: Path, repository_id: str,
+            ):
+                nonlocal snapshot_calls
+                snapshot_calls += 1
+                if snapshot_calls == 3:
+                    raise InputFingerprintError("injected unavailable input")
+                return repository_input_snapshot(scan_root, repository_id)
+
+            with patch(
+                "evospec.continuity.repository_input_snapshot",
+                side_effect=unavailable_at_commit_admission,
+            ):
+                with self.assertRaises(ContinuityError) as raised:
+                    self.close_accepted(root, accepted)
+
+            self.assertEqual(raised.exception.code, "CLOSE_BLOCKED")
+            self.assertEqual(snapshot_calls, 3)
+            self.assertEqual(state_path.read_bytes(), state_before)
+            self.assertEqual(
+                managed_before,
+                {
+                    path.relative_to(root): path.read_bytes()
+                    for path in (root / "specs").rglob("*") if path.is_file()
+                },
+            )
+            self.assertEqual(self.call(root, "status", None)["revision"], accepted["revision"])
+
+    def test_review_report_requires_an_explicit_reasoned_decision(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            result = self.call(root, "specify", 0, data={
+                **spec_request("Explicit review decision"),
+                "criteria": [{
+                    "description": "A reviewer assesses the change.",
+                    "check_kind": "review",
+                    "check_target": "Review the implementation",
+                }],
+                "increments": [],
+                "tasks": [{"title": "Implement and review the change", "criteria": [0]}],
+            })
+            feature = _selected_feature(result)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            result = self.report_success(root, result, task)
+            reported = self.call(root, "verify", result["revision"], data={
+                "feature_id": feature["id"], "criterion_id": criterion["id"],
+                "check_kind": "review", "check_target": criterion["check_target"],
+                "task_id": task["id"], "report": "The review report is caller supplied.",
+            })
+            reported_feature = _selected_feature(reported)
+            report = _criterion_check(reported_feature["criteria"][0])
+            self.assertEqual(report.get("status"), "REPORTED")
+            self.assertFalse(report["passed"])
+            self.assertEqual(reported_feature["tasks"][0]["status"], "REPORTED")
+            with self.assertRaises(ContinuityError) as raised:
+                self.accept_feature(root, reported)
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_BLOCKED")
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "review_decision", reported["revision"], data={
+                    "feature_id": feature["id"], "criterion_id": criterion["id"],
+                    "evidence_ref": "not-the-current-review",
+                    "decision": "ACCEPTED", "reason": "Wrong report.",
+                })
+            self.assertEqual(raised.exception.code, "REVIEW_EVIDENCE_STALE")
+
+            rejected = self.call(root, "review_decision", reported["revision"], data={
+                "feature_id": feature["id"], "criterion_id": criterion["id"],
+                "evidence_ref": report.get("evidence_ref"),
+                "decision": "REJECTED", "reason": "The report does not resolve the concern.",
+            })
+            self.assertEqual(_selected_feature(rejected)["tasks"][0]["status"], "REPORTED")
+            with self.assertRaises(ContinuityError) as raised:
+                self.accept_feature(root, rejected)
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_BLOCKED")
+
+            decided = self.call(root, "review_decision", rejected["revision"], data={
+                "feature_id": feature["id"], "criterion_id": criterion["id"],
+                "evidence_ref": report.get("evidence_ref"),
+                "decision": "ACCEPTED", "reason": "The subjective review is explicitly accepted.",
+            })
+            decided_feature = _selected_feature(decided)
+            self.assertEqual(decided_feature["tasks"][0]["status"], "COMPLETED")
+            self.assertFalse(_criterion_check(decided_feature["criteria"][0])["passed"])
+            review_decision = decided_feature["criteria"][0].get("review_decision")
+            if not _record(review_decision):
+                self.fail("expected the accepted review decision in the projection")
+            self.assertEqual(review_decision.get("decision"), "ACCEPTED")
+            accepted = self.accept_feature(root, decided)
+            acceptance = _selected_feature(accepted)["acceptance"]
+            if not _record(acceptance):
+                self.fail("expected acceptance after the explicit review decision")
+            acceptance_criteria = acceptance.get("criteria")
+            if not _record_views(acceptance_criteria) or not acceptance_criteria:
+                self.fail("expected accepted review evidence")
+            self.assertEqual(
+                acceptance_criteria[0].get("evidence_status"), "REPORTED",
+            )
+            self.assertEqual(
+                acceptance_criteria[0].get("review_decision_id"),
+                review_decision.get("id"),
+            )
+            closed = self.close_accepted(root, accepted)
+            self.assertEqual(_selected_feature(closed)["status"], "CLOSED")
+
+    def test_acceptance_rechecks_unknown_effects_pause_and_incomplete_tasks(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            created = self.call(root, "specify", 0, data={
+                **spec_request("Acceptance safety gates"),
+                "increments": [],
+                "tasks": [{"title": "Resolve the interrupted Task", "criteria": [0]}],
+            })
+            feature = _selected_feature(created)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            unknown = self.call(root, "implement", created["revision"], data={
+                "feature_id": feature["id"], "task_id": task["id"],
+                "phase": "begin",
+            })
+            with self.assertRaises(ContinuityError) as raised:
+                self.accept_feature(root, unknown)
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_BLOCKED")
+            self.assertEqual(self.call(root, "status", None)["revision"], unknown["revision"])
+
+            reconciled = self.call(root, "resume", unknown["revision"], data={
+                "feature_id": feature["id"], "task_id": task["id"],
+                "reconcile": "INCOMPLETE",
+                "evidence_ref": "Observed that the interrupted Task did not finish.",
+            })
+            reported = self.report_success(
+                root, reconciled, _selected_feature(reconciled)["tasks"][0],
+            )
+            verified = self.record_check(
+                root, reported["revision"],
+                _selected_feature(reported)["tasks"][0],
+                _selected_feature(reported)["criteria"][0],
+            )
+            paused = self.call(root, "pause", verified["revision"], data={
+                "feature_id": feature["id"], "reason": "Wait for an explicit review.",
+            })
+            with self.assertRaises(ContinuityError) as raised:
+                self.accept_feature(root, paused)
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_BLOCKED")
+            resumed = self.call(root, "resume", paused["revision"], data={
+                "feature_id": feature["id"],
+            })
+            accepted = self.accept_feature(root, resumed)
+            closed = self.close_accepted(root, accepted)
+            self.assertEqual(_selected_feature(closed)["status"], "CLOSED")
+            self.assertEqual(_selected_feature(closed)["tasks"][0]["attempts"], 2)
+
+    def test_evidence_from_prior_feature_cycle_is_stale(self) -> None:
+        with self._temp() as temporary:
+            root = Path(temporary)
+            result = self.call(root, "specify", 0, data={
+                **spec_request("Cycle-bound evidence"),
+                "increments": [],
+                "tasks": [{"title": "Implement behavior", "criteria": [0]}],
+            })
+            feature = _selected_feature(result)
+            task, criterion = feature["tasks"][0], feature["criteria"][0]
+            result = self.report_success(root, result, task)
+            result = self.record_check(root, result["revision"], task, criterion)
+            accepted = self.accept_feature(root, result)
+            result = self.close_accepted(root, accepted)
+            state_path = root / ".evospec" / "continuity.json"
+            state_before = state_path.read_bytes()
+            with self.assertRaises(ContinuityError) as raised:
+                self.call(root, "reopen", result["revision"], data={
+                    "reason": "The target must not be inferred from selection.",
+                })
+            self.assertEqual(raised.exception.code, "FEATURE_REQUIRED")
+            self.assertEqual(state_path.read_bytes(), state_before)
+            unchanged = _selected_feature(self.call(root, "status", None))
+            self.assertEqual(unchanged["status"], "CLOSED")
+            self.assertEqual(unchanged["cycle"], 1)
+            self.assertEqual(unchanged["reopen_history"], [])
+            self.assertEqual(self.call(root, "status", None)["revision"], result["revision"])
+            reopened = self.call(root, "reopen", result["revision"], data={
+                "feature_id": feature["id"],
+                "reason": "The same criterion needs work in a new Feature cycle.",
+            })
+            changed = self.call(root, "change", reopened["revision"], data={
+                "feature_id": feature["id"],
+                "task_title": "Implement the same criterion again",
+                "task_description": "The next Feature cycle keeps the same definition.",
+                "criteria_ids": [criterion["id"]],
+            })
+            current = _selected_feature(changed)
+            self.assertEqual(current["cycle"], 2)
+            check = _criterion_check(current["criteria"][0])
+            self.assertEqual(check.get("status"), "STALE")
+            self.assertFalse(check["passed"])
+            self.assertEqual(check.get("stale_reason"), "feature_cycle_changed")
 
     def test_input_snapshot_is_read_only_and_preserves_the_exact_revision(self) -> None:
         with self._temp() as temporary:
@@ -3863,7 +4634,10 @@ class ContinuityTests(unittest.TestCase):
             self.assertEqual(feature["tasks"][0]["status"], "REPORTED")
             with self.assertRaises(ContinuityError) as raised:
                 self.call(root, "close", current["revision"])
-            self.assertEqual(raised.exception.code, "CLOSE_BLOCKED")
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_REQUIRED")
+            with self.assertRaises(ContinuityError) as raised:
+                self.accept_feature(root, current)
+            self.assertEqual(raised.exception.code, "ACCEPTANCE_BLOCKED")
 
     def test_test_bytes_change_invalidates_a_passing_check_under_the_same_descriptor(self) -> None:
         with self._temp() as temporary:

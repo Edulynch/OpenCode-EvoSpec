@@ -139,6 +139,52 @@ behavior; it does not run a live model, OpenCode session, native permission
 dialog, or browser. See the AC1 contract and fixture limits in
 [the consolidated continuity document](ac0-consolidated-mvp.md).
 
+### AC2: status, evidence, and explicit Feature closure
+
+`/evospec.status` is read-only. Explain the current projected evidence state,
+pending review decision, close readiness/blockers, any Core-provided
+failure/staleness reason, and next eligible Task or supported next step implied
+by Core's fields in ordinary language. Use IDs returned by Core as opaque
+references; never ask the user to interpret a hash or digest.
+
+`/evospec.verify` uses the selected criterion's declared check. Python/Node
+checks run only the supported target and record the observed result. An
+`artifact-present` check means only that the exact target is a regular file;
+it does not validate contents or behavior. A `review` check records a report
+as `REPORTED`, not a functional pass. For a review decision, show the current
+report and obtain the explicit `ACCEPTED` or `REJECTED` choice and reason.
+Reread status, then call `evospec_continuity` at the current revision with
+`operation: "review_decision"` and the exact `feature_id`, `criterion_id`,
+current `evidence_ref`, `decision`, `reason`, and active `mandate_id` when
+present. Do not treat a permission result or review report as that decision.
+Descriptive `build`, `integration`, and `functional` criteria are not
+executable check routes.
+
+Feature acceptance and closure are separate writes. At the current revision,
+`accept` takes `feature_id`, a nonblank `reason`, and the active `mandate_id`
+when present. After it succeeds, reread status and use the returned latest
+`acceptance_id`, exact `feature_id`, and active `mandate_id` with `close` at the
+new revision. Core blocks stale acceptance or any remaining close blocker.
+Neither completed Tasks, passing checks, `close_feature: true`, nor `accept`
+closes a Feature implicitly.
+
+There are two valid intent paths: (A) `implement --all` starts with
+`close_feature: false`; if the user later explicitly requests closure, perform
+the same reasoned `accept`, then explicit `close` sequence when status shows
+the evidence is current. (B) If the user clearly requests closure at mandate
+start, record `close_feature: true`; carry that intent forward without asking
+again, but still wait for current evidence and perform both explicit writes.
+With no clear close intent, do not infer it from completion.
+
+Only a closed Feature can be reopened. Use `reopen` with its exact
+`feature_id` and a reason before making semantic changes; the new cycle retains
+the prior closure and check history, while affected evidence must be current
+again. Reopening and reasoned evolution are not implicit consequences of a
+status or change request.
+
+See the [AC2 evidence and state contract](ac0-consolidated-mvp.md) for fixture
+execution status and the simulated/native, browser, and LLM evidence limits.
+
 ### R2-C2: detect host delegation contract candidates, fail closed
 
 `evospec_auto_contract` is a separate, read-only **compatibility diagnostic** for the proposed Auto-first delegated authority in [#49](https://github.com/Edulynch/OpenCode-EvoSpec/issues/49). It reports whether the running host exposes a `permission.saved.list` function and whether an observed `permission.evaluate` event contains the candidate `rule.source` shape proposed in [OpenCode #61767](https://github.com/anomalyco/opencode/issues/61767). This observation is ephemeral and per-session: it stores a boolean, **not** rule values, resources, permission records, prompt texts, or user identities. It never calls the saved-rules function and does not issue a permission request.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
@@ -72,9 +72,13 @@ from .continuity_documents import (
     tasks_write as _write_tasks,
 )
 from .domain import (
+    CONTINUITY_CHECK_METHODS,
     CONTINUITY_INPUT_POLICY_DIGEST,
     CONTINUITY_INPUT_POLICY_ID,
     ContinuityAttempt,
+    ContinuityAcceptance,
+    ContinuityAcceptanceCriterion,
+    ContinuityAcceptanceTask,
     ContinuityCheck,
     ContinuityClosure,
     ContinuityCriterionDocument,
@@ -90,11 +94,14 @@ from .domain import (
     ContinuityMandate,
     ContinuityMandateReference,
     ContinuityReopen,
+    ContinuityReviewDecision,
     ContinuityStateData,
     ContinuityTaskEvent,
     ContinuityTaskDocument,
+    continuity_check_descriptor_valid,
 )
 from .input_fingerprint import (
+    InputSnapshot,
     InputFingerprintError,
     repository_input_snapshot,
 )
@@ -104,6 +111,7 @@ from .lifecycle import (
     ContinuityTaskView,
     continuity_close_blockers,
     continuity_current_checks,
+    continuity_task_reports,
     continuity_task_eligible,
     continuity_task_status,
 )
@@ -122,7 +130,8 @@ _MAX_INCREMENTS = 100
 _MAX_DECISIONS = 1000
 _COMMANDS = frozenset((
     "specify", "clarify", "plan", "tasks", "implement", "use", "change",
-    "status", "input_snapshot", "verify", "pause", "resume", "close",
+    "status", "input_snapshot", "verify", "review_decision", "accept",
+    "pause", "resume", "close", "reopen",
     "reconcile", "upgrade_markdown",
 ))
 
@@ -132,16 +141,25 @@ _DocumentRecord = TypeVar("_DocumentRecord", bound=Mapping[str, object])
 class _ContinuityCheckView(TypedDict):
     criterion_id: str
     criterion_digest: str
-    exit_code: int
     check_kind: str
     check_target: str
-    output_sha256: str
     task_id: str | None
     reported_by_session_id: str
     recorded_revision: int
-    observed_input_scope: NotRequired[dict[str, str]]
+    exit_code: NotRequired[int]
+    output_sha256: NotRequired[str]
+    observed_input_scope: NotRequired[ContinuityInputScope]
     task_digest: NotRequired[str]
     mandate_id: NotRequired[str]
+    feature_id: NotRequired[str]
+    feature_cycle: NotRequired[int]
+    purpose: NotRequired[str]
+    evidence_status: NotRequired[str]
+    source: NotRequired[str]
+    evidence_ref: NotRequired[str]
+    artifact_present: NotRequired[bool]
+    artifact_sha256: NotRequired[str]
+    report: NotRequired[str]
 
 
 def _plain_record(record: Mapping[str, object]) -> dict[str, object]:
@@ -192,6 +210,12 @@ def _continuity_input_scope(
         snapshot = repository_input_snapshot(root, state["repository_id"])
     except InputFingerprintError as error:
         raise ContinuityError("INPUT_SNAPSHOT_UNAVAILABLE", str(error)) from error
+    return _continuity_input_scope_from_snapshot(state, snapshot)
+
+
+def _continuity_input_scope_from_snapshot(
+    state: ContinuityStateData, snapshot: InputSnapshot,
+) -> ContinuityInputScope:
     excluded = set(state["documents"]) | {"specs/README.md"}
     excluded_directories = {
         path.rsplit("/", 1)[0]
@@ -276,24 +300,60 @@ def _continuity_state_view(
     input_snapshot: ContinuityInputScope | None = None,
 ) -> ContinuityStateView:
     execution = state["execution"]
-    return {
+    view: ContinuityStateView = {
         "checks": tuple(_continuity_check_view(check) for check in state["checks"]),
-        "attempts": tuple(state["attempts"]),
+        "attempts": (),
         "execution": None if execution is None else {"task_id": execution["task_id"]},
         "paused_features": tuple(state["paused_features"]),
-        "task_events": tuple(state.get("task_events", ())),
-        "input_snapshot": None if input_snapshot is None else {
-            "policy_id": input_snapshot["policy_id"],
-            "policy_digest": input_snapshot["policy_digest"],
-            "fingerprint": input_snapshot["fingerprint"],
-        },
     }
+    view["attempts"] = tuple(state["attempts"])
+    view["task_events"] = tuple(state.get("task_events", ()))
+    view["review_decisions"] = tuple(state.get("review_decisions", ()))
+    view["input_snapshot"] = None if input_snapshot is None else {
+        "policy_id": input_snapshot["policy_id"],
+        "policy_digest": input_snapshot["policy_digest"],
+        "fingerprint": input_snapshot["fingerprint"],
+    }
+    return view
 
 
 def _continuity_feature_view(
     feature: ContinuityFeatureDocument,
+    state: ContinuityStateData | None = None,
+    tasks: list[ContinuityTaskDocument] | None = None,
 ) -> ContinuityFeatureView:
-    return {"criteria": tuple(feature["criteria"])}
+    view = cast(
+        ContinuityFeatureView,
+        cast(object, {"criteria": tuple(feature["criteria"])}),
+    )
+    if state is not None:
+        feature_id = feature["id"]
+        view["id"] = feature_id
+        view["cycle"] = state["features"][feature_id]["cycle"]
+        mandate = _feature_mandate(state, feature_id)
+        view["mandate_id"] = None if mandate is None else mandate["id"]
+        view["mandate_scope_current"] = (
+            mandate is None
+            or (
+                _mandate_scope_matches(mandate, feature)
+                and (
+                    tasks is None
+                    or all(
+                        (
+                            task["increment_id"] is None
+                            or task["increment_id"] in {
+                                item["id"] for item in mandate["increments"]
+                            }
+                        )
+                        and set(task["criteria_ids"]) <= {
+                            item["id"] for item in mandate["criteria"]
+                        }
+                        for task in tasks
+                    )
+                )
+            )
+        )
+    return view
 
 
 def _continuity_task_view(task: ContinuityTaskDocument) -> ContinuityTaskView:
@@ -308,31 +368,182 @@ def _continuity_task_view(task: ContinuityTaskDocument) -> ContinuityTaskView:
 
 
 def _continuity_check_view(check: ContinuityCheck) -> _ContinuityCheckView:
-    view: _ContinuityCheckView = {
-        "criterion_id": check["criterion_id"],
-        "criterion_digest": check["criterion_digest"],
-        "exit_code": check["exit_code"],
-        "check_kind": check["check_kind"],
-        "check_target": check["check_target"],
-        "output_sha256": check["output_sha256"],
-        "task_id": check["task_id"],
-        "reported_by_session_id": check["reported_by_session_id"],
-        "recorded_revision": check["recorded_revision"],
-    }
-    observed = check.get("observed_input_scope")
-    if observed is not None:
-        view["observed_input_scope"] = {
-            "policy_id": observed["policy_id"],
-            "policy_digest": observed["policy_digest"],
-            "fingerprint": observed["fingerprint"],
-        }
-    task_digest = check.get("task_digest")
-    if task_digest is not None:
-        view["task_digest"] = task_digest
-    mandate_id = check.get("mandate_id")
-    if mandate_id is not None:
-        view["mandate_id"] = mandate_id
-    return view
+    return cast(_ContinuityCheckView, cast(object, dict(check)))
+
+
+def _current_review_decision(
+    state: ContinuityStateData,
+    feature_id: str,
+    cycle: int,
+    criterion: ContinuityCriterionDocument,
+    check: Mapping[str, object],
+    mandate_id: str | None,
+) -> ContinuityReviewDecision | None:
+    for decision in reversed(state.get("review_decisions", [])):
+        if (
+            decision["feature_id"] == feature_id
+            and decision["feature_cycle"] == cycle
+            and decision["criterion_id"] == criterion["id"]
+            and decision["criterion_digest"] == _digest(criterion)
+            and decision["evidence_ref"] == check.get("evidence_ref")
+            and decision["task_id"] == check.get("task_id")
+            and decision["task_digest"] == check.get("task_digest")
+            and decision["mandate_id"] == mandate_id
+        ):
+            return decision
+    return None
+
+
+def _acceptance_basis(
+    state: ContinuityStateData,
+    feature_id: str,
+    feature: ContinuityFeatureDocument,
+    tasks: list[ContinuityTaskDocument],
+    input_snapshot: ContinuityInputScope,
+    mandate_id: str | None,
+) -> tuple[list[ContinuityAcceptanceCriterion], list[ContinuityAcceptanceTask]]:
+    feature_view = _continuity_feature_view(feature, state, tasks)
+    state_view = _continuity_state_view(state, input_snapshot)
+    task_views = tuple(_continuity_task_view(task) for task in tasks)
+    checks = continuity_current_checks(state_view, feature_view, tasks=task_views)
+    criteria: list[ContinuityAcceptanceCriterion] = []
+    for criterion in feature["criteria"]:
+        check = checks.get(criterion["id"])
+        if check is None:
+            raise ContinuityError(
+                "ACCEPTANCE_BLOCKED",
+                f"criterion {criterion['id']} has no current attributable evidence",
+            )
+        evidence_status = check.get("status")
+        review_decision = (
+            _current_review_decision(
+                state, feature_id, state["features"][feature_id]["cycle"],
+                criterion, check, mandate_id,
+            )
+            if evidence_status == "REPORTED" and criterion["check_kind"] == "review"
+            else None
+        )
+        if evidence_status != "VERIFIED" and not (
+            evidence_status == "REPORTED"
+            and review_decision is not None
+            and review_decision["decision"] == "ACCEPTED"
+        ):
+            raise ContinuityError(
+                "ACCEPTANCE_BLOCKED",
+                f"criterion {criterion['id']} is not verified or explicitly accepted as a review",
+            )
+        check_ref = check.get("evidence_ref")
+        check_revision = check.get("recorded_revision")
+        task_id = check.get("task_id")
+        task_digest = check.get("task_digest")
+        reported_by = check.get("reported_by_session_id")
+        if (
+            not isinstance(check_ref, str)
+            or type(check_revision) is not int
+            or not isinstance(task_id, str)
+            or not isinstance(task_digest, str)
+            or not isinstance(reported_by, str)
+            or check.get("mandate_id") != mandate_id
+        ):
+            raise ContinuityError(
+                "ACCEPTANCE_BLOCKED",
+                f"criterion {criterion['id']} does not have current revision-bound evidence",
+            )
+        criteria.append({
+            "criterion_id": criterion["id"],
+            "criterion_digest": _digest(criterion),
+            "evidence_status": cast(str, evidence_status),
+            "check_ref": check_ref,
+            "check_revision": check_revision,
+            "task_id": task_id,
+            "task_digest": task_digest,
+            "reported_by_session_id": reported_by,
+            "review_decision_id": (
+                None if review_decision is None else review_decision["id"]
+            ),
+        })
+
+    accepted_tasks: list[ContinuityAcceptanceTask] = []
+    for task, task_view in zip(tasks, task_views, strict=True):
+        if continuity_task_status(state_view, feature_view, task_view, task_views) != "COMPLETED":
+            raise ContinuityError(
+                "ACCEPTANCE_BLOCKED", f"Task {task['id']} is not complete",
+            )
+        attempt = next(
+            (
+                item for item in reversed(state["attempts"])
+                if item["task_id"] == task["id"]
+                and item.get("feature_id") == feature_id
+                and item.get("feature_cycle") == state["features"][feature_id]["cycle"]
+                and item.get("task_digest") == _digest(task)
+                and item.get("mandate_id") == mandate_id
+            ),
+            None,
+        )
+        evidence_ref = None if attempt is None else attempt.get("evidence_ref")
+        reported_revision = None if attempt is None else attempt.get("reported_revision")
+        reported_by_session_id = (
+            None if attempt is None else attempt.get("reported_by_session_id")
+        )
+        if (
+            attempt is None
+            or attempt["status"] not in ("REPORTED", "RECONCILED_COMPLETE")
+            or not isinstance(evidence_ref, str)
+            or type(reported_revision) is not int
+            or not isinstance(reported_by_session_id, str)
+        ):
+            raise ContinuityError(
+                "ACCEPTANCE_BLOCKED",
+                f"Task {task['id']} has no current attributable completed attempt",
+            )
+        accepted_tasks.append({
+            "task_id": task["id"],
+            "task_digest": _digest(task),
+            "attempt": attempt["attempt"],
+            "attempt_status": attempt["status"],
+            "evidence_ref": evidence_ref,
+            "reported_revision": reported_revision,
+            "reported_by_session_id": reported_by_session_id,
+        })
+    return criteria, accepted_tasks
+
+
+def _latest_acceptance(
+    state: ContinuityStateData, feature_id: str, cycle: int,
+) -> ContinuityAcceptance | None:
+    return next(
+        (
+            item for item in reversed(state.get("acceptances", []))
+            if item["feature_id"] == feature_id and item["cycle"] == cycle
+        ),
+        None,
+    )
+
+
+def _acceptance_matches_current(
+    state: ContinuityStateData,
+    acceptance: ContinuityAcceptance,
+    feature_id: str,
+    feature: ContinuityFeatureDocument,
+    tasks: list[ContinuityTaskDocument],
+    input_snapshot: ContinuityInputScope,
+    mandate_id: str | None,
+) -> bool:
+    if (
+        acceptance["feature_id"] != feature_id
+        or acceptance["cycle"] != state["features"][feature_id]["cycle"]
+        or acceptance["revision"] != state["revision"]
+        or acceptance["mandate_id"] != mandate_id
+        or acceptance["input_snapshot"] != input_snapshot
+    ):
+        return False
+    try:
+        criteria, accepted_tasks = _acceptance_basis(
+            state, feature_id, feature, tasks, input_snapshot, mandate_id,
+        )
+    except ContinuityError:
+        return False
+    return acceptance["criteria"] == criteria and acceptance["tasks"] == accepted_tasks
 
 
 def execute(
@@ -487,6 +698,13 @@ def _mutate(
     if (operation == "tasks" and not data) or (operation == "use" and not data):
         return _project(store, state, session_id)
 
+    if operation == "reopen":
+        feature_id = data.get("feature_id")
+        if not isinstance(feature_id, str) or not feature_id.strip():
+            raise ContinuityError(
+                "FEATURE_REQUIRED", "reopen requires an explicit Feature ID",
+            )
+
     if operation == "specify":
         _keys(data, {"title", "outcome", "criteria", "increments", "tasks", "plan"})
         if len(state["features"]) >= _MAX_FEATURES:
@@ -546,6 +764,12 @@ def _mutate(
         writes.update(_index_write(root, candidate, new_feature=(record["id"], folder, record["title"])))
         return _publish_mutation(store, state, candidate, writes, session_id)
 
+    if operation == "accept":
+        _keys(data, {"feature_id", "reason", "mandate_id"})
+        if not isinstance(data.get("feature_id"), str) or not data["feature_id"]:
+            raise ContinuityError(
+                "FEATURE_REQUIRED", "accept requires an explicit Feature ID",
+            )
     feature_id = _selected_feature(state, session_id, data.get("feature_id"))
     if operation == "resume" and state["execution"] is not None:
         owner = _execution_feature(root, state)
@@ -557,6 +781,7 @@ def _mutate(
     decisions = _read_decisions(root, state, feature_id)
     candidate = _copy_state(state)
     writes: dict[str, tuple[bytes, str | None]] = {}
+    commit_guard: Callable[[], None] | None = None
     feature_path = candidate["features"][feature_id]["directory"]
 
     if operation == "use":
@@ -573,7 +798,7 @@ def _mutate(
 
     elif (
         candidate["features"][feature_id]["status"] == "CLOSED"
-        and operation not in ("change", "close")
+        and operation not in ("reopen", "close")
         and not (
             operation == "implement"
             and data.get("phase", "queue") == "queue"
@@ -582,9 +807,8 @@ def _mutate(
     ):
         raise ContinuityError(
             "REOPEN_INTENT_REQUIRED",
-            "mutations of a closed Feature require the explicit change operation "
-            "or reconcile with reopen_feature_id equal to this Feature ID; closure "
-            "history is retained",
+            "reopen a closed Feature explicitly with a reason before semantic changes; "
+            "closure history is retained",
         )
 
     elif operation == "clarify":
@@ -638,7 +862,7 @@ def _mutate(
             task_view = _continuity_task_view(task)
             task_status = continuity_task_status(
                 _continuity_state_view(state, current_snapshot),
-                _continuity_feature_view(feature), task_view,
+                _continuity_feature_view(feature, state, tasks), task_view,
                 tuple(_continuity_task_view(item) for item in tasks),
             )
             previous_event = next((
@@ -824,7 +1048,7 @@ def _mutate(
                 input_snapshot = None
             if not continuity_task_eligible(
                 _continuity_state_view(candidate, input_snapshot),
-                _continuity_feature_view(feature),
+                _continuity_feature_view(feature, candidate, tasks),
                 tuple(_continuity_task_view(item) for item in tasks),
                 _continuity_task_view(task),
             ):
@@ -839,6 +1063,10 @@ def _mutate(
                     "report", maximum=2048, allow_empty=False,
                 ),
                 "result": None, "result_status": None, "evidence_ref": None,
+                "feature_id": feature_id,
+                "feature_cycle": candidate["features"][feature_id]["cycle"],
+                "task_digest": _digest(task),
+                "started_revision": state["revision"] + 1,
             }
             if mandate is not None:
                 entry["mandate_id"] = mandate["id"]
@@ -871,30 +1099,25 @@ def _mutate(
             else:
                 candidate["execution"] = None
                 entry["evidence_ref"] = f"session:{session_id}:task:{task['id']}:attempt:{entry['attempt']}"
+                entry["reported_revision"] = state["revision"] + 1
+                entry["reported_by_session_id"] = session_id
+                try:
+                    entry["reported_input_scope"] = _continuity_input_scope(root, candidate)
+                except ContinuityError:
+                    pass
             writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
         else:
             raise ContinuityError("INVALID_REQUEST", "implement phase must be queue, begin, or report")
 
     elif operation == "verify":
-        _keys(data, {
-            "feature_id", "criterion_id", "exit_code", "output_sha256",
-            "check_kind", "check_target", "task_id",
-            "input_snapshot_before", "input_snapshot_after",
-            "mandate_id",
-        })
-        # The OpenCode tool supplies result fields only after it runs an allow-listed test.
         criterion = _by_id(feature["criteria"], data.get("criterion_id"), "C", "criterion_id")
-        exit_code = data.get("exit_code")
-        if type(exit_code) is not int or not 0 <= exit_code <= 255:
-            raise ContinuityError("INVALID_REQUEST", "check exit code must be between 0 and 255")
-        output_digest = data.get("output_sha256")
-        if not isinstance(output_digest, str) or re.fullmatch(r"[0-9a-f]{64}", output_digest) is None:
-            raise ContinuityError("INVALID_REQUEST", "check output digest must be a SHA-256 value")
         if (
             data.get("check_kind") != criterion["check_kind"]
             or data.get("check_target") != criterion["check_target"]
         ):
             raise ContinuityError("STALE_CRITERION", "check target differs from the current criterion")
+        if "feature_id" in data and data["feature_id"] != feature_id:
+            raise ContinuityError("FEATURE_MISMATCH", "evidence Feature differs from the selected Feature")
         if candidate["execution"] is not None:
             raise ContinuityError("EXECUTION_BUSY", "reconcile the in-flight Task before verifying")
         task_id = _text(data.get("task_id"), "task_id", maximum=256)
@@ -910,30 +1133,234 @@ def _mutate(
             raise ContinuityError(
                 "INVALID_REQUEST", "verification Task must be linked to the current criterion",
             )
-        input_before = _input_scope_argument(
-            data.get("input_snapshot_before"), "input_snapshot_before",
-        )
-        input_after = _input_scope_argument(
-            data.get("input_snapshot_after"), "input_snapshot_after",
-        )
-        current_input = _continuity_input_scope(root, state)
-        if input_before != input_after or input_before != current_input:
-            raise ContinuityError(
-                "STALE_INPUT", "repository inputs changed before the check receipt was admitted",
+        method = criterion["check_kind"]
+        source: str
+        evidence_status: str
+        artifact_present: bool | None = None
+        artifact_sha256: str | None = None
+        report: str | None = None
+        if method in ("python-unittest", "node-test"):
+            _keys(data, {
+                "feature_id", "criterion_id", "exit_code", "output_sha256",
+                "check_kind", "check_target", "task_id",
+                "input_snapshot_before", "input_snapshot_after", "mandate_id",
+            })
+            exit_code = data.get("exit_code")
+            if type(exit_code) is not int or not 0 <= exit_code <= 255:
+                raise ContinuityError("INVALID_REQUEST", "check exit code must be between 0 and 255")
+            output_digest = data.get("output_sha256")
+            if not isinstance(output_digest, str) or re.fullmatch(r"[0-9a-f]{64}", output_digest) is None:
+                raise ContinuityError("INVALID_REQUEST", "check output digest must be a SHA-256 value")
+            input_before = _input_scope_argument(
+                data.get("input_snapshot_before"), "input_snapshot_before",
             )
+            input_after = _input_scope_argument(
+                data.get("input_snapshot_after"), "input_snapshot_after",
+            )
+            current_input = _continuity_input_scope(root, state)
+            if input_before != input_after or input_before != current_input:
+                raise ContinuityError(
+                    "STALE_INPUT", "repository inputs changed before the check receipt was admitted",
+                )
+            evidence_status = "VERIFIED" if exit_code == 0 else "FAILED"
+            source = "CALLER_FORWARDED_UNATTESTED"
+        elif method == "artifact-present":
+            _keys(data, {
+                "feature_id", "criterion_id", "check_kind", "check_target",
+                "task_id", "mandate_id",
+            })
+            target = criterion["check_target"]
+            if target in state["documents"] or target == "specs/README.md":
+                raise ContinuityError(
+                    "UNSAFE_ARTIFACT", "artifact evidence cannot target a Core-managed Feature document",
+                )
+            try:
+                snapshot = repository_input_snapshot(root, state["repository_id"])
+            except InputFingerprintError as error:
+                raise ContinuityError("INPUT_SNAPSHOT_UNAVAILABLE", str(error)) from error
+            current_input = _continuity_input_scope_from_snapshot(state, snapshot)
+            file_digests = dict(snapshot.file_sha256)
+            if target in file_digests:
+                artifact_present = True
+                artifact_sha256 = file_digests[target]
+            elif target in snapshot.directory_paths:
+                raise ContinuityError(
+                    "UNSAFE_ARTIFACT", "artifact target names a directory, not a regular file",
+                )
+            else:
+                artifact_present = False
+            input_before = current_input
+            input_after = current_input
+            evidence_status = "VERIFIED" if artifact_present else "FAILED"
+            source = "CORE_OBSERVED"
+        elif method == "review":
+            _keys(data, {
+                "feature_id", "criterion_id", "check_kind", "check_target",
+                "task_id", "mandate_id", "report",
+            })
+            current_input = _continuity_input_scope(root, state)
+            input_before = current_input
+            input_after = current_input
+            report = _text(data.get("report"), "review report", maximum=4096, multiline=True)
+            evidence_status = "REPORTED"
+            source = "CALLER_REPORTED"
+        else:
+            raise ContinuityError(
+                "UNSUPPORTED_EVIDENCE_METHOD",
+                "build, integration, and functional descriptors are not executable Core evidence",
+            )
+
+        recorded_revision = state["revision"] + 1
+        feature_cycle = candidate["features"][feature_id]["cycle"]
         check: ContinuityCheck = {
             "criterion_id": criterion["id"], "criterion_digest": _digest(criterion),
             "check_kind": criterion["check_kind"], "check_target": criterion["check_target"],
-            "exit_code": exit_code, "output_sha256": output_digest,
             "reported_by_session_id": session_id, "task_id": task_id,
-            "recorded_revision": state["revision"] + 1,
+            "recorded_revision": recorded_revision,
             "observed_input_scope": current_input,
             "task_digest": _digest(task),
+            "feature_id": feature_id,
+            "feature_cycle": feature_cycle,
+            "purpose": criterion["description"],
+            "evidence_status": evidence_status,
+            "source": source,
+            "evidence_ref": (
+                f"continuity:{feature_id}:{feature_cycle}:{criterion['id']}:{recorded_revision}"
+            ),
+            "input_snapshot_before": input_before,
+            "input_snapshot_after": input_after,
         }
+        if method in ("python-unittest", "node-test"):
+            check["exit_code"] = cast(int, data["exit_code"])
+            check["output_sha256"] = cast(str, data["output_sha256"])
+        elif method == "artifact-present":
+            assert artifact_present is not None
+            check["artifact_present"] = artifact_present
+            if artifact_sha256 is not None:
+                check["artifact_sha256"] = artifact_sha256
+        elif report is not None:
+            check["report"] = report
         if mandate is not None:
             check["mandate_id"] = mandate["id"]
         candidate["checks"].append(check)
         writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
+
+    elif operation == "review_decision":
+        _keys(data, {
+            "feature_id", "criterion_id", "evidence_ref", "decision",
+            "reason", "mandate_id",
+        })
+        criterion = _by_id(
+            feature["criteria"], data.get("criterion_id"), "C", "criterion_id",
+        )
+        if criterion["check_kind"] != "review":
+            raise ContinuityError(
+                "INVALID_REVIEW_DECISION",
+                "only a review criterion can receive an explicit review decision",
+            )
+        mandate = _validate_mandate_request(
+            candidate, feature_id, data, feature, tasks,
+        )
+        if mandate is not None and not _mandate_scope_matches(mandate, feature):
+            raise ContinuityError(
+                "MANDATE_STALE_SCOPE", "review decision is outside the current mandate scope",
+            )
+        try:
+            input_snapshot = _continuity_input_scope(root, state)
+        except ContinuityError as error:
+            raise ContinuityError(
+                "REVIEW_EVIDENCE_STALE", "current repository inputs are unavailable",
+            ) from error
+        current_check = continuity_current_checks(
+            _continuity_state_view(state, input_snapshot),
+            _continuity_feature_view(feature, state, tasks),
+            tasks=tuple(_continuity_task_view(item) for item in tasks),
+        ).get(criterion["id"])
+        evidence_ref = data.get("evidence_ref")
+        if (
+            current_check is None
+            or current_check.get("status") != "REPORTED"
+            or current_check.get("source") != "CALLER_REPORTED"
+            or current_check.get("check_kind") != "review"
+            or not isinstance(evidence_ref, str)
+            or current_check.get("evidence_ref") != evidence_ref
+        ):
+            raise ContinuityError(
+                "REVIEW_EVIDENCE_STALE",
+                "review decision must identify the exact current review report",
+            )
+        task_id = current_check.get("task_id")
+        task_digest = current_check.get("task_digest")
+        if (
+            not isinstance(task_id, str)
+            or not isinstance(task_digest, str)
+            or task_id not in {item["id"] for item in tasks}
+        ):
+            raise ContinuityError(
+                "REVIEW_EVIDENCE_STALE",
+                "review report has no current attributable Task",
+            )
+        decision_kind = data.get("decision")
+        if decision_kind not in ("ACCEPTED", "REJECTED"):
+            raise ContinuityError(
+                "INVALID_REQUEST", "decision must be ACCEPTED or REJECTED",
+            )
+        review: ContinuityReviewDecision = {
+            "id": _new_id("D", candidate),
+            "feature_id": feature_id,
+            "feature_cycle": candidate["features"][feature_id]["cycle"],
+            "criterion_id": criterion["id"],
+            "criterion_digest": _digest(criterion),
+            "evidence_ref": evidence_ref,
+            "task_id": task_id,
+            "task_digest": task_digest,
+            "mandate_id": None if mandate is None else mandate["id"],
+            "decision": cast(str, decision_kind),
+            "reason": _text(data.get("reason"), "reason", maximum=2048),
+            "revision": state["revision"] + 1,
+            "session_id": session_id,
+        }
+        candidate.setdefault("review_decisions", []).append(review)
+        writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
+
+    elif operation == "accept":
+        mandate = _validate_mandate_request(
+            candidate, feature_id, data, feature, tasks,
+        )
+        try:
+            input_snapshot = _continuity_input_scope(root, state)
+        except ContinuityError as error:
+            raise ContinuityError(
+                "ACCEPTANCE_BLOCKED", "current repository inputs are unavailable",
+            ) from error
+        blockers = continuity_close_blockers(
+            _continuity_state_view(state, input_snapshot),
+            feature_id,
+            {"status": candidate["features"][feature_id]["status"]},
+            _continuity_feature_view(feature, candidate, tasks),
+            tuple(_continuity_task_view(item) for item in tasks),
+        )
+        if blockers:
+            raise ContinuityError("ACCEPTANCE_BLOCKED", "; ".join(blockers))
+        criteria, accepted_tasks = _acceptance_basis(
+            state, feature_id, feature, tasks, input_snapshot,
+            None if mandate is None else mandate["id"],
+        )
+        acceptance: ContinuityAcceptance = {
+            "id": _new_id("D", candidate),
+            "feature_id": feature_id,
+            "cycle": candidate["features"][feature_id]["cycle"],
+            "basis_revision": state["revision"],
+            "revision": state["revision"] + 1,
+            "session_id": session_id,
+            "reason": _text(data.get("reason"), "reason", maximum=2048),
+            "mandate_id": None if mandate is None else mandate["id"],
+            "input_snapshot": input_snapshot,
+            "criteria": criteria,
+            "tasks": accepted_tasks,
+        }
+        candidate.setdefault("acceptances", []).append(acceptance)
+        return _publish_state_only(store, state, candidate, session_id)
 
     elif operation == "pause":
         _keys(data, {
@@ -1046,6 +1473,12 @@ def _mutate(
             entry["result_status"] = reconcile
             entry["evidence_ref"] = evidence_ref
             entry["result"] = entry.get("result") or "Outcome reconciled explicitly after interruption"
+            entry["reported_revision"] = state["revision"] + 1
+            entry["reported_by_session_id"] = session_id
+            try:
+                entry["reported_input_scope"] = _continuity_input_scope(root, candidate)
+            except ContinuityError:
+                pass
             candidate["execution"] = None
             writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
         elif reconcile is not None:
@@ -1071,48 +1504,133 @@ def _mutate(
         candidate["pause_reasons"].pop(feature_id, None)
 
     elif operation == "close":
-        _keys(data, {"feature_id", "mandate_id"})
+        _keys(data, {"feature_id", "mandate_id", "acceptance_id"})
         mandate = _validate_mandate_request(
             candidate, feature_id, data, feature, tasks,
         )
-        if mandate is not None and not mandate["close_feature"]:
+        feature_state = candidate["features"][feature_id]
+        if feature_state["status"] == "CLOSED":
+            raise ContinuityError("ALREADY_CLOSED", "Feature is already closed in this cycle")
+        acceptance_id = data.get("acceptance_id")
+        close_acceptance = next(
+            (
+                item for item in reversed(candidate.get("acceptances", []))
+                if item["feature_id"] == feature_id
+                and item["cycle"] == feature_state["cycle"]
+            ),
+            None,
+        )
+        if (
+            close_acceptance is None
+            or not isinstance(acceptance_id, str)
+            or close_acceptance["id"] != acceptance_id
+        ):
             raise ContinuityError(
-                "MANDATE_CLOSE_NOT_REQUESTED",
-                "Feature closure was not explicitly included in the active mandate",
+                "ACCEPTANCE_REQUIRED",
+                "close requires the exact latest acceptance decision for this Feature cycle",
             )
         try:
             current_input_snapshot = _continuity_input_scope(root, state)
         except ContinuityError as error:
-            current_input_snapshot = None
-            input_snapshot_error = str(error)
-        else:
-            input_snapshot_error = None
+            raise ContinuityError(
+                "CLOSE_BLOCKED", "current input snapshot is unavailable",
+            ) from error
+        if close_acceptance["revision"] != state["revision"]:
+            raise ContinuityError(
+                "ACCEPTANCE_STALE",
+                "state changed after acceptance; reread, recheck, and record a new explicit acceptance",
+            )
         blockers = continuity_close_blockers(
             _continuity_state_view(state, current_input_snapshot),
             feature_id,
-            {"status": candidate["features"][feature_id]["status"]},
-            _continuity_feature_view(feature),
+            {"status": feature_state["status"]},
+            _continuity_feature_view(feature, candidate, tasks),
             tuple(_continuity_task_view(item) for item in tasks),
         )
-        if input_snapshot_error is not None:
-            blockers = (*blockers, f"current input snapshot is unavailable: {input_snapshot_error}")
         if blockers:
             raise ContinuityError("CLOSE_BLOCKED", "; ".join(blockers))
-        feature_state = candidate["features"][feature_id]
-        if feature_state["status"] == "CLOSED":
-            raise ContinuityError("ALREADY_CLOSED", "Feature is already closed in this cycle")
+        criteria_basis, tasks_basis = _acceptance_basis(
+            state, feature_id, feature, tasks, current_input_snapshot,
+            None if mandate is None else mandate["id"],
+        )
+        if (
+            close_acceptance["feature_id"] != feature_id
+            or close_acceptance["cycle"] != feature_state["cycle"]
+            or close_acceptance["mandate_id"] != (
+                None if mandate is None else mandate["id"]
+            )
+            or close_acceptance["input_snapshot"] != current_input_snapshot
+            or close_acceptance["criteria"] != criteria_basis
+            or close_acceptance["tasks"] != tasks_basis
+        ):
+            raise ContinuityError(
+                "ACCEPTANCE_STALE",
+                "accepted criteria, checks, Tasks, mandate, or repository inputs changed",
+            )
+        accepted_input_snapshot = close_acceptance["input_snapshot"]
+
+        def check_close_input_snapshot() -> None:
+            try:
+                latest_input_snapshot = _continuity_input_scope(root, state)
+            except ContinuityError as error:
+                raise ContinuityError(
+                    "CLOSE_BLOCKED", "current input snapshot is unavailable",
+                ) from error
+            if latest_input_snapshot != accepted_input_snapshot:
+                raise ContinuityError(
+                    "ACCEPTANCE_STALE",
+                    "repository inputs changed before closure publication",
+                )
+
+        commit_guard = check_close_input_snapshot
         receipt: ContinuityClosure = {
-                "id": _new_id("D", candidate, {item.get("id") for item in candidate["closures"]}), "feature_id": feature_id,
+            "id": _new_id("D", candidate),
+            "feature_id": feature_id,
             "cycle": feature_state["cycle"], "revision": state["revision"] + 1,
             "criteria": [
                 {"id": item["id"], "digest": _digest(item)}
                 for item in feature["criteria"]
             ],
             "session_id": session_id,
+            "acceptance_id": close_acceptance["id"],
+            "basis_revision": close_acceptance["basis_revision"],
+            "mandate_id": None if mandate is None else mandate["id"],
         }
         candidate["closures"].append(receipt)
         feature_state["status"] = "CLOSED"
         writes.update(_render_spec_write(root, candidate, feature_id, feature))
+        writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
+        writes.update(_index_write(root, candidate))
+
+    elif operation == "reopen":
+        _keys(data, {"feature_id", "reason"})
+        feature_state = candidate["features"][feature_id]
+        if feature_state["status"] != "CLOSED":
+            raise ContinuityError(
+                "FEATURE_NOT_CLOSED", "only a closed Feature can be explicitly reopened",
+            )
+        previous = next(
+            (
+                item for item in reversed(candidate["closures"])
+                if item["feature_id"] == feature_id
+                and item["cycle"] == feature_state["cycle"]
+            ),
+            None,
+        )
+        if previous is None:
+            raise ContinuityError(
+                "CORRUPT_CONTINUITY", "closed Feature has no current closure receipt",
+            )
+        candidate["reopens"].append({
+            "feature_id": feature_id,
+            "cycle": feature_state["cycle"] + 1,
+            "previous_closure_id": previous["id"],
+            "session_id": session_id,
+            "reason": _text(data.get("reason"), "reason", maximum=2048),
+            "revision": state["revision"] + 1,
+        })
+        feature_state["cycle"] += 1
+        feature_state["status"] = "OPEN"
         writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
         writes.update(_index_write(root, candidate))
 
@@ -1155,25 +1673,6 @@ def _mutate(
             raise ContinuityError("LIMIT_EXCEEDED", "Feature Task limit is exceeded")
         tasks.append(task)
         candidate["task_states"][task["id"]] = {"attempts": 0}
-        feature_state = candidate["features"][feature_id]
-        if feature_state["status"] == "CLOSED":
-            previous = next(
-                (
-                    item for item in reversed(candidate["closures"])
-                    if item["feature_id"] == feature_id and item["cycle"] == feature_state["cycle"]
-                ),
-                None,
-            )
-            assert previous is not None
-            reopen: ContinuityReopen = {
-                "feature_id": feature_id, "cycle": feature_state["cycle"] + 1,
-                "previous_closure_id": previous["id"],
-                "session_id": session_id,
-            }
-            candidate["reopens"].append(reopen)
-            feature_state["cycle"] += 1
-            feature_state["status"] = "OPEN"
-            writes.update(_index_write(root, candidate))
         writes.update(_render_spec_write(root, candidate, feature_id, changed))
         writes.update(_render_task_write(root, candidate, feature_id, tasks, changed))
         feature = changed
@@ -1181,29 +1680,48 @@ def _mutate(
     else:
         raise ContinuityError("INVALID_OPERATION", "unsupported continuity operation")
 
-    if operation == "verify":
-        observed_input_scope = candidate["checks"][-1].get("observed_input_scope")
+    if operation in ("verify", "review_decision"):
+        observed_input_scope = (
+            candidate["checks"][-1].get("observed_input_scope")
+            if operation == "verify"
+            else next(
+                (
+                    item.get("observed_input_scope")
+                    for item in candidate["checks"]
+                    if item.get("evidence_ref")
+                    == candidate.get("review_decisions", [])[-1]["evidence_ref"]
+                ),
+                None,
+            )
+        )
         if (
             observed_input_scope is None
             or _continuity_input_scope(root, state) != observed_input_scope
         ):
             raise ContinuityError(
-                "STALE_INPUT", "repository inputs changed before the check receipt was committed",
+                "STALE_INPUT",
+                "repository inputs changed before the evidence decision was committed",
             )
-    return _publish_mutation(store, state, candidate, writes, session_id)
+    return _publish_mutation(
+        store, state, candidate, writes, session_id,
+        commit_guard=commit_guard,
+    )
 
 
 def _publish_mutation(
     store: ContinuityPersistence, state: ContinuityStateData,
     candidate: ContinuityStateData, writes: dict[str, tuple[bytes, str | None]],
-    session_id: str,
+    session_id: str, *, commit_guard: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     candidate["revision"] = state["revision"] + 1
     read_set: dict[str, str | None] = {
         path: digest for path, digest in state["documents"].items()
     }
     _refresh_document_metadata(candidate, writes)
-    store.commit(state, candidate, writes, read_set=read_set)
+    store.commit(
+        state, candidate, writes, read_set=read_set,
+        commit_guard=commit_guard,
+    )
     saved = store.load()
     assert saved is not None
     return _project(store, saved, session_id)
@@ -1365,6 +1883,12 @@ def _report_attempt_state_only(
         entry["evidence_ref"] = (
             f"session:{session_id}:task:{execution['task_id']}:attempt:{entry['attempt']}"
         )
+        entry["reported_revision"] = state["revision"] + 1
+        entry["reported_by_session_id"] = session_id
+        try:
+            entry["reported_input_scope"] = _continuity_input_scope(store.root, candidate)
+        except ContinuityError:
+            pass
     return _publish_state_only(store, state, candidate, session_id)
 
 
@@ -1425,6 +1949,12 @@ def _reconcile_attempt_state_only(
     entry["result_status"] = cast(str, data["reconcile"])
     entry["evidence_ref"] = evidence_ref
     entry["result"] = entry.get("result") or "Outcome reconciled explicitly after interruption"
+    entry["reported_revision"] = state["revision"] + 1
+    entry["reported_by_session_id"] = session_id
+    try:
+        entry["reported_input_scope"] = _continuity_input_scope(store.root, candidate)
+    except ContinuityError:
+        pass
     candidate["execution"] = None
     return _publish_state_only(store, state, candidate, session_id)
 
@@ -1654,7 +2184,8 @@ def _reconcile_documents(
     session_id: str, data: dict[str, object],
 ) -> dict[str, object]:
     _keys(data, {
-        "feature_id", "retire_ids", "reopen_feature_id", "mandate_id",
+        "feature_id", "retire_ids", "reopen_feature_id", "reopen_reason",
+        "mandate_id",
     })
     feature_id = data.get("feature_id")
     if not isinstance(feature_id, str) or feature_id not in state["features"]:
@@ -1819,15 +2350,21 @@ def _reconcile_documents(
         )
         if previous is None:
             raise ContinuityError("CORRUPT_CONTINUITY", "closed Feature has no current closure receipt")
-        candidate["reopens"].append({
+        reopen: ContinuityReopen = {
             "feature_id": feature_id, "cycle": feature_state["cycle"] + 1,
             "previous_closure_id": previous["id"], "session_id": session_id,
-        })
+            "reason": _text(
+                data.get("reopen_reason"), "reopen_reason", maximum=2048,
+            ),
+            "revision": state["revision"] + 1,
+        }
+        candidate["reopens"].append(reopen)
         feature_state["cycle"] += 1
         feature_state["status"] = "OPEN"
-    elif reopen_feature is not None:
+    elif reopen_feature is not None or data.get("reopen_reason") is not None:
         raise ContinuityError(
-            "INVALID_REQUEST", "reopen_feature_id is accepted only for a closed Feature with semantic edits",
+            "INVALID_REQUEST",
+            "reopen intent is accepted only for semantic edits to a closed Feature",
         )
 
     for identity in retired:
@@ -2060,10 +2597,13 @@ def _implementation_projection(
         return view
 
     current_state = _continuity_state_view(state, input_snapshot)
-    current_feature = _continuity_feature_view(feature)
+    current_feature = _continuity_feature_view(feature, state, tasks)
     task_views = tuple(_continuity_task_view(item) for item in tasks)
     checks = continuity_current_checks(
         current_state, current_feature, tasks=task_views,
+    )
+    task_reports = continuity_task_reports(
+        current_state, current_feature, task_views,
     )
     task_projection: list[dict[str, object]] = []
     by_increment: dict[str | None, list[dict[str, object]]] = {}
@@ -2082,17 +2622,39 @@ def _implementation_projection(
         for identity in task["criteria_ids"]:
             linked_tasks[identity].append(task["id"])
 
-    criteria = [
-        {
+    criteria: list[dict[str, object]] = []
+    for reference in mandate["criteria"]:
+        identity = reference["id"]
+        criterion = next(
+            (item for item in feature["criteria"] if item["id"] == identity),
+            None,
+        )
+        evidence = checks.get(identity)
+        historical = None
+        if evidence is None and criterion is not None:
+            historical = _continuity_historical_check(
+                state, feature, criterion, input_snapshot, task_views,
+                mandate["feature_id"],
+            )
+        report = task_reports.get(identity)
+        evidence_status = (
+            evidence.get("status", "STALE") if evidence is not None
+            else "STALE" if historical is not None and report is None
+            else "REPORTED" if report is not None
+            else "PENDING"
+        )
+        criteria.append({
             "id": identity,
-            "status": (
-                "PASSING" if checks.get(identity, {}).get("passed")
-                else "FAILING" if identity in checks
-                else "PENDING"
-            ),
-        }
-        for identity in (item["id"] for item in mandate["criteria"])
-    ]
+            "status": {
+                "VERIFIED": "PASSING",
+                "FAILED": "FAILING",
+                "REPORTED": "REPORTED",
+                "STALE": "STALE",
+            }.get(cast(str, evidence_status), "PENDING"),
+            "evidence_status": evidence_status,
+            "evidence": evidence or report or historical,
+            **({"historical_evidence": historical} if historical is not None else {}),
+        })
     increments: list[dict[str, object]] = []
     for reference in mandate["increments"]:
         increment_tasks = by_increment.get(reference["id"], [])
@@ -2144,6 +2706,9 @@ def _implementation_projection(
         identity for identity, linked in linked_tasks.items() if not linked
     ]
     passing_count = sum(item["status"] == "PASSING" for item in criteria)
+    failed_count = sum(item["status"] == "FAILING" for item in criteria)
+    reported_count = sum(item["status"] == "REPORTED" for item in criteria)
+    stale_count = sum(item["status"] == "STALE" for item in criteria)
     execution = state["execution"]
     execution_owner = (
         None if execution is None
@@ -2186,6 +2751,9 @@ def _implementation_projection(
         "coverage": {
             "criteria_total": len(mandate["criteria"]),
             "criteria_passing": passing_count,
+            "criteria_failed": failed_count,
+            "criteria_reported": reported_count,
+            "criteria_stale": stale_count,
             "tasks_total": len(task_projection),
             "tasks_completed": sum(
                 item["status"] == "COMPLETED" for item in task_projection
@@ -2290,12 +2858,51 @@ def _project(
         feature = cast(ContinuityFeatureDocument, parsed["spec"])
         tasks = cast(list[ContinuityTaskDocument], parsed["tasks"])
         feature_state = state["features"][feature_id]
+        feature_mandate = _feature_mandate(state, feature_id)
+        mandate_id = None if feature_mandate is None else feature_mandate["id"]
         continuity_state = _continuity_state_view(state, input_snapshot)
-        continuity_feature = _continuity_feature_view(feature)
+        continuity_feature = _continuity_feature_view(feature, state, tasks)
         task_views = tuple(_continuity_task_view(item) for item in tasks)
         current_checks = continuity_current_checks(
             continuity_state, continuity_feature, tasks=task_views,
         )
+        task_reports = continuity_task_reports(
+            continuity_state, continuity_feature, task_views,
+        )
+        acceptance = _latest_acceptance(
+            state, feature_id, feature_state["cycle"],
+        )
+        acceptance_current = bool(
+            acceptance is not None
+            and input_snapshot is not None
+            and _acceptance_matches_current(
+                state, acceptance, feature_id, feature, tasks, input_snapshot,
+                mandate_id,
+            )
+        )
+        close_blockers = list(continuity_close_blockers(
+            continuity_state, feature_id,
+            {"status": feature_state["status"]},
+            continuity_feature, task_views,
+        ))
+        acceptance_consumed = bool(
+            acceptance is not None
+            and any(
+                item.get("acceptance_id") == acceptance["id"]
+                for item in state["closures"]
+                if item["feature_id"] == feature_id
+            )
+        )
+        if feature_state["status"] == "CLOSED":
+            close_status = "CLOSED"
+        elif acceptance is None:
+            close_blockers.append("an explicit current Feature acceptance is required")
+            close_status = "ACCEPTANCE_REQUIRED" if not close_blockers[:-1] else "BLOCKED"
+        elif not acceptance_current:
+            close_blockers.append("the latest Feature acceptance is stale")
+            close_status = "ACCEPTANCE_STALE"
+        else:
+            close_status = "READY" if not close_blockers else "BLOCKED"
         task_projection: list[dict[str, object]] = []
         for task in tasks:
             continuity_task = _continuity_task_view(task)
@@ -2318,20 +2925,79 @@ def _project(
                 ),
                 **({"latest_event": latest_event} if latest_event is not None else {}),
             })
+        criterion_projection: list[dict[str, object]] = []
+        pending_review_decisions: list[dict[str, object]] = []
+        for criterion in feature["criteria"]:
+            check = current_checks.get(criterion["id"])
+            review_decision = (
+                None if check is None else _current_review_decision(
+                    state, feature_id, feature_state["cycle"], criterion,
+                    check,
+                    mandate_id,
+                )
+            )
+            if (
+                criterion["check_kind"] == "review"
+                and check is not None
+                and check.get("status") == "REPORTED"
+                and (
+                    review_decision is None
+                    or review_decision["decision"] != "ACCEPTED"
+                )
+            ):
+                pending_review: dict[str, object] = {
+                    "criterion_id": criterion["id"],
+                    "evidence_ref": check.get("evidence_ref"),
+                    "reported_by_session_id": check.get("reported_by_session_id"),
+                    "decision_required": True,
+                }
+                if review_decision is not None:
+                    pending_review["decision"] = review_decision["decision"]
+                    pending_review["review_decision_id"] = review_decision["id"]
+                pending_review_decisions.append(pending_review)
+            historical_check = None
+            if check is None:
+                historical_check = _continuity_historical_check(
+                    state, feature, criterion, input_snapshot, task_views, feature_id,
+                )
+            task_report = task_reports.get(criterion["id"])
+            evidence_status = (
+                check.get("status", (
+                    "VERIFIED" if check.get("passed")
+                    else "STALE" if not check.get("fresh")
+                    else "FAILED"
+                )) if check is not None
+                else "REPORTED" if task_report is not None
+                else "STALE" if historical_check is not None
+                else "PENDING"
+            )
+            criterion_projection.append({
+                **criterion,
+                "digest": _digest(criterion),
+                "check": check or historical_check,
+                "evidence_status": evidence_status,
+                "evidence": check or task_report or historical_check,
+                **(
+                    {"reported_evidence": task_report}
+                    if task_report is not None else {}
+                ),
+                **(
+                    {"historical_evidence": historical_check}
+                    if historical_check is not None and task_report is not None else {}
+                ),
+                **(
+                    {"review_decision": review_decision}
+                    if review_decision is not None else {}
+                ),
+                "purpose": criterion["description"],
+                "method": criterion["check_kind"],
+                "descriptor": criterion["check_target"],
+            })
         feature_view: dict[str, object] = {
             "id": feature_id, "directory": feature_state["directory"],
             "kind": feature["kind"], "title": feature["title"],
             "outcome": feature["outcome"], "status": feature_state["status"],
-            "cycle": feature_state["cycle"], "criteria": [
-                {
-                    **criterion, "digest": _digest(criterion),
-                    "check": current_checks.get(criterion["id"]) or
-                    _continuity_historical_check(
-                        state, criterion, input_snapshot, task_views,
-                    ),
-                }
-                for criterion in feature["criteria"]
-            ],
+            "cycle": feature_state["cycle"], "criteria": criterion_projection,
             "increments": feature["increments"], "tasks": task_projection,
             "plan": cast(dict[str, object], parsed["plan"])["plan"],
             "decisions": parsed["decisions"],
@@ -2350,8 +3016,25 @@ def _project(
             "reopen_history": [
                 item for item in state["reopens"] if item["feature_id"] == feature_id
             ],
+            "acceptance": (
+                None if acceptance is None else {
+                    **acceptance,
+                    "status": (
+                        "CONSUMED" if acceptance_consumed
+                        else "CURRENT" if acceptance_current else "STALE"
+                    ),
+                }
+            ),
+            "acceptance_history": [
+                item for item in state.get("acceptances", [])
+                if item["feature_id"] == feature_id
+            ],
+            "pending_review_decisions": pending_review_decisions,
+            "close_readiness": {
+                "status": close_status,
+                "blockers": close_blockers,
+            },
         }
-        feature_mandate = _feature_mandate(state, feature_id)
         if feature_mandate is not None:
             feature_view["mandate"] = _implementation_projection(
                 state, feature_mandate, feature, tasks, input_snapshot,
@@ -2524,9 +3207,10 @@ def _document_diagnostics(
 
 
 def _continuity_historical_check(
-    state: ContinuityStateData, criterion: ContinuityCriterionDocument,
+    state: ContinuityStateData, feature: ContinuityFeatureDocument,
+    criterion: ContinuityCriterionDocument,
     input_snapshot: ContinuityInputScope | None,
-    tasks: tuple[ContinuityTaskView, ...],
+    tasks: tuple[ContinuityTaskView, ...], feature_id: str,
 ) -> dict[str, object] | None:
     receipt = next(
         (
@@ -2538,12 +3222,51 @@ def _continuity_historical_check(
     if receipt is None:
         return None
     observed = receipt.get("observed_input_scope")
+    current_mandate = _feature_mandate(state, feature_id)
+    current_mandate_id = None if current_mandate is None else current_mandate["id"]
     current_task = next(
         (item for item in tasks if item["id"] == receipt["task_id"]),
         None,
     )
-    if receipt["criterion_digest"] != _digest(criterion):
+    if (
+        receipt["criterion_digest"] != _digest(criterion)
+        or receipt["check_kind"] != criterion["check_kind"]
+        or receipt["check_target"] != criterion["check_target"]
+        or receipt.get("purpose", criterion["description"]) != criterion["description"]
+    ):
         stale_reason = "criterion_changed"
+    elif (
+        receipt.get("feature_id", feature_id) != feature_id
+        or (
+            receipt.get("feature_cycle") is not None
+            and receipt.get("feature_cycle") != state["features"][feature_id]["cycle"]
+        )
+        or (
+            receipt.get("feature_cycle") is None
+            and state["features"][feature_id]["cycle"] != 1
+        )
+    ):
+        stale_reason = "feature_cycle_changed"
+    elif (
+        receipt.get("mandate_id") != current_mandate_id
+        or current_mandate is not None
+        and (
+            not _mandate_scope_matches(current_mandate, feature)
+            or any(
+                (
+                    task["increment_id"] is not None
+                    and task["increment_id"] not in {
+                        item["id"] for item in current_mandate["increments"]
+                    }
+                )
+                or not set(task["criteria_ids"]) <= {
+                    item["id"] for item in current_mandate["criteria"]
+                }
+                for task in tasks
+            )
+        )
+    ):
+        stale_reason = "mandate_changed"
     elif (
         current_task is None
         or receipt.get("task_digest") != _digest(current_task)
@@ -2563,23 +3286,34 @@ def _continuity_historical_check(
         stale_reason = "task_not_current"
     else:
         return None
-    mandate_id = receipt.get("mandate_id")
-    return {
+    evidence_status = receipt.get("evidence_status")
+    historical_passed = (
+        evidence_status == "VERIFIED"
+        if isinstance(evidence_status, str)
+        else receipt.get("exit_code") == 0
+    )
+    result: dict[str, object] = {
         "passed": False, "fresh": False,
-        "historical_passed": receipt["exit_code"] == 0,
-        "exit_code": receipt["exit_code"],
+        "status": "STALE",
+        "historical_passed": historical_passed,
         "check_kind": receipt["check_kind"],
         "check_target": receipt["check_target"],
-        "output_sha256": receipt["output_sha256"],
         "task_id": receipt["task_id"],
         "reported_by_session_id": receipt["reported_by_session_id"],
         "recorded_revision": receipt["recorded_revision"],
         "stale_reason": stale_reason,
-        **(
-            {"mandate_id": mandate_id}
-            if isinstance(mandate_id, str) else {}
-        ),
+        "purpose": receipt.get("purpose", criterion["description"]),
+        "method": receipt["check_kind"],
+        "descriptor": receipt["check_target"],
     }
+    for key in (
+        "exit_code", "output_sha256", "mandate_id", "feature_id",
+        "feature_cycle", "evidence_status", "source", "evidence_ref",
+        "artifact_present", "artifact_sha256", "report",
+    ):
+        if key in receipt:
+            result[key] = receipt.get(key)
+    return result
 
 
 def _active_attempt(state: ContinuityStateData) -> ContinuityAttempt:
@@ -2701,12 +3435,15 @@ def _new_criterion(
     description = _text(raw.get("description"), "criterion description", maximum=2048)
     kind = raw.get("check_kind")
     target = _text(raw.get("check_target"), "criterion check_target", maximum=512)
-    if kind not in ("python-unittest", "node-test"):
-        raise ContinuityError("INVALID_REQUEST", "criterion check_kind must be python-unittest or node-test")
-    if kind == "python-unittest" and re.fullmatch(r"tests(?:\.[A-Za-z_][A-Za-z0-9_]*)+", target) is None:
-        raise ContinuityError("INVALID_REQUEST", "python check_target must name a tests.* unittest module")
-    if kind == "node-test" and re.fullmatch(r"tests/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\.test\.mjs", target) is None:
-        raise ContinuityError("INVALID_REQUEST", "node check_target must name a tests/*.test.mjs file")
+    if (
+        not isinstance(kind, str)
+        or kind not in CONTINUITY_CHECK_METHODS
+        or not continuity_check_descriptor_valid(kind, target)
+    ):
+        raise ContinuityError(
+            "INVALID_REQUEST",
+            "criterion check must use an allowlisted test, exact repository artifact path, or descriptive method",
+        )
     return {
         "id": _new_id("C", state, allocated),
         "description": description, "check_kind": kind, "check_target": target,

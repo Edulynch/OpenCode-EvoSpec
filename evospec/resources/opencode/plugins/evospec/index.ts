@@ -27,6 +27,7 @@ const boolean = { type: "boolean" }
 const nonnegativeInteger = { type: "integer", minimum: 0 }
 const stringArray = { type: "array", items: string }
 const sha256 = { type: "string", pattern: "^[0-9a-f]{64}$" }
+const MAX_PROTOCOL_RESPONSE_CHARACTERS = 262144
 const PYTHON_TEST_RUNNER =
   "import sys,unittest; root,module=sys.argv[1:3]; sys.path.insert(0,root); unittest.main(module=module,argv=[sys.argv[0]])"
 const commitRewrite = object({ old_sha: string, new_sha: string, identity_normalized: boolean })
@@ -54,10 +55,10 @@ async function drain(stream, maximumCharacters = 65536) {
   return `${output.trim()}${truncated ? "\n[diagnostics truncated]" : ""}`
 }
 
-async function capture(process) {
+async function capture(process, maximumCharacters = 65536) {
   const settled = await Promise.allSettled([
-    drain(process.stdout),
-    drain(process.stderr),
+    drain(process.stdout, maximumCharacters),
+    drain(process.stderr, maximumCharacters),
     process.exited,
   ])
   const failure = settled.find((item) => item.status === "rejected")
@@ -703,7 +704,7 @@ async function executeAcceptSliceOutcome(runtime, args, context) {
   }, context, { retryStale: false, authorizedRoot: root })
 }
 
-async function spawnCommand(command, root, context, input, env) {
+async function spawnCommand(command, root, context, input, env, maximumCharacters) {
   const options = {
     cwd: root,
     signal: context.signal,
@@ -714,13 +715,16 @@ async function spawnCommand(command, root, context, input, env) {
   if (input !== undefined) options.stdin = new Blob([new TextEncoder().encode(input)])
   if (env !== undefined) options.env = env
   const process = Bun.spawn(command, options)
-  return capture(process)
+  return capture(process, maximumCharacters)
 }
 
 async function rawExecuteRequest(runtime, request, context, rootOverride) {
   const root = rootOverride ?? await sessionRoot(runtime, context)
   const payload = typeof request === "string" ? request : JSON.stringify(request)
-  const result = await spawnCommand([...AGENT_COMMAND, "--root", root], root, context, payload)
+  const result = await spawnCommand(
+    [...AGENT_COMMAND, "--root", root], root, context, payload, undefined,
+    MAX_PROTOCOL_RESPONSE_CHARACTERS,
+  )
   const output = outcome(result)
   try {
     const response = JSON.parse(output)
@@ -2097,7 +2101,8 @@ function taskLinksCriterion(feature, taskID, criterionID) {
 }
 
 function continuityWrites(operation, data) {
-  if (["specify", "clarify", "plan", "change", "pause", "resume", "close", "reconcile", "upgrade_markdown"].includes(operation)) return true
+  if (["specify", "clarify", "plan", "change", "pause", "resume", "accept", "close",
+    "reopen", "review_decision", "reconcile", "upgrade_markdown"].includes(operation)) return true
   if (operation === "use") return Object.keys(data).length > 0
   if (operation === "tasks") return data.task_title !== undefined || data.task_event !== undefined
   if (operation === "implement") return ["start", "begin", "report"].includes(data.phase)
@@ -2134,6 +2139,11 @@ async function authorizeContinuityWrite(runtime, context, root, operation, data,
       criterion_id: data.criterion_id ?? null,
       mandate_id: data.mandate_id ?? data.replace_mandate_id ?? null,
       task_event: data.task_event ?? null,
+      ...(data.acceptance_id !== undefined ? { acceptance_id: data.acceptance_id } : {}),
+      ...(data.evidence_ref !== undefined ? { evidence_ref: data.evidence_ref } : {}),
+      ...(data.decision !== undefined ? { decision: data.decision } : {}),
+      ...(data.check_kind !== undefined ? { check_kind: data.check_kind } : {}),
+      ...(data.check_target !== undefined ? { check_target: data.check_target } : {}),
     })],
   })
   if (!sameRequester(context, requester) || resolve(await sessionRoot(runtime, context)) !== resolve(root)) {
@@ -2149,6 +2159,10 @@ async function executeContinuity(runtime, args, context) {
   }
   const operation = args.operation
   const data = args.data ?? {}
+  if (operation === "reopen" &&
+      (typeof data.feature_id !== "string" || !data.feature_id.trim())) {
+    throw new Error("Explicit Feature reopening requires a nonblank feature_id")
+  }
   if (operation !== "verify") {
     const write = continuityWrites(operation, data)
     if (write) {
@@ -2198,10 +2212,28 @@ async function executeContinuity(runtime, args, context) {
       args.expected_revision !== requested.revision) {
     throw new Error("STALE_REVISION: reread continuity status before verification")
   }
-  const command = criterionCommand(criterion.check_kind, criterion.check_target)
+  const executable = ["python-unittest", "node-test"].includes(criterion.check_kind)
+  const command = executable
+    ? criterionCommand(criterion.check_kind, criterion.check_target)
+    : null
+  if (command === null && !["artifact-present", "review"].includes(criterion.check_kind)) {
+    throw new Error("Continuity criterion has no supported adapter evidence route")
+  }
+  if (criterion.check_kind === "review") {
+    if (typeof data.report !== "string" || !data.report.trim()) {
+      throw new Error("A review criterion requires a nonblank caller report")
+    }
+    if (data.exit_code !== undefined || data.output_sha256 !== undefined) {
+      throw new Error("A caller report cannot supply executable test outcomes")
+    }
+  } else if (command === null &&
+      (data.report !== undefined || data.exit_code !== undefined || data.output_sha256 !== undefined)) {
+    throw new Error("Core-observed artifact evidence does not accept caller-supplied outcomes")
+  }
   const requester = await authorizeContinuityWrite(
     runtime, context, root, operation,
-    { ...data, feature_id: selectedFeature.id, criterion_id: criterion.id, command },
+    { ...data, feature_id: selectedFeature.id, criterion_id: criterion.id,
+      check_kind: criterion.check_kind, check_target: criterion.check_target, command },
     "evospec_continuity_verify",
   )
   const fresh = continuityValue(await rawExecuteRequest(
@@ -2219,6 +2251,25 @@ async function executeContinuity(runtime, args, context) {
       freshCriterion?.check_target !== criterion.check_target ||
       !taskLinksCriterion(freshFeature, taskID, criterion.id)) {
     throw new Error("STALE_REVISION: Core authority changed while continuity permission was pending")
+  }
+  if (!sameRequester(context, requester) || resolve(await sessionRoot(runtime, context)) !== resolve(root)) {
+    throw new Error("OpenCode continuity requester or repository changed before evidence recording")
+  }
+  if (command === null) {
+    return rawExecuteRequest(
+      runtime,
+      continuityRequest("verify", fresh.revision, requester.sessionID, {
+        feature_id: selectedFeature.id,
+        criterion_id: criterion.id,
+        check_kind: criterion.check_kind,
+        check_target: criterion.check_target,
+        task_id: taskID,
+        ...(data.mandate_id !== undefined ? { mandate_id: data.mandate_id } : {}),
+        ...(criterion.check_kind === "review" ? { report: data.report } : {}),
+      }),
+      context,
+      root,
+    )
   }
   const inputSnapshotBefore = await continuityInputSnapshot(
     runtime, fresh.revision, requester.sessionID, context, root,
@@ -2289,7 +2340,7 @@ async function executeContinuity(runtime, args, context) {
 const continuityCriterion = object({
   id: nullableString,
   description: string,
-  check_kind: { type: "string", enum: ["python-unittest", "node-test"] },
+  check_kind: { type: "string", enum: ["python-unittest", "node-test", "artifact-present", "review"] },
   check_target: string,
 }, ["description", "check_kind", "check_target"])
 const continuityData = object({
@@ -2326,11 +2377,12 @@ const continuityData = object({
   report: string,
   result: { type: "string", enum: ["SUCCEEDED", "BLOCKED", "UNKNOWN"] },
   criterion_id: string,
-  check_kind: { type: "string", enum: ["python-unittest", "node-test"] },
+  check_kind: { type: "string", enum: ["python-unittest", "node-test", "artifact-present", "review"] },
   check_target: string,
   exit_code: { type: "integer", minimum: 0, maximum: 255 },
   output_sha256: sha256,
   reason: string,
+  acceptance_id: string,
   detour_kind: { type: "string", enum: ["RELATED", "EXTERNAL"] },
   detour_title: string,
   return_task_id: string,
@@ -2362,7 +2414,7 @@ const tools = [
     "evospec_continuity",
     "Read or mutate the document-backed composed work continuity for this OpenCode worktree. The host supplies session identity; mutating operations and checks require host permission. A permission result is not Feature acceptance.",
     object({
-      operation: { type: "string", enum: ["specify", "clarify", "plan", "tasks", "implement", "use", "change", "status", "verify", "pause", "resume", "close", "reconcile", "upgrade_markdown"] },
+      operation: { type: "string", enum: ["specify", "clarify", "plan", "tasks", "implement", "use", "change", "status", "verify", "review_decision", "accept", "pause", "resume", "close", "reopen", "reconcile", "upgrade_markdown"] },
       expected_revision: { type: ["integer", "null"], minimum: 0 },
       data: continuityData,
     }, ["operation"]),

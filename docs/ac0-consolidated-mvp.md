@@ -214,6 +214,55 @@ This is composed application and adapter evidence only. It does not prove a
 live OpenCode session, native permission dialog, human approval, browser
 rendering, or authenticated identity.
 
+## AC2 — Evidence-backed Feature decisions and explicit closure
+
+AC2 keeps evidence, review decisions, Feature acceptance, closure, and reopening
+as separate Core transitions. `status` is read-only: report the current
+criterion evidence state (`VERIFIED`/passing, `FAILED`/failing, `REPORTED`,
+`STALE`, or pending as projected), any pending review decision, the exact close
+blocker/readiness, any Core-provided failure/staleness reason, and the next
+eligible Task or supported next step implied by the projection. Do not turn an
+opaque ID or digest into a question for the user.
+
+- `python-unittest` and `node-test` run only the criterion's supported target;
+  the adapter records the actual exit code and output digest. A check is current
+  only while its criterion, linked Task, Feature cycle, mandate (when present),
+  and repository inputs still match. The existing
+  [verification freshness contract](#verification-input-freshness) defines the
+  input boundary.
+- `artifact-present` records only whether the exact target is a regular file
+  when Core observes it. It does not inspect the file's contents or prove
+  behavior. Descriptive `build`, `integration`, and `functional` descriptors
+  are not executable evidence routes.
+- A `review` criterion records a nonblank report as `REPORTED`. It is not a
+  functional pass. A separate `review_decision` must name that exact current
+  report's `evidence_ref`, an `ACCEPTED` or `REJECTED` decision, and a reason;
+  only an accepted current review can satisfy a review criterion.
+- `accept` records an explicit reasoned decision for the exact Feature and
+  active mandate, if any. Core requires the current close gates to be clear.
+  Acceptance does not close the Feature. `close` is a separate operation and
+  must name the exact latest `acceptance_id` for that Feature cycle and mandate.
+  If checks, Tasks, mandate, or repository inputs change after acceptance, the
+  acceptance is stale; refresh status, address the reported blocker, and make a
+  new explicit acceptance before closing.
+- `close_feature: false` (the default for `implement --all`) means there is no
+  close intent in the mandate. If the user later explicitly requests closure,
+  the path is still `accept`, then `close`, once current evidence is grounded.
+  `close_feature: true` records that intent from the start; it does not accept
+  or close automatically. In both cases, do not ask again when the user's
+  explicit intent is still clear, but do not infer intent from completed work.
+- `reopen` is permitted only for a closed Feature and requires its exact
+  `feature_id` and a reason. It starts a new cycle and retains prior closure,
+  acceptance, and check history. A semantic change to a closed Feature first
+  requires this explicit reopening; changed criteria or inputs need current
+  evidence before another acceptance and closure.
+
+The AC2 scenario assertions are deterministic Core/adapter fixtures using
+simulated host permission/session behavior and temporary files; they were not
+run as part of this documentation task. Even when run, they are not a live
+OpenCode permission-dialog, browser-rendering, or LLM-judgment result, and no
+such native evidence is claimed here.
+
 ## Cross-cutting mode, document, and persistence contract
 
 - `specify` is the explicit opt-in for a fresh root. A legacy

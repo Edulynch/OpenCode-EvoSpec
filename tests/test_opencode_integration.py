@@ -71,6 +71,9 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertIn("retire_ids: stringArray", plugin)
         self.assertIn("reopen_feature_id: string", plugin)
         self.assertIn("evospec_continuity_verify", plugin)
+        self.assertIn('"review_decision", "accept"', plugin)
+        self.assertIn('"reopen"', plugin)
+        self.assertIn('"artifact-present", "review"', plugin)
         self.assertIn('continuityRequest("status"', plugin)
         self.assertIn("deriveContinuationDirective", plugin)
         self.assertIn("runtime.session.hook(\"context\"", plugin)
@@ -2223,6 +2226,21 @@ const context = {
 beginScenario(["status"])
 await tool.execute({ operation: "status" }, context)
 assert(permissionRequests.length === 0, "read-only status does not request write permission")
+for (const data of [{}, { feature_id: "  " }]) {
+  beginScenario(["reopen"])
+  const permissionCount = permissionRequests.length
+  const protocolCount = protocolRequests.length
+  let rejected = false
+  try {
+    await tool.execute({ operation: "reopen", expected_revision: 10, data }, context)
+  } catch (error) {
+    rejected = String(error).includes("nonblank feature_id")
+  }
+  await Promise.all(pendingReads)
+  assert(rejected && permissionRequests.length === permissionCount
+    && protocolRequests.length === protocolCount,
+  "reopen without an explicit Feature is rejected before permission or Core state")
+}
 beginScenario(["status"])
 let unlinkedTaskRejected = false
 try {
@@ -2361,6 +2379,21 @@ assert(protocolRequests.map((request) => request.operation).join(",") ===
 assert(protocolRequests.filter((request) => request.operation === "input_snapshot")
   .map((request) => request.expected_revision).join(",") === "10,10,11,11,11",
 "every pre/post snapshot is bound to the exact check revision")
+beginScenario(["reopen"])
+await tool.execute({
+  operation: "reopen",
+  expected_revision: coreRevision,
+  data: { feature_id: featureID, reason: "A follow-up cycle was requested." },
+}, context)
+await Promise.all(pendingReads)
+const explicitReopenPermission = permissionRequests[permissionRequests.length - 1]
+const explicitReopenResource = JSON.parse(explicitReopenPermission.resources[0])
+const explicitReopenRequest = protocolRequests[protocolRequests.length - 1]
+assert(explicitReopenPermission.action === "evospec_continuity_write"
+  && explicitReopenResource.feature_id === featureID
+  && explicitReopenRequest.operation === "reopen"
+  && explicitReopenRequest.data.feature_id === featureID,
+"an explicitly targeted reopen retains the existing permission and Core route")
 ''',
                 encoding="utf-8",
             )
@@ -2530,6 +2563,11 @@ const runtime = {
   permission: {
     assert: async (request) => {
       permissions.push(request)
+      assert(request.sessionID === activeSession && request.agent === "assistant"
+        && request.source?.type === "tool"
+        && request.source.messageID === `msg-${activeSession}`
+        && typeof request.source.id === "string",
+      "each simulated native permission assertion binds the exact host session and tool caller")
       if (denyNextPermission) throw new Error("SIMULATED_HOST_DENIED")
     },
   },
@@ -2552,6 +2590,13 @@ const continuityTool = definitions.find((definition) => definition.name === "evo
 assert(continuityTool, "the real packaged composed adapter is registered")
 assert(continuityTool.input.properties.data.properties.phase.enum.includes("start"),
   "the adapter schema exposes the one-time mandate start")
+assert(["review_decision", "accept", "close", "reopen"].every((operation) =>
+  continuityTool.input.properties.operation.enum.includes(operation)),
+"Core's review and Feature lifecycle operations are exposed as typed adapter actions")
+assert(["artifact-present", "review"].every((kind) =>
+  continuityTool.input.properties.data.properties.check_kind.enum.includes(kind))
+  && continuityTool.input.properties.data.properties.acceptance_id.type === "string",
+"artifact/review criteria and exact acceptance IDs are supported by the adapter schema")
 const context = () => tool.context
 const call = async (operation, expectedRevision, data = {}) => {
   const result = await continuityTool.execute({
@@ -2648,6 +2693,8 @@ const featureRequest = {
     { description: "Completed state is retained after reload.", check_kind: "node-test", check_target: "tests/complete.test.mjs" },
     { description: "Active and completed tasks can be filtered.", check_kind: "node-test", check_target: "tests/filter.test.mjs" },
     { description: "Completed tasks can be deleted without deleting active tasks.", check_kind: "node-test", check_target: "tests/delete-completed.test.mjs" },
+    { description: "The application artifact exists as a regular file.", check_kind: "artifact-present", check_target: "index.html" },
+    { description: "The implemented application has a reviewed scope report.", check_kind: "review", check_target: "Scope review" },
   ],
   increments: [
     { title: "Create and list", outcome: "Create task records and list them." },
@@ -2680,7 +2727,7 @@ current = await call("implement", current.revision, {
 const mandate = current.mandate
 assert(mandate && mandate.mode === "ALL" && mandate.close_feature === false,
   "one explicit start persists the default-open ALL mandate")
-assert(mandate.criterion_ids.length === 5 && mandate.increment_ids.length === 4,
+assert(mandate.criterion_ids.length === 7 && mandate.increment_ids.length === 4,
   "the mandate binds every accepted criterion and all four accepted Increments")
 assert(mandate.missing_increment_task_ids.length === 1
   && mandate.missing_increment_task_ids[0] === increments[3].id,
@@ -2877,6 +2924,18 @@ const task5 = current.selected_feature.tasks.at(-1)
 assert(task5.increment_id === increments[3].id
   && current.mandate.missing_increment_task_ids.length === 0,
   "the fourth-Increment Task is added later under the same mandate")
+current = await call("tasks", current.revision, {
+  feature_id: featureID, mandate_id: mandateID,
+  task_title: "Observe the artifact and record scope review",
+  task_description: "Inspect the existing application artifact and report a review without changing implementation.",
+  increment_id: increments[3].id,
+  criteria_ids: [criteria[5].id, criteria[6].id],
+  depends_on: [task5.id],
+})
+const task6 = current.selected_feature.tasks.at(-1)
+assert(task6.criteria_ids.join(",") === `${criteria[5].id},${criteria[6].id}`
+  && task6.depends_on[0] === task5.id,
+"the additional artifact and review evidence are linked to an explicit dependent Task")
 const beforeCheckpoint = await call("implement", current.revision, {
   feature_id: featureID, mandate_id: mandateID, phase: "queue",
 })
@@ -2928,18 +2987,111 @@ current = await verify(task2.id, criteria[1], current.revision)
 current = await verify(task3.id, criteria[2], current.revision)
 current = await verify(task4.id, criteria[3], current.revision)
 current = await verify(task5.id, criteria[4], current.revision)
+started = await begin(task6.id)
+current = await report(task6.id, started.revision,
+  "Inspected the existing application only; no implementation edit was made.")
+const checksBeforeObservedEvidence = checks.length
+const artifactResult = await call("verify", current.revision, {
+  feature_id: featureID, task_id: task6.id,
+  criterion_id: criteria[5].id, mandate_id: mandateID,
+})
+const artifactEvidence = artifactResult.selected_feature.criteria
+  .find((criterion) => criterion.id === criteria[5].id).check
+assert(artifactEvidence.status === "VERIFIED"
+  && artifactEvidence.source === "CORE_OBSERVED"
+  && artifactEvidence.artifact_present === true
+  && /^[0-9a-f]{64}$/.test(artifactEvidence.artifact_sha256),
+"Core observes and hashes the actual index.html artifact without a caller outcome")
+assert(await Bun.file("index.html").exists() && checks.length === checksBeforeObservedEvidence,
+"the artifact is a real isolated app file and the adapter launched no test/runtime for it")
+const reviewReport = "Reviewed the existing task controls against the accepted Feature scope."
+const reviewResult = await call("verify", artifactResult.revision, {
+  feature_id: featureID, task_id: task6.id,
+  criterion_id: criteria[6].id, mandate_id: mandateID, report: reviewReport,
+})
+const reportedReview = reviewResult.selected_feature.criteria
+  .find((criterion) => criterion.id === criteria[6].id).check
+assert(reportedReview.status === "REPORTED"
+  && reportedReview.source === "CALLER_REPORTED"
+  && reportedReview.report === reviewReport
+  && reportedReview.passed === false
+  && reportedReview.exit_code === undefined,
+"a review remains an unexecuted caller report, never a functional PASS")
+assert(checks.length === checksBeforeObservedEvidence,
+"artifact observation and review reporting spawn no Python or Node check")
+const reviewDecisionReason = "Accepted the exact current report after inspecting the isolated app."
+current = await call("review_decision", reviewResult.revision, {
+  feature_id: featureID, criterion_id: criteria[6].id,
+  evidence_ref: reportedReview.evidence_ref, decision: "ACCEPTED",
+  reason: reviewDecisionReason, mandate_id: mandateID,
+})
+const acceptedReview = current.selected_feature.criteria
+  .find((criterion) => criterion.id === criteria[6].id).review_decision
+assert(acceptedReview?.decision === "ACCEPTED"
+  && acceptedReview.evidence_ref === reportedReview.evidence_ref
+  && current.selected_feature.tasks.find((task) => task.id === task6.id).status === "COMPLETED",
+"the separate exact review decision, not the report itself, completes the review Task")
+await Promise.all(pendingReads)
+const artifactRequest = protocolRequests.findLast((request) =>
+  request.operation === "verify" && request.data.criterion_id === criteria[5].id)
+const reviewRequest = protocolRequests.findLast((request) =>
+  request.operation === "verify" && request.data.criterion_id === criteria[6].id)
+const reviewDecisionRequest = protocolRequests.findLast((request) =>
+  request.operation === "review_decision")
+assert(artifactRequest.action === "continuity"
+  && JSON.stringify(Object.keys(artifactRequest.data).sort()) === JSON.stringify([
+    "check_kind", "check_target", "criterion_id", "feature_id", "mandate_id", "task_id",
+  ].sort())
+  && artifactRequest.data.check_kind === "artifact-present"
+  && artifactRequest.data.check_target === "index.html",
+"the adapter forwards only Core-owned artifact descriptor and exact Feature/Task/mandate identities")
+assert(reviewRequest.action === "continuity"
+  && JSON.stringify(Object.keys(reviewRequest.data).sort()) === JSON.stringify([
+    "check_kind", "check_target", "criterion_id", "feature_id", "mandate_id", "report", "task_id",
+  ].sort())
+  && reviewRequest.data.report === reviewReport
+  && reviewRequest.data.check_kind === "review",
+"the adapter forwards the review report without executable outcome fields")
+assert(JSON.stringify(Object.keys(reviewDecisionRequest.data).sort()) === JSON.stringify([
+  "decision", "evidence_ref", "feature_id", "mandate_id", "reason", "criterion_id",
+].sort())
+  && reviewDecisionRequest.data.evidence_ref === reportedReview.evidence_ref,
+"the exact review_decision wire keys bind the decision and reason to current evidence")
+const artifactPermission = JSON.parse(permissions.at(-3).resources[0])
+const reviewPermission = JSON.parse(permissions.at(-2).resources[0])
+const reviewDecisionPermission = JSON.parse(permissions.at(-1).resources[0])
+assert(permissions.at(-3).action === "evospec_continuity_verify"
+  && artifactPermission.operation === "verify"
+  && artifactPermission.feature_id === featureID
+  && artifactPermission.task_id === task6.id
+  && artifactPermission.criterion_id === criteria[5].id
+  && artifactPermission.check_kind === "artifact-present"
+  && artifactPermission.check_target === "index.html",
+"Core-observed artifact recording still requires exact host permission")
+assert(permissions.at(-2).action === "evospec_continuity_verify"
+  && reviewPermission.criterion_id === criteria[6].id
+  && reviewPermission.check_kind === "review"
+  && permissions.at(-1).action === "evospec_continuity_write"
+  && reviewDecisionPermission.operation === "review_decision"
+  && reviewDecisionPermission.evidence_ref === reportedReview.evidence_ref
+  && reviewDecisionPermission.decision === "ACCEPTED",
+"review report and its separate acceptance each cross the exact simulated host permission boundary")
 const finalBlueTest = await runFixtureTest("tests/blue-button.test.mjs")
 assert(finalBlueTest.includes("Add button remains blue"),
   "the final app version still passes the exact related CSS check")
 const finalStatus = await call("status", undefined)
-assert(finalStatus.mandate.id === mandateID && finalStatus.mandate.status === "FINISHED",
-  "all four Increments finish with current checks and completed scoped Tasks")
+assert(finalStatus.mandate.id === mandateID
+  && finalStatus.mandate.coverage.increments_finished === 4
+  && finalStatus.mandate.coverage.tasks_completed === 6,
+  "all four Increments and six scoped Tasks finish under the original mandate")
 assert(finalStatus.selected_feature.status === "OPEN"
   && finalStatus.mandate.close_feature === false,
   "the continuous mandate never closes its Feature implicitly")
 assert(finalStatus.selected_feature.tasks.map((task) => task.attempts)
-  .join(",") === "1,1,1,1,1",
+  .join(",") === "1,1,1,1,1,1",
   "fresh-session reconciliation did not replay or duplicate any Task attempt")
+assert(finalStatus.selected_feature.close_readiness.status === "ACCEPTANCE_REQUIRED",
+  "all evidence is current, but Core explicitly requires Feature acceptance before close")
 assert(finalStatus.selected_feature.detours[0].kind === "EXTERNAL"
   && finalStatus.selected_feature.detours[0].return_task_id === task2.id
   && finalStatus.selected_feature.detours[1].kind === "RELATED"
@@ -2949,9 +3101,79 @@ assert(finalStatus.selected_feature.criteria[4].description.includes("deleted")
   && !finalStatus.selected_feature.increments.some((increment) =>
     /\\bblue\\b/i.test(`${increment.title} ${increment.outcome}`)),
   "the functional deletion Increment is accepted separately from the blue request")
+const attemptsBeforeAcceptance = finalStatus.selected_feature.tasks
+  .map((task) => task.attempts).join(",")
+const acceptanceReasonA = "All current checks and review decisions satisfy the original Feature scope."
+const acceptedA = await call("accept", finalStatus.revision, {
+  feature_id: featureID, reason: acceptanceReasonA, mandate_id: mandateID,
+})
+const acceptanceA = acceptedA.selected_feature.acceptance
+assert(acceptedA.selected_feature.status === "OPEN"
+  && acceptanceA.status === "CURRENT"
+  && acceptedA.selected_feature.closure_history.length === 0
+  && acceptedA.mandate.id === mandateID
+  && acceptedA.mandate.close_feature === false,
+"late explicit acceptance of the original false-close mandate does not close or replace it")
+const closeA = await call("close", acceptedA.revision, {
+  feature_id: featureID, mandate_id: mandateID, acceptance_id: acceptanceA.id,
+})
+const closureA = closeA.selected_feature.closure_history.at(-1)
+assert(closeA.selected_feature.status === "CLOSED"
+  && closureA.acceptance_id === acceptanceA.id
+  && closureA.mandate_id === mandateID
+  && closeA.selected_feature.tasks.map((task) => task.attempts).join(",") === attemptsBeforeAcceptance,
+"one exact close consumes the accepted receipt without replacing or rerunning the original mandate")
+await Promise.all(pendingReads)
+const acceptanceRequestA = protocolRequests.findLast((request) =>
+  request.operation === "accept" && request.data.feature_id === featureID)
+const closeRequestA = protocolRequests.findLast((request) =>
+  request.operation === "close" && request.data.feature_id === featureID)
+const acceptancePermissionA = JSON.parse(permissions.at(-2).resources[0])
+const closePermissionA = JSON.parse(permissions.at(-1).resources[0])
+assert(acceptanceRequestA.action === "continuity"
+  && JSON.stringify(Object.keys(acceptanceRequestA.data).sort()) === JSON.stringify([
+    "feature_id", "mandate_id", "reason",
+  ].sort())
+  && acceptanceRequestA.data.reason === acceptanceReasonA,
+"the adapter forwards late acceptance as its exact Core operation and reason")
+assert(closeRequestA.action === "continuity"
+  && JSON.stringify(Object.keys(closeRequestA.data).sort()) === JSON.stringify([
+    "acceptance_id", "feature_id", "mandate_id",
+  ].sort())
+  && closeRequestA.data.acceptance_id === acceptanceA.id
+  && permissions.at(-2).action === "evospec_continuity_write"
+  && acceptancePermissionA.operation === "accept"
+  && permissions.at(-1).action === "evospec_continuity_close"
+  && closePermissionA.operation === "close"
+  && closePermissionA.acceptance_id === acceptanceA.id,
+"accept and close each require exact simulated host permission; close names the accepted receipt without redundant acceptance")
+const reopenReasonA = "A new requested evolution follows the accepted and closed first cycle."
+const reopenedA = await call("reopen", closeA.revision, {
+  feature_id: featureID, reason: reopenReasonA,
+})
+const historicalA = reopenedA.selected_feature.criteria[0].check
+assert(reopenedA.selected_feature.status === "OPEN"
+  && reopenedA.selected_feature.cycle === 2
+  && reopenedA.selected_feature.reopen_history.at(-1).reason === reopenReasonA
+  && reopenedA.selected_feature.reopen_history.at(-1).previous_closure_id === closureA.id
+  && reopenedA.selected_feature.closure_history[0].id === closureA.id
+  && historicalA.status === "STALE"
+  && historicalA.stale_reason === "feature_cycle_changed"
+  && historicalA.historical_passed === true,
+"reasoned reopen preserves the old closure and historical evidence instead of reusing it as current")
+const independentCorrectionBeforeReopen = await Bun.file("external-correction.txt").text()
+const evolvedA = await call("plan", reopenedA.revision, {
+  feature_id: featureID,
+  plan: `${reopenedA.selected_feature.plan}\nAfter reopening, preserve the independent external correction.`,
+})
+assert(evolvedA.selected_feature.plan.includes("After reopening")
+  && evolvedA.selected_feature.closure_history[0].id === closureA.id
+  && evolvedA.selected_feature.reopen_history.at(-1).reason === reopenReasonA
+  && await Bun.file("external-correction.txt").text() === independentCorrectionBeforeReopen,
+"the reopened Feature evolves its plan while preserving closure history and the unrelated correction")
 
 activeSession = "ses-ac1-independent"
-let featureBState = await call("specify", finalStatus.revision, {
+let featureBState = await call("specify", evolvedA.revision, {
   title: "Independent Feature B",
   outcome: "Users can review a separate set of work.",
   criteria: [
@@ -2972,9 +3194,12 @@ const featureB = featureBState.selected_feature
 const taskB1 = featureB.tasks[0]
 const taskB2 = featureB.tasks[1]
 featureBState = await call("implement", featureBState.revision, {
-  feature_id: featureB.id, phase: "start", mode: "ALL",
+  feature_id: featureB.id, phase: "start", mode: "ALL", close_feature: true,
 })
 const mandateBID = featureBState.mandate.id
+assert(featureBState.mandate.close_feature === true
+  && featureBState.selected_feature.status === "OPEN",
+"Feature B records close intent without implicitly closing at mandate start")
 const beginB = await call("implement", featureBState.revision, {
   feature_id: featureB.id, task_id: taskB1.id,
   mandate_id: mandateBID, phase: "begin",
@@ -3026,23 +3251,73 @@ assert(oldBAuthorityRejected,
   "material Outcome drift rejects new effects under B's old pending mandate")
 const replacedB = await call("implement", reconciledB.revision, {
   feature_id: featureB.id, phase: "start", mode: "ALL",
-  replace_mandate_id: mandateBID,
+  close_feature: true, replace_mandate_id: mandateBID,
 })
 const replacementBID = replacedB.mandate.id
-assert(replacementBID !== mandateBID && replacedB.mandate.status === "PENDING",
+assert(replacementBID !== mandateBID && replacedB.mandate.status === "PENDING"
+  && replacedB.mandate.close_feature === true,
   "only the explicit exact-ID replacement grants work under B's revised Outcome")
+let completedB = await call("implement", replacedB.revision, {
+  feature_id: featureB.id, task_id: taskB1.id,
+  mandate_id: replacementBID, phase: "begin",
+})
+completedB = await call("implement", completedB.revision, {
+  feature_id: featureB.id, task_id: taskB1.id, mandate_id: replacementBID,
+  phase: "report", result: "SUCCEEDED", report: "Reconciled Feature B task one under the replacement mandate.",
+})
+completedB = await call("verify", completedB.revision, {
+  feature_id: featureB.id, task_id: taskB1.id,
+  criterion_id: featureB.criteria[0].id, mandate_id: replacementBID,
+})
+assert(completedB.selected_feature.tasks.find((task) => task.id === taskB1.id).status === "COMPLETED",
+"Feature B's first replacement-mandate Task has fresh linked evidence")
+completedB = await call("implement", completedB.revision, {
+  feature_id: featureB.id, task_id: taskB2.id,
+  mandate_id: replacementBID, phase: "begin",
+})
+completedB = await call("implement", completedB.revision, {
+  feature_id: featureB.id, task_id: taskB2.id, mandate_id: replacementBID,
+  phase: "report", result: "SUCCEEDED", report: "Reconciled Feature B task two under the replacement mandate.",
+})
+completedB = await call("verify", completedB.revision, {
+  feature_id: featureB.id, task_id: taskB2.id,
+  criterion_id: featureB.criteria[1].id, mandate_id: replacementBID,
+})
+assert(completedB.mandate.status === "FINISHED"
+  && completedB.mandate.close_feature === true
+  && completedB.selected_feature.status === "OPEN",
+"close intent remains non-implicit after every replacement-mandate Task and check completes")
+const acceptedB = await call("accept", completedB.revision, {
+  feature_id: featureB.id,
+  reason: "Both current Feature B checks and Tasks are complete.",
+  mandate_id: replacementBID,
+})
+assert(acceptedB.selected_feature.status === "OPEN"
+  && acceptedB.selected_feature.acceptance.status === "CURRENT",
+"Feature B's close-intent mandate still requires a separate explicit acceptance")
+const closeB = await call("close", acceptedB.revision, {
+  feature_id: featureB.id,
+  mandate_id: replacementBID,
+  acceptance_id: acceptedB.selected_feature.acceptance.id,
+})
+assert(closeB.selected_feature.status === "CLOSED"
+  && closeB.selected_feature.closure_history.at(-1).acceptance_id
+    === acceptedB.selected_feature.acceptance.id,
+"Feature B closes once against its exact accepted receipt without a redundant acceptance call")
 
 activeSession = "ses-ac1-primary"
 const returnedA = await call("status", undefined)
 const returnedBView = returnedA.features.find((feature) => feature.id === featureB.id)
 assert(returnedA.selected_feature.id === featureID
   && returnedA.mandate.id === mandateID
-  && returnedA.mandate.status === "FINISHED"
+  && returnedA.selected_feature.cycle === 2
+  && returnedA.selected_feature.closure_history.length === 1
   && returnedBView.mandate.id === replacementBID,
-  "returning to A preserves its original mandate while B retains its own replacement")
+  "returning to reopened A preserves its original mandate and closure while B retains its own replacement")
 await Promise.all(pendingReads)
 const bVerifyRequest = protocolRequests.findLast((request) =>
-  request.operation === "verify" && request.data.feature_id === featureB.id)
+  request.operation === "verify" && request.data.feature_id === featureB.id
+    && request.data.mandate_id === mandateBID)
 const bReconcileRequest = protocolRequests.findLast((request) =>
   request.operation === "reconcile" && request.data.feature_id === featureB.id)
 const bReplacementRequest = protocolRequests.findLast((request) =>
@@ -3073,31 +3348,120 @@ assert(starts.length === 3
   "the composed run starts A and B independently, then explicitly replaces only B")
 const begins = protocolRequests.filter((request) =>
   request.operation === "implement" && request.data.phase === "begin")
-assert(begins.length === 9
-  && new Set(begins.map((request) => request.data.task_id)).size === 7
+assert(begins.length === 12
+  && new Set(begins.map((request) => request.data.task_id)).size === 8
   && begins.filter((request) => request.data.task_id === task2.id).length === 2
   && begins.filter((request) => request.data.task_id === task5.id).length === 2
-  && begins.filter((request) => request.data.task_id === taskB1.id).length === 1
-  && begins.filter((request) => request.data.task_id === taskB2.id).length === 1,
+  && begins.filter((request) => request.data.task_id === task6.id).length === 1
+  && begins.filter((request) => request.data.task_id === taskB1.id).length === 2
+  && begins.filter((request) => request.data.task_id === taskB2.id).length === 2,
   "the original Tasks and Feature B retain distinct durable attempt routes")
 const verifyRequests = protocolRequests.filter((request) => request.operation === "verify")
-assert(verifyRequests.length === 18,
+assert(verifyRequests.length === 22,
   "each Task's check is recorded only after the latest input change")
 assert(verifyRequests.every((request) =>
   (request.data.feature_id === featureID && request.data.mandate_id === mandateID)
-  || (request.data.feature_id === featureB.id && request.data.mandate_id === mandateBID)),
+  || (request.data.feature_id === featureB.id
+    && [mandateBID, replacementBID].includes(request.data.mandate_id))),
   "every check preserves its own exact Feature and mandate binding")
 assert(checks.filter((target) => target === "tests/blue-button.test.mjs").length === 2
   && checks.filter((target) => target === "tests/delete-completed.test.mjs").length === 2
   && checks.every((target) => target.startsWith("tests/")),
   "all acceptance checks run only bounded temporary Node tests")
+
+const featureCState = await call("specify", returnedA.revision, {
+  title: "Criterion freshness fixture",
+  outcome: "A criterion can be precisely revalidated after a definition change.",
+  criteria: [{
+    description: "The task list creates and returns a task.",
+    check_kind: "node-test", check_target: "tests/create-list.test.mjs",
+  }],
+  increments: [{ title: "Revalidate a changed criterion", outcome: "Retain only current criterion evidence." }],
+  tasks: [{
+    title: "Create and check the task list", description: "Run the exact accepted criterion.",
+    increment_index: 0, criteria: [0], depends_on: [],
+  }],
+  plan: "Run the current accepted check and retain its receipt history.",
+})
+const featureC = featureCState.selected_feature
+const criterionC = featureC.criteria[0]
+const taskC = featureC.tasks[0]
+let currentC = await call("implement", featureCState.revision, {
+  feature_id: featureC.id, phase: "start", mode: "ALL", close_feature: false,
+})
+const mandateCID = currentC.mandate.id
+currentC = await call("implement", currentC.revision, {
+  feature_id: featureC.id, task_id: taskC.id, mandate_id: mandateCID, phase: "begin",
+})
+currentC = await call("implement", currentC.revision, {
+  feature_id: featureC.id, task_id: taskC.id, mandate_id: mandateCID,
+  phase: "report", result: "SUCCEEDED", report: "The existing isolated app implements this criterion.",
+})
+const initialChecksC = checks.length
+currentC = await call("verify", currentC.revision, {
+  feature_id: featureC.id, task_id: taskC.id,
+  criterion_id: criterionC.id, mandate_id: mandateCID,
+})
+const originalEvidenceC = currentC.selected_feature.criteria[0].check
+assert(originalEvidenceC.status === "VERIFIED"
+  && checks.length === initialChecksC + 1
+  && currentC.selected_feature.tasks[0].attempts === 1,
+"Feature C records the original actual test result against one implementation attempt")
+const featureCSpecPath = `specs/${featureC.directory}/spec.md`
+const featureCSpec = await Bun.file(featureCSpecPath).text()
+const revisedCriterionDescription = "The task list creates and returns a uniquely identified task."
+assert(featureCSpec.includes(criterionC.description), "the fixture contains the exact original criterion")
+await Bun.write(featureCSpecPath,
+  featureCSpec.replace(criterionC.description, revisedCriterionDescription))
+const driftedC = await call("status", undefined)
+assert(driftedC.status === "DOCUMENT_RECONCILIATION_REQUIRED"
+  && driftedC.document_changes.semantic.includes(featureCSpecPath),
+"a real criterion edit is observed through Core's canonical reconciliation projection")
+const reconciledC = await call("reconcile", driftedC.revision, {
+  feature_id: featureC.id, mandate_id: mandateCID,
+})
+const staleEvidenceC = reconciledC.selected_feature.criteria[0]
+assert(reconciledC.mandate.status === "STALE_SCOPE"
+  && staleEvidenceC.evidence_status === "STALE"
+  && staleEvidenceC.check.stale_reason === "criterion_changed"
+  && staleEvidenceC.check.historical_passed === true
+  && staleEvidenceC.check.evidence_ref === originalEvidenceC.evidence_ref,
+"Core preserves the exact prior passing receipt as stale history after criterion mutation")
+currentC = await call("implement", reconciledC.revision, {
+  feature_id: featureC.id, phase: "start", mode: "ALL",
+  close_feature: false, replace_mandate_id: mandateCID,
+})
+const replacementCID = currentC.mandate.id
+const attemptsBeforeRevalidationC = currentC.selected_feature.tasks[0].attempts
+const appBeforeRevalidationC = await Bun.file("index.html").text()
+const checksBeforeRevalidationC = checks.length
+currentC = await call("verify", currentC.revision, {
+  feature_id: featureC.id, task_id: taskC.id,
+  criterion_id: criterionC.id, mandate_id: replacementCID,
+})
+assert(currentC.selected_feature.criteria[0].check.status === "VERIFIED"
+  && currentC.selected_feature.criteria[0].check.purpose === revisedCriterionDescription
+  && checks.length === checksBeforeRevalidationC + 1
+  && currentC.selected_feature.tasks[0].attempts === attemptsBeforeRevalidationC
+  && await Bun.file("index.html").text() === appBeforeRevalidationC,
+"the exact changed criterion is revalidated by its check only, without another implementation attempt or app edit")
+await Promise.all(pendingReads)
+const featureCLedger = JSON.parse(await Bun.file(".evospec/continuity.json").text())
+const criterionCHistory = featureCLedger.checks.filter((check) =>
+  check.feature_id === featureC.id && check.criterion_id === criterionC.id)
+assert(criterionCHistory.length === 2
+  && criterionCHistory[0].evidence_ref === originalEvidenceC.evidence_ref
+  && criterionCHistory[0].criterion_digest !== currentC.selected_feature.criteria[0].digest
+  && criterionCHistory[1].evidence_ref === currentC.selected_feature.criteria[0].check.evidence_ref
+  && criterionCHistory[1].mandate_id === replacementCID,
+"Core ledger retains both the stale historical receipt and the fresh replacement-mandate receipt")
 const writeRequests = permissions.map((request) => ({
   action: request.action,
   resource: JSON.parse(request.resources[0]),
 }))
 assert(writeRequests.every(({ resource }) => resource.repository_root === process.cwd()),
   "simulated permission requests are bound to the exact temporary project root")
-console.log("AC1 composed ALL adapter/Core fixture passed")
+console.log("AC1 composed ALL adapter/Core fixture and AC2/E5 lifecycle extension passed")
 ''',
                 encoding="utf-8",
             )
@@ -3114,7 +3478,10 @@ console.log("AC1 composed ALL adapter/Core fixture passed")
                 env=environment,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
-            self.assertIn("AC1 composed ALL adapter/Core fixture passed", completed.stdout)
+            self.assertIn(
+                "AC1 composed ALL adapter/Core fixture and AC2/E5 lifecycle extension passed",
+                completed.stdout,
+            )
 
     def test_v2_plugin_spawn_hides_windows_children_and_preserves_protocol_io(self) -> None:
         with TemporaryDirectory() as temporary:
