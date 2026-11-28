@@ -4878,6 +4878,7 @@ _CONTINUITY_SEMANTIC_FIELDS = _CONTINUITY_FIELDS | frozenset(("semantic_digests"
 _CONTINUITY_IDENTITY_FIELDS = _CONTINUITY_SEMANTIC_FIELDS | frozenset(("identity_metadata",))
 _CONTINUITY_OPTIONAL_FIELDS = frozenset((
     "mandate", "mandates", "mandate_history", "task_events",
+    "review_decisions", "acceptances",
 ))
 _CONTINUITY_ID = re.compile(r"^[FSTCD]-[0-9a-f]{32}$")
 _CONTINUITY_DIR = re.compile(r"^[0-9]{3,}-[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -4898,6 +4899,46 @@ class ContinuityCriterionDocument(TypedDict):
     description: str
     check_kind: str
     check_target: str
+
+
+CONTINUITY_CHECK_METHODS = frozenset((
+    "python-unittest", "node-test", "artifact-present",
+    "build", "integration", "functional", "review",
+))
+
+
+def continuity_check_descriptor_valid(method: object, descriptor: object) -> bool:
+    """Validate a fixed test descriptor, exact artifact path, or descriptive method."""
+    if type(method) is not str or type(descriptor) is not str or not descriptor:
+        return False
+    try:
+        descriptor_size = len(descriptor.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
+    if method == "python-unittest":
+        return re.fullmatch(r"tests(?:\.[A-Za-z_][A-Za-z0-9_]*)+", descriptor) is not None
+    if method == "node-test":
+        return re.fullmatch(
+            r"tests/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\.test\.mjs",
+            descriptor,
+        ) is not None
+    if method == "artifact-present":
+        parts = descriptor.split("/")
+        return (
+            descriptor_size <= 512
+            and "\\" not in descriptor
+            and ":" not in descriptor
+            and not descriptor.startswith("/")
+            and unicodedata.normalize("NFC", descriptor) == descriptor
+            and all(part not in ("", ".", "..") for part in parts)
+            and parts[0].casefold() not in (".git", ".evospec")
+            and not any(ord(char) < 32 for char in descriptor)
+        )
+    return (
+        method in ("build", "integration", "functional", "review")
+        and descriptor_size <= 512
+        and not any(ord(char) < 32 for char in descriptor)
+    )
 
 
 class ContinuityIncrementDocument(TypedDict):
@@ -4977,6 +5018,13 @@ class ContinuityAttempt(TypedDict):
     result_status: str | None
     evidence_ref: str | None
     mandate_id: NotRequired[str]
+    feature_id: NotRequired[str]
+    feature_cycle: NotRequired[int]
+    task_digest: NotRequired[str]
+    started_revision: NotRequired[int]
+    reported_revision: NotRequired[int]
+    reported_by_session_id: NotRequired[str]
+    reported_input_scope: NotRequired[ContinuityInputScope]
 
 
 class ContinuityExecution(TypedDict):
@@ -5024,14 +5072,25 @@ class ContinuityCheck(TypedDict):
     criterion_digest: str
     check_kind: str
     check_target: str
-    exit_code: int
-    output_sha256: str
     reported_by_session_id: str
     task_id: str | None
     recorded_revision: int
+    exit_code: NotRequired[int]
+    output_sha256: NotRequired[str]
     observed_input_scope: NotRequired[ContinuityInputScope]
     task_digest: NotRequired[str]
     mandate_id: NotRequired[str]
+    feature_id: NotRequired[str]
+    feature_cycle: NotRequired[int]
+    purpose: NotRequired[str]
+    evidence_status: NotRequired[str]
+    source: NotRequired[str]
+    evidence_ref: NotRequired[str]
+    input_snapshot_before: NotRequired[ContinuityInputScope]
+    input_snapshot_after: NotRequired[ContinuityInputScope]
+    artifact_present: NotRequired[bool]
+    artifact_sha256: NotRequired[str]
+    report: NotRequired[str]
 
 
 class ContinuityCriterionDigest(TypedDict):
@@ -5046,6 +5105,9 @@ class ContinuityClosure(TypedDict):
     revision: int
     criteria: list[ContinuityCriterionDigest]
     session_id: str
+    acceptance_id: NotRequired[str]
+    basis_revision: NotRequired[int]
+    mandate_id: NotRequired[str | None]
 
 
 class ContinuityReopen(TypedDict):
@@ -5053,6 +5115,60 @@ class ContinuityReopen(TypedDict):
     cycle: int
     previous_closure_id: str
     session_id: str
+    reason: NotRequired[str]
+    revision: NotRequired[int]
+
+
+class ContinuityReviewDecision(TypedDict):
+    id: str
+    feature_id: str
+    feature_cycle: int
+    criterion_id: str
+    criterion_digest: str
+    evidence_ref: str
+    task_id: str
+    task_digest: str
+    mandate_id: str | None
+    decision: str
+    reason: str
+    revision: int
+    session_id: str
+
+
+class ContinuityAcceptanceCriterion(TypedDict):
+    criterion_id: str
+    criterion_digest: str
+    evidence_status: str
+    check_ref: str
+    check_revision: int
+    task_id: str
+    task_digest: str
+    reported_by_session_id: str
+    review_decision_id: str | None
+
+
+class ContinuityAcceptanceTask(TypedDict):
+    task_id: str
+    task_digest: str
+    attempt: int
+    attempt_status: str
+    evidence_ref: str
+    reported_revision: int
+    reported_by_session_id: str
+
+
+class ContinuityAcceptance(TypedDict):
+    id: str
+    feature_id: str
+    cycle: int
+    basis_revision: int
+    revision: int
+    session_id: str
+    reason: str
+    mandate_id: str | None
+    input_snapshot: ContinuityInputScope
+    criteria: list[ContinuityAcceptanceCriterion]
+    tasks: list[ContinuityAcceptanceTask]
 
 
 class ContinuityDetour(TypedDict):
@@ -5113,6 +5229,8 @@ class ContinuityStateData(TypedDict):
     mandates: NotRequired[dict[str, ContinuityMandate]]
     mandate_history: NotRequired[list[ContinuityMandate]]
     task_events: NotRequired[list[ContinuityTaskEvent]]
+    review_decisions: NotRequired[list[ContinuityReviewDecision]]
+    acceptances: NotRequired[list[ContinuityAcceptance]]
 
 
 def validate_continuity_state(
@@ -5157,6 +5275,8 @@ def validate_continuity_state(
         or ("mandate" in state and type(state["mandate"]) is not dict)
         or ("mandates" in state and type(state["mandates"]) is not dict)
         or ("mandate_history" in state and type(state["mandate_history"]) is not list)
+        or ("review_decisions" in state and type(state["review_decisions"]) is not list)
+        or ("acceptances" in state and type(state["acceptances"]) is not list)
         or (
             "mandate" in state
             and ("mandates" in state or "mandate_history" in state)
@@ -5188,6 +5308,8 @@ def validate_continuity_state(
     )
     mandate = state.get("mandate")
     task_events = cast(list[object], state.get("task_events", []))
+    review_decisions = cast(list[object], state.get("review_decisions", []))
+    acceptances = cast(list[object], state.get("acceptances", []))
     ids = cast(list[object], state["ids"])
     revision = cast(int, state["revision"])
     pending = cast(dict[str, object] | None, state["pending"])
@@ -5243,18 +5365,18 @@ def validate_continuity_state(
         counters[task_id] = 0
     attempt_mandate_ids: set[str] = set()
     for attempt in attempts:
+        required_attempt_fields = {
+            "task_id", "attempt", "status", "session_id", "checkpoint",
+            "result", "result_status", "evidence_ref",
+        }
+        optional_attempt_fields = {
+            "mandate_id", "feature_id", "feature_cycle", "task_digest", "started_revision",
+            "reported_revision", "reported_by_session_id", "reported_input_scope",
+        }
         if (
             type(attempt) is not dict
-            or set(attempt) not in (
-                {
-                    "task_id", "attempt", "status", "session_id", "checkpoint",
-                    "result", "result_status", "evidence_ref",
-                },
-                {
-                    "task_id", "attempt", "status", "session_id", "checkpoint",
-                    "result", "result_status", "evidence_ref", "mandate_id",
-                },
-            )
+            or not required_attempt_fields <= set(attempt)
+            or not set(attempt) <= required_attempt_fields | optional_attempt_fields
             or not isinstance(attempt["task_id"], str)
             or attempt["task_id"] not in counters
             or type(attempt["attempt"]) is not int or attempt["attempt"] < 1
@@ -5276,6 +5398,61 @@ def validate_continuity_state(
                     or re.fullmatch(r"D-[0-9a-f]{32}", attempt["mandate_id"]) is None
                 )
             )
+            or (
+                "feature_id" in attempt
+                and (
+                    not isinstance(attempt["feature_id"], str)
+                    or attempt["feature_id"] not in features
+                    or type(attempt.get("feature_cycle")) is not int
+                    or not 1 <= cast(int, attempt["feature_cycle"])
+                    <= cast(ContinuityFeatureIndex, cast(object, features[attempt["feature_id"]]))["cycle"]
+                    or not isinstance(attempt.get("task_digest"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", cast(str, attempt.get("task_digest"))) is None
+                )
+            )
+            or (
+                any(key in attempt for key in ("feature_cycle", "task_digest"))
+                and "feature_id" not in attempt
+            )
+            or (
+                "started_revision" in attempt
+                and (
+                    type(attempt["started_revision"]) is not int
+                    or not 1 <= cast(int, attempt["started_revision"]) <= revision
+                )
+            )
+            or (
+                any(key in attempt for key in ("reported_revision", "reported_by_session_id"))
+                and (
+                    type(attempt.get("reported_revision")) is not int
+                    or not 1 <= cast(int, attempt["reported_revision"]) <= revision
+                    or not valid_text(attempt.get("reported_by_session_id"), 256)
+                    or attempt["status"] not in (
+                        "REPORTED", "RECONCILED_COMPLETE", "RECONCILED_INCOMPLETE",
+                    )
+                )
+            )
+            or (
+                "reported_input_scope" in attempt
+                and (
+                    "reported_revision" not in attempt
+                    or type(attempt["reported_input_scope"]) is not dict
+                    or set(cast(dict[str, object], cast(object, attempt["reported_input_scope"])))
+                    != {"policy_id", "policy_digest", "fingerprint"}
+                    or cast(dict[str, object], cast(object, attempt["reported_input_scope"])).get("policy_id")
+                    != CONTINUITY_INPUT_POLICY_ID
+                    or cast(dict[str, object], cast(object, attempt["reported_input_scope"])).get("policy_digest")
+                    != CONTINUITY_INPUT_POLICY_DIGEST
+                    or not isinstance(
+                        cast(dict[str, object], cast(object, attempt["reported_input_scope"])).get("fingerprint"),
+                        str,
+                    )
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        cast(str, cast(dict[str, object], cast(object, attempt["reported_input_scope"])).get("fingerprint")),
+                    ) is None
+                )
+            )
         ):
             invalid("Task attempt history is invalid")
         if "mandate_id" in attempt:
@@ -5291,13 +5468,26 @@ def validate_continuity_state(
 
     legacy_check_fields = {
         "criterion_id", "criterion_digest", "check_kind", "check_target",
-        "exit_code", "output_sha256", "reported_by_session_id", "task_id",
-        "recorded_revision",
+        "reported_by_session_id", "task_id", "recorded_revision",
     }
-    optional_check_fields = {"observed_input_scope", "task_digest", "mandate_id"}
+    optional_check_fields = {
+        "exit_code", "output_sha256", "observed_input_scope", "task_digest",
+        "mandate_id", "feature_id", "feature_cycle", "purpose",
+        "evidence_status", "source", "evidence_ref", "input_snapshot_before",
+        "input_snapshot_after", "artifact_present", "artifact_sha256", "report",
+    }
     check_mandate_ids: set[str] = set()
     for check in checks:
         check_fields = set(check) if type(check) is dict else set()
+        kind = check.get("check_kind") if type(check) is dict else None
+        new_fields = {
+            "feature_id", "feature_cycle", "purpose", "evidence_status", "source",
+            "evidence_ref", "input_snapshot_before", "input_snapshot_after",
+        }
+        new_record = "evidence_status" in check_fields
+        expected_new_fields = new_fields | {"task_digest"} | (
+            {"mandate_id"} if "mandate_id" in check_fields else set()
+        )
         if (
             type(check) is not dict
             or not legacy_check_fields <= check_fields
@@ -5307,11 +5497,58 @@ def validate_continuity_state(
             or check["criterion_id"][0] != "C"
             or not isinstance(check["criterion_digest"], str)
             or re.fullmatch(r"[0-9a-f]{64}", check["criterion_digest"]) is None
-            or check["check_kind"] not in ("python-unittest", "node-test")
+            or not isinstance(kind, str)
+            or kind not in CONTINUITY_CHECK_METHODS
             or not isinstance(check["check_target"], str)
-            or type(check["exit_code"]) is not int or not 0 <= check["exit_code"] <= 255
-            or not isinstance(check["output_sha256"], str)
-            or re.fullmatch(r"[0-9a-f]{64}", check["output_sha256"]) is None
+            or not continuity_check_descriptor_valid(kind, check["check_target"])
+            or (
+                kind in ("python-unittest", "node-test")
+                and (
+                    type(check.get("exit_code")) is not int
+                    or not 0 <= cast(int, check["exit_code"]) <= 255
+                    or not isinstance(check.get("output_sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", cast(str, check["output_sha256"])) is None
+                    or any(key in check for key in ("artifact_present", "artifact_sha256", "report"))
+                )
+            )
+            or (
+                kind == "artifact-present"
+                and (
+                    type(check.get("artifact_present")) is not bool
+                    or (
+                        check.get("artifact_present") is True
+                        and "artifact_sha256" not in check
+                    )
+                    or (
+                        check.get("artifact_present") is False
+                        and "artifact_sha256" in check
+                    )
+                    or (
+                        "artifact_sha256" in check
+                        and (
+                            check.get("artifact_present") is not True
+                            or not isinstance(check.get("artifact_sha256"), str)
+                            or re.fullmatch(r"[0-9a-f]{64}", cast(str, check["artifact_sha256"])) is None
+                        )
+                    )
+                    or any(key in check for key in ("exit_code", "output_sha256", "report"))
+                )
+            )
+            or (
+                kind == "review"
+                and (
+                    not valid_text(check.get("report"), 4096)
+                    or "exit_code" in check
+                    or "output_sha256" in check
+                    or "artifact_present" in check
+                    or "artifact_sha256" in check
+                )
+            )
+            or (
+                kind in ("build", "integration", "functional")
+                or kind == "review" and not new_record
+                or kind == "artifact-present" and not new_record
+            )
             or not isinstance(check["reported_by_session_id"], str)
             or not check["reported_by_session_id"]
             or (
@@ -5343,14 +5580,70 @@ def validate_continuity_state(
                     or check["mandate_id"] not in ids
                 )
             )
+            or (
+                new_record
+                and (
+                    not expected_new_fields <= check_fields
+                    or not isinstance(check.get("feature_id"), str)
+                    or check.get("feature_id") not in features
+                    or type(check.get("feature_cycle")) is not int
+                    or not 1 <= cast(int, check["feature_cycle"])
+                    <= cast(ContinuityFeatureIndex, cast(object, features[cast(str, check["feature_id"])]))["cycle"]
+                    or not valid_text(check.get("purpose"), 2048)
+                    or check.get("task_id") is None
+                    or type(check.get("input_snapshot_before")) is not dict
+                    or type(check.get("input_snapshot_after")) is not dict
+                    or (
+                        "observed_input_scope" in check
+                        and (
+                            check.get("input_snapshot_before") != check.get("observed_input_scope")
+                            or check.get("input_snapshot_after") != check.get("observed_input_scope")
+                        )
+                    )
+                    or check.get("evidence_ref") != (
+                        f"continuity:{check.get('feature_id')}:{check.get('feature_cycle')}:"
+                        f"{check.get('criterion_id')}:{check.get('recorded_revision')}"
+                    )
+                    or (
+                        kind in ("python-unittest", "node-test")
+                        and (
+                            check.get("source") != "CALLER_FORWARDED_UNATTESTED"
+                            or check.get("evidence_status") != (
+                                "VERIFIED" if check.get("exit_code") == 0 else "FAILED"
+                            )
+                        )
+                    )
+                    or (
+                        kind == "artifact-present"
+                        and (
+                            check.get("source") != "CORE_OBSERVED"
+                            or check.get("evidence_status") != (
+                                "VERIFIED" if check.get("artifact_present") is True else "FAILED"
+                            )
+                        )
+                    )
+                    or (
+                        kind == "review"
+                        and (
+                            check.get("source") != "CALLER_REPORTED"
+                            or check.get("evidence_status") != "REPORTED"
+                        )
+                        )
+                )
+            )
+            or (
+                not new_record
+                and any(key in check_fields for key in new_fields)
+            )
         ):
             invalid("criterion check history is invalid")
         if "mandate_id" in check:
             check_mandate_ids.add(cast(str, check["mandate_id"]))
         if "observed_input_scope" in check:
-            scope = check["observed_input_scope"]
+            scope = check.get("observed_input_scope")
             if (
-                type(scope) is not dict
+                scope is None
+                or type(scope) is not dict
                 or set(scope) != {"policy_id", "policy_digest", "fingerprint"}
                 or not isinstance(scope["policy_id"], str)
                 or not scope["policy_id"].strip()
@@ -5361,6 +5654,21 @@ def validate_continuity_state(
                 or re.fullmatch(r"[0-9a-f]{64}", scope["fingerprint"]) is None
             ):
                 invalid("criterion check input scope is invalid")
+        if new_record:
+            for scope in (
+                check.get("input_snapshot_before"),
+                check.get("input_snapshot_after"),
+            ):
+                if (
+                    scope is None
+                    or type(scope) is not dict
+                    or set(scope) != {"policy_id", "policy_digest", "fingerprint"}
+                    or scope.get("policy_id") != CONTINUITY_INPUT_POLICY_ID
+                    or scope.get("policy_digest") != CONTINUITY_INPUT_POLICY_DIGEST
+                    or not isinstance(scope.get("fingerprint"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", cast(str, scope.get("fingerprint"))) is None
+                ):
+                    invalid("criterion evidence input snapshot is invalid")
 
     if any(
         not isinstance(path, str) or _CONTINUITY_DOC.fullmatch(path) is None
@@ -5498,6 +5806,249 @@ def validate_continuity_state(
             invalid("current implementation mandate does not follow its Feature history")
     if not attempt_mandate_ids <= mandate_ids or not check_mandate_ids <= mandate_ids:
         invalid("attempt or check references an unknown implementation mandate")
+    check_by_ref = {
+        cast(str, check["evidence_ref"]): check
+        for check in checks
+        if type(check) is dict and isinstance(check.get("evidence_ref"), str)
+    }
+    review_decision_by_id: dict[str, dict[str, object]] = {}
+    previous_review_revision = 0
+    for record in review_decisions:
+        if (
+            type(record) is not dict
+            or set(record) != {
+                "id", "feature_id", "feature_cycle", "criterion_id",
+                "criterion_digest", "evidence_ref", "task_id", "task_digest",
+                "mandate_id", "decision", "reason", "revision", "session_id",
+            }
+            or not isinstance(record.get("id"), str)
+            or _CONTINUITY_ID.fullmatch(cast(str, record.get("id"))) is None
+            or cast(str, record.get("id"))[0] != "D"
+            or cast(str, record.get("id")) not in ids
+            or cast(str, record.get("id")) in review_decision_by_id
+            or not isinstance(record.get("feature_id"), str)
+            or record.get("feature_id") not in features
+            or type(record.get("feature_cycle")) is not int
+            or not 1 <= cast(int, record.get("feature_cycle"))
+            <= cast(ContinuityFeatureIndex, cast(object, features[cast(str, record.get("feature_id"))]))["cycle"]
+            or not isinstance(record.get("criterion_id"), str)
+            or cast(str, record.get("criterion_id")) not in ids
+            or cast(str, record.get("criterion_id"))[0] != "C"
+            or not isinstance(record.get("criterion_digest"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", cast(str, record.get("criterion_digest"))) is None
+            or not isinstance(record.get("evidence_ref"), str)
+            or not isinstance(record.get("task_id"), str)
+            or record.get("task_id") not in counters
+            or not isinstance(record.get("task_digest"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", cast(str, record.get("task_digest"))) is None
+            or (
+                record.get("mandate_id") is not None
+                and (
+                    not isinstance(record.get("mandate_id"), str)
+                    or record.get("mandate_id") not in mandate_ids
+                )
+            )
+            or record.get("decision") not in ("ACCEPTED", "REJECTED")
+            or not valid_text(record.get("reason"), 2048)
+            or type(record.get("revision")) is not int
+            or not 1 <= cast(int, record.get("revision")) <= revision
+            or cast(int, record.get("revision")) <= previous_review_revision
+            or not valid_text(record.get("session_id"), 256)
+        ):
+            invalid("Feature review decision history is invalid")
+        decision = cast(dict[str, object], record)
+        check = check_by_ref.get(cast(str, decision["evidence_ref"]))
+        if (
+            check is None
+            or check.get("check_kind") != "review"
+            or check.get("evidence_status") != "REPORTED"
+            or check.get("feature_id") != decision["feature_id"]
+            or check.get("feature_cycle") != decision["feature_cycle"]
+            or check.get("criterion_id") != decision["criterion_id"]
+            or check.get("criterion_digest") != decision["criterion_digest"]
+            or check.get("task_id") != decision["task_id"]
+            or check.get("task_digest") != decision["task_digest"]
+            or check.get("mandate_id") != decision["mandate_id"]
+        ):
+            invalid("Feature review decision does not identify its exact review report")
+        review_decision_by_id[cast(str, decision["id"])] = decision
+        previous_review_revision = cast(int, decision["revision"])
+
+    attempt_by_task_number = {
+        (cast(str, attempt["task_id"]), cast(int, attempt["attempt"])): attempt
+        for attempt in attempts
+        if type(attempt) is dict
+    }
+    acceptance_by_id: dict[str, dict[str, object]] = {}
+    previous_acceptance_revision = 0
+    for record in acceptances:
+        if (
+            type(record) is not dict
+            or set(record) != {
+                "id", "feature_id", "cycle", "basis_revision", "revision",
+                "session_id", "reason", "mandate_id", "input_snapshot",
+                "criteria", "tasks",
+            }
+            or not isinstance(record.get("id"), str)
+            or _CONTINUITY_ID.fullmatch(cast(str, record.get("id"))) is None
+            or cast(str, record.get("id"))[0] != "D"
+            or cast(str, record.get("id")) not in ids
+            or cast(str, record.get("id")) in acceptance_by_id
+            or not isinstance(record.get("feature_id"), str)
+            or record.get("feature_id") not in features
+            or type(record.get("cycle")) is not int
+            or not 1 <= cast(int, record.get("cycle"))
+            <= cast(ContinuityFeatureIndex, cast(object, features[cast(str, record.get("feature_id"))]))["cycle"]
+            or type(record.get("basis_revision")) is not int
+            or type(record.get("revision")) is not int
+            or not 0 <= cast(int, record.get("basis_revision"))
+            < cast(int, record.get("revision")) <= revision
+            or cast(int, record.get("revision"))
+            != cast(int, record.get("basis_revision")) + 1
+            or cast(int, record.get("revision")) <= previous_acceptance_revision
+            or not valid_text(record.get("session_id"), 256)
+            or not valid_text(record.get("reason"), 2048)
+            or (
+                record.get("mandate_id") is not None
+                and (
+                    not isinstance(record.get("mandate_id"), str)
+                    or record.get("mandate_id") not in mandate_ids
+                )
+            )
+            or type(record.get("input_snapshot")) is not dict
+            or type(record.get("criteria")) is not list
+            or type(record.get("tasks")) is not list
+            or not record.get("criteria")
+            or not record.get("tasks")
+        ):
+            invalid("Feature acceptance history is invalid")
+        acceptance = cast(dict[str, object], record)
+        scope = cast(dict[str, object], acceptance["input_snapshot"])
+        if (
+            set(scope) != {"policy_id", "policy_digest", "fingerprint"}
+            or scope.get("policy_id") != CONTINUITY_INPUT_POLICY_ID
+            or scope.get("policy_digest") != CONTINUITY_INPUT_POLICY_DIGEST
+            or not isinstance(scope.get("fingerprint"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", cast(str, scope.get("fingerprint"))) is None
+        ):
+            invalid("Feature acceptance input snapshot is invalid")
+        criterion_ids: set[str] = set()
+        for item in cast(list[object], acceptance["criteria"]):
+            if (
+                type(item) is not dict
+                or set(item) != {
+                    "criterion_id", "criterion_digest", "evidence_status",
+                    "check_ref", "check_revision", "task_id", "task_digest",
+                    "reported_by_session_id", "review_decision_id",
+                }
+                or not isinstance(item.get("criterion_id"), str)
+                or cast(str, item.get("criterion_id")) not in ids
+                or cast(str, item.get("criterion_id"))[0] != "C"
+                or cast(str, item.get("criterion_id")) in criterion_ids
+                or not isinstance(item.get("criterion_digest"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", cast(str, item.get("criterion_digest"))) is None
+                or item.get("evidence_status") not in ("VERIFIED", "REPORTED")
+                or not isinstance(item.get("check_ref"), str)
+                or type(item.get("check_revision")) is not int
+                or not 1 <= cast(int, item.get("check_revision")) < cast(int, acceptance["revision"])
+                or not isinstance(item.get("task_id"), str)
+                or item.get("task_id") not in counters
+                or not isinstance(item.get("task_digest"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", cast(str, item.get("task_digest"))) is None
+                or not valid_text(item.get("reported_by_session_id"), 256)
+                or (
+                    item.get("review_decision_id") is not None
+                    and (
+                        not isinstance(item.get("review_decision_id"), str)
+                        or item.get("review_decision_id") not in review_decision_by_id
+                    )
+                )
+            ):
+                invalid("Feature acceptance criterion evidence is invalid")
+            criterion_item = cast(dict[str, object], item)
+            check = check_by_ref.get(cast(str, criterion_item["check_ref"]))
+            if (
+                check is None
+                or check.get("recorded_revision") != criterion_item["check_revision"]
+                or check.get("criterion_id") != criterion_item["criterion_id"]
+                or check.get("criterion_digest") != criterion_item["criterion_digest"]
+                or check.get("feature_id") != acceptance["feature_id"]
+                or check.get("feature_cycle") != acceptance["cycle"]
+                or check.get("task_id") != criterion_item["task_id"]
+                or check.get("task_digest") != criterion_item["task_digest"]
+                or check.get("reported_by_session_id") != criterion_item["reported_by_session_id"]
+                or check.get("evidence_status", "VERIFIED" if check.get("exit_code") == 0 else "FAILED")
+                != criterion_item["evidence_status"]
+                or check.get("mandate_id") != acceptance["mandate_id"]
+            ):
+                invalid("Feature acceptance criterion does not identify its exact evidence")
+            review_id = criterion_item["review_decision_id"]
+            if review_id is not None:
+                review = review_decision_by_id[cast(str, review_id)]
+                if (
+                    criterion_item["evidence_status"] != "REPORTED"
+                    or review.get("decision") != "ACCEPTED"
+                    or review.get("evidence_ref") != criterion_item["check_ref"]
+                    or review.get("feature_id") != acceptance["feature_id"]
+                    or review.get("feature_cycle") != acceptance["cycle"]
+                    or review.get("criterion_id") != criterion_item["criterion_id"]
+                ):
+                    invalid("Feature acceptance review decision is not attributable to its report")
+            elif criterion_item["evidence_status"] != "VERIFIED":
+                invalid("reported acceptance evidence has no explicit review decision")
+            criterion_ids.add(cast(str, criterion_item["criterion_id"]))
+        task_ids: set[str] = set()
+        for item in cast(list[object], acceptance["tasks"]):
+            if (
+                type(item) is not dict
+                or set(item) != {
+                    "task_id", "task_digest", "attempt", "attempt_status",
+                    "evidence_ref", "reported_revision", "reported_by_session_id",
+                }
+                or not isinstance(item.get("task_id"), str)
+                or item.get("task_id") not in counters
+                or cast(str, item.get("task_id")) in task_ids
+                or not isinstance(item.get("task_digest"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", cast(str, item.get("task_digest"))) is None
+                or type(item.get("attempt")) is not int
+                or cast(int, item.get("attempt")) < 1
+                or item.get("attempt_status") not in ("REPORTED", "RECONCILED_COMPLETE")
+                or not valid_text(item.get("evidence_ref"), 2048)
+                or type(item.get("reported_revision")) is not int
+                or not 1 <= cast(int, item.get("reported_revision")) < cast(int, acceptance["revision"])
+                or not valid_text(item.get("reported_by_session_id"), 256)
+            ):
+                invalid("Feature acceptance Task evidence is invalid")
+            task_item = cast(dict[str, object], item)
+            attempt = attempt_by_task_number.get((
+                cast(str, task_item["task_id"]), cast(int, task_item["attempt"]),
+            ))
+            if (
+                attempt is None
+                or attempt.get("feature_id") != acceptance["feature_id"]
+                or attempt.get("feature_cycle") != acceptance["cycle"]
+                or attempt.get("task_digest") != task_item["task_digest"]
+                or attempt.get("status") != task_item["attempt_status"]
+                or attempt.get("evidence_ref") != task_item["evidence_ref"]
+                or attempt.get("reported_revision") != task_item["reported_revision"]
+                or attempt.get("reported_by_session_id") != task_item["reported_by_session_id"]
+                or attempt.get("mandate_id") != acceptance["mandate_id"]
+            ):
+                invalid("Feature acceptance Task does not identify its exact reported attempt")
+            task_ids.add(cast(str, task_item["task_id"]))
+        identity = cast(str, acceptance["id"])
+        if acceptance["mandate_id"] is not None and not any(
+            isinstance(record, dict)
+            and record.get("id") == acceptance["mandate_id"]
+            and record.get("feature_id") == acceptance["feature_id"]
+            for record in (
+                [legacy_mandate] if legacy_mandate is not None else []
+            ) + list(current_mandates.values()) + mandate_history
+        ):
+            invalid("Feature acceptance mandate belongs to another Feature")
+        acceptance_by_id[identity] = acceptance
+        previous_acceptance_revision = cast(int, acceptance["revision"])
+
     if task_events:
         event_revisions: set[int] = set()
         last_events: dict[str, tuple[str, int]] = {}
@@ -5598,7 +6149,13 @@ def validate_continuity_state(
     for item in closures:
         if (
             type(item) is not dict
-            or set(item) != {"id", "feature_id", "cycle", "revision", "criteria", "session_id"}
+            or set(item) not in (
+                {"id", "feature_id", "cycle", "revision", "criteria", "session_id"},
+                {
+                    "id", "feature_id", "cycle", "revision", "criteria",
+                    "session_id", "acceptance_id", "basis_revision", "mandate_id",
+                },
+            )
             or not isinstance(item["id"], str) or _CONTINUITY_ID.fullmatch(item["id"]) is None
             or item["id"][0] != "D" or item["id"] not in ids
             or not isinstance(item["feature_id"], str)
@@ -5624,6 +6181,19 @@ def validate_continuity_state(
                 for criterion in cast(list[object], item["criteria"])
             }) != len(cast(list[object], item["criteria"]))
             or not isinstance(item["session_id"], str) or not item["session_id"]
+            or (
+                "acceptance_id" in item
+                and (
+                    not isinstance(item.get("acceptance_id"), str)
+                    or re.fullmatch(r"D-[0-9a-f]{32}", cast(str, item.get("acceptance_id"))) is None
+                    or cast(str, item.get("acceptance_id")) not in acceptance_by_id
+                    or type(item.get("basis_revision")) is not int
+                    or item.get("mandate_id") is not None
+                    and not isinstance(item.get("mandate_id"), str)
+                    or isinstance(item.get("mandate_id"), str)
+                    and item.get("mandate_id") not in mandate_ids
+                )
+            )
         ):
             invalid("Feature closure history is invalid")
     closure_cycles: dict[tuple[str, int], str] = {}
@@ -5633,12 +6203,47 @@ def validate_continuity_state(
         key = (item["feature_id"], item["cycle"])
         if key in closure_cycles or item["id"] in closure_id_set:
             invalid("Feature cycle has duplicate closure receipts")
+        if "acceptance_id" in item:
+            acceptance = acceptance_by_id.get(item["acceptance_id"])
+            if acceptance is None:
+                invalid("Feature closure does not consume its exact acceptance decision")
+            acceptance_revision = acceptance.get("revision")
+            acceptance_criteria = acceptance.get("criteria")
+            if type(acceptance_revision) is not int or not isinstance(acceptance_criteria, list):
+                invalid("Feature closure acceptance data is invalid")
+            closure_criteria: list[dict[str, str]] = []
+            for criterion in acceptance_criteria:
+                if not isinstance(criterion, dict):
+                    invalid("Feature closure acceptance criteria are invalid")
+                criterion_id = criterion.get("criterion_id")
+                criterion_digest = criterion.get("criterion_digest")
+                if not isinstance(criterion_id, str) or not isinstance(criterion_digest, str):
+                    invalid("Feature closure acceptance criteria are invalid")
+                closure_criteria.append({
+                    "id": criterion_id,
+                    "digest": criterion_digest,
+                })
+            if (
+                item.get("basis_revision") != acceptance.get("basis_revision")
+                or item.get("mandate_id") != acceptance["mandate_id"]
+                or item["feature_id"] != acceptance["feature_id"]
+                or item["cycle"] != acceptance["cycle"]
+                or item["revision"] != acceptance_revision + 1
+                or item["criteria"] != closure_criteria
+            ):
+                invalid("Feature closure does not consume its exact acceptance decision")
         closure_cycles[key] = item["id"]
         closure_id_set.add(item["id"])
     for item in reopens:
         if (
             type(item) is not dict
-            or set(item) != {"feature_id", "cycle", "previous_closure_id", "session_id"}
+            or set(item) not in (
+                {"feature_id", "cycle", "previous_closure_id", "session_id"},
+                {
+                    "feature_id", "cycle", "previous_closure_id", "session_id",
+                    "reason", "revision",
+                },
+            )
             or not isinstance(item["feature_id"], str)
             or item["feature_id"] not in features
             or type(item["cycle"]) is not int or item["cycle"] < 2
@@ -5649,6 +6254,19 @@ def validate_continuity_state(
                 (item["feature_id"], item["cycle"] - 1),
             )
             or not isinstance(item["session_id"], str) or not item["session_id"]
+            or (
+                "reason" in item
+                and (
+                    not valid_text(item.get("reason"), 2048)
+                    or type(item.get("revision")) is not int
+                    or not 1 <= cast(int, item["revision"]) <= revision
+                    or cast(int, item["revision"])
+                    <= next(
+                        closure["revision"] for closure in validated_closures
+                        if closure["id"] == item["previous_closure_id"]
+                    )
+                )
+            )
         ):
             invalid("Feature reopen history is invalid")
     reopen_cycles: set[tuple[str, int]] = set()

@@ -4783,6 +4783,7 @@ class ContinuityPersistence:
         self, current: ContinuityStateData, candidate: ContinuityStateData,
         writes: dict[str, tuple[bytes, str | None]],
         *, read_set: dict[str, str | None] | None = None,
+        commit_guard: Callable[[], None] | None = None,
     ) -> None:
         if candidate["pending"] is not None:
             raise ContinuityError("INVALID_STATE", "candidate state cannot contain a pending journal")
@@ -4851,6 +4852,8 @@ class ContinuityPersistence:
         validate_continuity_state(journal, repository_id=self.repository_id)
         journal_bytes = _encode_recoverable_continuity(journal, "recovery journal")
         marker = _artifact_path(self.__root, "continuity.json")
+        if commit_guard is not None:
+            commit_guard()
         try:
             _atomic_replace(
                 marker,

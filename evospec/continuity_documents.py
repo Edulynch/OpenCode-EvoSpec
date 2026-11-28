@@ -20,6 +20,7 @@ from .domain import (
     ContinuityPlanDocument,
     ContinuityStateData,
     ContinuityTaskDocument,
+    continuity_check_descriptor_valid,
 )
 from .lifecycle import (
     ContinuityFeatureView,
@@ -46,40 +47,31 @@ _DOCUMENT_NAMES = {"spec": "spec", "plan": "plan", "tasks": "tasks", "decisions"
 class _ContinuityCheckView(TypedDict):
     criterion_id: str
     criterion_digest: str
-    exit_code: int
     check_kind: str
     check_target: str
-    output_sha256: str
     task_id: str | None
     reported_by_session_id: str
     recorded_revision: int
+    exit_code: NotRequired[int]
+    output_sha256: NotRequired[str]
     observed_input_scope: NotRequired[dict[str, str]]
+    task_digest: NotRequired[str]
     mandate_id: NotRequired[str]
+    feature_id: NotRequired[str]
+    feature_cycle: NotRequired[int]
+    purpose: NotRequired[str]
+    evidence_status: NotRequired[str]
+    source: NotRequired[str]
+    evidence_ref: NotRequired[str]
+    input_snapshot_before: NotRequired[dict[str, str]]
+    input_snapshot_after: NotRequired[dict[str, str]]
+    artifact_present: NotRequired[bool]
+    artifact_sha256: NotRequired[str]
+    report: NotRequired[str]
 
 
 def _continuity_check_view(check: ContinuityCheck) -> _ContinuityCheckView:
-    view: _ContinuityCheckView = {
-        "criterion_id": check["criterion_id"],
-        "criterion_digest": check["criterion_digest"],
-        "exit_code": check["exit_code"],
-        "check_kind": check["check_kind"],
-        "check_target": check["check_target"],
-        "output_sha256": check["output_sha256"],
-        "task_id": check["task_id"],
-        "reported_by_session_id": check["reported_by_session_id"],
-        "recorded_revision": check["recorded_revision"],
-    }
-    observed = check.get("observed_input_scope")
-    if observed is not None:
-        view["observed_input_scope"] = {
-            "policy_id": observed["policy_id"],
-            "policy_digest": observed["policy_digest"],
-            "fingerprint": observed["fingerprint"],
-        }
-    mandate_id = check.get("mandate_id")
-    if mandate_id is not None:
-        view["mandate_id"] = mandate_id
-    return view
+    return cast(_ContinuityCheckView, cast(object, dict(check)))
 
 
 def initial_documents(
@@ -979,8 +971,9 @@ def _validate_feature(value: dict[str, object]) -> None:
             type(item) is not dict or set(item) != {"id", "description", "check_kind", "check_target"}
             or not _valid_identity(item["id"], "C") or item["id"] in all_ids
             or not isinstance(item["description"], str) or not item["description"].strip()
-            or item["check_kind"] not in ("python-unittest", "node-test")
+            or not isinstance(item["check_kind"], str)
             or not isinstance(item["check_target"], str)
+            or not continuity_check_descriptor_valid(item["check_kind"], item["check_target"])
         ):
             raise ContinuityError("DOCUMENT_DIVERGED", "Feature criterion is malformed")
         all_ids.add(cast(str, item["id"]))
@@ -1067,20 +1060,35 @@ def _generated_checklist(
     tasks: Sequence[ContinuityTaskDocument],
 ) -> str:
     input_snapshot = cast(ContinuityInputScope | None, state.get("input_snapshot"))
-    view_state: ContinuityStateView = {
+    view_state = cast(ContinuityStateView, cast(object, {
         "checks": tuple(_continuity_check_view(check) for check in state["checks"]),
         "attempts": tuple(state["attempts"]),
         "execution": None if state["execution"] is None else {"task_id": state["execution"]["task_id"]},
         "paused_features": tuple(state["paused_features"]),
         "task_events": tuple(state.get("task_events", ())),
+        "review_decisions": tuple(state.get("review_decisions", ())),
         "input_snapshot": None if input_snapshot is None else {
             "policy_id": input_snapshot["policy_id"],
             "policy_digest": input_snapshot["policy_digest"],
             "fingerprint": input_snapshot["fingerprint"],
         },
-    }
+    }))
     criteria = cast(list[ContinuityCriterionDocument], feature["criteria"])
-    view_feature: ContinuityFeatureView = {"criteria": tuple(criteria)}
+    mandate = cast(
+        dict[str, object] | None,
+        state.get("mandates", {}).get(feature_id, state.get("mandate")),
+    )
+    if mandate is not None and mandate.get("feature_id") != feature_id:
+        mandate = None
+    view_feature = cast(ContinuityFeatureView, cast(object, {
+        "criteria": tuple(criteria),
+        "id": feature_id,
+        "cycle": state["features"][feature_id]["cycle"],
+        "mandate_id": None if mandate is None else cast(str, mandate["id"]),
+        "mandate_scope_current": _mandate_scope_current(
+            mandate, feature, tasks,
+        ),
+    }))
     view_tasks: tuple[ContinuityTaskView, ...] = tuple(
         {
             "id": item["id"], "title": item["title"],
@@ -1106,6 +1114,43 @@ def _generated_checklist(
         lines.append(f"- [{'x' if status == 'COMPLETED' else ' '}] `{item['id']}` — {status}")
     lines.extend((_GENERATED_END, ""))
     return "\n".join(lines)
+
+
+def _mandate_scope_current(
+    mandate: dict[str, object] | None,
+    feature: dict[str, object],
+    tasks: Sequence[ContinuityTaskDocument],
+) -> bool:
+    if mandate is None:
+        return True
+    criteria = cast(list[dict[str, object]], feature["criteria"])
+    increments = cast(list[dict[str, object]], feature["increments"])
+
+    def digest(value: object) -> str:
+        return sha256(json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+    criterion_ids = {item["id"] for item in cast(list[dict[str, object]], mandate["criteria"])}
+    increment_ids = {item["id"] for item in cast(list[dict[str, object]], mandate["increments"])}
+    return (
+        mandate.get("outcome_digest") == digest(feature["outcome"])
+        and mandate.get("criteria") == [
+            {"id": item["id"], "digest": digest(item)} for item in criteria
+        ]
+        and mandate.get("increments") == [
+            {
+                "id": item["id"],
+                "digest": digest({"id": item["id"], "outcome": item["outcome"]}),
+            }
+            for item in increments
+        ]
+        and all(
+            (task["increment_id"] is None or task["increment_id"] in increment_ids)
+            and set(task["criteria_ids"]) <= criterion_ids
+            for task in tasks
+        )
+    )
 
 
 def _task_definition(task: ContinuityTaskDocument) -> str:
