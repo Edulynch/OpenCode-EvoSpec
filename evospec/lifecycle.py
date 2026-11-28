@@ -41,6 +41,7 @@ class _ContinuityCheck(TypedDict):
     reported_by_session_id: str
     recorded_revision: int
     observed_input_scope: NotRequired[dict[str, str]]
+    mandate_id: NotRequired[str]
 
 
 class _ContinuityAttempt(TypedDict):
@@ -48,6 +49,13 @@ class _ContinuityAttempt(TypedDict):
     attempt: int
     status: str
     result_status: str | None
+
+
+class _ContinuityTaskEvent(TypedDict):
+    task_id: str
+    event: str
+    recorded_revision: int
+    attempt_count: int
 
 
 class _ContinuityExecution(TypedDict):
@@ -60,6 +68,7 @@ class ContinuityStateView(TypedDict):
     execution: _ContinuityExecution | None
     paused_features: Sequence[str]
     input_snapshot: NotRequired[dict[str, str] | None]
+    task_events: NotRequired[Sequence[_ContinuityTaskEvent]]
 
 class LifecycleState(StrEnum):
     PROPOSED = "PROPOSED"
@@ -322,6 +331,7 @@ def continuity_current_checks(
                 or criterion_id in task_criteria.get(receipt_task_id, set())
             )
         ):
+            mandate_id = receipt.get("mandate_id")
             latest[criterion_id] = {
                 "passed": receipt.get("exit_code") == 0,
                 "fresh": True,
@@ -332,6 +342,10 @@ def continuity_current_checks(
                 "task_id": receipt.get("task_id"),
                 "reported_by_session_id": receipt.get("reported_by_session_id"),
                 "recorded_revision": receipt.get("recorded_revision"),
+                **(
+                    {"mandate_id": mandate_id}
+                    if isinstance(mandate_id, str) else {}
+                ),
             }
     return latest
 
@@ -347,6 +361,18 @@ def continuity_task_status(
     if execution is not None and execution["task_id"] == task["id"]:
         return "OUTCOME_UNKNOWN"
     attempts = [item for item in state["attempts"] if item["task_id"] == task["id"]]
+    events = [
+        item for item in state.get("task_events", ())
+        if item["task_id"] == task["id"]
+    ]
+    latest_event = events[-1] if events else None
+    if latest_event is not None:
+        if latest_event["event"] == "BLOCKED":
+            return "BLOCKED"
+        if latest_event["event"] == "CANCELED":
+            return "CANCELED"
+        if latest_event["event"] == "REOPENED" and len(attempts) <= latest_event["attempt_count"]:
+            return "READY"
     if not attempts:
         return "READY"
     last = attempts[-1]
@@ -363,6 +389,12 @@ def continuity_task_status(
     checks = continuity_current_checks(
         state, feature, tasks=tasks, task_id=task["id"],
     )
+    if latest_event is not None and latest_event["event"] == "REOPENED" and any(
+        type(recorded_revision := check.get("recorded_revision")) is int
+        and recorded_revision <= latest_event["recorded_revision"]
+        for check in checks.values()
+    ):
+        return "REPORTED"
     if all(checks.get(identity, {}).get("passed") for identity in task["criteria_ids"]):
         return "COMPLETED"
     return "REPORTED"

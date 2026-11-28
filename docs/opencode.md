@@ -95,6 +95,50 @@ clean-legacy `upgrade_markdown` transition through the same host write
 permission and provider-neutral Core protocol. Neither a tool call nor a
 permission result proves that a native prompt appeared or was approved.
 
+### Continuous `--all` implementation
+
+An explicit `/evospec.implement --all` begins with one revision-bound Core
+`implement` call using `phase: "start"`, the exact Feature ID, and `mode: "ALL"`.
+Core persists one current mandate per Feature, binding its normative Feature
+Outcome, criterion definitions, and Increment IDs and Outcomes; replaced
+mandates remain in history. Session-local Feature selection chooses the
+selected mandate, while status retains each Feature's mandate. This does not
+allow parallel execution: one unresolved Task checkpoint remains global to the
+worktree and blocks another start or semantic document reconciliation. A
+mandate on Feature A alone does not redirect or replace Feature B's mandate.
+`close_feature` defaults to false. Queue, checkpoint, report, verification,
+scoped Task addition, detour, and recovery calls carry the exact Feature and
+that Feature's mandate ID. Re-read status after each result and follow Core's
+next-Task projection; an empty queue is not completion, and the fourth or a
+later accepted Increment can receive a Task under the existing mandate.
+Display titles, notes, formatting, and technical plan refinements do not stale
+a mandate; a plan refinement can be tied to its stable Increment ID but cannot
+expand its normative Outcome. A changed Feature Outcome, criterion definition,
+or Increment Outcome stales the mandate even if IDs remain unchanged. Reconcile
+the Markdown, then explicitly replace by naming the exact stale mandate ID;
+prior attempt/check attribution remains in history. A legacy mandate without
+the normative Outcome binding is stale for new effects, but an already
+checkpointed Task may be reported/reconciled only against its exact Feature,
+mandate, Task, and evidence before explicit replacement. `/evospec.implement
+--all` never closes the Feature.
+
+Core checkpoints a Task before effects. A fresh session may inspect the
+checkpoint but cannot report or replay the originating attempt; it must
+reconcile that exact Task and mandate with an evidence reference first. A
+checkpoint is not a filesystem grant, evidence of completion, host
+cancellation, or permission approval. `BLOCKED`, `CANCELED`, and `REOPENED`
+are reasoned same-Task lifecycle events; cancellation is not success, and a
+reopened Task needs a new attempt and fresh linked check. Verification remains
+bound to Core's current repository-input snapshots.
+
+The deterministic AC1 adapter fixture drives four functional Increments and
+an exact-ID technical plan refinement through the actual packaged adapter,
+provider-neutral protocol, and Core against a temporary app root. It simulates
+OpenCode sessions and permission callbacks and uses Node VM tests for app
+behavior; it does not run a live model, OpenCode session, native permission
+dialog, or browser. See the AC1 contract and fixture limits in
+[the consolidated continuity document](ac0-consolidated-mvp.md).
+
 ### R2-C2: detect host delegation contract candidates, fail closed
 
 `evospec_auto_contract` is a separate, read-only **compatibility diagnostic** for the proposed Auto-first delegated authority in [#49](https://github.com/Edulynch/OpenCode-EvoSpec/issues/49). It reports whether the running host exposes a `permission.saved.list` function and whether an observed `permission.evaluate` event contains the candidate `rule.source` shape proposed in [OpenCode #61767](https://github.com/anomalyco/opencode/issues/61767). This observation is ephemeral and per-session: it stores a boolean, **not** rule values, resources, permission records, prompt texts, or user identities. It never calls the saved-rules function and does not issue a permission request.

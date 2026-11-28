@@ -2099,8 +2099,8 @@ function taskLinksCriterion(feature, taskID, criterionID) {
 function continuityWrites(operation, data) {
   if (["specify", "clarify", "plan", "change", "pause", "resume", "close", "reconcile", "upgrade_markdown"].includes(operation)) return true
   if (operation === "use") return Object.keys(data).length > 0
-  if (operation === "tasks") return data.task_title !== undefined
-  if (operation === "implement") return data.phase === "begin" || data.phase === "report"
+  if (operation === "tasks") return data.task_title !== undefined || data.task_event !== undefined
+  if (operation === "implement") return ["start", "begin", "report"].includes(data.phase)
   return false
 }
 
@@ -2132,6 +2132,8 @@ async function authorizeContinuityWrite(runtime, context, root, operation, data,
       feature_id: data.feature_id ?? null,
       task_id: data.task_id ?? null,
       criterion_id: data.criterion_id ?? null,
+      mandate_id: data.mandate_id ?? data.replace_mandate_id ?? null,
+      task_event: data.task_event ?? null,
     })],
   })
   if (!sameRequester(context, requester) || resolve(await sessionRoot(runtime, context)) !== resolve(root)) {
@@ -2167,15 +2169,29 @@ async function executeContinuity(runtime, args, context) {
     context,
     root,
   ))
-  const feature = requested.features?.find((item) =>
-    item.id === (data.feature_id ?? requested.selected_feature_id))
-  const criterion = feature?.criteria?.find((item) => item.id === data.criterion_id)
+  const featureID = data.feature_id ?? requested.selected_feature_id
+  const feature = requested.features?.find((item) => item.id === featureID)
+  const mandate = feature?.mandate ?? (
+    requested.mandate?.feature_id === featureID ? requested.mandate : undefined
+  )
+  if (mandate && (
+      data.mandate_id !== mandate.id ||
+      featureID !== mandate.feature_id ||
+      !mandate.criterion_ids?.includes(data.criterion_id))) {
+    throw new Error("Continuity verification requires the exact active mandate, Feature, and criterion")
+  }
+  if (!mandate && data.mandate_id !== undefined) {
+    throw new Error("Continuity verification supplied a mandate that Core does not have")
+  }
+  const selectedFeature = feature ?? requested.features?.find((item) =>
+    item.id === (mandate?.feature_id ?? requested.selected_feature_id))
+  const criterion = selectedFeature?.criteria?.find((item) => item.id === data.criterion_id)
   const taskID = data.task_id
-  if (!feature || !criterion || feature.status !== "OPEN" || requested.execution !== null) {
+  if (!selectedFeature || !criterion || selectedFeature.status !== "OPEN" || requested.execution !== null) {
     throw new Error("Continuity verification is stale, ambiguous, closed, or blocked by an unresolved Task attempt")
   }
   if (typeof taskID !== "string" || !taskID.trim() ||
-      !taskLinksCriterion(feature, taskID, criterion.id)) {
+      !taskLinksCriterion(selectedFeature, taskID, criterion.id)) {
     throw new Error("Continuity verification requires a current Task linked to the selected criterion")
   }
   if (args.expected_revision !== undefined && args.expected_revision !== null &&
@@ -2185,7 +2201,7 @@ async function executeContinuity(runtime, args, context) {
   const command = criterionCommand(criterion.check_kind, criterion.check_target)
   const requester = await authorizeContinuityWrite(
     runtime, context, root, operation,
-    { ...data, feature_id: feature.id, criterion_id: criterion.id, command },
+    { ...data, feature_id: selectedFeature.id, criterion_id: criterion.id, command },
     "evospec_continuity_verify",
   )
   const fresh = continuityValue(await rawExecuteRequest(
@@ -2194,9 +2210,10 @@ async function executeContinuity(runtime, args, context) {
     context,
     root,
   ))
-  const freshFeature = fresh.features?.find((item) => item.id === feature.id)
+  const freshFeature = fresh.features?.find((item) => item.id === selectedFeature.id)
   const freshCriterion = freshFeature?.criteria?.find((item) => item.id === criterion.id)
   if (fresh.revision !== requested.revision || fresh.execution !== null ||
+      (mandate && freshFeature?.mandate?.id !== mandate.id) ||
       freshCriterion?.digest !== criterion.digest ||
       freshCriterion?.check_kind !== criterion.check_kind ||
       freshCriterion?.check_target !== criterion.check_target ||
@@ -2219,7 +2236,7 @@ async function executeContinuity(runtime, args, context) {
     context,
     root,
   ))
-  const checkedFeature = checked.features?.find((item) => item.id === feature.id)
+  const checkedFeature = checked.features?.find((item) => item.id === selectedFeature.id)
   const checkedCriterion = checkedFeature?.criteria?.find((item) => item.id === criterion.id)
   if (checked.revision !== fresh.revision || checked.execution !== null ||
       checkedCriterion?.digest !== criterion.digest ||
@@ -2242,13 +2259,14 @@ async function executeContinuity(runtime, args, context) {
   const recorded = await rawExecuteRequest(
     runtime,
     continuityRequest("verify", checked.revision, requester.sessionID, {
-      feature_id: feature.id,
+      feature_id: selectedFeature.id,
       criterion_id: criterion.id,
       check_kind: criterion.check_kind,
       check_target: criterion.check_target,
       exit_code: result.exitStatus,
       output_sha256: outputDigest,
       task_id: taskID,
+      ...(data.mandate_id !== undefined ? { mandate_id: data.mandate_id } : {}),
       input_snapshot_before: inputSnapshotBefore,
       input_snapshot_after: inputSnapshotAfter,
     }),
@@ -2299,7 +2317,12 @@ const continuityData = object({
   criteria_ids: stringArray,
   depends_on: stringArray,
   task_id: string,
-  phase: { type: "string", enum: ["queue", "begin", "report"] },
+  phase: { type: "string", enum: ["start", "queue", "begin", "report"] },
+  mode: { type: "string", enum: ["ALL"] },
+  close_feature: boolean,
+  replace_mandate_id: string,
+  mandate_id: string,
+  task_event: { type: "string", enum: ["BLOCKED", "CANCELED", "REOPENED"] },
   report: string,
   result: { type: "string", enum: ["SUCCEEDED", "BLOCKED", "UNKNOWN"] },
   criterion_id: string,

@@ -87,8 +87,11 @@ from .domain import (
     ContinuityIdentityMetadata,
     ContinuityIncrementDocument,
     ContinuityInputScope,
+    ContinuityMandate,
+    ContinuityMandateReference,
     ContinuityReopen,
     ContinuityStateData,
+    ContinuityTaskEvent,
     ContinuityTaskDocument,
 )
 from .input_fingerprint import (
@@ -138,6 +141,7 @@ class _ContinuityCheckView(TypedDict):
     recorded_revision: int
     observed_input_scope: NotRequired[dict[str, str]]
     task_digest: NotRequired[str]
+    mandate_id: NotRequired[str]
 
 
 def _plain_record(record: Mapping[str, object]) -> dict[str, object]:
@@ -277,6 +281,7 @@ def _continuity_state_view(
         "attempts": tuple(state["attempts"]),
         "execution": None if execution is None else {"task_id": execution["task_id"]},
         "paused_features": tuple(state["paused_features"]),
+        "task_events": tuple(state.get("task_events", ())),
         "input_snapshot": None if input_snapshot is None else {
             "policy_id": input_snapshot["policy_id"],
             "policy_digest": input_snapshot["policy_digest"],
@@ -324,6 +329,9 @@ def _continuity_check_view(check: ContinuityCheck) -> _ContinuityCheckView:
     task_digest = check.get("task_digest")
     if task_digest is not None:
         view["task_digest"] = task_digest
+    mandate_id = check.get("mandate_id")
+    if mandate_id is not None:
+        view["mandate_id"] = mandate_id
     return view
 
 
@@ -594,36 +602,213 @@ def _mutate(
         writes.update(_render_plan_write(root, candidate, feature_id, feature, plan))
 
     elif operation == "tasks":
-        _keys(data, {"feature_id", "task_title", "task_description", "increment_id", "criteria_ids", "depends_on"})
-        title = _text(data.get("task_title"), "task_title", maximum=2048)
-        description = _text(data.get("task_description", ""), "task_description", maximum=4096, multiline=True, allow_empty=True)
-        criteria_ids = _id_list(data.get("criteria_ids"), "criteria_ids", "C", _criterion_ids(feature))
-        if not criteria_ids:
-            raise ContinuityError("INVALID_REQUEST", "a Task must be linked to at least one current criterion")
-        increment_id = data.get("increment_id")
-        increments = feature["increments"]
-        if increment_id is not None and increment_id not in {item["id"] for item in increments}:
-            raise ContinuityError("INVALID_REQUEST", "increment_id is not part of the selected Feature")
-        assert increment_id is None or isinstance(increment_id, str)
-        depends_on = _id_list(data.get("depends_on", []), "depends_on", "T", {item["id"] for item in tasks})
-        if len(tasks) >= _MAX_TASKS:
-            raise ContinuityError("LIMIT_EXCEEDED", "Feature Task limit is exceeded")
-        task: ContinuityTaskDocument = {
-            "id": _new_id("T", candidate), "title": title, "description": description,
-            "increment_id": increment_id, "criteria_ids": criteria_ids,
-            "depends_on": depends_on,
-        }
-        tasks.append(task)
-        candidate["task_states"][task["id"]] = {"attempts": 0}
-        writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
+        _keys(data, {
+            "feature_id", "task_title", "task_description", "increment_id",
+            "criteria_ids", "depends_on", "mandate_id", "task_event",
+            "task_id", "reason", "evidence_ref",
+        })
+        mandate = _validate_mandate_request(
+            candidate, feature_id, data, feature, tasks,
+        )
+        if "task_event" in data:
+            if candidate["execution"] is not None:
+                raise ContinuityError(
+                    "EXECUTION_BUSY", "reconcile the checkpointed Task before changing Task status",
+                )
+            if mandate is None:
+                raise ContinuityError(
+                    "MANDATE_REQUIRED", "Task lifecycle events require an active implementation mandate",
+                )
+            task = _by_id(tasks, data.get("task_id"), "T", "task_id")
+            if not _mandate_allows_task(mandate, task):
+                raise ContinuityError(
+                    "MANDATE_SCOPE", "Task is outside the active implementation mandate",
+                )
+            event_kind = data.get("task_event")
+            if event_kind not in ("BLOCKED", "CANCELED", "REOPENED"):
+                raise ContinuityError(
+                    "INVALID_REQUEST", "task_event must be BLOCKED, CANCELED, or REOPENED",
+                )
+            reason = _text(data.get("reason"), "reason", maximum=2048)
+            evidence_ref = _text(data.get("evidence_ref"), "evidence_ref", maximum=2048)
+            try:
+                current_snapshot = _continuity_input_scope(root, state)
+            except ContinuityError:
+                current_snapshot = None
+            task_view = _continuity_task_view(task)
+            task_status = continuity_task_status(
+                _continuity_state_view(state, current_snapshot),
+                _continuity_feature_view(feature), task_view,
+                tuple(_continuity_task_view(item) for item in tasks),
+            )
+            previous_event = next((
+                item for item in reversed(candidate.get("task_events", []))
+                if item["task_id"] == task["id"]
+            ), None)
+            if event_kind == "REOPENED":
+                if task_status not in ("BLOCKED", "CANCELED", "REPORTED", "COMPLETED"):
+                    raise ContinuityError(
+                        "TASK_NOT_REOPENABLE",
+                        "only a blocked, canceled, reported, or completed Task can be reopened",
+                    )
+            elif task_status in ("BLOCKED", "CANCELED") or (
+                previous_event is not None
+                and previous_event["event"] == "REOPENED"
+                and candidate["task_states"][task["id"]]["attempts"]
+                <= previous_event["attempt_count"]
+            ):
+                raise ContinuityError(
+                    "TASK_TRANSITION_INVALID",
+                    "resolve or reopen this Task before recording another blocked/canceled result",
+                )
+            candidate.setdefault("task_events", []).append({
+                "task_id": task["id"], "event": event_kind,
+                "reason": reason, "evidence_ref": evidence_ref,
+                "session_id": session_id,
+                "recorded_revision": state["revision"] + 1,
+                "attempt_count": candidate["task_states"][task["id"]]["attempts"],
+            })
+            writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
+        else:
+            title = _text(data.get("task_title"), "task_title", maximum=2048)
+            description = _text(data.get("task_description", ""), "task_description", maximum=4096, multiline=True, allow_empty=True)
+            criteria_ids = _id_list(data.get("criteria_ids"), "criteria_ids", "C", _criterion_ids(feature))
+            if not criteria_ids:
+                raise ContinuityError("INVALID_REQUEST", "a Task must be linked to at least one current criterion")
+            increment_id = data.get("increment_id")
+            increments = feature["increments"]
+            if increment_id is not None and increment_id not in {item["id"] for item in increments}:
+                raise ContinuityError("INVALID_REQUEST", "increment_id is not part of the selected Feature")
+            assert increment_id is None or isinstance(increment_id, str)
+            depends_on = _id_list(data.get("depends_on", []), "depends_on", "T", {item["id"] for item in tasks})
+            if len(tasks) >= _MAX_TASKS:
+                raise ContinuityError("LIMIT_EXCEEDED", "Feature Task limit is exceeded")
+            task: ContinuityTaskDocument = {
+                "id": _new_id("T", candidate), "title": title, "description": description,
+                "increment_id": increment_id, "criteria_ids": criteria_ids,
+                "depends_on": depends_on,
+            }
+            if mandate is not None and not _mandate_allows_task(mandate, task):
+                raise ContinuityError(
+                    "MANDATE_SCOPE",
+                    "new Task must use only criteria and Increments bound to the active mandate",
+                )
+            tasks.append(task)
+            candidate["task_states"][task["id"]] = {"attempts": 0}
+            writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
 
     elif operation == "implement":
-        _keys(data, {"feature_id", "task_id", "phase", "report", "result"})
+        _keys(data, {
+            "feature_id", "task_id", "phase", "report", "result", "mandate_id",
+            "mode", "close_feature", "replace_mandate_id",
+        })
         task_id = data.get("task_id")
         phase = data.get("phase", "queue")
+        if phase == "start":
+            if not isinstance(data.get("feature_id"), str):
+                raise ContinuityError(
+                    "FEATURE_REQUIRED", "implement start requires the exact Feature ID",
+                )
+            if task_id is not None or data.get("mode") != "ALL":
+                raise ContinuityError(
+                    "INVALID_REQUEST", "implement start requires mode ALL and no task_id",
+                )
+            close_feature = data.get("close_feature", False)
+            if type(close_feature) is not bool:
+                raise ContinuityError("INVALID_REQUEST", "close_feature must be a boolean")
+            if candidate["execution"] is not None:
+                raise ContinuityError(
+                    "EXECUTION_BUSY", "reconcile the checkpointed Task before starting a mandate",
+                )
+            if feature_id in candidate["paused_features"]:
+                raise ContinuityError(
+                    "FEATURE_PAUSED", "resume the selected Feature before starting a mandate",
+                )
+            current_mandate = _feature_mandate(candidate, feature_id)
+            replace_id = data.get("replace_mandate_id")
+            if current_mandate is not None:
+                if (
+                    current_mandate["feature_id"] == feature_id
+                    and _mandate_scope_matches(current_mandate, feature)
+                    and current_mandate["close_feature"] == close_feature
+                ):
+                    if replace_id not in (None, current_mandate["id"]):
+                        raise ContinuityError(
+                            "MANDATE_MISMATCH",
+                            "replacement must name the current mandate for this Feature",
+                        )
+                    return _project(store, state, session_id)
+                if replace_id != current_mandate["id"]:
+                    raise ContinuityError(
+                        "MANDATE_ACTIVE",
+                        "an active mandate can be replaced only by naming its exact ID after it is finished or stale",
+                    )
+                if current_mandate["feature_id"] != feature_id:
+                    raise ContinuityError(
+                        "FEATURE_MISMATCH", "a mandate can only be replaced for its bound Feature",
+                    )
+                try:
+                    old_snapshot = _continuity_input_scope(root, state)
+                except ContinuityError:
+                    old_snapshot = None
+                old_status = _implementation_projection(
+                    state, current_mandate, feature, tasks, old_snapshot,
+                )["status"]
+                if old_status not in ("FINISHED", "STALE_SCOPE"):
+                    raise ContinuityError(
+                        "MANDATE_ACTIVE",
+                        "finish the current mandate or reconcile its changed scope before replacing it",
+                    )
+            elif replace_id is not None:
+                raise ContinuityError(
+                    "MANDATE_MISMATCH", "there is no current mandate with that replacement ID",
+                )
+            current_mandates = _mutable_mandates(candidate)
+            mandate_id = _new_id("D", candidate)
+            new_mandate: ContinuityMandate = {
+                "id": mandate_id, "feature_id": feature_id, "mode": "ALL",
+                "criteria": [
+                    {"id": item["id"], "digest": _digest(item)}
+                    for item in feature["criteria"]
+                ],
+                "increments": [
+                    {
+                        "id": item["id"],
+                        "digest": _digest({
+                            "id": item["id"], "outcome": item["outcome"],
+                        }),
+                    }
+                    for item in feature["increments"]
+                ],
+                "source_revision": state["revision"],
+                "recorded_revision": state["revision"] + 1,
+                "session_id": session_id, "close_feature": close_feature,
+                "outcome_digest": _digest(feature["outcome"]),
+            }
+            if current_mandate is not None:
+                candidate.setdefault("mandate_history", []).append(current_mandate)
+            current_mandates[feature_id] = new_mandate
+            candidate["mandates"] = current_mandates
+            return _publish_state_only(store, state, candidate, session_id)
         if phase == "queue" and task_id is None:
+            _validate_mandate_request(
+                candidate, feature_id, data, feature, tasks,
+            )
             return _project(store, state, session_id)
         task = _by_id(tasks, task_id, "T", "task_id")
+        execution = candidate["execution"]
+        mandate = _validate_mandate_request(
+            candidate, feature_id, data, feature, tasks,
+            allow_unbound_recovery=(
+                phase == "report"
+                and execution is not None
+                and execution["task_id"] == task["id"]
+            ),
+        )
+        if mandate is not None and not _mandate_allows_task(mandate, task):
+            raise ContinuityError(
+                "MANDATE_SCOPE", "Task is outside the active implementation mandate",
+            )
         if phase == "begin":
             execution = candidate["execution"]
             if execution is not None:
@@ -655,6 +840,8 @@ def _mutate(
                 ),
                 "result": None, "result_status": None, "evidence_ref": None,
             }
+            if mandate is not None:
+                entry["mandate_id"] = mandate["id"]
             candidate["attempts"].append(entry)
             execution_record: ContinuityExecution = {
                 "task_id": task["id"], "attempt": attempt, "session_id": session_id,
@@ -693,6 +880,7 @@ def _mutate(
             "feature_id", "criterion_id", "exit_code", "output_sha256",
             "check_kind", "check_target", "task_id",
             "input_snapshot_before", "input_snapshot_after",
+            "mandate_id",
         })
         # The OpenCode tool supplies result fields only after it runs an allow-listed test.
         criterion = _by_id(feature["criteria"], data.get("criterion_id"), "C", "criterion_id")
@@ -711,6 +899,13 @@ def _mutate(
             raise ContinuityError("EXECUTION_BUSY", "reconcile the in-flight Task before verifying")
         task_id = _text(data.get("task_id"), "task_id", maximum=256)
         task = _by_id(tasks, task_id, "T", "task_id")
+        mandate = _validate_mandate_request(
+            candidate, feature_id, data, feature, tasks,
+        )
+        if mandate is not None and not _mandate_allows_task(mandate, task):
+            raise ContinuityError(
+                "MANDATE_SCOPE", "verification Task is outside the active implementation mandate",
+            )
         if criterion["id"] not in task["criteria_ids"]:
             raise ContinuityError(
                 "INVALID_REQUEST", "verification Task must be linked to the current criterion",
@@ -735,11 +930,23 @@ def _mutate(
             "observed_input_scope": current_input,
             "task_digest": _digest(task),
         }
+        if mandate is not None:
+            check["mandate_id"] = mandate["id"]
         candidate["checks"].append(check)
         writes.update(_render_task_write(root, candidate, feature_id, tasks, feature))
 
     elif operation == "pause":
-        _keys(data, {"feature_id", "reason", "detour_kind", "detour_title", "return_task_id"})
+        _keys(data, {
+            "feature_id", "reason", "detour_kind", "detour_title",
+            "return_task_id", "mandate_id",
+        })
+        mandate = _validate_mandate_request(
+            candidate, feature_id, data, feature, tasks,
+        )
+        if mandate is not None and candidate["execution"] is not None:
+            raise ContinuityError(
+                "EXECUTION_BUSY", "reconcile the checkpointed Task before pausing or detouring",
+            )
         reason = _text(data.get("reason"), "reason", maximum=2048)
         detour_kind = data.get("detour_kind")
         if detour_kind is not None:
@@ -754,6 +961,10 @@ def _mutate(
             return_task = _by_id(
                 tasks, data.get("return_task_id"), "T", "return_task_id",
             )
+            if mandate is not None and not _mandate_allows_task(mandate, return_task):
+                raise ContinuityError(
+                    "MANDATE_SCOPE", "detour return Task is outside the active mandate",
+                )
             return_task_id = return_task["id"]
             detour_id = _new_id("D", candidate, {item["id"] for item in decisions})
             detour: ContinuityDetour = {
@@ -781,13 +992,26 @@ def _mutate(
     elif operation == "resume":
         _keys(data, {
             "feature_id", "reconcile", "task_id", "evidence_ref", "detour_summary",
+            "mandate_id",
         })
         execution = candidate["execution"]
         reconcile = data.get("reconcile")
+        mandate = _validate_mandate_request(
+            candidate, feature_id, data, feature, tasks,
+            allow_unbound_recovery=(
+                execution is not None
+                and reconcile in ("COMPLETE", "INCOMPLETE")
+                and data.get("task_id") == execution["task_id"]
+            ),
+        )
         pending_detour = _pending_detour(candidate, feature_id)
         detour_result: str | None = None
         if pending_detour is not None:
-            _by_id(tasks, pending_detour["return_task_id"], "T", "return_task_id")
+            return_task = _by_id(tasks, pending_detour["return_task_id"], "T", "return_task_id")
+            if mandate is not None and not _mandate_allows_task(mandate, return_task):
+                raise ContinuityError(
+                    "MANDATE_SCOPE", "detour return Task is outside the active mandate",
+                )
             if data.get("detour_summary") is None:
                 raise ContinuityError(
                     "DETOUR_OUTCOME_REQUIRED",
@@ -809,6 +1033,13 @@ def _mutate(
                 )
             if data.get("task_id") != execution["task_id"]:
                 raise ContinuityError("TASK_MISMATCH", "reconciliation must name the exact checkpointed Task")
+            if mandate is not None and not any(
+                task["id"] == execution["task_id"] and _mandate_allows_task(mandate, task)
+                for task in tasks
+            ):
+                raise ContinuityError(
+                    "MANDATE_SCOPE", "checkpointed Task is outside the active mandate",
+                )
             evidence_ref = _text(data.get("evidence_ref"), "evidence_ref", maximum=2048)
             entry = _active_attempt(candidate)
             entry["status"] = "RECONCILED_COMPLETE" if reconcile == "COMPLETE" else "RECONCILED_INCOMPLETE"
@@ -840,7 +1071,15 @@ def _mutate(
         candidate["pause_reasons"].pop(feature_id, None)
 
     elif operation == "close":
-        _keys(data, {"feature_id"})
+        _keys(data, {"feature_id", "mandate_id"})
+        mandate = _validate_mandate_request(
+            candidate, feature_id, data, feature, tasks,
+        )
+        if mandate is not None and not mandate["close_feature"]:
+            raise ContinuityError(
+                "MANDATE_CLOSE_NOT_REQUESTED",
+                "Feature closure was not explicitly included in the active mandate",
+            )
         try:
             current_input_snapshot = _continuity_input_scope(root, state)
         except ContinuityError as error:
@@ -880,9 +1119,17 @@ def _mutate(
     elif operation == "change":
         _keys(data, {
             "feature_id", "outcome", "criteria", "task_title", "task_description",
-            "increment_id", "criteria_ids",
+            "increment_id", "criteria_ids", "mandate_id",
         })
+        mandate = _validate_mandate_request(
+            candidate, feature_id, data, feature, tasks,
+        )
         changed = _amend_feature(feature, data, candidate)
+        if mandate is not None and not _mandate_scope_matches(mandate, changed):
+            raise ContinuityError(
+                "MANDATE_STALE_SCOPE",
+                "criterion definitions cannot change under this mandate; reconcile explicitly, then start a new mandate",
+            )
         task_title = _text(data.get("task_title"), "task_title", maximum=2048)
         task_description = _text(data.get("task_description", ""), "task_description", maximum=4096, multiline=True, allow_empty=True)
         criteria_ids = _id_list(
@@ -900,6 +1147,10 @@ def _mutate(
             "description": task_description, "increment_id": increment_id,
             "criteria_ids": criteria_ids, "depends_on": [],
         }
+        if mandate is not None and not _mandate_allows_task(mandate, task):
+            raise ContinuityError(
+                "MANDATE_SCOPE", "new Task must use only criteria and Increments bound to the active mandate",
+            )
         if len(tasks) >= _MAX_TASKS:
             raise ContinuityError("LIMIT_EXCEEDED", "Feature Task limit is exceeded")
         tasks.append(task)
@@ -1053,7 +1304,13 @@ def _project_pending(
         "mode": "COMPOSED", "revision": state["revision"],
         "status": "RECOVERY_REQUIRED", "next_action": "resume",
         "execution": state["execution"],
-        "active_attempt": None if state["execution"] is None else _active_attempt(state),
+        "execution_feature_id": _task_owner(
+            state, state["execution"]["task_id"],
+        ) if state["execution"] is not None else None,
+        "active_attempt": (
+            None if state["execution"] is None
+            else _active_attempt_projection(state)
+        ),
     }
     recovery = store.pending_resolution_preview(state)
     if recovery is not None:
@@ -1070,16 +1327,24 @@ def _report_attempt_state_only(
     expected_revision: int | None, session_id: str, data: dict[str, object],
 ) -> dict[str, object]:
     _expect_revision(expected_revision, state["revision"])
-    _keys(data, {"feature_id", "task_id", "phase", "report", "result"})
+    _keys(data, {
+        "feature_id", "task_id", "phase", "report", "result", "mandate_id",
+    })
     execution = state["execution"]
     if execution is None or execution["task_id"] != data.get("task_id"):
         raise ContinuityError("NO_ACTIVE_ATTEMPT", "no matching checkpointed Task attempt exists")
+    owner = _task_owner(state, execution["task_id"])
+    mandate = _require_mandate_id(state, owner, data)
+    active_attempt = _active_attempt(state)
+    if mandate is not None and active_attempt.get("mandate_id") != mandate["id"]:
+        raise ContinuityError(
+            "MANDATE_MISMATCH", "the checkpoint was not started under this Feature mandate",
+        )
     if execution["session_id"] != session_id:
         raise ContinuityError(
             "OUTCOME_UNKNOWN",
             "only the originating host session may report this checkpointed attempt",
         )
-    owner = _task_owner(state, execution["task_id"])
     if data.get("feature_id") is not None and data.get("feature_id") != owner:
         raise ContinuityError("TASK_MISMATCH", "report must target the Feature owning the checkpointed Task")
     if data.get("phase") != "report":
@@ -1110,6 +1375,7 @@ def _reconcile_attempt_state_only(
     _expect_revision(expected_revision, state["revision"])
     _keys(data, {
         "feature_id", "reconcile", "task_id", "evidence_ref", "detour_summary",
+        "mandate_id",
     })
     execution = state["execution"]
     if execution is None:
@@ -1122,6 +1388,14 @@ def _reconcile_attempt_state_only(
     if data.get("task_id") != execution["task_id"]:
         raise ContinuityError("TASK_MISMATCH", "reconciliation must name the exact checkpointed Task")
     owner = _task_owner(state, execution["task_id"])
+    mandate = _require_mandate_id(state, owner, data)
+    if (
+        mandate is not None
+        and _active_attempt(state).get("mandate_id") != mandate["id"]
+    ):
+        raise ContinuityError(
+            "MANDATE_MISMATCH", "the checkpoint was not started under this Feature mandate",
+        )
     if data.get("feature_id") is not None and data.get("feature_id") != owner:
         raise ContinuityError("TASK_MISMATCH", "reconciliation must target the Feature owning the checkpointed Task")
     if data.get("detour_summary") is not None:
@@ -1175,6 +1449,126 @@ def _task_owner(state: ContinuityStateData, task_id: str) -> str | None:
         return None
     feature_id = metadata.get("feature_id")
     return feature_id if isinstance(feature_id, str) and feature_id in state["features"] else None
+
+
+def _feature_mandate(
+    state: ContinuityStateData, feature_id: str,
+) -> ContinuityMandate | None:
+    mandates = state.get("mandates")
+    if mandates is not None:
+        return mandates.get(feature_id)
+    legacy = state.get("mandate")
+    return legacy if legacy is not None and legacy["feature_id"] == feature_id else None
+
+
+def _current_mandates(
+    state: ContinuityStateData,
+) -> dict[str, ContinuityMandate]:
+    current = dict(state.get("mandates", {}))
+    legacy = state.get("mandate")
+    if legacy is not None:
+        current.setdefault(legacy["feature_id"], legacy)
+    return current
+
+
+def _mutable_mandates(
+    state: ContinuityStateData,
+) -> dict[str, ContinuityMandate]:
+    current = _current_mandates(state)
+    cast(dict[str, object], cast(object, state)).pop("mandate", None)
+    state["mandates"] = current
+    state.setdefault("mandate_history", [])
+    return current
+
+
+def _validate_mandate_request(
+    state: ContinuityStateData, feature_id: str, data: dict[str, object],
+    feature: ContinuityFeatureDocument, tasks: list[ContinuityTaskDocument],
+    *, check_scope: bool = True, allow_unbound_recovery: bool = False,
+) -> ContinuityMandate | None:
+    mandate = _feature_mandate(state, feature_id)
+    supplied = data.get("mandate_id")
+    if mandate is None:
+        if supplied is not None:
+            if any(item["id"] == supplied for item in _current_mandates(state).values()):
+                raise ContinuityError(
+                    "FEATURE_MISMATCH",
+                    "the supplied mandate belongs to a different Feature",
+                )
+            raise ContinuityError("MANDATE_REQUIRED", "there is no active implementation mandate for this Feature")
+        return None
+    if supplied != mandate["id"]:
+        raise ContinuityError(
+            "MANDATE_MISMATCH", "the exact current Core mandate ID for this Feature is required",
+        )
+    if check_scope and not allow_unbound_recovery:
+        if "outcome_digest" not in mandate:
+            raise ContinuityError(
+                "MANDATE_STALE_SCOPE",
+                "legacy mandate has no normative Feature Outcome binding; reconcile and explicitly replace it before new effects",
+            )
+        if not _mandate_scope_matches(mandate, feature):
+            raise ContinuityError(
+                "MANDATE_STALE_SCOPE",
+                "accepted Feature Outcome, criterion, or Increment outcome changed; explicitly reconcile and start a new mandate",
+            )
+        increment_ids = {item["id"] for item in mandate["increments"]}
+        criterion_ids = {item["id"] for item in mandate["criteria"]}
+        if any(
+            (
+                task["increment_id"] is not None
+                and task["increment_id"] not in increment_ids
+            )
+            or not set(task["criteria_ids"]) <= criterion_ids
+            for task in tasks
+        ):
+            raise ContinuityError(
+                "MANDATE_STALE_SCOPE", "a current Task falls outside the bound Increment and criterion IDs",
+            )
+    return mandate
+
+
+def _require_mandate_id(
+    state: ContinuityStateData, feature_id: str | None,
+    data: dict[str, object],
+) -> ContinuityMandate | None:
+    supplied = data.get("mandate_id")
+    mandate = (
+        _feature_mandate(state, feature_id)
+        if feature_id is not None
+        else next(
+            (item for item in _current_mandates(state).values() if item["id"] == supplied),
+            None,
+        )
+    )
+    if mandate is None:
+        if supplied is not None:
+            if any(item["id"] == supplied for item in _current_mandates(state).values()):
+                raise ContinuityError(
+                    "FEATURE_MISMATCH",
+                    "the supplied mandate belongs to a different Feature",
+                )
+            raise ContinuityError("MANDATE_REQUIRED", "there is no active implementation mandate")
+        return None
+    if supplied != mandate["id"]:
+        raise ContinuityError(
+            "MANDATE_MISMATCH", "the exact active Core mandate ID is required",
+        )
+    if feature_id is not None and feature_id != mandate["feature_id"]:
+        raise ContinuityError(
+            "FEATURE_MISMATCH", "the operation must target the Feature bound to its mandate",
+        )
+    return mandate
+
+
+def _mandate_allows_task(
+    mandate: ContinuityMandate, task: ContinuityTaskDocument,
+) -> bool:
+    criteria = {item["id"] for item in mandate["criteria"]}
+    increments = {item["id"] for item in mandate["increments"]}
+    return (
+        task["increment_id"] is None or task["increment_id"] in increments
+    ) and set(task["criteria_ids"]) <= criteria
 
 
 def _resolve_pending_publication(
@@ -1259,12 +1653,15 @@ def _reconcile_documents(
     store: ContinuityPersistence, state: ContinuityStateData,
     session_id: str, data: dict[str, object],
 ) -> dict[str, object]:
-    _keys(data, {"feature_id", "retire_ids", "reopen_feature_id"})
+    _keys(data, {
+        "feature_id", "retire_ids", "reopen_feature_id", "mandate_id",
+    })
     feature_id = data.get("feature_id")
     if not isinstance(feature_id, str) or feature_id not in state["features"]:
         raise ContinuityError(
             "FEATURE_REQUIRED", "reconcile requires the exact current Feature ID",
         )
+    _require_mandate_id(state, feature_id, data)
     if _has_legacy_documents(store.root, state):
         raise ContinuityError(
             "UPGRADE_REQUIRED",
@@ -1584,6 +1981,222 @@ def _file_digest(path: Path) -> str | None:
         raise ContinuityError("DOCUMENT_UNREADABLE", f"{path.name} cannot be read") from error
 
 
+def _mandate_scope_matches(
+    mandate: ContinuityMandate, feature: ContinuityFeatureDocument,
+) -> bool:
+    return (
+        feature["id"] == mandate["feature_id"]
+        and mandate.get("outcome_digest") == _digest(feature["outcome"])
+        and mandate["criteria"] == [
+            {"id": item["id"], "digest": _digest(item)}
+            for item in feature["criteria"]
+        ]
+        and mandate["increments"] == [
+            {
+                "id": item["id"],
+                "digest": _digest({"id": item["id"], "outcome": item["outcome"]}),
+            }
+            for item in feature["increments"]
+        ]
+    )
+
+
+def _implementation_projection(
+    state: ContinuityStateData, mandate: ContinuityMandate,
+    feature: ContinuityFeatureDocument | None,
+    tasks: list[ContinuityTaskDocument] | None,
+    input_snapshot: ContinuityInputScope | None,
+) -> dict[str, object]:
+    view: dict[str, object] = {
+        "id": mandate["id"], "mode": mandate["mode"],
+        "feature_id": mandate["feature_id"],
+        "source_revision": mandate["source_revision"],
+        "recorded_revision": mandate["recorded_revision"],
+        "started_by_session_id": mandate["session_id"],
+        "close_feature": mandate["close_feature"],
+        "outcome_digest": mandate.get("outcome_digest"),
+        "criteria_scope": mandate["criteria"],
+        "increments_scope": mandate["increments"],
+        "criterion_ids": [item["id"] for item in mandate["criteria"]],
+        "increment_ids": [item["id"] for item in mandate["increments"]],
+        "next_task": None,
+    }
+    if feature is None or tasks is None or not _mandate_scope_matches(mandate, feature):
+        view.update({
+            "status": "STALE_SCOPE",
+            "stale_reason": (
+                "legacy mandate has no normative Feature Outcome binding"
+                if "outcome_digest" not in mandate
+                else "accepted Outcome, criterion, or Increment definition is unavailable or changed"
+            ),
+            "coverage": {
+                "criteria_total": len(mandate["criteria"]), "criteria_passing": 0,
+                "tasks_total": 0, "tasks_completed": 0,
+                "increments_total": len(mandate["increments"]), "increments_finished": 0,
+            },
+            "criteria": [{"id": item["id"], "status": "STALE"} for item in mandate["criteria"]],
+            "increments": [
+                {"id": item["id"], "status": "STALE", "task_ids": []}
+                for item in mandate["increments"]
+            ],
+            "tasks": [],
+        })
+        return view
+
+    criterion_ids = {item["id"] for item in mandate["criteria"]}
+    increment_ids = {item["id"] for item in mandate["increments"]}
+    if any(
+        (
+            task["increment_id"] is not None
+            and task["increment_id"] not in increment_ids
+        )
+        or not set(task["criteria_ids"]) <= criterion_ids
+        for task in tasks
+    ):
+        view.update({
+            "status": "STALE_SCOPE",
+            "stale_reason": "a Task is not within the bound Increment and criterion IDs",
+        })
+        return view
+
+    current_state = _continuity_state_view(state, input_snapshot)
+    current_feature = _continuity_feature_view(feature)
+    task_views = tuple(_continuity_task_view(item) for item in tasks)
+    checks = continuity_current_checks(
+        current_state, current_feature, tasks=task_views,
+    )
+    task_projection: list[dict[str, object]] = []
+    by_increment: dict[str | None, list[dict[str, object]]] = {}
+    linked_tasks: dict[str, list[str]] = {identity: [] for identity in criterion_ids}
+    for task, task_view in zip(tasks, task_views, strict=True):
+        status = continuity_task_status(current_state, current_feature, task_view, task_views)
+        projection: dict[str, object] = {
+            "id": task["id"], "increment_id": task["increment_id"],
+            "status": status,
+            "eligible": continuity_task_eligible(
+                current_state, current_feature, task_views, task_view,
+            ),
+        }
+        task_projection.append(projection)
+        by_increment.setdefault(task["increment_id"], []).append(projection)
+        for identity in task["criteria_ids"]:
+            linked_tasks[identity].append(task["id"])
+
+    criteria = [
+        {
+            "id": identity,
+            "status": (
+                "PASSING" if checks.get(identity, {}).get("passed")
+                else "FAILING" if identity in checks
+                else "PENDING"
+            ),
+        }
+        for identity in (item["id"] for item in mandate["criteria"])
+    ]
+    increments: list[dict[str, object]] = []
+    for reference in mandate["increments"]:
+        increment_tasks = by_increment.get(reference["id"], [])
+        statuses = [item["status"] for item in increment_tasks]
+        if not increment_tasks:
+            status = "PENDING"
+        elif "OUTCOME_UNKNOWN" in statuses:
+            status = "UNKNOWN_EFFECT"
+        elif any(item in ("BLOCKED", "CANCELED") for item in statuses):
+            status = "BLOCKED"
+        elif all(item == "COMPLETED" for item in statuses):
+            status = "FINISHED"
+        elif "REPORTED" in statuses:
+            status = "REPORTED"
+        elif any(
+            item["status"] == "READY" and not item["eligible"]
+            for item in increment_tasks
+        ):
+            status = "INELIGIBLE"
+        else:
+            status = "PENDING"
+        increments.append({
+            "id": reference["id"], "status": status,
+            "task_ids": [item["id"] for item in increment_tasks],
+        })
+
+    missing_increment_tasks = [
+        item["id"] for item in increments if not item["task_ids"]
+    ]
+    if mandate["increments"]:
+        ordered_groups = (
+            ([by_increment[None]] if by_increment.get(None) else [])
+            + [by_increment.get(item["id"], []) for item in mandate["increments"]]
+        )
+    else:
+        ordered_groups = [by_increment.get(None, [])]
+    next_task: str | None = None
+    for group in ordered_groups:
+        if not group:
+            break
+        incomplete = next((item for item in group if item["status"] != "COMPLETED"), None)
+        if incomplete is None:
+            continue
+        if incomplete["status"] == "READY" and incomplete["eligible"]:
+            next_task = cast(str, incomplete["id"])
+        break
+
+    unassigned_criteria = [
+        identity for identity, linked in linked_tasks.items() if not linked
+    ]
+    passing_count = sum(item["status"] == "PASSING" for item in criteria)
+    execution = state["execution"]
+    execution_owner = (
+        None if execution is None
+        else _task_owner(state, execution["task_id"])
+    )
+    if execution is not None and execution_owner == mandate["feature_id"]:
+        status = "UNKNOWN_EFFECT"
+    elif mandate["feature_id"] in state["paused_features"]:
+        status = "PAUSED"
+    elif unassigned_criteria:
+        status = "INELIGIBLE"
+    elif any(item["status"] in ("BLOCKED", "CANCELED") for item in task_projection):
+        status = "BLOCKED"
+    elif any(item["status"] == "FAILING" for item in criteria):
+        status = "BLOCKED"
+    elif missing_increment_tasks:
+        status = "PENDING"
+    elif (
+        all(item["status"] == "COMPLETED" for item in task_projection)
+        and passing_count == len(mandate["criteria"])
+        and all(item["status"] == "FINISHED" for item in increments)
+    ):
+        status = "FINISHED"
+    elif any(item["status"] == "REPORTED" for item in task_projection):
+        status = "REPORTED"
+    elif next_task is None and any(
+        item["status"] != "COMPLETED" for item in task_projection
+    ):
+        status = "INELIGIBLE"
+    else:
+        status = "PENDING"
+
+    if execution is not None and execution_owner != mandate["feature_id"]:
+        next_task = None
+    view.update({
+        "status": status, "criteria": criteria, "increments": increments,
+        "tasks": task_projection, "next_task": next_task,
+        "missing_increment_task_ids": missing_increment_tasks,
+        "unassigned_criterion_ids": unassigned_criteria,
+        "coverage": {
+            "criteria_total": len(mandate["criteria"]),
+            "criteria_passing": passing_count,
+            "tasks_total": len(task_projection),
+            "tasks_completed": sum(
+                item["status"] == "COMPLETED" for item in task_projection
+            ),
+            "increments_total": len(mandate["increments"]),
+            "increments_finished": sum(item["status"] == "FINISHED" for item in increments),
+        },
+    })
+    return view
+
+
 def _project(
     store: ContinuityPersistence, state: ContinuityStateData, session_id: str,
 ) -> dict[str, object]:
@@ -1605,8 +2218,16 @@ def _project(
         dict[str, dict[str, object]],
         document_changes.pop("_parsed_documents", {}),
     )
+    selected = state["session_features"].get(session_id) or state["default_feature_id"]
+    mandate_history = list(state.get("mandate_history", []))
     if document_changes["identity_ref_conflicts"] or document_changes["semantic"]:
-        return {
+        selected_mandate = (
+            None if selected is None else _feature_mandate(state, selected)
+        )
+        selected_documents = (
+            None if selected is None else parsed_documents.get(selected)
+        )
+        result: dict[str, object] = {
             "mode": "COMPOSED", "revision": state["revision"],
             "status": (
                 "DOCUMENT_CONFLICT"
@@ -1615,12 +2236,34 @@ def _project(
             ),
             "document_changes": document_changes,
             "execution": state["execution"],
-            "active_attempt": None if state["execution"] is None else _active_attempt(state),
+            "execution_feature_id": (
+                None if state["execution"] is None
+                else _task_owner(state, state["execution"]["task_id"])
+            ),
+            "active_attempt": (
+                None if state["execution"] is None
+                else _active_attempt_projection(state)
+            ),
             "features": [],
+            "selected_feature_id": selected,
             "selected_feature": None,
             "next_task": None,
+            "mandate_history": mandate_history,
         }
-    selected = state["session_features"].get(session_id) or state["default_feature_id"]
+        if selected_mandate is not None:
+            selected_feature = (
+                None if selected_documents is None
+                else cast(ContinuityFeatureDocument, selected_documents["spec"])
+            )
+            selected_tasks = (
+                None if selected_documents is None
+                else cast(list[ContinuityTaskDocument], selected_documents["tasks"])
+            )
+            result["mandate"] = _implementation_projection(
+                state, selected_mandate, selected_feature, selected_tasks,
+                input_snapshot,
+            )
+        return result
     feature_views: list[dict[str, object]] = []
     result: dict[str, object] = {
         "mode": "COMPOSED", "revision": state["revision"],
@@ -1629,7 +2272,16 @@ def _project(
         "selection_scope": "session" if session_id in state["session_features"] else "worktree",
         "features": feature_views,
         "execution": state["execution"],
+        "execution_feature_id": (
+            None if state["execution"] is None
+            else _task_owner(state, state["execution"]["task_id"])
+        ),
+        "active_attempt": (
+            None if state["execution"] is None
+            else _active_attempt_projection(state)
+        ),
         "document_changes": document_changes,
+        "mandate_history": mandate_history,
     }
     if input_snapshot_error is not None:
         result["input_snapshot_error"] = input_snapshot_error
@@ -1650,12 +2302,21 @@ def _project(
             status = continuity_task_status(
                 continuity_state, continuity_feature, continuity_task, task_views,
             )
+            latest_event = next((
+                item for item in reversed(state.get("task_events", []))
+                if item["task_id"] == task["id"]
+            ), None)
             task_projection.append({
                 **task, "status": status,
                 "attempts": state["task_states"][task["id"]]["attempts"],
+                "attempt_history": [
+                    item for item in state["attempts"]
+                    if item["task_id"] == task["id"]
+                ],
                 "eligible": continuity_task_eligible(
                     continuity_state, continuity_feature, task_views, continuity_task,
                 ),
+                **({"latest_event": latest_event} if latest_event is not None else {}),
             })
         feature_view: dict[str, object] = {
             "id": feature_id, "directory": feature_state["directory"],
@@ -1679,6 +2340,10 @@ def _project(
             "detours": [
                 item for item in state["detours"] if item["feature_id"] == feature_id
             ],
+            "task_events": [
+                item for item in state.get("task_events", [])
+                if any(task["id"] == item["task_id"] for task in tasks)
+            ],
             "closure_history": [
                 item for item in state["closures"] if item["feature_id"] == feature_id
             ],
@@ -1686,12 +2351,39 @@ def _project(
                 item for item in state["reopens"] if item["feature_id"] == feature_id
             ],
         }
+        feature_mandate = _feature_mandate(state, feature_id)
+        if feature_mandate is not None:
+            feature_view["mandate"] = _implementation_projection(
+                state, feature_mandate, feature, tasks, input_snapshot,
+            )
         feature_views.append(feature_view)
     selected_feature = next(
         (feature for feature in feature_views if feature["id"] == selected), None
     )
     result["selected_feature"] = selected_feature
-    result["next_task"] = _next_task(selected_feature)
+    selected_mandate = (
+        None if selected is None else _feature_mandate(state, selected)
+    )
+    if selected_mandate is None:
+        result["next_task"] = _next_task(selected_feature)
+    else:
+        mandate_documents = parsed_documents.get(selected_mandate["feature_id"])
+        implementation = _implementation_projection(
+            state, selected_mandate,
+            None if mandate_documents is None else cast(
+                ContinuityFeatureDocument, mandate_documents["spec"],
+            ),
+            None if mandate_documents is None else cast(
+                list[ContinuityTaskDocument], mandate_documents["tasks"],
+            ),
+            input_snapshot,
+        )
+        result["mandate"] = implementation
+        result["next_task"] = (
+            implementation["next_task"]
+            if selected == selected_mandate["feature_id"]
+            and state["execution"] is None else None
+        )
     return result
 
 
@@ -1871,6 +2563,7 @@ def _continuity_historical_check(
         stale_reason = "task_not_current"
     else:
         return None
+    mandate_id = receipt.get("mandate_id")
     return {
         "passed": False, "fresh": False,
         "historical_passed": receipt["exit_code"] == 0,
@@ -1882,6 +2575,10 @@ def _continuity_historical_check(
         "reported_by_session_id": receipt["reported_by_session_id"],
         "recorded_revision": receipt["recorded_revision"],
         "stale_reason": stale_reason,
+        **(
+            {"mandate_id": mandate_id}
+            if isinstance(mandate_id, str) else {}
+        ),
     }
 
 
@@ -1893,6 +2590,16 @@ def _active_attempt(state: ContinuityStateData) -> ContinuityAttempt:
         if attempt["task_id"] == execution["task_id"] and attempt["attempt"] == execution["attempt"]:
             return attempt
     raise ContinuityError("CORRUPT_CONTINUITY", "active Task attempt is missing from history")
+
+
+def _active_attempt_projection(state: ContinuityStateData) -> dict[str, object]:
+    attempt = dict(_active_attempt(state))
+    execution = state["execution"]
+    assert execution is not None
+    owner = _task_owner(state, execution["task_id"])
+    if owner is not None:
+        attempt["feature_id"] = owner
+    return attempt
 
 
 def _pending_detour(
